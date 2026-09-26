@@ -47,9 +47,59 @@ npm run tauri build
 
 ## Shortcuts
 
+### Tools
+
 | Shortcut | Action |
 | --- | --- |
 | `B` | Brush tool |
 | `E` | Eraser tool |
+| `M` | Rectangle selection |
+| `L` | Lasso selection |
+| `G` | Bucket fill |
+| `T` | Text tool |
+| `F` | Comic frame tool |
+| `I` / `Alt` (hold) | Eyedropper / Pipette |
+| `J` | Liquify tool |
+| `X` | Swap primary and secondary colors |
+| `[` | Toggle left panel |
+
+### Navigation and Canvas
+
+| Shortcut | Action |
+| --- | --- |
+| `Space` + Drag | Pan canvas (Hand tool) |
+| `Shift + Space` + Drag | Rotate canvas |
+| `Ctrl + Alt` + Drag | Interactive brush size & hardness adjustment |
+| `Ctrl + +` / `Ctrl + =` | Zoom in |
+| `Ctrl + -` | Zoom out |
+| `Ctrl + 0` | Reset zoom (100%), rotation (0°), and center |
+| `Ctrl + Alt + 0` | Reset rotation only |
+
+### Edit and Layers
+
+| Shortcut | Action |
+| --- | --- |
 | `Ctrl + Z` | Undo |
 | `Ctrl + Y` / `Ctrl + Shift + Z` | Redo |
+| `Ctrl + T` | Free transform |
+| `Enter` | Apply transform |
+| `Escape` | Cancel transform / Deselect / Cancel text |
+| `Ctrl + C` | Copy active layer |
+| `Ctrl + V` | Paste layer |
+| `Delete` | Delete active layer or clear selection |
+| `Ctrl + D` | Deselect |
+| `Ctrl + Shift + I` | Invert selection |
+| `Ctrl + I` | Invert colors |
+| `Ctrl + U` | Hue, saturation, and luminosity |
+
+### Project and Rulers
+
+| Shortcut | Action |
+| --- | --- |
+| `Ctrl + N` | New canvas |
+| `Ctrl + O` | Open file |
+| `Ctrl + S` | Save |
+| `Ctrl + Shift + S` | Save As |
+| `Ctrl + Shift + R` | Toggle perspective ruler |
+| `Ctrl + Shift + P` | Toggle perspective snapping |
+| `Ctrl + ,` | Settings |
