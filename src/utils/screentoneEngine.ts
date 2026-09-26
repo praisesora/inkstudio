@@ -47,6 +47,19 @@ export interface ScreentoneOptions {
    * Set false for strict 1-bit binary output (e.g. monochrome print). (default: true)
    */
   antiAliasing?: boolean;
+
+  /**
+   * Density calculation method:
+   * - 'specified': Fixed tone density determined by specifiedDensity, modulated by alpha (Clip Studio Paint style)
+   * - 'image': Grayscale luminance-to-halftone conversion
+   * (default: 'specified')
+   */
+  densityType?: 'specified' | 'image';
+
+  /**
+   * Specified density normalized to [0.0, 1.0], where 0.4 = 40% (default: 0.4)
+   */
+  specifiedDensity?: number;
 }
 
 // Runtime system endianness check for ultra-fast 32-bit pixel writes
@@ -132,6 +145,16 @@ export function evaluateHalftoneDot(
   return spot >= (1.0 - density);
 }
 
+let cachedDstImageData: ImageData | null = null;
+
+function getScratchImageData(ctx: CanvasRenderingContext2D, w: number, h: number): ImageData {
+  if (cachedDstImageData && cachedDstImageData.width === w && cachedDstImageData.height === h) {
+    return cachedDstImageData;
+  }
+  cachedDstImageData = ctx.createImageData(w, h);
+  return cachedDstImageData;
+}
+
 /**
  * High-throughput CPU 32-bit TypedArray implementation.
  *
@@ -180,8 +203,9 @@ export function applyScreentoneCPU(
 
   const srcImageData = srcCtx.getImageData(minX, minY, regionW, regionH);
   const srcData = srcImageData.data;
+  const srcData32 = new Uint32Array(srcImageData.data.buffer);
 
-  const dstImageData = dstCtx.createImageData(regionW, regionH);
+  const dstImageData = getScratchImageData(dstCtx, regionW, regionH);
   const dstData32 = new Uint32Array(dstImageData.data.buffer);
 
   // Configuration parameters
@@ -196,8 +220,12 @@ export function applyScreentoneCPU(
   const cellSize = Math.max(3.5, dpi / frequency);
   const invCellSize = 1.0 / cellSize;
   const dotShape = options.dotShape ?? 'circle';
+  const isLine = dotShape === 'line';
   const solidBlackAtMax = options.solidBlackAtMax !== false;
   const antiAliasing = options.antiAliasing !== false;
+  const isSpecified = options.densityType !== 'image';
+  const specDensity = Math.max(0, Math.min(1, options.specifiedDensity ?? 0.4));
+  const specOneMinusDensity = 1.0 - specDensity;
 
   // Sub-pixel anti-aliasing transition half-width in spot function units
   const aaHalfSpan = Math.min(0.25, 0.75 * invCellSize);
@@ -207,50 +235,72 @@ export function applyScreentoneCPU(
   let dstIdx = 0;
 
   for (let y = minY; y < maxY; y++) {
-    // Exact document-space row offsets (no incremental cumulative drift)
     const ySinT = y * sinT;
     const yCosT = y * cosT;
+    let xr = minX * cosT - ySinT;
+    let yr = minX * sinT + yCosT;
 
-    for (let x = minX; x < maxX; x++, srcIdx += 4, dstIdx++) {
+    for (let x = minX; x < maxX; x++, srcIdx += 4, dstIdx++, xr += cosT, yr += sinT) {
+      // 32-bit fast path: completely transparent pixel
+      if (srcData32[dstIdx] === 0) {
+        dstData32[dstIdx] = TRANSPARENT_U32;
+        continue;
+      }
+
       const a = srcData[srcIdx + 3];
-      // Completely transparent source pixel => strict transparent 1-bit mask
       if (a === 0) {
         dstData32[dstIdx] = TRANSPARENT_U32;
         continue;
       }
 
-      const r = srcData[srcIdx];
-      const g = srcData[srcIdx + 1];
-      const b = srcData[srcIdx + 2];
-
-      // Perceptual ITU-R BT.601 luminance (0.0 = pure black, 1.0 = pure white)
-      const luminance = (r * 299 + g * 587 + b * 114) * INV_LUMINANCE_255K;
-
-      // Ink density normalized in [0.0, 1.0] modulated by stroke opacity
-      const density = (1.0 - luminance) * (a * INV_255);
-
-      // Clean cutoff for paper white or near-zero anti-alias fringe (< 0.1% darkness)
-      if (density <= 0.001) {
-        dstData32[dstIdx] = TRANSPARENT_U32;
-        continue;
+      let oneMinusDensity: number;
+      if (isSpecified) {
+        if (a === 255) {
+          if (specDensity <= 0.001) {
+            dstData32[dstIdx] = TRANSPARENT_U32;
+            continue;
+          }
+          if (solidBlackAtMax && specDensity >= 0.999) {
+            dstData32[dstIdx] = SOLID_BLACK_U32;
+            continue;
+          }
+          oneMinusDensity = specOneMinusDensity;
+        } else {
+          const density = specDensity * (a * INV_255);
+          if (density <= 0.001) {
+            dstData32[dstIdx] = TRANSPARENT_U32;
+            continue;
+          }
+          if (solidBlackAtMax && density >= 0.999) {
+            dstData32[dstIdx] = SOLID_BLACK_U32;
+            continue;
+          }
+          oneMinusDensity = 1.0 - density;
+        }
+      } else {
+        const r = srcData[srcIdx];
+        const g = srcData[srcIdx + 1];
+        const b = srcData[srcIdx + 2];
+        // Perceptual ITU-R BT.601 luminance (0.0 = pure black, 1.0 = pure white)
+        const luminance = (r * 299 + g * 587 + b * 114) * INV_LUMINANCE_255K;
+        const density = (1.0 - luminance) * (a * INV_255);
+        if (density <= 0.001) {
+          dstData32[dstIdx] = TRANSPARENT_U32;
+          continue;
+        }
+        if (solidBlackAtMax && density >= 0.999) {
+          dstData32[dstIdx] = SOLID_BLACK_U32;
+          continue;
+        }
+        oneMinusDensity = 1.0 - density;
       }
-
-      if (solidBlackAtMax && density >= 0.999) {
-        dstData32[dstIdx] = SOLID_BLACK_U32;
-        continue;
-      }
-
-      // Exact document-space rotated coordinates
-      const xr = x * cosT - ySinT;
-      const yr = x * sinT + yCosT;
 
       // Normalized cell coordinates in [-0.5, 0.5]
       const u = (xr * invCellSize) - Math.floor(xr * invCellSize) - 0.5;
       const v = (yr * invCellSize) - Math.floor(yr * invCellSize) - 0.5;
 
       let spot: number;
-
-      if (dotShape === 'line') {
+      if (isLine) {
         spot = 1.0 - 2.0 * Math.abs(u);
       } else {
         const absU = Math.abs(u);
@@ -264,7 +314,7 @@ export function applyScreentoneCPU(
         }
       }
 
-      const diff = spot - (1.0 - density);
+      const diff = spot - oneMinusDensity;
 
       if (antiAliasing) {
         const coverage = diff * invTwoAaHalfSpan + 0.5;
@@ -273,7 +323,7 @@ export function applyScreentoneCPU(
         } else if (coverage >= 1.0) {
           dstData32[dstIdx] = SOLID_BLACK_U32;
         } else {
-          const alpha = Math.round(coverage * 255);
+          const alpha = (coverage * 255 + 0.5) | 0;
           dstData32[dstIdx] = isLittleEndian ? (alpha << 24) : alpha;
         }
       } else {
@@ -309,6 +359,8 @@ uniform float u_cellSize;
 uniform int u_dotShape;
 uniform int u_solidBlackAtMax;
 uniform int u_antiAliasing;
+uniform int u_densityType;
+uniform float u_specifiedDensity;
 
 varying vec2 v_texCoord;
 
@@ -320,9 +372,15 @@ void main() {
     return;
   }
 
-  // ITU-R BT.601 perceptual luminance
-  float luminance = dot(srcColor.rgb, vec3(0.299, 0.587, 0.114));
-  float density = clamp((1.0 - luminance) * srcColor.a, 0.0, 1.0);
+  float density;
+  if (u_densityType == 0) {
+    // Specified density mode (CSP tone layer)
+    density = clamp(u_specifiedDensity * srcColor.a, 0.0, 1.0);
+  } else {
+    // Image brightness mode (ITU-R BT.601 perceptual luminance)
+    float luminance = dot(srcColor.rgb, vec3(0.299, 0.587, 0.114));
+    density = clamp((1.0 - luminance) * srcColor.a, 0.0, 1.0);
+  }
 
   if (density <= 0.001) {
     gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
@@ -394,6 +452,8 @@ class WebGLHalftonePipeline {
   private uDotShapeLoc: WebGLUniformLocation | null = null;
   private uSolidBlackAtMaxLoc: WebGLUniformLocation | null = null;
   private uAntiAliasingLoc: WebGLUniformLocation | null = null;
+  private uDensityTypeLoc: WebGLUniformLocation | null = null;
+  private uSpecifiedDensityLoc: WebGLUniformLocation | null = null;
 
   public isAvailable(): boolean {
     if (typeof document === 'undefined') return false;
@@ -463,6 +523,8 @@ class WebGLHalftonePipeline {
       this.uDotShapeLoc = gl.getUniformLocation(prog, 'u_dotShape');
       this.uSolidBlackAtMaxLoc = gl.getUniformLocation(prog, 'u_solidBlackAtMax');
       this.uAntiAliasingLoc = gl.getUniformLocation(prog, 'u_antiAliasing');
+      this.uDensityTypeLoc = gl.getUniformLocation(prog, 'u_densityType');
+      this.uSpecifiedDensityLoc = gl.getUniformLocation(prog, 'u_specifiedDensity');
 
       this.texture = gl.createTexture();
       return true;
@@ -578,6 +640,8 @@ class WebGLHalftonePipeline {
     gl.uniform1i(this.uDotShapeLoc, dotShapeVal);
     gl.uniform1i(this.uSolidBlackAtMaxLoc, options.solidBlackAtMax !== false ? 1 : 0);
     gl.uniform1i(this.uAntiAliasingLoc, options.antiAliasing !== false ? 1 : 0);
+    gl.uniform1i(this.uDensityTypeLoc, options.densityType === 'image' ? 1 : 0);
+    gl.uniform1f(this.uSpecifiedDensityLoc, Math.max(0, Math.min(1, options.specifiedDensity ?? 0.4)));
 
     // Render to GL canvas
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -707,7 +771,7 @@ export function applyScreentone(
     }
   }
 
-  // CPU TypedArray path (instant for real-time strokes, supports subpixel AA, and 100% reliable)
+  // CPU TypedArray path (instant for real-time strokes and full canvas with rAF, 100% reliable)
   applyScreentoneCPU(sourceCanvas, targetCanvas, options, dirtyRect);
 }
 

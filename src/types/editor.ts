@@ -340,6 +340,8 @@ export interface LayerItem {
   toneFrequency?: number; // Lines / LPI (20 to 85, default: 60)
   toneAngle?: number; // Angle in degrees (0 to 90, default: 45)
   toneDotShape?: 'circle' | 'euclidean' | 'line'; // Default: circle
+  toneDensity?: number; // Density percentage (1 to 100, default: 40)
+  toneDensityType?: 'specified' | 'image'; // 'specified' ("Use specified density") or 'image' ("Use image brightness")
   // Clip Studio Paint Style Layer Color (Tint Effect)
   layerColorEnabled?: boolean;
   layerColor?: string; // Primary tint color (default: '#1c73c2')

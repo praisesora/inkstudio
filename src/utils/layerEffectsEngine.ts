@@ -1,6 +1,6 @@
 import { LayerItem, DirtyRect } from '../types/editor';
 import { parseRgba } from './colorUtils';
-import { applyScreentoneCPU } from './screentoneEngine';
+import { applyScreentone } from './screentoneEngine';
 
 export type ExpressionColor = 'color' | 'gray' | 'monochrome';
 
@@ -192,7 +192,7 @@ export function applyLayerEffects(
       }
     }
 
-    applyScreentoneCPU(
+    applyScreentone(
       toneInputCanvas,
       targetCanvas,
       {
@@ -200,6 +200,9 @@ export function applyLayerEffects(
         angle: layer.toneAngle ?? 45,
         dotShape: layer.toneDotShape ?? 'circle',
         dpi,
+        densityType: layer.toneDensityType ?? 'specified',
+        specifiedDensity: Math.max(0, Math.min(1, (layer.toneDensity ?? 40) / 100)),
+        renderBackend: 'auto',
       },
       dirtyRect
     );

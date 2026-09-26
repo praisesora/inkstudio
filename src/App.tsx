@@ -123,6 +123,7 @@ import {
   DEFAULT_BRUSH_PRESET_ID,
 } from './utils/brushPresetManager';
 import { TonalCorrectionModal } from './components/TonalCorrectionModal';
+import { SimpleToneModal, SimpleToneSettings } from './components/SimpleToneModal';
 import {
   TonalCorrectionType,
   applyTonalFilter,
@@ -283,6 +284,7 @@ export function App() {
   const [isNewCanvasModalOpen, setIsNewCanvasModalOpen] = useState<boolean>(false);
   const [isResizeCanvasModalOpen, setIsResizeCanvasModalOpen] = useState<boolean>(false);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState<boolean>(false);
+  const [isToneModalOpen, setIsToneModalOpen] = useState<boolean>(false);
   const [tonalModalState, setTonalModalState] = useState<{
     isOpen: boolean;
     type: TonalCorrectionType;
@@ -411,6 +413,8 @@ export function App() {
     setToneFrequency,
     setToneAngle,
     setToneDotShape,
+    setToneDensity,
+    setToneDensityType,
     toggleLayerColor,
     setLayerColor,
     setLayerSubColor,
@@ -1921,16 +1925,35 @@ export function App() {
   );
 
   const handleFillScreentone = useCallback(() => {
-    if (!selection) return;
+    setIsToneModalOpen(true);
+  }, []);
 
-    const { id, canvas } = fillScreentoneSelection(selection);
-    const ctx = get2DContext(canvas);
-    if (ctx) {
-      const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      pushHistoryStep('screentone', 'Screentone Fill', null, afterData, id);
-    }
-    showToast('Created Screentone Layer');
-  }, [selection, fillScreentoneSelection, pushHistoryStep, showToast]);
+  const handleConfirmTone = useCallback(
+    (settings: SimpleToneSettings) => {
+      setIsToneModalOpen(false);
+      const { id, canvas } = fillScreentoneSelection(
+        selection,
+        settings.density,
+        settings.frequency,
+        settings.angle,
+        settings.dotShape,
+        settings.densityType
+      );
+      const ctx = get2DContext(canvas);
+      if (ctx) {
+        const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        pushHistoryStep(
+          'screentone',
+          `Screentone (${settings.density}%)`,
+          null,
+          afterData,
+          id
+        );
+      }
+      showToast(`Created Screentone Layer (${settings.density}%)`);
+    },
+    [selection, fillScreentoneSelection, pushHistoryStep, showToast]
+  );
 
   // Apply previewed Expression Color permanently to layer with Undo history
   const handleApplyExpressionColor = useCallback(
@@ -4352,6 +4375,8 @@ export function App() {
           onSetToneFrequency={setToneFrequency}
           onSetToneAngle={setToneAngle}
           onSetToneDotShape={setToneDotShape}
+          onSetToneDensity={setToneDensity}
+          onSetToneDensityType={setToneDensityType}
           onToggleLayerColor={toggleLayerColor}
           onSetLayerColor={setLayerColor}
           onSetLayerSubColor={setLayerSubColor}
@@ -4418,6 +4443,16 @@ export function App() {
         onClose={handleTonalCancel}
         onApply={handleTonalApply}
         onPreviewChange={handleTonalPreviewChange}
+      />
+
+      {/* Clip Studio Paint Simple Tone Settings Modal */}
+      <SimpleToneModal
+        isOpen={isToneModalOpen}
+        onClose={() => setIsToneModalOpen(false)}
+        onConfirm={handleConfirmTone}
+        initialFrequency={activeLayer?.toneFrequency || documents.find((d) => d.id === activeDocumentId)?.defaultFrequency || 60}
+        initialDensity={activeLayer?.toneDensity || 40}
+        dpi={dimensions.dpi ?? 600}
       />
 
       {/* Multiplayer Collaboration Modals & Overlays */}

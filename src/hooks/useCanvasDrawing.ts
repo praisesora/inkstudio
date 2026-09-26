@@ -602,7 +602,9 @@ export function useCanvasDrawing({
       drewDirectlyOnLayerCanvasRef.current = true;
     }
     if (!targetCtx) return;
-    const extraPreviewCtx = (isTone && sourceCanvas && draftCtx && targetCtx !== draftCtx && !isEraser) ? draftCtx : null;
+    const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+    const isToneLayer = Boolean(activeLayer?.toneEnabled);
+    const extraPreviewCtx = (isTone && sourceCanvas && draftCtx && targetCtx !== draftCtx && !isEraser && !isToneLayer) ? draftCtx : null;
 
     const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, mode);
     const strokeHardness = mode === 'monochrome' ? 1.0 : (bs.hardness ?? 1.0);
@@ -870,31 +872,6 @@ export function useCanvasDrawing({
       }
     }
 
-    if (isTone && sourceCanvas && canvas) {
-      const pLast = pts[pts.length - 1];
-      const pPrev = pts.length >= 2 ? pts[pts.length - 2] : pLast;
-      const dims = dimensionsRef.current;
-      const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
-      const margin = Math.ceil(Math.max(pLast.width, pPrev.width) * 1.5 + 8);
-      const segMinX = Math.max(0, Math.floor(Math.min(pPrev.x, pLast.x) - margin));
-      const segMinY = Math.max(0, Math.floor(Math.min(pPrev.y, pLast.y) - margin));
-      const segMaxX = Math.min(dims.width, Math.ceil(Math.max(pPrev.x, pLast.x) + margin));
-      const segMaxY = Math.min(dims.height, Math.ceil(Math.max(pPrev.y, pLast.y) + margin));
-      if (activeLayer) {
-        applyLayerEffects(
-          sourceCanvas,
-          canvas,
-          activeLayer,
-          dims.dpi ?? 600,
-          {
-            x: segMinX,
-            y: segMinY,
-            width: segMaxX - segMinX,
-            height: segMaxY - segMinY,
-          }
-        );
-      }
-    }
   }, [getActiveCanvas]);
 
   // Stabilize and render point onto draft canvas
@@ -978,17 +955,61 @@ export function useCanvasDrawing({
 
     const batch = queue.splice(0, queue.length);
     const chunkPts: Point[] = [];
+    let batchMinX = Infinity;
+    let batchMinY = Infinity;
+    let batchMaxX = -Infinity;
+    let batchMaxY = -Infinity;
+    let maxStrokeWidth = 0;
+
     for (let i = 0; i < batch.length; i++) {
       const item = batch[i];
       applyStabilizedPointAndRender(draftCtx, item.x, item.y, item.pressure, item.pointerType);
       if (allStrokePointsRef.current.length > 0) {
-        chunkPts.push(allStrokePointsRef.current[allStrokePointsRef.current.length - 1]);
+        const lastPt = allStrokePointsRef.current[allStrokePointsRef.current.length - 1];
+        chunkPts.push(lastPt);
+        batchMinX = Math.min(batchMinX, lastPt.x);
+        batchMinY = Math.min(batchMinY, lastPt.y);
+        batchMaxX = Math.max(batchMaxX, lastPt.x);
+        batchMaxY = Math.max(batchMaxY, lastPt.y);
+        maxStrokeWidth = Math.max(maxStrokeWidth, lastPt.width);
       }
     }
+
+    if (isToneStrokeRef.current && batchMinX <= batchMaxX) {
+      const currentLayerId = activeLayerIdRef.current;
+      const sourceCanvas = layerSourceCanvasesRef?.current?.get(currentLayerId);
+      const canvas = getActiveCanvas();
+      const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+      if (sourceCanvas && canvas && activeLayer) {
+        const dims = dimensionsRef.current;
+        const freq = activeLayer.toneFrequency ?? 60;
+        const cellSize = Math.max(3.5, (dims.dpi ?? 600) / freq);
+        const margin = Math.ceil(maxStrokeWidth * 0.75 + Math.max(cellSize * 2, 16));
+        const segMinX = Math.max(0, Math.floor(batchMinX - margin));
+        const segMinY = Math.max(0, Math.floor(batchMinY - margin));
+        const segMaxX = Math.min(dims.width, Math.ceil(batchMaxX + margin));
+        const segMaxY = Math.min(dims.height, Math.ceil(batchMaxY + margin));
+        if (segMaxX > segMinX && segMaxY > segMinY) {
+          applyLayerEffects(
+            sourceCanvas,
+            canvas,
+            activeLayer,
+            dims.dpi ?? 600,
+            {
+              x: segMinX,
+              y: segMinY,
+              width: segMaxX - segMinX,
+              height: segMaxY - segMinY,
+            }
+          );
+        }
+      }
+    }
+
     if (currentStrokeIdRef.current && chunkPts.length > 0) {
       onCollabStrokeChunkRef.current?.(currentStrokeIdRef.current, chunkPts);
     }
-  }, [applyStabilizedPointAndRender, effectiveDraftCanvasRef]);
+  }, [applyStabilizedPointAndRender, effectiveDraftCanvasRef, getActiveCanvas, layerSourceCanvasesRef]);
 
 
   // Pointer Down handler: initialize lightweight live stroke overlay without touching base canvas
@@ -1399,6 +1420,8 @@ export function useCanvasDrawing({
       const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
 
       const isTone = isToneStrokeRef.current;
+      const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+      const isToneLayer = Boolean(activeLayer?.toneEnabled);
       const sourceCanvas = isTone ? layerSourceCanvasesRef?.current?.get(currentLayerId) : null;
       const isWetColor = isWetColorStrokeRef.current;
       const targetTailCtx = isTone && sourceCanvas ? get2DContext(sourceCanvas) : (isWetColor && canvas ? get2DContext(canvas) : draftCtx);
@@ -1464,7 +1487,7 @@ export function useCanvasDrawing({
           if ((isTone || isWetColor) && targetTailCtx !== draftCtx) {
             drewDirectlyOnLayerCanvasRef.current = true;
           }
-          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser) {
+          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser && !isToneLayer) {
             drawTexturedBezierSegment(
               draftCtx,
               lastMid,
@@ -1489,7 +1512,7 @@ export function useCanvasDrawing({
             bs.grain ?? 1.0,
             bs.hardness
           );
-          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser) {
+          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser && !isToneLayer) {
             drawPencilBezierSegment(
               draftCtx,
               lastMid,
@@ -1514,7 +1537,7 @@ export function useCanvasDrawing({
             bs.flow ?? 1.0,
             bs.spacing ?? 0.08
           );
-          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser) {
+          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser && !isToneLayer) {
             drawSmoothBezierSegment(
               draftCtx,
               lastMid,
@@ -1534,18 +1557,20 @@ export function useCanvasDrawing({
       const dirty = dirtyRectRef.current;
 
       if (isTone && sourceCanvas && canvas) {
-        const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
         if (activeLayer) {
+          const freq = activeLayer?.toneFrequency ?? 60;
+          const cellSize = Math.max(3.5, (dimensionsRef.current.dpi ?? 600) / freq);
+          const cellMargin = Math.ceil(cellSize * 2);
           applyLayerEffects(
             sourceCanvas,
             canvas,
             activeLayer,
             dimensionsRef.current.dpi ?? 600,
             dirty ? {
-              x: Math.max(0, Math.floor(dirty.minX)),
-              y: Math.max(0, Math.floor(dirty.minY)),
-              width: Math.max(1, Math.ceil(dirty.maxX) - Math.max(0, Math.floor(dirty.minX))),
-              height: Math.max(1, Math.ceil(dirty.maxY) - Math.max(0, Math.floor(dirty.minY))),
+              x: Math.max(0, Math.floor(dirty.minX - cellMargin)),
+              y: Math.max(0, Math.floor(dirty.minY - cellMargin)),
+              width: Math.min(canvas.width, Math.ceil(dirty.maxX + cellMargin)) - Math.max(0, Math.floor(dirty.minX - cellMargin)),
+              height: Math.min(canvas.height, Math.ceil(dirty.maxY + cellMargin)) - Math.max(0, Math.floor(dirty.minY - cellMargin)),
             } : undefined
           );
         }

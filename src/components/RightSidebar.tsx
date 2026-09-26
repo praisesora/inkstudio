@@ -64,6 +64,8 @@ interface RightSidebarProps {
   onSetToneFrequency?: (id: string, frequency: number) => void;
   onSetToneAngle?: (id: string, angle: number) => void;
   onSetToneDotShape?: (id: string, dotShape: 'circle' | 'euclidean') => void;
+  onSetToneDensity?: (id: string, density: number) => void;
+  onSetToneDensityType?: (id: string, densityType: 'specified' | 'image') => void;
   // Clip Studio Paint Layer Color (Tint) & Expression Color Props
   onToggleLayerColor?: (id: string) => void;
   onSetLayerColor?: (id: string, color: string) => void;
@@ -167,6 +169,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onSetToneFrequency,
   onSetToneAngle,
   onSetToneDotShape,
+  onSetToneDensity,
+  onSetToneDensityType,
   onToggleLayerColor,
   onSetLayerColor,
   onSetLayerSubColor,
@@ -540,7 +544,12 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                                 title={isToneSettingsOpen ? 'Hide tone settings' : 'Show tone settings'}
                                 className="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-[#1e1e1e] hover:bg-[#2a2a2a] border border-[#3a3a3a] text-amber-400/90 font-mono text-[10px] transition-colors cursor-pointer"
                               >
-                                <span>{activeLayer.toneFrequency ?? 60}L</span>
+                                <span>
+                                  {activeLayer.toneFrequency ?? 60}L
+                                  {(activeLayer.toneDensityType ?? 'specified') === 'specified'
+                                    ? ` • ${activeLayer.toneDensity ?? 40}%`
+                                    : ''}
+                                </span>
                                 {isToneSettingsOpen ? (
                                   <ChevronUp className="w-3 h-3 text-[#aaaaaa]" />
                                 ) : (
@@ -570,6 +579,73 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                         {/* Tone Settings Controls */}
                         {activeLayer.toneEnabled && isToneSettingsOpen && (
                           <div className="p-1.5 bg-[#1b1b1b] rounded border border-[#333333] flex flex-col space-y-1.5 mt-0.5">
+                            {/* Density Selector & Slider (Clip Studio Paint style) */}
+                            <div>
+                              <div className="flex items-center justify-between text-[10px] mb-1">
+                                <span className="text-[#999999] font-medium">Density:</span>
+                                <select
+                                  value={activeLayer.toneDensityType ?? 'specified'}
+                                  onChange={(e) =>
+                                    onSetToneDensityType?.(activeLayer.id, e.target.value as 'specified' | 'image')
+                                  }
+                                  className="bg-[#252526] border border-[#3a3a3a] text-[#cccccc] text-[10px] rounded px-1.5 py-0.5 outline-none cursor-pointer hover:border-[#555555]"
+                                >
+                                  <option value="specified">Use specified density</option>
+                                  <option value="image">Use image brightness</option>
+                                </select>
+                              </div>
+
+                              {(activeLayer.toneDensityType ?? 'specified') === 'specified' && (
+                                <div className="space-y-1">
+                                  <div className="flex items-center space-x-2">
+                                    <input
+                                      type="range"
+                                      min="1"
+                                      max="100"
+                                      step="1"
+                                      value={activeLayer.toneDensity ?? 40}
+                                      onChange={(e) =>
+                                        onSetToneDensity?.(activeLayer.id, parseInt(e.target.value, 10))
+                                      }
+                                      className="flex-1 cursor-pointer h-1.5 accent-amber-400"
+                                    />
+                                    <div className="flex items-center">
+                                      <input
+                                        type="number"
+                                        min="1"
+                                        max="100"
+                                        value={activeLayer.toneDensity ?? 40}
+                                        onChange={(e) => {
+                                          const val = parseInt(e.target.value, 10);
+                                          if (!isNaN(val)) {
+                                            onSetToneDensity?.(activeLayer.id, Math.max(1, Math.min(100, val)));
+                                          }
+                                        }}
+                                        className="w-10 bg-[#252526] border border-[#3a3a3a] text-amber-300 font-mono text-[10px] rounded px-1 py-0.5 text-right outline-none hover:border-[#555555] focus:border-amber-400"
+                                      />
+                                      <span className="text-[10px] text-[#888888] ml-0.5 font-mono">%</span>
+                                    </div>
+                                  </div>
+                                  <div className="flex items-center justify-between text-[8px] text-[#666666] font-mono">
+                                    {[5, 10, 20, 30, 40, 50, 60, 70, 80].map((preset) => (
+                                      <button
+                                        key={preset}
+                                        type="button"
+                                        onClick={() => onSetToneDensity?.(activeLayer.id, preset)}
+                                        className={`hover:text-amber-300 transition-colors ${
+                                          (activeLayer.toneDensity ?? 40) === preset
+                                            ? 'text-amber-400 font-bold'
+                                            : ''
+                                        }`}
+                                      >
+                                        {preset}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
                             {/* Frequency (Lines / LPI) */}
                             <div>
                               <div className="flex items-center justify-between text-[10px] mb-0.5">
@@ -1185,10 +1261,15 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                             onToggleTone?.(layer.id);
                           }}
                           className="text-[9px] px-1.5 py-0.5 rounded bg-amber-950/60 border border-amber-600/50 text-amber-300 font-mono flex items-center gap-1 shrink-0 hover:border-amber-400 hover:text-amber-200 transition-colors"
-                          title={`Tone: ${layer.toneFrequency ?? 60} LPI, ${layer.toneAngle ?? 45}° (Click to toggle)`}
+                          title={`Tone: ${layer.toneFrequency ?? 60} LPI, ${layer.toneAngle ?? 45}°, ${(layer.toneDensityType ?? 'specified') === 'specified' ? `${layer.toneDensity ?? 40}%` : 'Image'} (Click to toggle)`}
                         >
                           <ScreentoneIcon className="w-2.5 h-2.5 text-amber-400" />
-                          <span>{layer.toneFrequency ?? 60}L</span>
+                          <span>
+                            {layer.toneFrequency ?? 60}L
+                            {(layer.toneDensityType ?? 'specified') === 'specified'
+                              ? ` • ${layer.toneDensity ?? 40}%`
+                              : ''}
+                          </span>
                         </button>
                       )}
 

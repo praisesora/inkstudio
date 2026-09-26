@@ -1,5 +1,5 @@
-import { useState, useRef, useCallback } from 'react';
-import { LayerItem, BlendMode, CanvasDimensions, CanvasColorMode, LoadedDocument, ExpressionColor, CanvasSelection } from '../types/editor';
+import { useState, useRef, useCallback, useEffect } from 'react';
+import { LayerItem, BlendMode, CanvasDimensions, CanvasColorMode, LoadedDocument, ExpressionColor, CanvasSelection, DirtyRect } from '../types/editor';
 import { ResizeCanvasOptions } from '../types/settings';
 import { createCanvasThumbnail, get2DContext } from '../utils/canvasUtils';
 import { applyLayerEffects, applyExpressionColorToImageData } from '../utils/layerEffectsEngine';
@@ -468,6 +468,38 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
     [_dimensions]
   );
 
+  const pendingEffectRendersRef = useRef<Map<string, { layer: LayerItem; dirtyRect?: DirtyRect }>>(new Map());
+  const effectRafIdRef = useRef<number | null>(null);
+
+  const scheduleLayerEffectRender = useCallback((layer: LayerItem, dirtyRect?: DirtyRect) => {
+    pendingEffectRendersRef.current.set(layer.id, { layer, dirtyRect });
+    if (effectRafIdRef.current === null) {
+      effectRafIdRef.current = requestAnimationFrame(() => {
+        effectRafIdRef.current = null;
+        const queue = new Map(pendingEffectRendersRef.current);
+        pendingEffectRendersRef.current.clear();
+
+        queue.forEach(({ layer: l, dirtyRect: rect }, id) => {
+          const sourceCanvas = ensureSourceCanvas(id, true, false);
+          const displayCanvas = layerCanvasesRef.current.get(id);
+          if (sourceCanvas && displayCanvas) {
+            applyLayerEffects(sourceCanvas, displayCanvas, l, _dimensions.dpi ?? 600, rect);
+            updateLayerThumbnail(id, false);
+          }
+        });
+      });
+    }
+  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+
+  useEffect(() => {
+    return () => {
+      if (effectRafIdRef.current !== null) {
+        cancelAnimationFrame(effectRafIdRef.current);
+        effectRafIdRef.current = null;
+      }
+    };
+  }, []);
+
   // Toggle non-destructive Clip Studio Paint style screentone effect on a layer
   // Toggle non-destructive Clip Studio Paint style screentone effect on a layer
   const toggleTone = useCallback((id: string) => {
@@ -479,6 +511,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       const freq = target.toneFrequency ?? defaultToneFrequencyRef.current ?? 60;
       const angle = target.toneAngle ?? 45;
       const shape = target.toneDotShape ?? 'circle';
+      const density = target.toneDensity ?? 40;
+      const densityType = target.toneDensityType ?? 'specified';
 
       const updatedLayer: LayerItem = {
         ...target,
@@ -486,6 +520,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         toneFrequency: freq,
         toneAngle: angle,
         toneDotShape: shape,
+        toneDensity: density,
+        toneDensityType: densityType,
       };
 
       const displayCanvas = layerCanvasesRef.current.get(id);
@@ -543,19 +579,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       if (!target || target.type === 'folder') return prev;
 
       const updatedLayer: LayerItem = { ...target, toneFrequency: clampedFreq };
-
       if (target.toneEnabled) {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
 
   // Update screentone angle (0 to 90 degrees)
   const setToneAngle = useCallback((id: string, angle: number) => {
@@ -565,19 +594,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       if (!target || target.type === 'folder') return prev;
 
       const updatedLayer: LayerItem = { ...target, toneAngle: clampedAngle };
-
       if (target.toneEnabled) {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
 
   // Update screentone dot shape (default: circle)
   const setToneDotShape = useCallback((id: string, dotShape: HalftoneDotShape) => {
@@ -586,19 +608,41 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       if (!target || target.type === 'folder') return prev;
 
       const updatedLayer: LayerItem = { ...target, toneDotShape: dotShape };
-
       if (target.toneEnabled) {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
+
+  // Update screentone density (1 to 100%)
+  const setToneDensity = useCallback((id: string, density: number) => {
+    const clampedDensity = Math.max(1, Math.min(100, Math.round(density)));
+    setLayers((prev) => {
+      const target = prev.find((l) => l.id === id);
+      if (!target || target.type === 'folder') return prev;
+
+      const updatedLayer: LayerItem = { ...target, toneDensity: clampedDensity };
+      if (target.toneEnabled) {
+        scheduleLayerEffectRender(updatedLayer);
+      }
+      return prev.map((l) => (l.id === id ? updatedLayer : l));
+    });
+  }, [scheduleLayerEffectRender]);
+
+  // Update screentone density mode ('specified' vs 'image')
+  const setToneDensityType = useCallback((id: string, densityType: 'specified' | 'image') => {
+    setLayers((prev) => {
+      const target = prev.find((l) => l.id === id);
+      if (!target || target.type === 'folder') return prev;
+
+      const updatedLayer: LayerItem = { ...target, toneDensityType: densityType };
+      if (target.toneEnabled) {
+        scheduleLayerEffectRender(updatedLayer);
+      }
+      return prev.map((l) => (l.id === id ? updatedLayer : l));
+    });
+  }, [scheduleLayerEffectRender]);
 
   // Toggle Clip Studio Paint style Layer Color (Tint) effect on a layer
   const toggleLayerColor = useCallback((id: string) => {
@@ -640,19 +684,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         ...target,
         layerColor: color,
       };
-
       if (target.layerColorEnabled) {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
 
   // Update Layer Sub Color (Tint secondary color)
   const setLayerSubColor = useCallback((id: string, color: string) => {
@@ -664,19 +701,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         ...target,
         layerSubColor: color,
       };
-
       if (target.layerColorEnabled) {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
 
   // Update Expression Color ('color' | 'gray' | 'monochrome')
   const setLayerExpressionColor = useCallback((id: string, mode: ExpressionColor) => {
@@ -716,19 +746,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         ...target,
         monoThreshold: clamped,
       };
-
       if (target.expressionColor === 'monochrome') {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
 
   // Update Monochrome Express Colors (express black, express white)
   const setLayerMonoExpressMode = useCallback((id: string, expressBlack: boolean, expressWhite: boolean) => {
@@ -741,19 +764,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         monoExpressBlack: expressBlack,
         monoExpressWhite: expressWhite,
       };
-
       if (target.expressionColor === 'monochrome') {
-        const sourceCanvas = ensureSourceCanvas(id, false, false);
-        const displayCanvas = layerCanvasesRef.current.get(id);
-        if (sourceCanvas && displayCanvas) {
-          applyLayerEffects(sourceCanvas, displayCanvas, updatedLayer, _dimensions.dpi ?? 600);
-          updateLayerThumbnail(id, false);
-        }
+        scheduleLayerEffectRender(updatedLayer);
       }
-
       return prev.map((l) => (l.id === id ? updatedLayer : l));
     });
-  }, [_dimensions.dpi, ensureSourceCanvas, updateLayerThumbnail]);
+  }, [scheduleLayerEffectRender]);
 
   // Apply previewed expression color permanently into layer pixel buffer
   const applyExpressionColorOfPreview = useCallback(
@@ -1152,43 +1168,51 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   // Fill selection with non-destructive Clip Studio Paint screentone layer
   const fillScreentoneSelection = useCallback(
     (
-      selection: CanvasSelection,
-      density: number = 0.5,
+      selection: CanvasSelection | null,
+      density: number = 40,
       frequency: number = defaultToneFrequencyRef.current ?? 60,
       angle: number = 45,
-      dotShape: HalftoneDotShape = 'circle'
+      dotShape: HalftoneDotShape = 'circle',
+      densityType: 'specified' | 'image' = 'specified'
     ): { id: string; canvas: HTMLCanvasElement; sourceCanvas: HTMLCanvasElement } => {
       const resolvedFreq = frequency || defaultToneFrequencyRef.current || 60;
+      const resolvedDensity = Math.max(1, Math.min(100, Math.round(density <= 1.0 && density > 0 ? density * 100 : density)));
       const newId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const targetW = _dimensions.width;
       const targetH = _dimensions.height;
 
-      // 1. Offscreen source canvas with continuous grayscale tone
+      // 1. Offscreen source canvas with continuous mask/tone
       const sourceCanvas = document.createElement('canvas');
       sourceCanvas.width = targetW;
       sourceCanvas.height = targetH;
       const sCtx = get2DContext(sourceCanvas);
       if (sCtx) {
         sCtx.save();
-        const clampedDensity = Math.max(0, Math.min(1, density));
-        const grayVal = Math.round(255 * (1 - clampedDensity));
+        // In "specified" mode, solid black ink acts as the mask
+        // In "image" mode, grayscale value corresponds to density
+        const grayVal = densityType === 'specified' ? 0 : Math.round(255 * (1 - resolvedDensity / 100));
         sCtx.fillStyle = `rgb(${grayVal},${grayVal},${grayVal})`;
 
-        if (selection.type === 'rect') {
-          sCtx.fillRect(
-            selection.bounds.x,
-            selection.bounds.y,
-            selection.bounds.width,
-            selection.bounds.height
-          );
-        } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
-          sCtx.beginPath();
-          sCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-          for (let i = 1; i < selection.polygon.length; i++) {
-            sCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+        if (selection) {
+          if (selection.type === 'rect') {
+            sCtx.fillRect(
+              selection.bounds.x,
+              selection.bounds.y,
+              selection.bounds.width,
+              selection.bounds.height
+            );
+          } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+            sCtx.beginPath();
+            sCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+            for (let i = 1; i < selection.polygon.length; i++) {
+              sCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+            }
+            sCtx.closePath();
+            sCtx.fill();
           }
-          sCtx.closePath();
-          sCtx.fill();
+        } else {
+          // If no active selection, fill full canvas
+          sCtx.fillRect(0, 0, targetW, targetH);
         }
         sCtx.restore();
       }
@@ -1213,9 +1237,11 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         toneFrequency: resolvedFreq,
         toneAngle: angle,
         toneDotShape: dotShape,
+        toneDensity: resolvedDensity,
+        toneDensityType: densityType,
       };
 
-      applyLayerEffects(sourceCanvas, displayCanvas, newLayer, _dimensions.dpi ?? 600, selection.bounds);
+      applyLayerEffects(sourceCanvas, displayCanvas, newLayer, _dimensions.dpi ?? 600, selection ? selection.bounds : undefined);
 
       const thumb = createCanvasThumbnail(displayCanvas, true);
       newLayer.thumbnailUrl = thumb;
@@ -1543,6 +1569,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
     setToneFrequency,
     setToneAngle,
     setToneDotShape,
+    setToneDensity,
+    setToneDensityType,
     toggleLayerColor,
     setLayerColor,
     setLayerSubColor,
