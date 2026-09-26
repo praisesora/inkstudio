@@ -1,0 +1,160 @@
+import { LoadedDocument, LayerItem, CanvasColorMode } from '../types/editor';
+import { createCanvasThumbnail } from './canvasUtils';
+
+/**
+ * Loads standard raster/vector image formats (.png, .jpg, .jpeg, .webp, .bmp, .gif, .svg).
+ */
+export async function loadStandardImage(file: File): Promise<LoadedDocument> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const width = img.naturalWidth || 1440;
+        const height = img.naturalHeight || 900;
+
+        const layerId = `layer-${Date.now()}`;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0);
+        }
+
+        const bgId = `layer-bg-${Date.now()}`;
+        const bgCanvas = document.createElement('canvas');
+        bgCanvas.width = width;
+        bgCanvas.height = height;
+        const bgCtx = bgCanvas.getContext('2d');
+        if (bgCtx) {
+          bgCtx.fillStyle = '#ffffff';
+          bgCtx.fillRect(0, 0, width, height);
+        }
+
+        const layerCanvases = new Map<string, HTMLCanvasElement>();
+        layerCanvases.set(layerId, canvas);
+        layerCanvases.set(bgId, bgCanvas);
+
+        const thumb = createCanvasThumbnail(canvas, false);
+        const bgThumb = createCanvasThumbnail(bgCanvas, false);
+
+        const layers: LayerItem[] = [
+          {
+            id: layerId,
+            name: file.name.replace(/\.[^/.]+$/, ''),
+            type: 'raster',
+            visible: true,
+            opacity: 1,
+            blendMode: 'normal',
+            locked: false,
+            parentId: null,
+            thumbnailUrl: thumb,
+          },
+          {
+            id: bgId,
+            name: 'Background',
+            type: 'raster',
+            visible: true,
+            opacity: 1,
+            blendMode: 'normal',
+            locked: true,
+            parentId: null,
+            thumbnailUrl: bgThumb,
+          },
+        ];
+
+        resolve({
+          name: file.name.replace(/\.[^/.]+$/, ''),
+          dimensions: { width, height, dpi: 600 },
+          colorMode: 'color' as CanvasColorMode,
+          layers,
+          layerCanvases,
+        });
+      };
+
+      img.onerror = (err) => reject(new Error('Failed to load image element: ' + err));
+      img.src = e.target?.result as string;
+    };
+
+    reader.onerror = () => reject(new Error('Failed to read file.'));
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Universal file opener detecting file extension and loading image, PSD, or CSP files.
+ */
+export async function openFile(file: File): Promise<LoadedDocument> {
+  const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+
+  if (ext === '.psd' || ext === '.psb') {
+    const { parsePsdFile } = await import('./psdParser');
+    const buffer = await file.arrayBuffer();
+    return await parsePsdFile(buffer, file.name);
+  }
+
+  if (ext === '.clip' || ext === '.csp') {
+    const { parseCspFile } = await import('./cspParser');
+    const buffer = await file.arrayBuffer();
+    return await parseCspFile(buffer, file.name);
+  }
+
+  if (ext === '.ink' || ext === '.sora' || ext === '.json') {
+    try {
+      const text = await file.text();
+      const project = JSON.parse(text);
+      if (project.layers && Array.isArray(project.layers)) {
+        const width = project.dimensions?.width || 1440;
+        const height = project.dimensions?.height || 900;
+        const colorMode: CanvasColorMode = project.colorMode || 'color';
+        const layers: LayerItem[] = project.layers;
+        const layerCanvases = new Map<string, HTMLCanvasElement>();
+
+        const loadPromises = layers.map((layer) => {
+          if (layer.type === 'folder') return Promise.resolve();
+          return new Promise<void>((resolve) => {
+            const dataUrl = project.canvases?.[layer.id];
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+
+            if (dataUrl) {
+              const img = new Image();
+              img.onload = () => {
+                const ctx = canvas.getContext('2d');
+                ctx?.drawImage(img, 0, 0);
+                layerCanvases.set(layer.id, canvas);
+                resolve();
+              };
+              img.onerror = () => {
+                layerCanvases.set(layer.id, canvas);
+                resolve();
+              };
+              img.src = dataUrl;
+            } else {
+              layerCanvases.set(layer.id, canvas);
+              resolve();
+            }
+          });
+        });
+
+        await Promise.all(loadPromises);
+
+        return {
+          name: project.name || file.name.replace(/\.[^/.]+$/, ''),
+          dimensions: { width, height },
+          colorMode,
+          layers,
+          layerCanvases,
+        };
+      }
+    } catch (err) {
+      console.warn('Failed to parse .sora project JSON, falling back to image loader:', err);
+    }
+  }
+
+  // Common image extensions: .png, .jpg, .jpeg, .webp, .bmp, .gif, .svg
+  return await loadStandardImage(file);
+}

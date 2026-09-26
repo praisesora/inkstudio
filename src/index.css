@@ -1,0 +1,315 @@
+@import "tailwindcss";
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  html, body, #root {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background-color: #1e1e1e;
+    color: #cccccc;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 13px;
+    touch-action: none;
+    -webkit-touch-callout: none;
+  }
+
+  canvas {
+    touch-action: none;
+    -webkit-touch-callout: none;
+  }
+}
+
+/* Utilitarian desktop scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #1e1e1e;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333333;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #444444;
+}
+
+/* Tactile desktop range sliders (scaled for comfortable stylus interaction) */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+  height: 22px;
+}
+
+input[type="range"]:focus {
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 6px;
+  background: #2a2a2a;
+  border: 1px solid #383838;
+  border-radius: 2px;
+}
+
+input[type="range"]::-moz-range-track {
+  height: 6px;
+  background: #2a2a2a;
+  border: 1px solid #383838;
+  border-radius: 2px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 20px;
+  background: #555555;
+  border: 1px solid #707070;
+  border-radius: 2px;
+  margin-top: -7px;
+}
+
+input[type="range"]:hover::-webkit-slider-thumb {
+  background: #666666;
+  border-color: #888888;
+}
+
+input[type="range"]:active::-webkit-slider-thumb {
+  background: #808080;
+  border-color: #aaaaaa;
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 20px;
+  background: #555555;
+  border: 1px solid #707070;
+  border-radius: 2px;
+}
+
+input[type="range"]:hover::-moz-range-thumb {
+  background: #666666;
+  border-color: #888888;
+}
+
+input[type="range"]:active::-moz-range-thumb {
+  background: #808080;
+  border-color: #aaaaaa;
+}
+
+/* ==========================================================================
+   VINTAGE MANGA STUDIO (COMIC STUDIO / CSP VINTAGE) DESIGN SYSTEM
+   Japanese desktop DCC styling: neutral industrial grey, tactile beveled relief,
+   sunken grooves, steel-blue highlights, and utilitarian compact controls.
+   ========================================================================== */
+
+[data-theme="vintage-manga"] {
+  --theme-bg-workbench: #48484b;
+  --theme-bg-panel: #4a4a4d;
+  --theme-bg-panel-dark: #3e3e41;
+  --theme-bg-header: linear-gradient(180deg, #525255 0%, #3e3e40 100%);
+  --theme-bg-button: linear-gradient(180deg, #56565a 0%, #424245 100%);
+  --theme-bg-button-hover: linear-gradient(180deg, #626266 0%, #4b4b4e 100%);
+  --theme-bg-active: linear-gradient(180deg, #376590 0%, #204264 100%);
+  --theme-border-active: #4a8fc7;
+  --theme-border-dark: #242426;
+  --theme-border-highlight: rgba(255, 255, 255, 0.18);
+  --theme-bg-sunken: #2b2b2e;
+}
+
+[data-theme="vintage-manga"] body,
+[data-theme="vintage-manga"] #root,
+[data-theme="vintage-manga"] .app-root-container {
+  background-color: #48484b !important;
+  color: #d6d6da !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Meiryo", "MS UI Gothic", "Hiragino Kaku Gothic ProN", Arial, sans-serif !important;
+}
+
+/* Vintage panel & sidebar surfaces */
+[data-theme="vintage-manga"] .bg-\[\#1e1e1e\],
+[data-theme="vintage-manga"] .bg-\[\#1e2023\],
+[data-theme="vintage-manga"] .bg-\[\#252526\],
+[data-theme="vintage-manga"] .bg-\[\#222223\],
+[data-theme="vintage-manga"] .bg-\[\#222224\],
+[data-theme="vintage-manga"] .bg-\[\#222225\],
+[data-theme="vintage-manga"] .bg-\[\#252528\] {
+  background-color: #48484b !important;
+}
+
+[data-theme="vintage-manga"] .bg-\[\#1b1c1e\],
+[data-theme="vintage-manga"] .bg-\[\#1a1b1e\],
+[data-theme="vintage-manga"] .bg-\[\#161719\],
+[data-theme="vintage-manga"] .bg-\[\#141517\],
+[data-theme="vintage-manga"] .bg-\[\#141518\],
+[data-theme="vintage-manga"] .bg-\[\#18191b\],
+[data-theme="vintage-manga"] .bg-\[\#1c1d1f\],
+[data-theme="vintage-manga"] .bg-\[\#242426\],
+[data-theme="vintage-manga"] .bg-\[\#2a2a2a\],
+[data-theme="vintage-manga"] .bg-\[\#2a2a2d\],
+[data-theme="vintage-manga"] .bg-\[\#202226\] {
+  background-color: #3e3e41 !important;
+}
+
+/* Vintage borders */
+[data-theme="vintage-manga"] .border-\[\#333333\],
+[data-theme="vintage-manga"] .border-\[\#2b2d31\],
+[data-theme="vintage-manga"] .border-\[\#25272c\],
+[data-theme="vintage-manga"] .border-\[\#26282c\],
+[data-theme="vintage-manga"] .border-\[\#3e3e42\],
+[data-theme="vintage-manga"] .border-\[\#282a2e\],
+[data-theme="vintage-manga"] .border-\[\#333336\],
+[data-theme="vintage-manga"] .border-\[\#38383a\],
+[data-theme="vintage-manga"] .border-\[\#3a3a3a\] {
+  border-color: #242426 !important;
+}
+
+/* Vintage tactile buttons in toolbars & panels */
+[data-theme="vintage-manga"] button[class*="rounded"]:not([class*="rounded-full"]):not([class*="accent"]):not([class*="bg-transparent"]) {
+  background-image: linear-gradient(180deg, #56565a 0%, #424245 100%);
+  border: 1px solid #242426;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18), 0 1px 1px rgba(0, 0, 0, 0.3);
+  color: #cccccc;
+}
+
+[data-theme="vintage-manga"] button[class*="rounded"]:not([class*="rounded-full"]):not([class*="accent"]):not([class*="bg-transparent"]):hover {
+  background-image: linear-gradient(180deg, #626266 0%, #4b4b4e 100%);
+  color: #ffffff;
+}
+
+/* Signature Manga Studio steel-blue active state */
+[data-theme="vintage-manga"] button[class*="bg-\[\#293d45\]"],
+[data-theme="vintage-manga"] button[class*="bg-\[\#383838\]"],
+[data-theme="vintage-manga"] button[class*="bg-\[\#37485e\]"],
+[data-theme="vintage-manga"] button[class*="bg-\[\#007acc\]"],
+[data-theme="vintage-manga"] div[class*="bg-\[\#007acc\]"],
+[data-theme="vintage-manga"] div[class*="bg-\[\#293d45\]"],
+[data-theme="vintage-manga"] .active-item {
+  background-image: linear-gradient(180deg, #376590 0%, #204264 100%) !important;
+  background-color: #204264 !important;
+  border-color: #4a8fc7 !important;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.65), 0 0 4px rgba(74, 143, 199, 0.4) !important;
+  color: #ffffff !important;
+}
+
+/* Vintage sunken inputs, select boxes & textareas */
+[data-theme="vintage-manga"] input[type="text"],
+[data-theme="vintage-manga"] input[type="number"],
+[data-theme="vintage-manga"] select,
+[data-theme="vintage-manga"] textarea {
+  background-color: #2b2b2e !important;
+  border: 1px solid #1c1c1e !important;
+  box-shadow: inset 1px 1px 2px rgba(0, 0, 0, 0.6), inset -1px -1px 0 rgba(255, 255, 255, 0.06) !important;
+  color: #f0f0f4 !important;
+  border-radius: 1px !important;
+}
+
+[data-theme="vintage-manga"] input[type="text"]:focus,
+[data-theme="vintage-manga"] input[type="number"]:focus,
+[data-theme="vintage-manga"] select:focus {
+  border-color: #3888cc !important;
+  outline: none !important;
+}
+
+/* Vintage tactile range sliders */
+[data-theme="vintage-manga"] input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px;
+  background: #1c1c1e;
+  border: 1px solid #141416;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.12);
+  border-radius: 1px;
+}
+
+[data-theme="vintage-manga"] input[type="range"]::-moz-range-track {
+  height: 5px;
+  background: #1c1c1e;
+  border: 1px solid #141416;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.8), 0 1px 0 rgba(255, 255, 255, 0.12);
+  border-radius: 1px;
+}
+
+[data-theme="vintage-manga"] input[type="range"]::-webkit-slider-thumb {
+  width: 10px;
+  height: 16px;
+  background: linear-gradient(180deg, #78787e 0%, #4e4e52 100%);
+  border: 1px solid #222224;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 1px 2px rgba(0, 0, 0, 0.5);
+  border-radius: 1px;
+  margin-top: -6px;
+}
+
+[data-theme="vintage-manga"] input[type="range"]:hover::-webkit-slider-thumb {
+  background: linear-gradient(180deg, #88888e 0%, #5a5a5e 100%);
+  border-color: #303034;
+}
+
+[data-theme="vintage-manga"] input[type="range"]::-moz-range-thumb {
+  width: 10px;
+  height: 16px;
+  background: linear-gradient(180deg, #78787e 0%, #4e4e52 100%);
+  border: 1px solid #222224;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 1px 2px rgba(0, 0, 0, 0.5);
+  border-radius: 1px;
+}
+
+/* Vintage scrollbars */
+[data-theme="vintage-manga"] ::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+[data-theme="vintage-manga"] ::-webkit-scrollbar-track {
+  background: #343437;
+}
+
+[data-theme="vintage-manga"] ::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, #58585c 0%, #444447 100%);
+  border: 1px solid #242426;
+  border-radius: 1px;
+}
+
+[data-theme="vintage-manga"] ::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #646469 0%, #4e4e52 100%);
+}
+
+/* Canvas viewport paper drop shadow in vintage mode */
+[data-theme="vintage-manga"] canvas.canvas-paper {
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.65), 0 0 0 1px rgba(0, 0, 0, 0.45);
+}
+
+[data-theme="vintage-manga"] .canvas-viewport,
+[data-theme="vintage-manga"] main[class*="bg-\[\#282828\]"] {
+  background-color: #48484b !important;
+}
+
+/* Vintage Manga Studio popup menus and dropdowns */
+[data-theme="vintage-manga"] div[role="menu"] {
+  background-color: #3e3e41 !important;
+  border-color: #242426 !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.15) !important;
+}
+
+[data-theme="vintage-manga"] div[role="menu"] button[role="menuitem"]:hover:not([disabled]) {
+  background-image: linear-gradient(180deg, #376590 0%, #204264 100%) !important;
+  color: #ffffff !important;
+}
+
+/* Vintage Manga Studio modal dialogs */
+[data-theme="vintage-manga"] div[class*="shadow-2xl"][class*="border"] {
+  border-color: #242426 !important;
+  box-shadow: 0 12px 36px rgba(0, 0, 0, 0.8), 0 0 0 1px #1e1e20 !important;
+}
