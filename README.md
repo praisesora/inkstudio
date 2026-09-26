@@ -1,51 +1,55 @@
-# Ink Studio - Desktop Graphics Editor
+# Ink Studio
 
-A modern desktop graphics editor built with **Tauri v2 + React 19 + TypeScript + Tailwind CSS v4**.
+A lightweight desktop digital painting application with real-time collaborative multiplayer drawing, inspired by Clip Studio Paint.
 
-## ✨ Features (Step 1)
+## Features
 
-1. **Modern Dark Theme Layout**:
-   - **Narrow Left Toolbar**: Brush (`B`) and Eraser (`E`) with active indicators and color swatch.
-   - **Central Canvas Workspace**: Dark canvas background with dot grid, drop-shadowed artboard, zoom controls, and dynamic brush size cursor ring.
-   - **Right Inspector Panel**:
-     - Interactive Color Palette (native color picker, HEX input, preset swatches).
-     - Stroke Dynamics (brush size, pen pressure sensitivity toggle, min-taper slider, Bézier anti-aliasing toggle).
-     - Layers Panel placeholder with drawing layer and background layer items.
-   - **Top Header**: Fast brush sizing, Undo/Redo, Zoom controls, Clear Canvas, and Export PNG.
-   - **Bottom Status Bar**: Pointer coordinates $(X, Y)$, real-time stylus pressure gauge, tool mode, and zoom level.
+- **Real-Time Multiplayer**: Draw collaboratively with others on a shared live canvas.
+- **Clip Studio-Inspired UI**: Clean, familiar workspace with quick access to tools, swatches, and canvas controls.
+- **Drawing Engine**: Smooth brush and eraser tools with dynamic size scaling and stroke stabilization.
+- **Color & Swatches**: Interactive color picker, hex inputs, and custom preset palettes.
+- **History & Export**: Full undo/redo history buffer and instant PNG export.
 
-2. **Advanced HTML5 Canvas Drawing Engine**:
-   - **Pointer Events**: Fully supports `PointerDown`, `PointerMove`, `PointerUp`, `PointerEnter`, and `PointerLeave`.
-   - **Stylus Pen Pressure**: Reads `e.pressure` (with tablet coalesced events via `e.getCoalescedEvents()`) and modulates stroke thickness. Gracefully falls back to 0.5 for standard mouse input.
-   - **Bézier Anti-Aliasing & Smoothing**: Uses quadratic Bézier midpoint interpolation with continuous width graduation along the curve, eliminating angular kinks and stair-stepping.
-   - **Full Undo / Redo**: `Ctrl+Z` / `Ctrl+Y` / `Ctrl+Shift+Z` with snapshot history buffer.
-   - **Eraser Mode**: Canvas pixel erasing using `globalCompositeOperation = 'destination-out'`.
+## Tech Stack
 
----
+- Tauri v2
+- React 19
+- TypeScript
+- Tailwind CSS v4
+- Vite
 
-## 🚀 Quick Start Commands
+## Getting Started
 
-### 1. Run Frontend Development Server (Browser / Vite)
+### Installation
+
+```bash
+npm install
+```
+
+### Development
+
+Run in browser:
 ```bash
 npm run dev
 ```
 
-### 2. Run Desktop App with Tauri
+Run as desktop app:
 ```bash
 npm run tauri dev
 ```
 
-### 3. Build for Production
+### Production Build
+
 ```bash
 npm run build
 npm run tauri build
 ```
 
----
+## Shortcuts
 
-## ⌨️ Shortcuts
-
-- `B`: Select Brush tool
-- `E`: Select Eraser tool
-- `Ctrl + Z`: Undo stroke
-- `Ctrl + Y` or `Ctrl + Shift + Z`: Redo stroke
+| Shortcut | Action |
+| --- | --- |
+| `B` | Brush tool |
+| `E` | Eraser tool |
+| `Ctrl + Z` | Undo |
+| `Ctrl + Y` / `Ctrl + Shift + Z` | Redo |
