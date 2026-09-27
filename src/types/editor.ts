@@ -54,10 +54,14 @@ export interface CspSpraySettings {
 }
 
 export interface CspTaperSettings {
+  useIn?: boolean;
   inLength: number;
   inRatio: number;
+  useOut?: boolean;
   outLength: number;
   outRatio: number;
+  inOutType?: number;
+  inOutBySpeed?: boolean;
 }
 
 export interface CspBrush {

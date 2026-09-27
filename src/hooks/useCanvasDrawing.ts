@@ -13,8 +13,8 @@ import {
 } from '../types/editor';
 import {
   calculateStrokeWidth,
-  getMidPoint,
-  drawSmoothBezierSegment,
+  drawSmoothCubicBezierSegment,
+  catmullRomToBezier,
   drawDot,
   screenToCanvas,
   createCanvasThumbnail,
@@ -24,10 +24,10 @@ import {
   getReusableBakeCanvas,
   renderCompleteStroke,
 } from '../utils/canvasUtils';
-import { enforceColorMode, applyColorModeToCanvas } from '../utils/colorUtils';
-import { drawPencilBezierSegment, drawPencilDot, PencilGrade } from '../utils/pencilEngine';
+import { enforceColorMode, binarizeCanvasRect } from '../utils/colorUtils';
+import { drawPencilCubicBezierSegment, drawPencilDot, PencilGrade } from '../utils/pencilEngine';
 import {
-  drawTexturedBezierSegment,
+  drawTexturedCubicBezierSegment,
   drawTexturedDot,
   TexturedBrushOptions,
 } from '../utils/stampEngine';
@@ -170,7 +170,10 @@ export function useCanvasDrawing({
   // Sliding window of points for real-time Bézier smoothing on the draft overlay canvas
   const strokePointsRef = useRef<Point[]>([]);
 
-  // Stabilizer tracking ref for exponential moving average (EMA)
+  // Raw points window buffer for symmetric Gaussian FIR stabilization
+  const rawPointsBufferRef = useRef<{ x: number; y: number; pressure: number; pointerType: string }[]>([]);
+
+  // Stabilizer tracking ref
   const stabilizedPointRef = useRef<Point | null>(null);
 
   // Distance accumulator for textured brush dab stepping
@@ -180,9 +183,25 @@ export function useCanvasDrawing({
   const activeReservoirRef = useRef<PaintReservoir | null>(null);
   const layerPixelSamplerRef = useRef<LayerPixelSampler | null>(null);
   const strokeBackupCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const dedicatedBackupCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const getDedicatedBackupCanvas = useCallback((width: number, height: number): HTMLCanvasElement => {
+    if (!dedicatedBackupCanvasRef.current) {
+      dedicatedBackupCanvasRef.current = document.createElement('canvas');
+    }
+    const c = dedicatedBackupCanvasRef.current;
+    if (c.width !== width || c.height !== height) {
+      c.width = width;
+      c.height = height;
+    }
+    return c;
+  }, []);
+
   const isWetColorStrokeRef = useRef<boolean>(false);
   const drewDirectlyOnLayerCanvasRef = useRef<boolean>(false);
   const lastPointTimeRef = useRef<number>(0);
+  const recentPointsTrailRef = useRef<{ x: number; y: number; t: number; pressure: number; width: number }[]>([]);
+  const strokeTotalDistanceRef = useRef<number>(0);
 
   // Dirty bounding box for the active stroke
   const dirtyRectRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
@@ -193,8 +212,6 @@ export function useCanvasDrawing({
   const drawRafIdRef = useRef<number | null>(null);
   const clearDraftRafRef = useRef<number | null>(null);
 
-  // If raster layer eraser is active, we temporarily hide the layer while erasing live on the draft canvas
-  const hiddenLayerCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Undo / Redo history stack of rich history items
   const historyRef = useRef<HistoryItem[]>([]);
@@ -360,9 +377,58 @@ export function useCanvasDrawing({
     [getActiveCanvas, layerCanvasesRef, syncHistoryState]
   );
 
+  // Abort any in-progress stroke session immediately
+  const abortActiveStroke = useCallback(() => {
+    if (!isDrawingRef.current) return;
+    if (drawRafIdRef.current !== null) {
+      cancelAnimationFrame(drawRafIdRef.current);
+      drawRafIdRef.current = null;
+    }
+    const draftCanvas = effectiveDraftCanvasRef?.current;
+    if (draftCanvas) {
+      const dCtx = get2DContext(draftCanvas);
+      if (dCtx) {
+        try {
+          dCtx.restore();
+        } catch (_) {}
+        dCtx.resetTransform();
+        dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
+      }
+    }
+    if (drewDirectlyOnLayerCanvasRef.current && strokeBackupCanvasRef.current) {
+      const currentLayerId = activeLayerIdRef.current;
+      const canvas = layerCanvasesRef.current.get(currentLayerId) || getActiveCanvas();
+      if (canvas && strokeBackupCanvasRef.current) {
+        const cCtx = get2DContext(canvas);
+        if (cCtx) {
+          cCtx.clearRect(0, 0, canvas.width, canvas.height);
+          cCtx.drawImage(strokeBackupCanvasRef.current, 0, 0);
+        }
+      }
+    }
+    isDrawingRef.current = false;
+    activePointerIdRef.current = null;
+    allStrokePointsRef.current = [];
+    strokePointsRef.current = [];
+    stabilizedPointRef.current = null;
+    lastProcessedPointRef.current = null;
+    dirtyRectRef.current = null;
+    pendingPointsQueueRef.current = [];
+    drewDirectlyOnLayerCanvasRef.current = false;
+    isToneStrokeRef.current = false;
+    strokeBackupCanvasRef.current = null;
+    layerPixelSamplerRef.current = null;
+    activeReservoirRef.current = null;
+    snapSessionRef.current.endStroke();
+    onActiveConstraintAxisChangeRef.current?.(null);
+  }, [effectiveDraftCanvasRef, getActiveCanvas, layerCanvasesRef]);
+
   // Jump directly to any past or future history step
   const jumpToHistoryIndex = useCallback(
     (targetIndex: number) => {
+      if (isDrawingRef.current) {
+        abortActiveStroke();
+      }
       if (targetIndex < 0 || targetIndex >= historyRef.current.length) return;
       const currentIndex = historyIndexRef.current;
       if (targetIndex === currentIndex) return;
@@ -376,40 +442,72 @@ export function useCanvasDrawing({
             const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
             const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
             const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-            const hasEffect = Boolean(
-              (targetLayer?.toneEnabled ||
-                targetLayer?.layerColorEnabled ||
-                (targetLayer?.expressionColor && targetLayer.expressionColor !== 'color')) &&
-              sourceCanvas
-            );
-            const destCanvas = hasEffect && sourceCanvas ? sourceCanvas : canvas;
+            const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
 
-            if (destCanvas) {
-              const ctx = get2DContext(destCanvas);
-              if (ctx) {
+            if (isToneStep && sourceCanvas) {
+              const sCtx = get2DContext(sourceCanvas);
+              if (sCtx) {
                 if (item.dirtyRect && item.beforeImageData) {
-                  ctx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
+                  sCtx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
                 } else if (item.beforeImageData) {
-                  ctx.putImageData(item.beforeImageData, 0, 0);
+                  sCtx.putImageData(item.beforeImageData, 0, 0);
                 } else if (item.type === 'initial') {
                   if (targetLayerId === 'layer-bg') {
-                    ctx.fillStyle = '#ffffff';
-                    ctx.fillRect(0, 0, destCanvas.width, destCanvas.height);
+                    sCtx.fillStyle = '#ffffff';
+                    sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                   } else {
-                    ctx.clearRect(0, 0, destCanvas.width, destCanvas.height);
+                    sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                   }
                 }
               }
-            }
 
-            if (hasEffect && sourceCanvas && canvas && targetLayer) {
-              applyLayerEffects(
-                sourceCanvas,
-                canvas,
-                targetLayer,
-                dimensionsRef.current.dpi ?? 600,
-                item.dirtyRect
-              );
+              if (canvas && targetLayer) {
+                applyLayerEffects(
+                  sourceCanvas,
+                  canvas,
+                  targetLayer,
+                  dimensionsRef.current.dpi ?? 600,
+                  item.dirtyRect
+                );
+              }
+            } else {
+              // Direct canvas restoration for monochrome, color, gray, normal pen, eraser, etc.
+              if (canvas) {
+                const cCtx = get2DContext(canvas);
+                if (cCtx) {
+                  if (item.dirtyRect && item.beforeImageData) {
+                    cCtx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
+                  } else if (item.beforeImageData) {
+                    cCtx.putImageData(item.beforeImageData, 0, 0);
+                  } else if (item.type === 'initial') {
+                    if (targetLayerId === 'layer-bg') {
+                      cCtx.fillStyle = '#ffffff';
+                      cCtx.fillRect(0, 0, canvas.width, canvas.height);
+                    } else {
+                      cCtx.clearRect(0, 0, canvas.width, canvas.height);
+                    }
+                  }
+                }
+              }
+
+              // Keep sourceCanvas synchronized if present
+              if (sourceCanvas) {
+                const sCtx = get2DContext(sourceCanvas);
+                if (sCtx) {
+                  if (item.dirtyRect && item.beforeImageData) {
+                    sCtx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
+                  } else if (item.beforeImageData) {
+                    sCtx.putImageData(item.beforeImageData, 0, 0);
+                  } else if (item.type === 'initial') {
+                    if (targetLayerId === 'layer-bg') {
+                      sCtx.fillStyle = '#ffffff';
+                      sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+                    } else {
+                      sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+                    }
+                  }
+                }
+              }
             }
 
             if (canvas) {
@@ -427,40 +525,72 @@ export function useCanvasDrawing({
             const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
             const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
             const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-            const hasEffect = Boolean(
-              (targetLayer?.toneEnabled ||
-                targetLayer?.layerColorEnabled ||
-                (targetLayer?.expressionColor && targetLayer.expressionColor !== 'color')) &&
-              sourceCanvas
-            );
-            const destCanvas = hasEffect && sourceCanvas ? sourceCanvas : canvas;
+            const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
 
-            if (destCanvas) {
-              const ctx = get2DContext(destCanvas);
-              if (ctx) {
+            if (isToneStep && sourceCanvas) {
+              const sCtx = get2DContext(sourceCanvas);
+              if (sCtx) {
                 if (item.dirtyRect && dataToApply) {
-                  ctx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
+                  sCtx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
                 } else if (dataToApply) {
-                  ctx.putImageData(dataToApply, 0, 0);
+                  sCtx.putImageData(dataToApply, 0, 0);
                 } else if (item.type === 'initial') {
                   if (targetLayerId === 'layer-bg') {
-                    ctx.fillStyle = '#ffffff';
-                    ctx.fillRect(0, 0, destCanvas.width, destCanvas.height);
+                    sCtx.fillStyle = '#ffffff';
+                    sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                   } else {
-                    ctx.clearRect(0, 0, destCanvas.width, destCanvas.height);
+                    sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                   }
                 }
               }
-            }
 
-            if (hasEffect && sourceCanvas && canvas && targetLayer) {
-              applyLayerEffects(
-                sourceCanvas,
-                canvas,
-                targetLayer,
-                dimensionsRef.current.dpi ?? 600,
-                item.dirtyRect
-              );
+              if (canvas && targetLayer) {
+                applyLayerEffects(
+                  sourceCanvas,
+                  canvas,
+                  targetLayer,
+                  dimensionsRef.current.dpi ?? 600,
+                  item.dirtyRect
+                );
+              }
+            } else {
+              // Direct canvas restoration for monochrome, color, gray, normal pen, eraser, etc.
+              if (canvas) {
+                const cCtx = get2DContext(canvas);
+                if (cCtx) {
+                  if (item.dirtyRect && dataToApply) {
+                    cCtx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
+                  } else if (dataToApply) {
+                    cCtx.putImageData(dataToApply, 0, 0);
+                  } else if (item.type === 'initial') {
+                    if (targetLayerId === 'layer-bg') {
+                      cCtx.fillStyle = '#ffffff';
+                      cCtx.fillRect(0, 0, canvas.width, canvas.height);
+                    } else {
+                      cCtx.clearRect(0, 0, canvas.width, canvas.height);
+                    }
+                  }
+                }
+              }
+
+              // Keep sourceCanvas synchronized if present
+              if (sourceCanvas) {
+                const sCtx = get2DContext(sourceCanvas);
+                if (sCtx) {
+                  if (item.dirtyRect && dataToApply) {
+                    sCtx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
+                  } else if (dataToApply) {
+                    sCtx.putImageData(dataToApply, 0, 0);
+                  } else if (item.type === 'initial') {
+                    if (targetLayerId === 'layer-bg') {
+                      sCtx.fillStyle = '#ffffff';
+                      sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+                    } else {
+                      sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
+                    }
+                  }
+                }
+              }
             }
 
             if (canvas) {
@@ -473,20 +603,26 @@ export function useCanvasDrawing({
       historyIndexRef.current = targetIndex;
       syncHistoryState();
     },
-    [activeLayerId, getActiveCanvas, layerCanvasesRef, onUpdateLayerThumbnail, syncHistoryState]
+    [abortActiveStroke, activeLayerId, getActiveCanvas, layerCanvasesRef, onUpdateLayerThumbnail, syncHistoryState]
   );
 
   // Undo action
   const undo = useCallback(() => {
+    if (isDrawingRef.current) {
+      abortActiveStroke();
+    }
     if (historyIndexRef.current <= 0) return;
     jumpToHistoryIndex(historyIndexRef.current - 1);
-  }, [jumpToHistoryIndex]);
+  }, [abortActiveStroke, jumpToHistoryIndex]);
 
   // Redo action
   const redo = useCallback(() => {
+    if (isDrawingRef.current) {
+      abortActiveStroke();
+    }
     if (historyIndexRef.current >= historyRef.current.length - 1) return;
     jumpToHistoryIndex(historyIndexRef.current + 1);
-  }, [jumpToHistoryIndex]);
+  }, [abortActiveStroke, jumpToHistoryIndex]);
 
   // Clear active layer action
   const clearCanvas = useCallback(() => {
@@ -559,14 +695,22 @@ export function useCanvasDrawing({
         dims
       );
 
-      const pressure = e.pressure !== undefined && e.pressure > 0 ? e.pressure : 0.5;
+      let pressure = 0;
+      if (e.pointerType === 'mouse') {
+        pressure = (e.buttons & 1) ? 0.5 : 0;
+      } else {
+        pressure = e.pressure !== undefined ? Math.max(0, Math.min(1.0, e.pressure)) : 0;
+      }
+
       const width = calculateStrokeWidth(
         bs.size,
         pressure,
         bs.minSizeFactor,
         bs.usePressure,
         e.pointerType,
-        bs.pressureCurveGamma ?? 1.0
+        bs.pressureCurveGamma ?? 1.0,
+        1.0,
+        bs.pressureCurve
       );
 
       return { x, y, pressure, width };
@@ -574,13 +718,38 @@ export function useCanvasDrawing({
     [getViewportRect]
   );
 
-  // Render a single smooth segment onto the draft overlay context
+  // Render a single smooth segment onto the draft overlay context using Catmull-Rom cubic splines
   const renderDraftSegment = useCallback((draftCtx: CanvasRenderingContext2D, point: Point) => {
     const pts = strokePointsRef.current;
     pts.push(point);
-    if (pts.length > 8) {
-      pts.splice(0, pts.length - 8);
+
+    if (pts.length < 3) {
+      return;
     }
+
+    let k0: Point, k1: Point, k2: Point, k3: Point;
+    if (pts.length === 3) {
+      // First segment: P0 -> P1 with knots (P0, P0, P1, P2)
+      k0 = pts[0];
+      k1 = pts[0];
+      k2 = pts[1];
+      k3 = pts[2];
+    } else {
+      // Subsequent segments: P_{n-2} -> P_{n-1} with knots (P_{n-3}, P_{n-2}, P_{n-1}, P_n)
+      const n = pts.length;
+      k0 = pts[n - 4];
+      k1 = pts[n - 3];
+      k2 = pts[n - 2];
+      k3 = pts[n - 1];
+    }
+
+    if (pts.length > 5) {
+      pts.shift();
+    }
+
+    const { c1, c2 } = catmullRomToBezier(k0, k1, k2, k3);
+    const segStart = k1;
+    const segEnd = k2;
 
     const isEraser = toolRef.current === 'eraser';
     const isBgEraser = isEraser && activeLayerIdRef.current === 'layer-bg';
@@ -589,25 +758,30 @@ export function useCanvasDrawing({
     const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
     const canvas = getActiveCanvas();
     const currentLayerId = activeLayerIdRef.current;
+    const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+    const isToneLayer = Boolean(activeLayer?.toneEnabled);
+    const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
+    const isMonochrome = mode === 'monochrome' || isMonoLayer;
     const isTone = isToneStrokeRef.current;
     const sourceCanvas = isTone ? layerSourceCanvasesRef?.current?.get(currentLayerId) : null;
     const isWetColor = isWetColorStrokeRef.current;
+    const isTranslucentBrush = !isEraser && !isMonochrome && (bs.opacity ?? 1.0) < 0.999;
+    const isDirectRender = isMonochrome || isWetColor || isEraser || (!isTranslucentBrush && !isToneLayer);
 
-    let targetCtx: CanvasRenderingContext2D | null = draftCtx;
-    if (isTone && sourceCanvas) {
+    let targetCtx: CanvasRenderingContext2D | null = null;
+    if (isToneLayer && sourceCanvas) {
       targetCtx = get2DContext(sourceCanvas);
       drewDirectlyOnLayerCanvasRef.current = true;
-    } else if (isWetColor && canvas) {
+    } else if (isDirectRender && canvas) {
       targetCtx = get2DContext(canvas);
       drewDirectlyOnLayerCanvasRef.current = true;
+    } else {
+      targetCtx = draftCtx;
     }
     if (!targetCtx) return;
-    const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
-    const isToneLayer = Boolean(activeLayer?.toneEnabled);
-    const extraPreviewCtx = (isTone && sourceCanvas && draftCtx && targetCtx !== draftCtx && !isEraser && !isToneLayer) ? draftCtx : null;
 
-    const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, mode);
-    const strokeHardness = mode === 'monochrome' ? 1.0 : (bs.hardness ?? 1.0);
+    const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+    const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
     const strokeFlow = bs.flow ?? 1.0;
     const strokeSpacing = bs.spacing ?? 0.08;
 
@@ -624,9 +798,10 @@ export function useCanvasDrawing({
         angleDynamics: bs.customTipAngleDynamics,
         rotationRandomScale: bs.customTipRotationRandomScale,
         hardness: strokeHardness,
-        antiAlias: bs.antiAlias,
+        antiAlias: isMonochrome ? 0 : bs.antiAlias,
         pressureCurve: bs.pressureCurve,
         velocityCurve: bs.velocityCurve,
+        usePressure: bs.usePressure,
         useVelocity: bs.useVelocity,
         subTips: bs.subTips,
         subTipOrder: bs.subTipOrder,
@@ -652,226 +827,51 @@ export function useCanvasDrawing({
         reservoir: activeReservoirRef.current || undefined,
         isEraser: isEraser && !isBgEraser,
         isBgEraser,
+        currentStrokeDist: strokeTotalDistanceRef.current,
       };
 
-      if (pts.length >= 3) {
-        const p0 = pts[pts.length - 3];
-        const p1 = pts[pts.length - 2];
-        const p2 = pts[pts.length - 1];
-
-        const startMid = getMidPoint(p0, p1);
-        const endMid = getMidPoint(p1, p2);
-
-        stampRemainderDistRef.current = drawTexturedBezierSegment(
-          targetCtx,
-          startMid,
-          p1,
-          endMid,
-          strokeColor,
-          bs.customTipImage,
-          tipOptions,
-          stampRemainderDistRef.current
-        );
-        if (extraPreviewCtx) {
-          drawTexturedBezierSegment(
-            extraPreviewCtx,
-            startMid,
-            p1,
-            endMid,
-            strokeColor,
-            bs.customTipImage,
-            tipOptions,
-            stampRemainderDistRef.current
-          );
-        }
-      } else if (pts.length === 2) {
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const mid = getMidPoint(p0, p1);
-
-        stampRemainderDistRef.current = drawTexturedBezierSegment(
-          targetCtx,
-          p0,
-          p0,
-          mid,
-          strokeColor,
-          bs.customTipImage,
-          tipOptions,
-          stampRemainderDistRef.current
-        );
-        if (extraPreviewCtx) {
-          drawTexturedBezierSegment(
-            extraPreviewCtx,
-            p0,
-            p0,
-            mid,
-            strokeColor,
-            bs.customTipImage,
-            tipOptions,
-            stampRemainderDistRef.current
-          );
-        }
-      }
+      stampRemainderDistRef.current = drawTexturedCubicBezierSegment(
+        targetCtx,
+        segStart,
+        c1,
+        c2,
+        segEnd,
+        strokeColor,
+        bs.customTipImage,
+        tipOptions,
+        stampRemainderDistRef.current
+      );
     } else if (isPencil) {
       const grade = (bs.preset as PencilGrade) || 'pencil-2b';
       const pFlow = bs.flow ?? 0.74;
       const pGrain = bs.grain ?? 1.0;
 
-      if (pts.length >= 3) {
-        const p0 = pts[pts.length - 3];
-        const p1 = pts[pts.length - 2];
-        const p2 = pts[pts.length - 1];
-
-        const startMid = getMidPoint(p0, p1);
-        const endMid = getMidPoint(p1, p2);
-
-        drawPencilBezierSegment(
-          targetCtx,
-          startMid,
-          p1,
-          endMid,
-          strokeColor,
-          grade,
-          pFlow,
-          pGrain,
-          bs.hardness
-        );
-        if (extraPreviewCtx) {
-          drawPencilBezierSegment(
-            extraPreviewCtx,
-            startMid,
-            p1,
-            endMid,
-            strokeColor,
-            grade,
-            pFlow,
-            pGrain,
-            bs.hardness
-          );
-        }
-      } else if (pts.length === 2) {
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const mid = getMidPoint(p0, p1);
-
-        drawPencilBezierSegment(
-          targetCtx,
-          p0,
-          p0,
-          mid,
-          strokeColor,
-          grade,
-          pFlow,
-          pGrain,
-          bs.hardness
-        );
-        if (extraPreviewCtx) {
-          drawPencilBezierSegment(
-            extraPreviewCtx,
-            p0,
-            p0,
-            mid,
-            strokeColor,
-            grade,
-            pFlow,
-            pGrain,
-            bs.hardness
-          );
-        }
-      }
-    } else if (bs.smoothing) {
-      if (pts.length >= 3) {
-        const p0 = pts[pts.length - 3];
-        const p1 = pts[pts.length - 2];
-        const p2 = pts[pts.length - 1];
-
-        const startMid = getMidPoint(p0, p1);
-        const endMid = getMidPoint(p1, p2);
-
-        drawSmoothBezierSegment(
-          targetCtx,
-          startMid,
-          p1,
-          endMid,
-          strokeColor,
-          isEraser && !isBgEraser,
-          strokeHardness,
-          strokeFlow,
-          strokeSpacing
-        );
-        if (extraPreviewCtx) {
-          drawSmoothBezierSegment(
-            extraPreviewCtx,
-            startMid,
-            p1,
-            endMid,
-            strokeColor,
-            false,
-            strokeHardness,
-            strokeFlow,
-            strokeSpacing
-          );
-        }
-      } else if (pts.length === 2) {
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const mid = getMidPoint(p0, p1);
-
-        drawSmoothBezierSegment(
-          targetCtx,
-          p0,
-          p0,
-          mid,
-          strokeColor,
-          isEraser && !isBgEraser,
-          strokeHardness,
-          strokeFlow,
-          strokeSpacing
-        );
-        if (extraPreviewCtx) {
-          drawSmoothBezierSegment(
-            extraPreviewCtx,
-            p0,
-            p0,
-            mid,
-            strokeColor,
-            false,
-            strokeHardness,
-            strokeFlow,
-            strokeSpacing
-          );
-        }
-      }
+      drawPencilCubicBezierSegment(
+        targetCtx,
+        segStart,
+        c1,
+        c2,
+        segEnd,
+        strokeColor,
+        grade,
+        pFlow,
+        pGrain,
+        bs.hardness
+      );
     } else {
-      if (pts.length >= 2) {
-        const pPrev = pts[pts.length - 2];
-        const pCurr = pts[pts.length - 1];
-
-        targetCtx.save();
-        targetCtx.lineCap = 'round';
-        targetCtx.lineJoin = 'round';
-        if (strokeFlow < 0.999) {
-          targetCtx.globalAlpha = Math.max(0.01, Math.min(1.0, strokeFlow));
-        }
-        if (isBgEraser) {
-          targetCtx.globalCompositeOperation = 'source-over';
-          targetCtx.strokeStyle = '#ffffff';
-        } else if (isEraser) {
-          targetCtx.globalCompositeOperation = 'destination-out';
-          targetCtx.strokeStyle = 'rgba(0, 0, 0, 1)';
-        } else {
-          targetCtx.globalCompositeOperation = 'source-over';
-          targetCtx.strokeStyle = strokeColor;
-        }
-        targetCtx.lineWidth = (pPrev.width + pCurr.width) / 2;
-        targetCtx.beginPath();
-        targetCtx.moveTo(pPrev.x, pPrev.y);
-        targetCtx.lineTo(pCurr.x, pCurr.y);
-        targetCtx.stroke();
-        targetCtx.restore();
-      }
+      drawSmoothCubicBezierSegment(
+        targetCtx,
+        segStart,
+        c1,
+        c2,
+        segEnd,
+        strokeColor,
+        isEraser && !isBgEraser,
+        strokeHardness,
+        strokeFlow,
+        strokeSpacing
+      );
     }
-
   }, [getActiveCanvas]);
 
   // Stabilize and render point onto draft canvas
@@ -892,8 +892,11 @@ export function useCanvasDrawing({
         velocityScale = Math.max(0.65, Math.min(1.0, 1.0 - Math.max(0, speed - 0.5) * 0.12));
       }
 
+      rawPointsBufferRef.current.push({ x: rawX, y: rawY, pressure: rawPressure, pointerType });
+
       let pt: Point;
-      if (stab <= 0 || !stabilizedPointRef.current) {
+      if (stab <= 0) {
+        rawPointsBufferRef.current.length = 0;
         const width = calculateStrokeWidth(
           bs.size,
           rawPressure,
@@ -901,16 +904,32 @@ export function useCanvasDrawing({
           bs.usePressure,
           pointerType,
           bs.pressureCurveGamma ?? 1.0,
-          velocityScale
+          velocityScale,
+          bs.pressureCurve
         );
         pt = { x: rawX, y: rawY, pressure: rawPressure, width };
         stabilizedPointRef.current = pt;
       } else {
-        const alpha = Math.max(0.04, 1 / (1 + stab * 0.22));
-        const prev = stabilizedPointRef.current;
-        const smoothX = prev.x + (rawX - prev.x) * alpha;
-        const smoothY = prev.y + (rawY - prev.y) * alpha;
-        const smoothPressure = prev.pressure + (rawPressure - prev.pressure) * alpha;
+        const W = Math.min(9, Math.max(3, 1 + 2 * Math.floor(stab / 7)));
+        if (rawPointsBufferRef.current.length < W) {
+          return;
+        }
+
+        const buf = rawPointsBufferRef.current;
+        const mid = Math.floor(W / 2);
+        let sumX = 0, sumY = 0, sumP = 0, sumW = 0;
+        for (let i = 0; i < W; i++) {
+          const w = Math.pow(2, mid - Math.abs(i - mid));
+          sumX += buf[i].x * w;
+          sumY += buf[i].y * w;
+          sumP += buf[i].pressure * w;
+          sumW += w;
+        }
+        buf.shift();
+
+        const smoothX = sumX / sumW;
+        const smoothY = sumY / sumW;
+        const smoothPressure = sumP / sumW;
         const smoothWidth = calculateStrokeWidth(
           bs.size,
           smoothPressure,
@@ -918,15 +937,26 @@ export function useCanvasDrawing({
           bs.usePressure,
           pointerType,
           bs.pressureCurveGamma ?? 1.0,
-          velocityScale
+          velocityScale,
+          bs.pressureCurve
         );
         pt = { x: smoothX, y: smoothY, pressure: smoothPressure, width: smoothWidth };
         stabilizedPointRef.current = pt;
       }
 
+      // Track recent trail for exit velocity & tangent calculation
+      if (allStrokePointsRef.current.length > 0) {
+        const lastPt = allStrokePointsRef.current[allStrokePointsRef.current.length - 1];
+        strokeTotalDistanceRef.current += Math.hypot(pt.x - lastPt.x, pt.y - lastPt.y);
+      }
+      recentPointsTrailRef.current.push({ x: pt.x, y: pt.y, t: now, pressure: pt.pressure, width: pt.width });
+      if (recentPointsTrailRef.current.length > 16) {
+        recentPointsTrailRef.current.shift();
+      }
+
       // Expand dirty rectangle in canvas coordinates
       const blurMargin = (1 - (bs.hardness ?? 1.0)) * (pt.width * 1.5);
-      const r = Math.max(8, Math.ceil(pt.width / 2 + blurMargin + 8));
+      const r = Math.max(24, Math.ceil(pt.width + blurMargin + 24));
       if (dirtyRectRef.current) {
         dirtyRectRef.current.minX = Math.max(0, Math.min(dirtyRectRef.current.minX, Math.floor(pt.x - r)));
         dirtyRectRef.current.minY = Math.max(0, Math.min(dirtyRectRef.current.minY, Math.floor(pt.y - r)));
@@ -975,33 +1005,67 @@ export function useCanvasDrawing({
       }
     }
 
-    if (isToneStrokeRef.current && batchMinX <= batchMaxX) {
+    if (batchMinX <= batchMaxX) {
       const currentLayerId = activeLayerIdRef.current;
-      const sourceCanvas = layerSourceCanvasesRef?.current?.get(currentLayerId);
       const canvas = getActiveCanvas();
       const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
-      if (sourceCanvas && canvas && activeLayer) {
-        const dims = dimensionsRef.current;
-        const freq = activeLayer.toneFrequency ?? 60;
-        const cellSize = Math.max(3.5, (dims.dpi ?? 600) / freq);
-        const margin = Math.ceil(maxStrokeWidth * 0.75 + Math.max(cellSize * 2, 16));
-        const segMinX = Math.max(0, Math.floor(batchMinX - margin));
-        const segMinY = Math.max(0, Math.floor(batchMinY - margin));
-        const segMaxX = Math.min(dims.width, Math.ceil(batchMaxX + margin));
-        const segMaxY = Math.min(dims.height, Math.ceil(batchMaxY + margin));
-        if (segMaxX > segMinX && segMaxY > segMinY) {
-          applyLayerEffects(
-            sourceCanvas,
-            canvas,
-            activeLayer,
-            dims.dpi ?? 600,
-            {
-              x: segMinX,
-              y: segMinY,
-              width: segMaxX - segMinX,
-              height: segMaxY - segMinY,
+      const isToneLayer = Boolean(activeLayer?.toneEnabled);
+      const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
+      const isMonochrome = colorModeRef.current === 'monochrome' || isMonoLayer;
+      const dims = dimensionsRef.current;
+      const margin = Math.ceil(maxStrokeWidth * 1.5 + 32);
+      const segMinX = Math.max(0, Math.floor(batchMinX - margin));
+      const segMinY = Math.max(0, Math.floor(batchMinY - margin));
+      const segMaxX = Math.min(dims.width, Math.ceil(batchMaxX + margin));
+      const segMaxY = Math.min(dims.height, Math.ceil(batchMaxY + margin));
+      const segW = segMaxX - segMinX;
+      const segH = segMaxY - segMinY;
+
+      if (dirtyRectRef.current) {
+        dirtyRectRef.current.minX = Math.min(dirtyRectRef.current.minX, segMinX);
+        dirtyRectRef.current.minY = Math.min(dirtyRectRef.current.minY, segMinY);
+        dirtyRectRef.current.maxX = Math.max(dirtyRectRef.current.maxX, segMaxX);
+        dirtyRectRef.current.maxY = Math.max(dirtyRectRef.current.maxY, segMaxY);
+      }
+
+      if (segW > 0 && segH > 0 && canvas) {
+        if (isMonochrome) {
+          const cCtx = get2DContext(canvas);
+          if (cCtx) {
+            binarizeCanvasRect(
+              cCtx,
+              { x: segMinX, y: segMinY, width: segW, height: segH },
+              activeLayer?.monoThreshold ?? 128,
+              activeLayer?.monoExpressBlack ?? true,
+              activeLayer?.monoExpressWhite ?? true
+            );
+          }
+          if (layerSourceCanvasesRef?.current?.has(currentLayerId)) {
+            const sourceCanvas = layerSourceCanvasesRef.current.get(currentLayerId);
+            if (sourceCanvas) {
+              const sCtx = get2DContext(sourceCanvas);
+              if (sCtx) {
+                sCtx.clearRect(segMinX, segMinY, segW, segH);
+                sCtx.drawImage(canvas, segMinX, segMinY, segW, segH, segMinX, segMinY, segW, segH);
+              }
             }
-          );
+          }
+        } else if (isToneLayer && isToneStrokeRef.current) {
+          const sourceCanvas = layerSourceCanvasesRef?.current?.get(currentLayerId);
+          if (sourceCanvas && activeLayer) {
+            applyLayerEffects(
+              sourceCanvas,
+              canvas,
+              activeLayer,
+              dims.dpi ?? 600,
+              {
+                x: segMinX,
+                y: segMinY,
+                width: segW,
+                height: segH,
+              }
+            );
+          }
         }
       }
     }
@@ -1077,6 +1141,14 @@ export function useCanvasDrawing({
 
       const currentLayerId = activeLayerIdRef.current;
       const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+      const bs = brushSettingsRef.current;
+      const mode = colorModeRef.current;
+      const dims = dimensionsRef.current;
+      const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
+
+      const isToneLayer = Boolean(activeLayer?.toneEnabled);
+      const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
+      const isMonochrome = mode === 'monochrome' || isMonoLayer;
       const isTone = Boolean(
         activeLayer?.toneEnabled ||
         activeLayer?.layerColorEnabled ||
@@ -1097,13 +1169,6 @@ export function useCanvasDrawing({
         }
       }
 
-      // For transparent layer erasing: copy current layer into draft overlay and hide base layer during gesture
-      if (isEraser && !isBgEraser && !isTone) {
-        draftCtx.drawImage(canvas, 0, 0);
-        canvas.style.visibility = 'hidden';
-        hiddenLayerCanvasRef.current = canvas;
-      }
-
       if (interactionRef.current) {
         try {
           interactionRef.current.setPointerCapture(e.pointerId);
@@ -1118,19 +1183,28 @@ export function useCanvasDrawing({
 
       allStrokePointsRef.current = [startPoint];
       strokePointsRef.current = [startPoint];
+      rawPointsBufferRef.current = [{
+        x: startPoint.x,
+        y: startPoint.y,
+        pressure: startPoint.pressure,
+        pointerType: e.pointerType,
+      }];
       stabilizedPointRef.current = { ...startPoint };
       lastProcessedPointRef.current = { x: startPoint.x, y: startPoint.y };
       pendingPointsQueueRef.current = [];
+      recentPointsTrailRef.current = [{
+        x: startPoint.x,
+        y: startPoint.y,
+        t: performance.now(),
+        pressure: startPoint.pressure,
+        width: startPoint.width,
+      }];
+      strokeTotalDistanceRef.current = 0;
 
       dispatchPointerStat(startPoint.x, startPoint.y, startPoint.pressure);
 
-      const bs = brushSettingsRef.current;
-      const mode = colorModeRef.current;
-      const dims = dimensionsRef.current;
-      const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
-
       const blurMargin = (1 - (bs.hardness ?? 1.0)) * (startPoint.width * 1.5);
-      const r = Math.max(8, Math.ceil(startPoint.width / 2 + blurMargin + 8));
+      const r = Math.max(32, Math.ceil(startPoint.width + blurMargin + 32));
       dirtyRectRef.current = {
         minX: Math.max(0, Math.floor(startPoint.x - r)),
         minY: Math.max(0, Math.floor(startPoint.y - r)),
@@ -1138,14 +1212,18 @@ export function useCanvasDrawing({
         maxY: Math.min(dims.height, Math.ceil(startPoint.y + r)),
       };
 
-      const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, mode);
+      const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+      const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
 
       const isWetColor = !isEraser && Boolean(bs.colorMixing) && Boolean(bs.customTipImage);
       isWetColorStrokeRef.current = isWetColor;
+
+      const isTranslucentBrush = !isEraser && !isMonochrome && (bs.opacity ?? 1.0) < 0.999;
+      const isDirectRender = isMonochrome || isWetColor || isEraser || (!isTranslucentBrush && !isToneLayer);
       drewDirectlyOnLayerCanvasRef.current = false;
 
-      if (isTone && sourceCanvas) {
-        const backupCanvas = getReusableBakeCanvas(sourceCanvas.width, sourceCanvas.height);
+      if (isToneLayer && sourceCanvas) {
+        const backupCanvas = getDedicatedBackupCanvas(sourceCanvas.width, sourceCanvas.height);
         const backupCtx = get2DContext(backupCanvas);
         if (backupCtx) {
           backupCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
@@ -1154,16 +1232,21 @@ export function useCanvasDrawing({
         }
         layerPixelSamplerRef.current = null;
         activeReservoirRef.current = null;
-      } else if (isWetColor && canvas) {
-        const backupCanvas = getReusableBakeCanvas(canvas.width, canvas.height);
+      } else if ((isDirectRender || isWetColor) && canvas) {
+        const backupCanvas = getDedicatedBackupCanvas(canvas.width, canvas.height);
         const backupCtx = get2DContext(backupCanvas);
         if (backupCtx) {
           backupCtx.clearRect(0, 0, canvas.width, canvas.height);
           backupCtx.drawImage(canvas, 0, 0);
           strokeBackupCanvasRef.current = backupCanvas;
         }
-        layerPixelSamplerRef.current = new LayerPixelSampler(canvas);
-        activeReservoirRef.current = new PaintReservoir(strokeColor);
+        if (isWetColor) {
+          layerPixelSamplerRef.current = new LayerPixelSampler(canvas);
+          activeReservoirRef.current = new PaintReservoir(strokeColor);
+        } else {
+          layerPixelSamplerRef.current = null;
+          activeReservoirRef.current = null;
+        }
       } else {
         strokeBackupCanvasRef.current = null;
         layerPixelSamplerRef.current = null;
@@ -1174,9 +1257,11 @@ export function useCanvasDrawing({
       currentStrokeIdRef.current = strokeId;
       onCollabStrokeStartRef.current?.(strokeId, activeLayerIdRef.current, bs, toolRef.current, startPoint);
 
-      stampRemainderDistRef.current = 0;
+      stampRemainderDistRef.current = Math.max(0.2, startPoint.width * (bs.spacing ?? 0.08));
 
-      const targetStartCtx = isTone && sourceCanvas ? get2DContext(sourceCanvas) : (isWetColor && canvas ? get2DContext(canvas) : draftCtx);
+      const targetStartCtx = isToneLayer && sourceCanvas
+        ? get2DContext(sourceCanvas)
+        : (isDirectRender && canvas ? get2DContext(canvas) : draftCtx);
       if (targetStartCtx && targetStartCtx !== draftCtx) {
         drewDirectlyOnLayerCanvasRef.current = true;
       }
@@ -1193,8 +1278,8 @@ export function useCanvasDrawing({
           angle: bs.customTipAngle,
           angleDynamics: bs.customTipAngleDynamics,
           rotationRandomScale: bs.customTipRotationRandomScale,
-          hardness: bs.hardness ?? 0.8,
-          antiAlias: bs.antiAlias,
+          hardness: strokeHardness,
+          antiAlias: isMonochrome ? 0 : bs.antiAlias,
           pressureCurve: bs.pressureCurve,
           velocityCurve: bs.velocityCurve,
           useVelocity: bs.useVelocity,
@@ -1246,13 +1331,30 @@ export function useCanvasDrawing({
             startPoint,
             strokeColor,
             isEraser && !isBgEraser,
-            mode === 'monochrome' ? 1.0 : (bs.hardness ?? 1.0),
+            strokeHardness,
             bs.flow ?? 1.0
           );
         }
       }
 
-      if (isTone && sourceCanvas && canvas && activeLayer) {
+      if (isMonochrome && canvas && dirtyRectRef.current) {
+        const dotDirty = dirtyRectRef.current;
+        const dw = dotDirty.maxX - dotDirty.minX;
+        const dh = dotDirty.maxY - dotDirty.minY;
+        if (dw > 0 && dh > 0) {
+          binarizeCanvasRect(
+            get2DContext(canvas)!,
+            { x: dotDirty.minX, y: dotDirty.minY, width: dw, height: dh },
+            activeLayer?.monoThreshold ?? 128,
+            activeLayer?.monoExpressBlack ?? true,
+            activeLayer?.monoExpressWhite ?? true
+          );
+          if (sourceCanvas && targetStartCtx !== get2DContext(sourceCanvas)) {
+            const sCtx = get2DContext(sourceCanvas);
+            sCtx?.drawImage(canvas, dotDirty.minX, dotDirty.minY, dw, dh, dotDirty.minX, dotDirty.minY, dw, dh);
+          }
+        }
+      } else if (isToneLayer && sourceCanvas && canvas && activeLayer) {
         applyLayerEffects(
           sourceCanvas,
           canvas,
@@ -1315,16 +1417,18 @@ export function useCanvasDrawing({
             const last = lastProcessedPointRef.current;
             if (last && !isLast) {
               const distSq = (cx - last.x) * (cx - last.x) + (cy - last.y) * (cy - last.y);
-              if (distSq < 0.5) {
+              if (distSq < 2.0) {
                 continue;
               }
             }
 
             lastProcessedPointRef.current = { x: cx, y: cy };
-            const cPressure =
-              cEvent.pressure !== undefined && cEvent.pressure > 0
-                ? cEvent.pressure
-                : 0.5;
+            let cPressure = 0;
+            if (cEvent.pointerType === 'mouse') {
+              cPressure = (cEvent.buttons & 1) ? 0.5 : 0;
+            } else {
+              cPressure = cEvent.pressure !== undefined ? Math.max(0, Math.min(1.0, cEvent.pressure)) : 0;
+            }
 
             pendingPointsQueueRef.current.push({
               x: cx,
@@ -1347,6 +1451,14 @@ export function useCanvasDrawing({
       const finalY = snapRes.y;
       if (snapRes.axis) {
         onActiveConstraintAxisChangeRef.current?.(snapRes.axis);
+      }
+
+      const last = lastProcessedPointRef.current;
+      if (last) {
+        const distSq = (finalX - last.x) * (finalX - last.x) + (finalY - last.y) * (finalY - last.y);
+        if (distSq < 1.0) {
+          return;
+        }
       }
 
       lastProcessedPointRef.current = { x: finalX, y: finalY };
@@ -1387,30 +1499,48 @@ export function useCanvasDrawing({
       flushPendingPoints();
 
       const bs = brushSettingsRef.current;
-      const stab = bs.stabilization ?? 0;
       const endPoint = getCanvasPoint(e);
       const draftCanvas = effectiveDraftCanvasRef?.current;
       const draftCtx = draftCanvas ? get2DContext(draftCanvas) : null;
       const canvas = getActiveCanvas();
 
-      // Catch-up smoothing trail to pen release point
-      if (stab > 0 && stabilizedPointRef.current && draftCtx) {
-        const curr = stabilizedPointRef.current;
-        const distToEnd = Math.hypot(endPoint.x - curr.x, endPoint.y - curr.y);
+      // Drain any buffered raw points through the stabilizer
+      while (rawPointsBufferRef.current.length > 0) {
+        const buf = rawPointsBufferRef.current;
+        const len = buf.length;
+        const mid = Math.floor(len / 2);
+        let sumX = 0, sumY = 0, sumP = 0, sumW = 0;
+        for (let i = 0; i < len; i++) {
+          const w = Math.pow(2, mid - Math.abs(i - mid));
+          sumX += buf[i].x * w;
+          sumY += buf[i].y * w;
+          sumP += buf[i].pressure * w;
+          sumW += w;
+        }
+        const ptType = buf[0].pointerType;
+        buf.shift();
 
-        if (distToEnd > 0.5) {
-          const catchUpSteps = Math.min(4, Math.max(2, Math.ceil(distToEnd / 6)));
-          for (let i = 1; i <= catchUpSteps; i++) {
-            const t = i / catchUpSteps;
-            const interpX = curr.x + (endPoint.x - curr.x) * t;
-            const interpY = curr.y + (endPoint.y - curr.y) * t;
-            const interpP = curr.pressure + (endPoint.pressure - curr.pressure) * t;
-            applyStabilizedPointAndRender(draftCtx, interpX, interpY, interpP, e.pointerType);
-          }
+        const sX = sumX / sumW;
+        const sY = sumY / sumW;
+        const sP = sumP / sumW;
+        const sW = calculateStrokeWidth(
+          bs.size,
+          sP,
+          bs.minSizeFactor,
+          bs.usePressure,
+          ptType,
+          bs.pressureCurveGamma ?? 1.0,
+          1.0,
+          bs.pressureCurve
+        );
+        const pt: Point = { x: sX, y: sY, pressure: sP, width: sW };
+        allStrokePointsRef.current.push(pt);
+        if (draftCtx) {
+          renderDraftSegment(draftCtx, pt);
         }
       }
 
-      // Finalize tail segment on draft canvas
+      // Finalize tail segment on draft canvas using Catmull-Rom cubic Bézier
       const pts = strokePointsRef.current;
       const currentTool = toolRef.current;
       const currentLayerId = activeLayerIdRef.current;
@@ -1422,15 +1552,27 @@ export function useCanvasDrawing({
       const isTone = isToneStrokeRef.current;
       const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
       const isToneLayer = Boolean(activeLayer?.toneEnabled);
+      const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
+      const isMonochrome = mode === 'monochrome' || isMonoLayer;
       const sourceCanvas = isTone ? layerSourceCanvasesRef?.current?.get(currentLayerId) : null;
-      const isWetColor = isWetColorStrokeRef.current;
-      const targetTailCtx = isTone && sourceCanvas ? get2DContext(sourceCanvas) : (isWetColor && canvas ? get2DContext(canvas) : draftCtx);
+      const targetTailCtx = isToneLayer && sourceCanvas
+        ? get2DContext(sourceCanvas)
+        : (drewDirectlyOnLayerCanvasRef.current && canvas ? get2DContext(canvas) : draftCtx);
 
       if (targetTailCtx && pts.length >= 2) {
         const pLast = pts[pts.length - 1];
         const pPrev = pts[pts.length - 2];
-        const lastMid = getMidPoint(pPrev, pLast);
-        const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, mode);
+        const pPrev2 = pts.length >= 3 ? pts[pts.length - 3] : pPrev;
+
+        // If stylus pen is lifted, naturally taper pressure to 0 at release point
+        if (bs.usePressure && e.pointerType === 'pen') {
+          pLast.pressure = 0;
+          pLast.width = Math.max(0.1, bs.size * (bs.minSizeFactor ?? 0));
+        }
+
+        const { c1, c2 } = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
+        const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+        const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
 
         if (bs.customTipImage) {
           const tipOptions: TexturedBrushOptions = {
@@ -1444,10 +1586,11 @@ export function useCanvasDrawing({
             angle: bs.customTipAngle,
             angleDynamics: bs.customTipAngleDynamics,
             rotationRandomScale: bs.customTipRotationRandomScale,
-            hardness: bs.hardness ?? 0.8,
-            antiAlias: bs.antiAlias,
+            hardness: strokeHardness,
+            antiAlias: isMonochrome ? 0 : bs.antiAlias,
             pressureCurve: bs.pressureCurve,
             velocityCurve: bs.velocityCurve,
+            usePressure: bs.usePressure,
             useVelocity: bs.useVelocity,
             subTips: bs.subTips,
             subTipOrder: bs.subTipOrder,
@@ -1473,38 +1616,26 @@ export function useCanvasDrawing({
             reservoir: activeReservoirRef.current || undefined,
             isEraser: isEraser && !isBgEraser,
             isBgEraser,
+            currentStrokeDist: strokeTotalDistanceRef.current,
           };
-          drawTexturedBezierSegment(
+          drawTexturedCubicBezierSegment(
             targetTailCtx,
-            lastMid,
-            pLast,
+            pPrev,
+            c1,
+            c2,
             pLast,
             strokeColor,
             bs.customTipImage,
             tipOptions,
             stampRemainderDistRef.current
           );
-          if ((isTone || isWetColor) && targetTailCtx !== draftCtx) {
-            drewDirectlyOnLayerCanvasRef.current = true;
-          }
-          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser && !isToneLayer) {
-            drawTexturedBezierSegment(
-              draftCtx,
-              lastMid,
-              pLast,
-              pLast,
-              strokeColor,
-              bs.customTipImage,
-              tipOptions,
-              stampRemainderDistRef.current
-            );
-          }
         } else if (isPencil) {
           const grade = (bs.preset as PencilGrade) || 'pencil-2b';
-          drawPencilBezierSegment(
+          drawPencilCubicBezierSegment(
             targetTailCtx,
-            lastMid,
-            pLast,
+            pPrev,
+            c1,
+            c2,
             pLast,
             strokeColor,
             grade,
@@ -1512,43 +1643,56 @@ export function useCanvasDrawing({
             bs.grain ?? 1.0,
             bs.hardness
           );
-          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser && !isToneLayer) {
-            drawPencilBezierSegment(
-              draftCtx,
-              lastMid,
-              pLast,
-              pLast,
-              strokeColor,
-              grade,
-              bs.flow ?? 0.74,
-              bs.grain ?? 1.0,
-              bs.hardness
-            );
-          }
         } else if (bs.smoothing) {
-          drawSmoothBezierSegment(
+          drawSmoothCubicBezierSegment(
             targetTailCtx,
-            lastMid,
-            pLast,
+            pPrev,
+            c1,
+            c2,
             pLast,
             strokeColor,
             isEraser && !isBgEraser,
-            mode === 'monochrome' ? 1.0 : (bs.hardness ?? 1.0),
+            strokeHardness,
             bs.flow ?? 1.0,
             bs.spacing ?? 0.08
           );
-          if (isTone && sourceCanvas && draftCtx && targetTailCtx !== draftCtx && !isEraser && !isToneLayer) {
-            drawSmoothBezierSegment(
-              draftCtx,
-              lastMid,
-              pLast,
-              pLast,
-              strokeColor,
-              false,
-              mode === 'monochrome' ? 1.0 : (bs.hardness ?? 1.0),
-              bs.flow ?? 1.0,
-              bs.spacing ?? 0.08
-            );
+        }
+      }
+
+      if (pts.length >= 2) {
+        const pLast = pts[pts.length - 1];
+        const pPrev = pts[pts.length - 2];
+        const tailMargin = Math.ceil(Math.max(pLast.width, pPrev.width) * 1.5 + 32);
+        const tMinX = Math.max(0, Math.floor(Math.min(pLast.x, pPrev.x) - tailMargin));
+        const tMinY = Math.max(0, Math.floor(Math.min(pLast.y, pPrev.y) - tailMargin));
+        const tMaxX = Math.min(canvas ? canvas.width : dimensionsRef.current.width, Math.ceil(Math.max(pLast.x, pPrev.x) + tailMargin));
+        const tMaxY = Math.min(canvas ? canvas.height : dimensionsRef.current.height, Math.ceil(Math.max(pLast.y, pPrev.y) + tailMargin));
+
+        if (dirtyRectRef.current) {
+          dirtyRectRef.current.minX = Math.min(dirtyRectRef.current.minX, tMinX);
+          dirtyRectRef.current.minY = Math.min(dirtyRectRef.current.minY, tMinY);
+          dirtyRectRef.current.maxX = Math.max(dirtyRectRef.current.maxX, tMaxX);
+          dirtyRectRef.current.maxY = Math.max(dirtyRectRef.current.maxY, tMaxY);
+        }
+
+        if (isMonochrome && canvas) {
+          const tW = tMaxX - tMinX;
+          const tH = tMaxY - tMinY;
+          if (tW > 0 && tH > 0) {
+            const cCtx = get2DContext(canvas);
+            if (cCtx) {
+              binarizeCanvasRect(
+                cCtx,
+                { x: tMinX, y: tMinY, width: tW, height: tH },
+                activeLayer?.monoThreshold ?? 128,
+                activeLayer?.monoExpressBlack ?? true,
+                activeLayer?.monoExpressWhite ?? true
+              );
+            }
+            if (sourceCanvas) {
+              const sCtx = get2DContext(sourceCanvas);
+              sCtx?.drawImage(canvas, tMinX, tMinY, tW, tH, tMinX, tMinY, tW, tH);
+            }
           }
         }
       }
@@ -1556,11 +1700,11 @@ export function useCanvasDrawing({
       // BAKE STROKE INTO HIGH-RESOLUTION BASE CANVAS (Dirty Rect only)
       const dirty = dirtyRectRef.current;
 
-      if (isTone && sourceCanvas && canvas) {
+      if (isToneLayer && sourceCanvas && canvas) {
         if (activeLayer) {
           const freq = activeLayer?.toneFrequency ?? 60;
           const cellSize = Math.max(3.5, (dimensionsRef.current.dpi ?? 600) / freq);
-          const cellMargin = Math.ceil(cellSize * 2);
+          const cellMargin = Math.ceil(cellSize * 2 + 32);
           applyLayerEffects(
             sourceCanvas,
             canvas,
@@ -1578,10 +1722,11 @@ export function useCanvasDrawing({
       const allPoints = allStrokePointsRef.current;
 
       if (canvas && dirty && allPoints.length > 0) {
-        const sx = Math.max(0, Math.floor(dirty.minX));
-        const sy = Math.max(0, Math.floor(dirty.minY));
-        const maxX = Math.min(canvas.width, Math.ceil(dirty.maxX));
-        const maxY = Math.min(canvas.height, Math.ceil(dirty.maxY));
+        const pad = Math.ceil(Math.max(32, (bs.size || 10) * 1.5));
+        const sx = Math.max(0, Math.floor(dirty.minX - pad));
+        const sy = Math.max(0, Math.floor(dirty.minY - pad));
+        const maxX = Math.min(canvas.width, Math.ceil(dirty.maxX + pad));
+        const maxY = Math.min(canvas.height, Math.ceil(dirty.maxY + pad));
         const dw = maxX - sx;
         const dh = maxY - sy;
 
@@ -1589,47 +1734,33 @@ export function useCanvasDrawing({
           const ctx = get2DContext(canvas);
           if (ctx) {
             let beforeData: ImageData | null = null;
+            let afterData: ImageData | null = null;
 
-            if (isTone && strokeBackupCanvasRef.current && sourceCanvas) {
+            if (isToneLayer && strokeBackupCanvasRef.current && sourceCanvas) {
               const bCtx = get2DContext(strokeBackupCanvasRef.current);
               beforeData = bCtx ? bCtx.getImageData(sx, sy, dw, dh) : null;
               const sCtx = get2DContext(sourceCanvas);
-              const afterData = sCtx ? sCtx.getImageData(sx, sy, dw, dh) : null;
-
-              let label = 'Brush Stroke';
-              if (currentTool === 'eraser') {
-                label = 'Eraser';
-              } else if (bs.brushName) {
-                label = bs.brushName;
-              } else if (bs.preset === 'pencil-f') {
-                label = 'Pencil (F)';
-              } else if (bs.preset === 'pencil-2b') {
-                label = 'Pencil (2B)';
-              } else if (bs.preset === 'pencil-4b') {
-                label = 'Pencil (4B)';
-              } else if (bs.preset === 'pencil-hb') {
-                label = 'Pencil (HB)';
-              } else {
-                label = 'Tone Stroke';
-              }
-
-              if (beforeData && afterData) {
-                pushHistoryStep(
-                  currentTool === 'eraser' ? 'eraser' : (isPencil ? 'pencil' : 'brush'),
-                  label,
-                  beforeData,
-                  afterData,
-                  currentLayerId,
-                  { x: sx, y: sy, width: dw, height: dh }
-                );
-              }
-            } else if (isWetColor && strokeBackupCanvasRef.current && drewDirectlyOnLayerCanvasRef.current) {
-              // The stroke has already been painted onto canvas with full real-time color mixing!
-              // beforeData is extracted from the pre-stroke backup canvas
+              afterData = sCtx ? sCtx.getImageData(sx, sy, dw, dh) : null;
+            } else if (drewDirectlyOnLayerCanvasRef.current && strokeBackupCanvasRef.current) {
+              // Direct render: stroke is ALREADY drawn on canvas with real-time binarization/effects!
+              // Zero re-rendering, zero delay, zero lag, zero flicker!
               const bCtx = get2DContext(strokeBackupCanvasRef.current);
               beforeData = bCtx ? bCtx.getImageData(sx, sy, dw, dh) : null;
+              afterData = ctx.getImageData(sx, sy, dw, dh);
+
+              // Synchronize dirty bounding box to sourceCanvas so tone can be toggled without losing edits
+              if (layerSourceCanvasesRef?.current?.has(currentLayerId)) {
+                const existingSource = layerSourceCanvasesRef.current.get(currentLayerId);
+                if (existingSource) {
+                  const sCtx = get2DContext(existingSource);
+                  if (sCtx) {
+                    sCtx.clearRect(sx, sy, dw, dh);
+                    sCtx.drawImage(canvas, sx, sy, dw, dh, sx, sy, dw, dh);
+                  }
+                }
+              }
             } else {
-              // For non-wet brushes (pencils, inking pens):
+              // Translucent brushes drawn onto draft canvas overlay:
               beforeData = ctx.getImageData(sx, sy, dw, dh);
 
               ctx.save();
@@ -1637,46 +1768,23 @@ export function useCanvasDrawing({
               ctx.rect(sx, sy, dw, dh);
               ctx.clip();
 
-              const isTranslucentBrush = !isEraser && (bs.opacity ?? 1.0) < 0.999;
+              const bakeCanvas = getReusableBakeCanvas(dw, dh);
+              const bCtx = bakeCanvas.getContext('2d', { alpha: true });
+              if (bCtx) {
+                bCtx.clearRect(0, 0, bakeCanvas.width, bakeCanvas.height);
+                bCtx.save();
+                bCtx.translate(-sx, -sy);
+                renderCompleteStroke(bCtx, allPoints, bs, currentTool, mode, isBgEraser);
+                bCtx.restore();
 
-              if (isTranslucentBrush) {
-                const bakeCanvas = getReusableBakeCanvas(dw, dh);
-                const bCtx = bakeCanvas.getContext('2d', { alpha: true });
-                if (bCtx) {
-                  bCtx.clearRect(0, 0, bakeCanvas.width, bakeCanvas.height);
-                  bCtx.save();
-                  bCtx.translate(-sx, -sy);
-                  renderCompleteStroke(bCtx, allPoints, bs, currentTool, mode, isBgEraser);
-                  bCtx.restore();
-
-                  ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
-                  ctx.globalCompositeOperation = 'source-over';
-                  ctx.drawImage(bakeCanvas, 0, 0, dw, dh, sx, sy, dw, dh);
-                }
-              } else {
-                renderCompleteStroke(ctx, allPoints, bs, currentTool, mode, isBgEraser);
+                ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
+                ctx.globalCompositeOperation = 'source-over';
+                ctx.drawImage(bakeCanvas, 0, 0, dw, dh, sx, sy, dw, dh);
               }
 
               ctx.restore();
-            }
 
-            if (mode === 'monochrome') {
-              applyColorModeToCanvas(canvas, 'monochrome', { x: sx, y: sy, width: dw, height: dh });
-            }
-
-            // Snapshot afterImageData ONLY for the dirty bounding box
-            const afterData = ctx.getImageData(sx, sy, dw, dh);
-
-            // Synchronize dirty bounding box to sourceCanvas so tone can be toggled without losing edits
-            if (!isTone && layerSourceCanvasesRef?.current?.has(currentLayerId)) {
-              const existingSource = layerSourceCanvasesRef.current.get(currentLayerId);
-              if (existingSource) {
-                const sCtx = get2DContext(existingSource);
-                if (sCtx) {
-                  sCtx.clearRect(sx, sy, dw, dh);
-                  sCtx.drawImage(canvas, sx, sy, dw, dh, sx, sy, dw, dh);
-                }
-              }
+              afterData = ctx.getImageData(sx, sy, dw, dh);
             }
 
             let label = 'Brush Stroke';
@@ -1699,10 +1807,10 @@ export function useCanvasDrawing({
             } else if (bs.preset === 'blend-smudge') {
               label = 'Smudge & Blender';
             } else {
-              label = 'Round Brush';
+              label = isMonochrome ? 'Monochrome Pen' : 'Round Brush';
             }
 
-            if (beforeData) {
+            if (beforeData && afterData) {
               pushHistoryStep(
                 currentTool === 'eraser' ? 'eraser' : (isPencil ? 'pencil' : 'brush'),
                 label,
@@ -1716,32 +1824,21 @@ export function useCanvasDrawing({
         }
       }
 
-      // Restore active layer visibility after baking has finished on base canvas
-      if (hiddenLayerCanvasRef.current) {
-        hiddenLayerCanvasRef.current.style.visibility = 'visible';
-        hiddenLayerCanvasRef.current = null;
-      }
-
-      // Clear the Draft Overlay Canvas atomically:
-      // Bake the completed stroke directly into the active base canvas layer first.
-      // Clear the overlay canvas ONLY immediately after the base canvas draw call finishes,
-      // using requestAnimationFrame to guarantee zero visible gap or blink.
+      // Synchronously clear draftCanvas immediately in the exact same render turn to guarantee zero flicker
       if (clearDraftRafRef.current !== null) {
         cancelAnimationFrame(clearDraftRafRef.current);
-      }
-      clearDraftRafRef.current = requestAnimationFrame(() => {
         clearDraftRafRef.current = null;
-        if (draftCanvas) {
-          const dCtx = get2DContext(draftCanvas);
-          if (dCtx) {
-            try {
-              dCtx.restore(); // Restore artboard clip
-            } catch (_) {}
-            dCtx.resetTransform();
-            dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
-          }
+      }
+      if (draftCanvas) {
+        const dCtx = get2DContext(draftCanvas);
+        if (dCtx) {
+          try {
+            dCtx.restore(); // Restore artboard clip
+          } catch (_) {}
+          dCtx.resetTransform();
+          dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
         }
-      });
+      }
 
       if (currentStrokeIdRef.current) {
         onCollabStrokeFinishRef.current?.(

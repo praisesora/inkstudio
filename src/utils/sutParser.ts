@@ -922,12 +922,25 @@ export async function parseSutFile(
           // Taper (In / Out)
           const rawUseIn = getVal(['BrushUseIn']);
           const rawUseOut = getVal(['BrushUseOut']);
-          if (Boolean(rawUseIn) || Boolean(rawUseOut)) {
+          const useIn = rawUseIn !== null ? Boolean(rawUseIn) : false;
+          const useOut = rawUseOut !== null ? Boolean(rawUseOut) : false;
+          const inLength = Number(getVal(['BrushInLength']) || 0);
+          const inRatio = Number(getVal(['BrushInRatio']) || 0);
+          const outLength = Number(getVal(['BrushOutLength']) || 0);
+          const outRatio = Number(getVal(['BrushOutRatio']) || 0);
+          const inOutType = Number(getVal(['BrushInOutType']) || 0);
+          const inOutBySpeed = Boolean(getVal(['BrushInOutBySpeed']));
+
+          if (useIn || useOut || inLength > 0 || outLength > 0 || inRatio > 0 || outRatio > 0) {
             taper = {
-              inLength: getVal(['BrushInLength']) || 0,
-              inRatio: getVal(['BrushInRatio']) || 0,
-              outLength: getVal(['BrushOutLength']) || 0,
-              outRatio: getVal(['BrushOutRatio']) || 0,
+              useIn,
+              inLength,
+              inRatio,
+              useOut,
+              outLength,
+              outRatio,
+              inOutType,
+              inOutBySpeed,
             };
           }
 

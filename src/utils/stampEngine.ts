@@ -23,6 +23,7 @@ export interface TexturedBrushOptions {
   antiAlias?: number;
   pressureCurve?: [number, number][];
   velocityCurve?: [number, number][];
+  usePressure?: boolean;
   useVelocity?: boolean;
   subTips?: CspSubTip[];
   subTipOrder?: 'random' | 'sequential' | 'direction' | 'reverse';
@@ -160,9 +161,12 @@ export function drawSingleStamp(
   isEraser: boolean = false,
   isBgEraser: boolean = false
 ) {
-  if (width <= 0 || height <= 0 || alpha <= 0.002) return;
+  if (width < 0.1 || height < 0.1 || alpha <= 0.002) return;
 
-  const effAlpha = Math.max(0.005, Math.min(1.0, alpha));
+  const subpixelScale = width < 1.0 ? Math.max(0.1, width) : 1.0;
+  const effAlpha = Math.max(0.003, Math.min(1.0, alpha * subpixelScale));
+  const renderW = Math.max(0.6, width);
+  const renderH = Math.max(0.6, height);
 
   // Ultra-fast path for unrotated normal stamps
   if (Math.abs(angleRad) < 0.001 && !isEraser && !isBgEraser) {
@@ -170,7 +174,7 @@ export function drawSingleStamp(
     const prevOp = ctx.globalCompositeOperation;
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = effAlpha;
-    ctx.drawImage(stampSource, x - width / 2, y - height / 2, width, height);
+    ctx.drawImage(stampSource, x - renderW / 2, y - renderH / 2, renderW, renderH);
     ctx.globalAlpha = prevAlpha;
     ctx.globalCompositeOperation = prevOp;
     return;
@@ -331,64 +335,126 @@ export function drawTexturedDot(
 }
 
 // -------------------------------------------------------------
-// Quadratic Bézier Evaluation and Gauss-Legendre Arc Length
+// Cubic Bézier Evaluation and Arc Length Parameterization
 // -------------------------------------------------------------
 
-function evalQuadraticBezier(
+export function evalCubicBezier(
   p0: Point,
-  control: Point,
-  p2: Point,
+  c1: Point,
+  c2: Point,
+  p3: Point,
   t: number
 ): { x: number; y: number; width: number; pressure: number; dx: number; dy: number; speed: number } {
   const invT = 1.0 - t;
   const invT2 = invT * invT;
+  const invT3 = invT2 * invT;
   const t2 = t * t;
-  const twoInvTT = 2.0 * invT * t;
+  const t3 = t2 * t;
 
-  const x = invT2 * p0.x + twoInvTT * control.x + t2 * p2.x;
-  const y = invT2 * p0.y + twoInvTT * control.y + t2 * p2.y;
-  const width = invT * p0.width + t * p2.width;
-  const pressure = invT * p0.pressure + t * p2.pressure;
+  const a = invT3;
+  const b = 3.0 * invT2 * t;
+  const c = 3.0 * invT * t2;
+  const d = t3;
 
-  const dx = 2.0 * invT * (control.x - p0.x) + 2.0 * t * (p2.x - control.x);
-  const dy = 2.0 * invT * (control.y - p0.y) + 2.0 * t * (p2.y - control.y);
+  const x = a * p0.x + b * c1.x + c * c2.x + d * p3.x;
+  const y = a * p0.y + b * c1.y + c * c2.y + d * p3.y;
+  const width = invT * p0.width + t * p3.width;
+  const pressure = invT * p0.pressure + t * p3.pressure;
+
+  const d01x = c1.x - p0.x;
+  const d01y = c1.y - p0.y;
+  const d12x = c2.x - c1.x;
+  const d12y = c2.y - c1.y;
+  const d23x = p3.x - c2.x;
+  const d23y = p3.y - c2.y;
+
+  const dx = 3.0 * invT2 * d01x + 6.0 * invT * t * d12x + 3.0 * t2 * d23x;
+  const dy = 3.0 * invT2 * d01y + 6.0 * invT * t * d12y + 3.0 * t2 * d23y;
   const speed = Math.hypot(dx, dy);
 
   return { x, y, width, pressure, dx, dy, speed };
 }
 
-function computeQuadraticArcLength(p0: Point, control: Point, p2: Point): number {
-  const nodes = [0.046910077, 0.230765345, 0.5, 0.769234655, 0.953089923];
-  const weights = [0.118463442, 0.239314335, 0.284444444, 0.239314335, 0.118463442];
+interface ArcLengthTable {
+  totalLength: number;
+  distances: number[];
+}
 
-  let length = 0;
-  for (let i = 0; i < 5; i++) {
-    const t = nodes[i];
+function buildCubicArcLengthTable(p0: Point, c1: Point, c2: Point, p3: Point): ArcLengthTable {
+  const steps = 8;
+  const distances: number[] = [0];
+  let total = 0;
+  let prevX = p0.x;
+  let prevY = p0.y;
+
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
     const invT = 1.0 - t;
-    const dx = 2.0 * invT * (control.x - p0.x) + 2.0 * t * (p2.x - control.x);
-    const dy = 2.0 * invT * (control.y - p0.y) + 2.0 * t * (p2.y - control.y);
-    length += weights[i] * Math.hypot(dx, dy);
+    const invT2 = invT * invT;
+    const invT3 = invT2 * invT;
+    const t2 = t * t;
+    const t3 = t2 * t;
+
+    const x = invT3 * p0.x + 3.0 * invT2 * t * c1.x + 3.0 * invT * t2 * c2.x + t3 * p3.x;
+    const y = invT3 * p0.y + 3.0 * invT2 * t * c1.y + 3.0 * invT * t2 * c2.y + t3 * p3.y;
+
+    total += Math.hypot(x - prevX, y - prevY);
+    distances.push(total);
+    prevX = x;
+    prevY = y;
   }
-  return length;
+
+  return { totalLength: total, distances };
+}
+
+function getCubicPointAtArcLength(
+  p0: Point,
+  c1: Point,
+  c2: Point,
+  p3: Point,
+  targetDist: number,
+  table: ArcLengthTable
+): { x: number; y: number; width: number; pressure: number; dx: number; dy: number; speed: number } {
+  const { totalLength, distances } = table;
+  if (totalLength <= 0.0001 || targetDist <= 0) {
+    return evalCubicBezier(p0, c1, c2, p3, 0);
+  }
+  if (targetDist >= totalLength) {
+    return evalCubicBezier(p0, c1, c2, p3, 1.0);
+  }
+
+  let idx = 0;
+  while (idx < 8 && distances[idx + 1] < targetDist) {
+    idx++;
+  }
+
+  const d0 = distances[idx];
+  const d1 = distances[idx + 1];
+  const frac = d1 > d0 ? (targetDist - d0) / (d1 - d0) : 0;
+  const t = (idx + frac) / 8.0;
+
+  return evalCubicBezier(p0, c1, c2, p3, Math.max(0, Math.min(1.0, t)));
 }
 
 /**
- * Draws textured brush stamps along a quadratic Bézier curve using true arc-length parameterization.
+ * Draws textured brush stamps along a cubic Bézier curve using arc-length parameterization.
  * Supports multi-tips, spline pressure curve, spray particle scattering, and wet edge.
  */
-export function drawTexturedBezierSegment(
+export function drawTexturedCubicBezierSegment(
   ctx: CanvasRenderingContext2D,
-  start: Point,
-  control: Point,
-  end: Point,
+  p0: Point,
+  c1: Point,
+  c2: Point,
+  p3: Point,
   color: string,
   tipImage: HTMLImageElement,
   options: TexturedBrushOptions,
   remainderDist: number = 0,
   dabCounter: { count: number } = { count: 0 }
 ): number {
-  const totalCurveLength = computeQuadraticArcLength(start, control, end);
-  if (totalCurveLength < 0.15) {
+  const arcTable = buildCubicArcLengthTable(p0, c1, c2, p3);
+  const totalCurveLength = arcTable.totalLength;
+  if (totalCurveLength < 0.1) {
     return remainderDist;
   }
 
@@ -410,167 +476,254 @@ export function drawTexturedBezierSegment(
   const spacingRatio = Math.max(0.015, Math.min(1.0, options.spacing ?? 0.07));
   const thickness = options.thickness ?? 1.0;
   const rotationRandomScale = options.rotationRandomScale ?? 0;
-  const minSizeFactor = options.minSizeFactor ?? 0.2;
 
   let smoothCos = Math.cos(baseAngleRad);
   let smoothSin = Math.sin(baseAngleRad);
 
-  let currentDist = -remainderDist;
-  let t = 0;
+  let currentDist = remainderDist > 0 ? remainderDist : 0;
 
-  while (currentDist < totalCurveLength) {
-    const rawT = Math.max(0, Math.min(1.0, (currentDist + remainderDist) / totalCurveLength));
-    const interpPressure = start.pressure * (1.0 - rawT) + end.pressure * rawT;
-    const effPressure = evaluateCspSpline(interpPressure, options.pressureCurve);
+  while (currentDist <= totalCurveLength) {
+    const pt = getCubicPointAtArcLength(p0, c1, c2, p3, currentDist, arcTable);
+    const effPressure = evaluateCspSpline(pt.pressure, options.pressureCurve);
+    const minFactor = Math.max(0, Math.min(1.0, options.minSizeFactor ?? 0));
 
-    let curWidth = Math.max(1, options.size * (minSizeFactor + (1.0 - minSizeFactor) * effPressure));
+    let curWidth = options.usePressure !== false
+      ? options.size * (minFactor + (1.0 - minFactor) * effPressure)
+      : options.size;
 
-    // Stroke taper modulation
-    if (options.taper && options.totalLength && options.totalLength > 0) {
-      const distFromStart = (options.currentStrokeDist ?? 0) + currentDist;
-      const distFromEnd = options.totalLength - distFromStart;
-      if (options.taper.inLength > 0 && distFromStart < options.taper.inLength) {
-        const inFactor = distFromStart / options.taper.inLength;
-        curWidth *= Math.max(0.1, inFactor);
+    // Stroke taper modulation (Clip Studio Paint style)
+    if (options.taper) {
+      const strokeDist = (options.currentStrokeDist ?? 0) + currentDist;
+      const inLen = options.taper.inLength || (options.taper.inRatio ? options.taper.inRatio * 2.5 : 0);
+      if (options.taper.useIn && inLen > 0 && strokeDist < inLen) {
+        const inFactor = Math.max(0.01, Math.min(1.0, strokeDist / inLen));
+        curWidth *= Math.pow(inFactor, 0.75);
       }
-      if (options.taper.outLength > 0 && distFromEnd < options.taper.outLength) {
-        const outFactor = distFromEnd / options.taper.outLength;
-        curWidth *= Math.max(0.05, outFactor);
+      if (options.totalLength && options.totalLength > 0) {
+        const distFromEnd = options.totalLength - strokeDist;
+        const outLen = options.taper.outLength || (options.taper.outRatio ? options.taper.outRatio * 3.0 : 0);
+        if (options.taper.useOut && outLen > 0 && distFromEnd < outLen) {
+          const outFactor = Math.max(0.01, Math.min(1.0, distFromEnd / outLen));
+          curWidth *= Math.pow(outFactor, 0.85);
+        }
       }
     }
 
-    const requiredStep = Math.max(0.75, curWidth * spacingRatio);
-    currentDist += requiredStep;
-    if (currentDist > totalCurveLength) {
-      break;
+    curWidth = Math.max(0.1, curWidth);
+
+    let stampAngle = baseAngleRad;
+    if (options.angleDynamics === 'direction' && pt.speed > 0.05) {
+      const targetAngle = Math.atan2(pt.dy, pt.dx) + baseAngleRad;
+      const tCos = Math.cos(targetAngle);
+      const tSin = Math.sin(targetAngle);
+      smoothCos = smoothCos * 0.65 + tCos * 0.35;
+      smoothSin = smoothSin * 0.65 + tSin * 0.35;
+      stampAngle = Math.atan2(smoothSin, smoothCos);
+    } else if (options.angleDynamics === 'random') {
+      stampAngle = baseAngleRad + (Math.random() - 0.5) * Math.PI * 2;
     }
 
-    if (currentDist >= 0) {
-      t = Math.max(0, Math.min(1.0, currentDist / totalCurveLength));
-      const pt = evalQuadraticBezier(start, control, end, t);
+    if (rotationRandomScale > 0) {
+      stampAngle += (Math.random() - 0.5) * Math.PI * 2 * rotationRandomScale;
+    }
 
-      let stampAngle = baseAngleRad;
-      if (options.angleDynamics === 'direction' && pt.speed > 0.05) {
-        const targetAngle = Math.atan2(pt.dy, pt.dx) + baseAngleRad;
-        const tCos = Math.cos(targetAngle);
-        const tSin = Math.sin(targetAngle);
-        smoothCos = smoothCos * 0.65 + tCos * 0.35;
-        smoothSin = smoothSin * 0.65 + tSin * 0.35;
-        stampAngle = Math.atan2(smoothSin, smoothCos);
-      } else if (options.angleDynamics === 'random') {
-        stampAngle = baseAngleRad + (Math.random() - 0.5) * Math.PI * 2;
-      }
+    let dabColor = baseColor;
+    let dabAlpha = baseFlow;
 
-      if (rotationRandomScale > 0) {
-        stampAngle += (Math.random() - 0.5) * Math.PI * 2 * rotationRandomScale;
-      }
-
-      let dabColor = baseColor;
-      let dabAlpha = baseFlow;
-
-      if (isColorMixing && reservoir) {
-        let sampled = { r: 255, g: 255, b: 255, a: 0 };
-        if (sampler) {
-          sampled = sampler.sampleColor(pt.x, pt.y, curWidth * 0.45);
-        } else {
-          const sampleCanvas = options.underlyingCanvas || ctx.canvas;
-          const sampleCtx = sampleCanvas ? sampleCanvas.getContext('2d') : null;
-          if (sampleCtx) {
-            sampled = sampleCanvasColor(sampleCtx, pt.x, pt.y, curWidth * 0.45);
-          }
-        }
-
-        const mixed = reservoir.mixWithCanvas(
-          sampled,
-          options.amountOfPaint ?? 0.65,
-          options.densityOfPaint ?? 0.9,
-          options.colorStretch ?? 0.75,
-          options.mixingMode ?? 'blend',
-          effPressure,
-          baseFlow,
-          requiredStep
-        );
-
-        dabColor = mixed.colorHex;
-        dabAlpha = mixed.alpha;
-
-        if (sampler) {
-          sampler.depositDab(
-            pt.x,
-            pt.y,
-            curWidth * 0.45,
-            mixed.r,
-            mixed.g,
-            mixed.b,
-            mixed.alpha
-          );
-        }
-      }
-
-      // Wet Edge rim boost
-      if (options.wetEdge && options.wetEdge > 0) {
-        dabAlpha = Math.min(1.0, dabAlpha * (1.0 + options.wetEdge * 0.25));
-      }
-
-      // Select tip from multi-tip array
-      const activeTip = selectTipImage(
-        options.subTipImages,
-        tipImage,
-        options.subTipOrder,
-        dabCounter.count++,
-        stampAngle
-      );
-      const isColorTip = Boolean(options.subTips && options.subTips[0]?.isColor);
-      const master = getTintedTipMaster(activeTip, dabColor, isColorTip);
-
-      const stampW = curWidth;
-      const stampH = curWidth * aspect * thickness;
-
-      if (options.spray?.enabled) {
-        const pCount = options.spray.density;
-        const pSize = Math.max(1, options.spray.size);
-        const radius = curWidth / 2;
-        for (let sp = 0; sp < pCount; sp++) {
-          const u1 = Math.random();
-          const u2 = Math.random();
-          const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
-          const th = Math.PI * 2 * Math.random();
-          drawSingleStamp(
-            ctx,
-            master,
-            pt.x + r * Math.cos(th),
-            pt.y + r * Math.sin(th),
-            pSize,
-            pSize * aspect * thickness,
-            stampAngle,
-            dabAlpha,
-            isEraser,
-            isBgEraser
-          );
-        }
+    if (isColorMixing && reservoir) {
+      let sampled = { r: 255, g: 255, b: 255, a: 0 };
+      if (sampler) {
+        sampled = sampler.sampleColor(pt.x, pt.y, curWidth * 0.45);
       } else {
+        const sampleCanvas = options.underlyingCanvas || ctx.canvas;
+        const sampleCtx = sampleCanvas ? sampleCanvas.getContext('2d') : null;
+        if (sampleCtx) {
+          sampled = sampleCanvasColor(sampleCtx, pt.x, pt.y, curWidth * 0.45);
+        }
+      }
+
+      const mixed = reservoir.mixWithCanvas(
+        sampled,
+        options.amountOfPaint ?? 0.65,
+        options.densityOfPaint ?? 0.9,
+        options.colorStretch ?? 0.75,
+        options.mixingMode ?? 'blend',
+        effPressure,
+        baseFlow,
+        Math.max(0.2, curWidth * spacingRatio)
+      );
+
+      dabColor = mixed.colorHex;
+      dabAlpha = mixed.alpha;
+
+      if (sampler) {
+        sampler.depositDab(
+          pt.x,
+          pt.y,
+          curWidth * 0.45,
+          mixed.r,
+          mixed.g,
+          mixed.b,
+          mixed.alpha
+        );
+      }
+    }
+
+    // Wet Edge rim boost
+    if (options.wetEdge && options.wetEdge > 0) {
+      dabAlpha = Math.min(1.0, dabAlpha * (1.0 + options.wetEdge * 0.25));
+    }
+
+    // Select tip from multi-tip array
+    const activeTip = selectTipImage(
+      options.subTipImages,
+      tipImage,
+      options.subTipOrder,
+      dabCounter.count++,
+      stampAngle
+    );
+    const isColorTip = Boolean(options.subTips && options.subTips[0]?.isColor);
+    const master = getTintedTipMaster(activeTip, dabColor, isColorTip);
+
+    const stampW = curWidth;
+    const stampH = curWidth * aspect * thickness;
+
+    if (options.spray?.enabled) {
+      const pCount = options.spray.density;
+      const pSize = Math.max(1, options.spray.size);
+      const radius = curWidth / 2;
+      for (let sp = 0; sp < pCount; sp++) {
+        const u1 = Math.random();
+        const u2 = Math.random();
+        const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
+        const th = Math.PI * 2 * Math.random();
         drawSingleStamp(
           ctx,
           master,
-          pt.x,
-          pt.y,
-          stampW,
-          stampH,
+          pt.x + r * Math.cos(th),
+          pt.y + r * Math.sin(th),
+          pSize,
+          pSize * aspect * thickness,
           stampAngle,
           dabAlpha,
           isEraser,
           isBgEraser
         );
       }
+    } else {
+      drawSingleStamp(
+        ctx,
+        master,
+        pt.x,
+        pt.y,
+        stampW,
+        stampH,
+        stampAngle,
+        dabAlpha,
+        isEraser,
+        isBgEraser
+      );
     }
+
+    const requiredStep = Math.max(0.2, curWidth * spacingRatio);
+    currentDist += requiredStep;
   }
 
-  const remainder = totalCurveLength - (currentDist - Math.max(0.75, end.width * spacingRatio));
-  return Math.max(0, remainder);
+  const nextRemainder = currentDist - totalCurveLength;
+  return Math.max(0, nextRemainder);
 }
 
 /**
- * Renders an entire completed textured stroke onto the target Canvas2D context.
+ * Draws textured brush stamps along a quadratic Bézier curve by elevating to cubic.
+ */
+export function drawTexturedBezierSegment(
+  ctx: CanvasRenderingContext2D,
+  start: Point,
+  control: Point,
+  end: Point,
+  color: string,
+  tipImage: HTMLImageElement,
+  options: TexturedBrushOptions,
+  remainderDist: number = 0,
+  dabCounter: { count: number } = { count: 0 }
+): number {
+  const c1: Point = {
+    x: start.x + (2.0 / 3.0) * (control.x - start.x),
+    y: start.y + (2.0 / 3.0) * (control.y - start.y),
+    pressure: start.pressure + (2.0 / 3.0) * (control.pressure - start.pressure),
+    width: start.width + (2.0 / 3.0) * (control.width - start.width),
+  };
+  const c2: Point = {
+    x: end.x + (2.0 / 3.0) * (control.x - end.x),
+    y: end.y + (2.0 / 3.0) * (control.y - end.y),
+    pressure: end.pressure + (2.0 / 3.0) * (control.pressure - end.pressure),
+    width: end.width + (2.0 / 3.0) * (control.width - end.width),
+  };
+  return drawTexturedCubicBezierSegment(
+    ctx,
+    start,
+    c1,
+    c2,
+    end,
+    color,
+    tipImage,
+    options,
+    remainderDist,
+    dabCounter
+  );
+}
+
+/**
+ * Converts 4 Catmull-Rom spline knots into cubic Bézier control points.
+ */
+function catmullRomToCubicKnots(
+  p0: Point,
+  p1: Point,
+  p2: Point,
+  p3: Point
+): { c1: Point; c2: Point } {
+  const dChord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+
+  let dx1 = (p2.x - p0.x) / 6;
+  let dy1 = (p2.y - p0.y) / 6;
+  let dx2 = (p3.x - p1.x) / 6;
+  let dy2 = (p3.y - p1.y) / 6;
+
+  if (dChord > 0.001) {
+    const maxHandle = dChord * 0.5;
+    const len1 = Math.hypot(dx1, dy1);
+    if (len1 > maxHandle) {
+      const s = maxHandle / len1;
+      dx1 *= s;
+      dy1 *= s;
+    }
+    const len2 = Math.hypot(dx2, dy2);
+    if (len2 > maxHandle) {
+      const s = maxHandle / len2;
+      dx2 *= s;
+      dy2 *= s;
+    }
+  }
+
+  const c1: Point = {
+    x: p1.x + dx1,
+    y: p1.y + dy1,
+    pressure: p1.pressure + (p2.pressure - p0.pressure) / 6,
+    width: p1.width + (p2.width - p0.width) / 6,
+  };
+
+  const c2: Point = {
+    x: p2.x - dx2,
+    y: p2.y - dy2,
+    pressure: p2.pressure - (p3.pressure - p1.pressure) / 6,
+    width: p2.width - (p3.width - p1.width) / 6,
+  };
+
+  return { c1, c2 };
+}
+
+/**
+ * Renders an entire completed textured stroke onto the target Canvas2D context using Catmull-Rom cubic splines.
  */
 export function renderCompleteTexturedStroke(
   ctx: CanvasRenderingContext2D,
@@ -598,61 +751,35 @@ export function renderCompleteTexturedStroke(
     return;
   }
 
-  let accDist = 0;
   const dabCounter = { count: 0 };
+  let accDist = Math.max(0.2, points[0].width * (options.spacing ?? 0.07));
 
   if (points.length === 2) {
     const p0 = points[0];
     const p1 = points[1];
-    const mid = {
-      x: (p0.x + p1.x) / 2,
-      y: (p0.y + p1.y) / 2,
-      pressure: (p0.pressure + p1.pressure) / 2,
-      width: (p0.width + p1.width) / 2,
-    };
-    accDist = drawTexturedBezierSegment(ctx, p0, p0, mid, color, tipImage, options, accDist, dabCounter);
-    drawTexturedBezierSegment(ctx, mid, p1, p1, color, tipImage, options, accDist, dabCounter);
+    const { c1, c2 } = catmullRomToCubicKnots(p0, p0, p1, p1);
+    drawTexturedCubicBezierSegment(ctx, p0, c1, c2, p1, color, tipImage, options, accDist, dabCounter);
     return;
   }
 
+  // First segment: P0 -> P1 using (P0, P0, P1, P2)
   const p0 = points[0];
   const p1 = points[1];
-  const mid0 = {
-    x: (p0.x + p1.x) / 2,
-    y: (p0.y + p1.y) / 2,
-    pressure: (p0.pressure + p1.pressure) / 2,
-    width: (p0.width + p1.width) / 2,
-  };
-  accDist = drawTexturedBezierSegment(ctx, p0, p0, mid0, color, tipImage, options, accDist, dabCounter);
+  const p2 = points[2];
+  const first = catmullRomToCubicKnots(p0, p0, p1, p2);
+  accDist = drawTexturedCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, color, tipImage, options, accDist, dabCounter);
 
-  for (let i = 2; i < points.length; i++) {
-    const pPrev = points[i - 2];
-    const pMid = points[i - 1];
-    const pNext = points[i];
-
-    const startMid = {
-      x: (pPrev.x + pMid.x) / 2,
-      y: (pPrev.y + pMid.y) / 2,
-      pressure: (pPrev.pressure + pMid.pressure) / 2,
-      width: (pPrev.width + pMid.width) / 2,
-    };
-    const endMid = {
-      x: (pMid.x + pNext.x) / 2,
-      y: (pMid.y + pNext.y) / 2,
-      pressure: (pMid.pressure + pNext.pressure) / 2,
-      width: (pMid.width + pNext.width) / 2,
-    };
-
-    accDist = drawTexturedBezierSegment(ctx, startMid, pMid, endMid, color, tipImage, options, accDist, dabCounter);
+  // Intermediate segments: P_{i-1} -> P_i using (P_{i-2}, P_{i-1}, P_i, P_{i+1})
+  for (let i = 2; i < points.length - 1; i++) {
+    const seg = catmullRomToCubicKnots(points[i - 2], points[i - 1], points[i], points[i + 1]);
+    accDist = drawTexturedCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], color, tipImage, options, accDist, dabCounter);
   }
 
-  const pLast = points[points.length - 1];
-  const pSecondLast = points[points.length - 2];
-  const lastMid = {
-    x: (pSecondLast.x + pLast.x) / 2,
-    y: (pSecondLast.y + pLast.y) / 2,
-    pressure: (pSecondLast.pressure + pLast.pressure) / 2,
-    width: (pSecondLast.width + pLast.width) / 2,
-  };
-  drawTexturedBezierSegment(ctx, lastMid, pLast, pLast, color, tipImage, options, accDist, dabCounter);
+  // Last segment: P_{N-2} -> P_{N-1} using (P_{N-3}, P_{N-2}, P_{N-1}, P_{N-1})
+  const n = points.length;
+  const pPrev2 = points[n - 3];
+  const pPrev = points[n - 2];
+  const pLast = points[n - 1];
+  const last = catmullRomToCubicKnots(pPrev2, pPrev, pLast, pLast);
+  drawTexturedCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, color, tipImage, options, accDist, dabCounter);
 }

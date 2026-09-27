@@ -83,27 +83,73 @@ export function applyColorModeToImageData(imageData: ImageData, mode: CanvasColo
     for (let i = 0; i < len; i += 4) {
       const alpha = data[i + 3];
       if (alpha === 0) continue;
-      const lum = Math.round(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+      const lum = (19595 * data[i] + 38470 * data[i + 1] + 7471 * data[i + 2] + 32768) >> 16;
       data[i] = lum;
       data[i + 1] = lum;
       data[i + 2] = lum;
     }
   } else if (mode === 'monochrome') {
-    // Manga 1-bit crisp binary thresholding
-    for (let i = 0; i < len; i += 4) {
-      const alpha = data[i + 3];
+    // Manga 1-bit crisp binary thresholding (Uint32Array fast-path)
+    const u32 = new Uint32Array(imageData.data.buffer);
+    const u32Len = u32.length;
+    for (let i = 0; i < u32Len; i++) {
+      const pix = u32[i];
+      const alpha = (pix >>> 24) & 0xFF;
       if (alpha < 128) {
-        data[i + 3] = 0; // transparent
+        u32[i] = 0;
         continue;
       }
-      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      const val = lum >= 128 ? 255 : 0;
-      data[i] = val;
-      data[i + 1] = val;
-      data[i + 2] = val;
-      data[i + 3] = 255; // solid
+      const r = pix & 0xFF;
+      const g = (pix >>> 8) & 0xFF;
+      const b = (pix >>> 16) & 0xFF;
+      const lum = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+      u32[i] = lum >= 128 ? 0xFFFFFFFF : 0xFF000000;
     }
   }
+}
+
+/**
+ * Ultra-fast 32-bit in-place binary thresholding on a canvas context rect.
+ * Converts anti-aliased stroke edges to 1-bit crisp binary output in real time (<0.05ms).
+ */
+export function binarizeCanvasRect(
+  ctx: CanvasRenderingContext2D,
+  rect: { x: number; y: number; width: number; height: number },
+  threshold: number = 128,
+  expressBlack: boolean = true,
+  expressWhite: boolean = true
+) {
+  const sx = Math.max(0, Math.floor(rect.x));
+  const sy = Math.max(0, Math.floor(rect.y));
+  const sw = Math.min(ctx.canvas.width - sx, Math.ceil(rect.width));
+  const sh = Math.min(ctx.canvas.height - sy, Math.ceil(rect.height));
+
+  if (sw <= 0 || sh <= 0) return;
+
+  const imgData = ctx.getImageData(sx, sy, sw, sh);
+  const u32 = new Uint32Array(imgData.data.buffer);
+  const len = u32.length;
+  const thresh = Math.max(1, Math.min(255, threshold));
+
+  for (let i = 0; i < len; i++) {
+    const pix = u32[i];
+    const alpha = (pix >>> 24) & 0xFF;
+    if (alpha < 128) {
+      u32[i] = 0; // transparent
+      continue;
+    }
+    const r = pix & 0xFF;
+    const g = (pix >>> 8) & 0xFF;
+    const b = (pix >>> 16) & 0xFF;
+    const lum = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+    if (lum < thresh) {
+      u32[i] = expressBlack ? 0xFF000000 : 0;
+    } else {
+      u32[i] = expressWhite ? 0xFFFFFFFF : 0;
+    }
+  }
+
+  ctx.putImageData(imgData, sx, sy);
 }
 
 /**

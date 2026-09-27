@@ -194,6 +194,10 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
           collapsed: false,
           parentId,
           thumbnailUrl: '',
+          expressionColor: activeLayer?.expressionColor === 'monochrome' ? 'monochrome' : activeLayer?.expressionColor === 'gray' ? 'gray' : 'color',
+          monoThreshold: activeLayer?.monoThreshold ?? 128,
+          monoExpressBlack: activeLayer?.monoExpressBlack ?? true,
+          monoExpressWhite: activeLayer?.monoExpressWhite ?? true,
         };
         createdLayer = newLayer;
 
@@ -1044,6 +1048,10 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
           parentId: null,
           thumbnailUrl: '',
           toneFrequency: defaultToneFrequencyRef.current,
+          expressionColor: _mode === 'monochrome' ? 'monochrome' : _mode === 'grayscale' ? 'gray' : 'color',
+          monoThreshold: 128,
+          monoExpressBlack: true,
+          monoExpressWhite: true,
         },
         {
           id: bgId,

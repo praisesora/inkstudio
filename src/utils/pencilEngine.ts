@@ -201,7 +201,7 @@ export function parseRgba(colorStr: string): [number, number, number, number] {
 /**
  * Evaluates a quadratic Bézier curve at parameter t (0 <= t <= 1).
  */
-function getQuadraticBezierPoint(
+export function getQuadraticBezierPoint(
   p0: Point,
   control: Point,
   p2: Point,
@@ -232,14 +232,38 @@ function getPencilNoise(seed: number): number {
 }
 
 /**
- * Draws a real pencil mark along a quadratic Bézier curve.
- * Accurately models graphite flakes catching on world-anchored paper tooth ridges.
+ * Evaluates a cubic Bézier point at parameter t (0 <= t <= 1).
  */
-export function drawPencilBezierSegment(
+export function getCubicBezierPoint(
+  p0: Point,
+  c1: Point,
+  c2: Point,
+  p3: Point,
+  t: number
+): Point {
+  const invT = 1.0 - t;
+  const invT2 = invT * invT;
+  const invT3 = invT2 * invT;
+  const t2 = t * t;
+  const t3 = t2 * t;
+
+  return {
+    x: invT3 * p0.x + 3.0 * invT2 * t * c1.x + 3.0 * invT * t2 * c2.x + t3 * p3.x,
+    y: invT3 * p0.y + 3.0 * invT2 * t * c1.y + 3.0 * invT * t2 * c2.y + t3 * p3.y,
+    pressure: invT * p0.pressure + t * p3.pressure,
+    width: invT * p0.width + t * p3.width,
+  };
+}
+
+/**
+ * Draws a real pencil mark along a cubic Bézier curve.
+ */
+export function drawPencilCubicBezierSegment(
   ctx: CanvasRenderingContext2D,
-  start: Point,
-  control: Point,
-  end: Point,
+  p0: Point,
+  c1: Point,
+  c2: Point,
+  p3: Point,
   color: string,
   grade: PencilGrade = 'pencil-2b',
   userFlow: number = 0.75,
@@ -248,15 +272,15 @@ export function drawPencilBezierSegment(
 ) {
   const config = PENCIL_CONFIGS[grade] || PENCIL_CONFIGS['pencil-2b'];
 
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
+  const dx = p3.x - p0.x;
+  const dy = p3.y - p0.y;
   const dist = Math.hypot(dx, dy);
   if (dist < 0.15) return;
 
   const [cr, cg, cb] = parseRgba(color);
 
   // Dynamic spacing: smaller width = tighter micro-stamps for silky continuity
-  const avgWidth = Math.max(1, (start.width + end.width) / 2);
+  const avgWidth = Math.max(1, (p0.width + p3.width) / 2);
   const stepDist = Math.max(0.45, Math.min(1.8, avgWidth * 0.18));
   const numSteps = Math.max(2, Math.ceil(dist / stepDist));
 
@@ -271,7 +295,7 @@ export function drawPencilBezierSegment(
 
   for (let i = 0; i <= numSteps; i++) {
     const t = i / numSteps;
-    const pt = getQuadraticBezierPoint(start, control, end, t);
+    const pt = getCubicBezierPoint(p0, c1, c2, p3, t);
 
     const radius = Math.max(0.6, pt.width / 2);
     const pressure = Math.min(Math.max(pt.pressure || 0.5, 0.05), 1.0);
@@ -328,6 +352,35 @@ export function drawPencilBezierSegment(
   }
 
   ctx.restore();
+}
+
+/**
+ * Draws a real pencil mark along a quadratic Bézier curve by elevating to cubic.
+ */
+export function drawPencilBezierSegment(
+  ctx: CanvasRenderingContext2D,
+  start: Point,
+  control: Point,
+  end: Point,
+  color: string,
+  grade: PencilGrade = 'pencil-2b',
+  userFlow: number = 0.75,
+  grainIntensity: number = 1.0,
+  userHardness?: number
+) {
+  const c1: Point = {
+    x: start.x + (2.0 / 3.0) * (control.x - start.x),
+    y: start.y + (2.0 / 3.0) * (control.y - start.y),
+    pressure: start.pressure + (2.0 / 3.0) * (control.pressure - start.pressure),
+    width: start.width + (2.0 / 3.0) * (control.width - start.width),
+  };
+  const c2: Point = {
+    x: end.x + (2.0 / 3.0) * (control.x - end.x),
+    y: end.y + (2.0 / 3.0) * (control.y - end.y),
+    pressure: end.pressure + (2.0 / 3.0) * (control.pressure - end.pressure),
+    width: end.width + (2.0 / 3.0) * (control.width - end.width),
+  };
+  drawPencilCubicBezierSegment(ctx, start, c1, c2, end, color, grade, userFlow, grainIntensity, userHardness);
 }
 
 /**

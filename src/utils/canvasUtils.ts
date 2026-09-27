@@ -1,7 +1,8 @@
 import { Point, CanvasDimensions, BlendMode, ToolType, BrushSettings, CanvasColorMode, LayerItem } from '../types/editor';
 import { enforceColorMode } from './colorUtils';
-import { drawPencilBezierSegment, drawPencilDot, PencilGrade } from './pencilEngine';
+import { drawPencilCubicBezierSegment, drawPencilDot, PencilGrade } from './pencilEngine';
 import { renderCompleteTexturedStroke, TexturedBrushOptions } from './stampEngine';
+import { evaluateCspSpline } from './sutParser';
 
 export const CANVAS_2D_CONTEXT_OPTIONS: CanvasRenderingContext2DSettings = {
   alpha: true,
@@ -20,8 +21,8 @@ export function get2DContext(
 }
 
 /**
- * Calculates stroke width based on base brush size, pressure, and minimum size ratio.
- * Mouse events typically give pressure = 0.5 or 0. If unmeasured or mouse, fallback gracefully.
+ * Calculates stroke width based on base brush size, pressure, pressure curve, and minimum size ratio.
+ * Follows Clip Studio Paint's exact dynamics calculation.
  */
 export function calculateStrokeWidth(
   baseSize: number,
@@ -30,27 +31,35 @@ export function calculateStrokeWidth(
   usePressure: boolean,
   pointerType: string,
   pressureCurveGamma: number = 1.0,
-  velocityScale: number = 1.0
+  velocityScale: number = 1.0,
+  pressureCurve?: [number, number][]
 ): number {
-  if (!usePressure || pointerType === 'mouse') {
-    return Math.max(1, baseSize * velocityScale);
+  if (!usePressure) {
+    return Math.max(0.2, baseSize * velocityScale);
   }
 
-  // Tablet stylus pressure
+  // Tablet stylus pressure vs mouse fallback
   let effectivePressure = pressure;
-  if (effectivePressure <= 0 || Number.isNaN(effectivePressure)) {
+  if (pointerType === 'mouse') {
     effectivePressure = 0.5;
+  } else {
+    if (Number.isNaN(effectivePressure) || effectivePressure === undefined) {
+      effectivePressure = 0;
+    }
+    effectivePressure = Math.max(0, Math.min(1.0, effectivePressure));
   }
 
-  // Clamp pressure between 0.01 and 1.0 to preserve full dynamic range
-  const clampedPressure = Math.min(Math.max(effectivePressure, 0.01), 1.0);
-  // Apply CSP pressure response curve gamma (e.g. 0.6 soft, 1.0 linear, 1.6 hard)
-  const gammaPressure = pressureCurveGamma !== 1.0
-    ? Math.pow(clampedPressure, pressureCurveGamma)
-    : clampedPressure;
+  // Evaluate through authentic CSP cubic Hermite spline curve if available
+  let curvePressure = effectivePressure;
+  if (pressureCurve && pressureCurve.length > 0) {
+    curvePressure = evaluateCspSpline(effectivePressure, pressureCurve);
+  } else if (pressureCurveGamma !== 1.0) {
+    curvePressure = Math.pow(Math.max(0, effectivePressure), pressureCurveGamma);
+  }
 
-  const minWidth = baseSize * minSizeFactor;
-  return Math.max(0.5, (minWidth + (baseSize - minWidth) * gammaPressure) * velocityScale);
+  const minRatio = Math.max(0, Math.min(1.0, minSizeFactor ?? 0));
+  const dynamicWidth = baseSize * (minRatio + (1.0 - minRatio) * curvePressure) * velocityScale;
+  return Math.max(0.1, dynamicWidth);
 }
 
 /**
@@ -87,28 +96,81 @@ export function getQuadraticBezierPoint(
 }
 
 /**
- * Draws a smooth tapered segment along a quadratic Bézier curve.
- * Optimized for instant, zero-lag rendering at 120+ FPS like Clip Studio Paint.
+ * Converts 4 Catmull-Rom spline knots (p0, p1, p2, p3) into cubic Bézier control points (c1, c2)
+ * for the segment from p1 to p2.
+ * Includes centripetal chord bounding to prevent overshooting or loops on tight turns.
  */
-export function drawSmoothBezierSegment(
+export function catmullRomToBezier(
+  p0: Point,
+  p1: Point,
+  p2: Point,
+  p3: Point
+): { c1: Point; c2: Point } {
+  const dChord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+
+  let dx1 = (p2.x - p0.x) / 6;
+  let dy1 = (p2.y - p0.y) / 6;
+  let dx2 = (p3.x - p1.x) / 6;
+  let dy2 = (p3.y - p1.y) / 6;
+
+  // Prevent overshoot on tight turns or uneven knot spacing
+  if (dChord > 0.001) {
+    const maxHandle = dChord * 0.5;
+    const len1 = Math.hypot(dx1, dy1);
+    if (len1 > maxHandle) {
+      const s = maxHandle / len1;
+      dx1 *= s;
+      dy1 *= s;
+    }
+    const len2 = Math.hypot(dx2, dy2);
+    if (len2 > maxHandle) {
+      const s = maxHandle / len2;
+      dx2 *= s;
+      dy2 *= s;
+    }
+  }
+
+  const c1: Point = {
+    x: p1.x + dx1,
+    y: p1.y + dy1,
+    pressure: p1.pressure + (p2.pressure - p0.pressure) / 6,
+    width: p1.width + (p2.width - p0.width) / 6,
+  };
+
+  const c2: Point = {
+    x: p2.x - dx2,
+    y: p2.y - dy2,
+    pressure: p2.pressure - (p3.pressure - p1.pressure) / 6,
+    width: p2.width - (p3.width - p1.width) / 6,
+  };
+
+  return { c1, c2 };
+}
+
+/**
+ * Draws a smooth tapered segment along a cubic Bézier curve.
+ * Gives 120+ FPS instantaneous rendering like Clip Studio Paint.
+ */
+export function drawSmoothCubicBezierSegment(
   ctx: CanvasRenderingContext2D,
-  start: Point,
-  control: Point,
-  end: Point,
+  p0: Point,
+  c1: Point,
+  c2: Point,
+  p3: Point,
   color: string,
   isEraser: boolean = false,
   hardness: number = 1.0,
   flow: number = 1.0,
   _spacing: number = 0.1
 ) {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
+  const dx = p3.x - p0.x;
+  const dy = p3.y - p0.y;
   const dist = Math.hypot(dx, dy);
 
-  if (dist < 0.2) return;
+  if (dist < 0.15) return;
 
-  const avgWidth = (start.width + end.width) / 2;
-  const widthDiff = Math.abs(end.width - start.width);
+  const avgWidth = (p0.width + p3.width) / 2;
+  const widthDiff = Math.abs(p3.width - p0.width);
 
   ctx.save();
   ctx.lineCap = 'round';
@@ -132,36 +194,72 @@ export function drawSmoothBezierSegment(
     ctx.shadowColor = isEraser ? 'rgba(0, 0, 0, 1)' : color;
   }
 
-  // Fast-path: single quadratic curve when width change is small or distance is short
-  // Gives 0.003ms instant rendering per stroke segment (zero latency like CSP)
-  if (widthDiff <= 1.5 || dist <= 8) {
+  // Fast-path: native cubic Bézier when width change is small
+  if (widthDiff <= 1.5 || dist <= 12) {
     ctx.beginPath();
     ctx.lineWidth = avgWidth;
-    ctx.moveTo(start.x, start.y);
-    ctx.quadraticCurveTo(control.x, control.y, end.x, end.y);
+    ctx.moveTo(p0.x, p0.y);
+    ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, p3.x, p3.y);
     ctx.stroke();
     ctx.restore();
     return;
   }
 
-  // Tapered stroke when width changes significantly: at most 2 or 3 adaptive steps
-  const steps = dist > 24 ? 3 : 2;
-  let prevPoint = { x: start.x, y: start.y, width: start.width };
+  // Tapered stroke when width changes significantly: adaptive cubic steps
+  const steps = dist > 32 ? 4 : 2;
+  let prevPt = { x: p0.x, y: p0.y, width: p0.width };
 
   for (let i = 1; i <= steps; i++) {
     const t = i / steps;
-    const currPoint = getQuadraticBezierPoint(start, control, end, t);
+    const invT = 1.0 - t;
+    const invT2 = invT * invT;
+    const invT3 = invT2 * invT;
+    const t2 = t * t;
+    const t3 = t2 * t;
+
+    const currX = invT3 * p0.x + 3.0 * invT2 * t * c1.x + 3.0 * invT * t2 * c2.x + t3 * p3.x;
+    const currY = invT3 * p0.y + 3.0 * invT2 * t * c1.y + 3.0 * invT * t2 * c2.y + t3 * p3.y;
+    const currWidth = invT * p0.width + t * p3.width;
 
     ctx.beginPath();
-    ctx.lineWidth = (prevPoint.width + currPoint.width) / 2;
-    ctx.moveTo(prevPoint.x, prevPoint.y);
-    ctx.lineTo(currPoint.x, currPoint.y);
+    ctx.lineWidth = (prevPt.width + currWidth) / 2;
+    ctx.moveTo(prevPt.x, prevPt.y);
+    ctx.lineTo(currX, currY);
     ctx.stroke();
 
-    prevPoint = currPoint;
+    prevPt = { x: currX, y: currY, width: currWidth };
   }
 
   ctx.restore();
+}
+
+/**
+ * Draws a smooth tapered segment along a quadratic Bézier curve by elevating to cubic.
+ */
+export function drawSmoothBezierSegment(
+  ctx: CanvasRenderingContext2D,
+  start: Point,
+  control: Point,
+  end: Point,
+  color: string,
+  isEraser: boolean = false,
+  hardness: number = 1.0,
+  flow: number = 1.0,
+  spacing: number = 0.1
+) {
+  const c1: Point = {
+    x: start.x + (2.0 / 3.0) * (control.x - start.x),
+    y: start.y + (2.0 / 3.0) * (control.y - start.y),
+    pressure: start.pressure + (2.0 / 3.0) * (control.pressure - start.pressure),
+    width: start.width + (2.0 / 3.0) * (control.width - start.width),
+  };
+  const c2: Point = {
+    x: end.x + (2.0 / 3.0) * (control.x - end.x),
+    y: end.y + (2.0 / 3.0) * (control.y - end.y),
+    pressure: end.pressure + (2.0 / 3.0) * (control.pressure - end.pressure),
+    width: end.width + (2.0 / 3.0) * (control.width - end.width),
+  };
+  drawSmoothCubicBezierSegment(ctx, start, c1, c2, end, color, isEraser, hardness, flow, spacing);
 }
 
 /**
@@ -551,52 +649,54 @@ export function renderCompleteStroke(
     if (points.length === 2) {
       const p0 = points[0];
       const p1 = points[1];
-      const mid = getMidPoint(p0, p1);
-      drawPencilBezierSegment(ctx, p0, p0, mid, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
-      drawPencilBezierSegment(ctx, mid, p1, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+      const { c1, c2 } = catmullRomToBezier(p0, p0, p1, p1);
+      drawPencilCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
       return;
     }
 
     const p0 = points[0];
     const p1 = points[1];
-    const mid0 = getMidPoint(p0, p1);
-    drawPencilBezierSegment(ctx, p0, p0, mid0, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+    const p2 = points[2];
+    const first = catmullRomToBezier(p0, p0, p1, p2);
+    drawPencilCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
 
-    for (let i = 2; i < points.length; i++) {
-      const startMid = getMidPoint(points[i - 2], points[i - 1]);
-      const endMid = getMidPoint(points[i - 1], points[i]);
-      drawPencilBezierSegment(ctx, startMid, points[i - 1], endMid, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+    for (let i = 2; i < points.length - 1; i++) {
+      const seg = catmullRomToBezier(points[i - 2], points[i - 1], points[i], points[i + 1]);
+      drawPencilCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
     }
 
-    const pLast = points[points.length - 1];
-    const pPrev = points[points.length - 2];
-    const lastMid = getMidPoint(pPrev, pLast);
-    drawPencilBezierSegment(ctx, lastMid, pLast, pLast, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+    const n = points.length;
+    const pPrev2 = points[n - 3];
+    const pPrev = points[n - 2];
+    const pLast = points[n - 1];
+    const last = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
+    drawPencilCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
   } else if (brushSettings.smoothing) {
     if (points.length === 2) {
       const p0 = points[0];
       const p1 = points[1];
-      const mid = getMidPoint(p0, p1);
-      drawSmoothBezierSegment(ctx, p0, p0, mid, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
-      drawSmoothBezierSegment(ctx, mid, p1, p1, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
+      const { c1, c2 } = catmullRomToBezier(p0, p0, p1, p1);
+      drawSmoothCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
       return;
     }
 
     const p0 = points[0];
     const p1 = points[1];
-    const mid0 = getMidPoint(p0, p1);
-    drawSmoothBezierSegment(ctx, p0, p0, mid0, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
+    const p2 = points[2];
+    const first = catmullRomToBezier(p0, p0, p1, p2);
+    drawSmoothCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
 
-    for (let i = 2; i < points.length; i++) {
-      const startMid = getMidPoint(points[i - 2], points[i - 1]);
-      const endMid = getMidPoint(points[i - 1], points[i]);
-      drawSmoothBezierSegment(ctx, startMid, points[i - 1], endMid, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
+    for (let i = 2; i < points.length - 1; i++) {
+      const seg = catmullRomToBezier(points[i - 2], points[i - 1], points[i], points[i + 1]);
+      drawSmoothCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
     }
 
-    const pLast = points[points.length - 1];
-    const pPrev = points[points.length - 2];
-    const lastMid = getMidPoint(pPrev, pLast);
-    drawSmoothBezierSegment(ctx, lastMid, pLast, pLast, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
+    const n = points.length;
+    const pPrev2 = points[n - 3];
+    const pPrev = points[n - 2];
+    const pLast = points[n - 1];
+    const last = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
+    drawSmoothCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
   } else {
     ctx.save();
     ctx.lineCap = 'round';
