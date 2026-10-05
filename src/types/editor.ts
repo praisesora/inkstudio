@@ -25,6 +25,7 @@ export interface Point {
   tiltX?: number;
   tiltY?: number;
   twist?: number;
+  timestamp?: number;
 }
 
 export type BrushPresetId =
@@ -69,6 +70,37 @@ export interface CspTaperSettings {
   inOutType?: number;
   inOutBySpeed?: boolean;
 }
+
+export interface BrushDynamics {
+  sizeJitter: number; // 0.0 to 1.0 (random size variance per stamp)
+  angleJitter: number; // 0.0 to 1.0 (random 360-degree rotation variance)
+  roundnessJitter: number; // 0.0 to 1.0 (random flattening)
+  scatter: number; // 0.0 to 5.0 (perpendicular offset from stroke normal)
+  scatterBothAxes: boolean;
+  count: number; // 1 to 10 (number of dabs emitted per spacing interval)
+  flowJitter: number; // 0.0 to 1.0
+  // Color Dynamics
+  colorJitterEnabled: boolean;
+  hueJitter: number; // 0.0 to 1.0
+  saturationJitter: number; // 0.0 to 1.0
+  brightnessJitter: number; // 0.0 to 1.0
+  foregroundBackgroundJitter: number; // 0.0 to 1.0 (mix with secondary color)
+}
+
+export const DEFAULT_BRUSH_DYNAMICS: BrushDynamics = {
+  sizeJitter: 0,
+  angleJitter: 0,
+  roundnessJitter: 0,
+  scatter: 0,
+  scatterBothAxes: false,
+  count: 1,
+  flowJitter: 0,
+  colorJitterEnabled: false,
+  hueJitter: 0,
+  saturationJitter: 0,
+  brightnessJitter: 0,
+  foregroundBackgroundJitter: 0,
+};
 
 export interface CspBrush {
   id: string; // Unique ID, e.g. "csp-1727256000000-xyz"
@@ -123,6 +155,7 @@ export interface CspBrush {
   isRibbon?: boolean;
   pressureCurveGamma?: number; // CSP Pressure response curve gamma
   velocityDynamics?: boolean; // Velocity-based taper
+  dynamics?: BrushDynamics; // Multi-axis jitter matrix
   importedAt: number;
 }
 
@@ -130,6 +163,7 @@ export interface BrushSettings {
   size: number;
   minSizeFactor: number; // minimum width ratio at lowest pressure (e.g. 0.2)
   color: string;
+  secondaryColor?: string; // Secondary / background color for color dynamics
   opacity: number; // Brush opacity (0.0 to 1.0)
   flow: number; // Ink flow rate (0.0 to 1.0)
   spacing: number; // Spacing between stamps (0.01 to 1.0)
@@ -180,6 +214,7 @@ export interface BrushSettings {
   velocityDynamics?: boolean;
   useGpu?: boolean; // Run brush mathematics on GPU video card by default
   isTransparentInk?: boolean; // Transparent Ink mode (CSP 'C' key toggle)
+  dynamics?: BrushDynamics; // Multi-axis jitter matrix
 }
 
 export interface OnionSkinSettings {
@@ -575,6 +610,17 @@ export interface LayerItem {
 }
 
 export type Layer = LayerItem;
+
+export interface LTConversionSettings {
+  lineWidth: number; // 1 to 5 px (edge detection stroke width)
+  lineThreshold: number; // 0.05 to 0.8 (Sobel edge sensitivity)
+  toneCount: number; // 1 to 4 tone layers
+  folderName: string; // Target output folder name, e.g. "3D Extraction [Model Name]"
+  toneFrequencies?: number[];
+  toneDensities?: number[];
+  toneAngles?: number[];
+  antiAliasing?: boolean;
+}
 
 export interface CanvasDimensions {
   width: number;

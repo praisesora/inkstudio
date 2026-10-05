@@ -1,5 +1,6 @@
 import { Point, BrushSettings, ToolType } from '../types/editor';
 import { evaluateCspSpline } from './sutParser';
+import { applyColorDynamics } from './stampEngine';
 
 /**
  * Information about the host video card powering the WebGL brush engine.
@@ -716,6 +717,17 @@ export class WebGlBrushEngine {
     let prevX = p0.x;
     let prevY = p0.y;
 
+    const dynamics = settings.dynamics;
+    const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
+    const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
+    const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
+    const roundnessJitter = Math.max(0, Math.min(1, dynamics?.roundnessJitter ?? 0));
+    const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
+    const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
+    const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
+    const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+    const secondaryRgb = this.parseColor(settings.secondaryColor || '#ffffff');
+
     for (let i = 1; i <= steps; i++) {
       const t = i / steps;
       const invT = 1.0 - t;
@@ -750,54 +762,118 @@ export class WebGlBrushEngine {
       const requiredInterval = Math.max(0.8, curWidth * spacingRatio);
 
       if (accDist >= requiredInterval) {
-        let angle = baseAngleRad;
+        let baseAngle = baseAngleRad;
         if (angleDynamics === 'direction' && stepDist > 0.05) {
-          angle = Math.atan2(dy, dx) + baseAngleRad;
+          baseAngle = Math.atan2(dy, dx) + baseAngleRad;
         } else if (angleDynamics === 'random') {
-          angle = baseAngleRad + (Math.random() - 0.5) * Math.PI * 2;
+          baseAngle = baseAngleRad + (Math.random() - 0.5) * Math.PI * 2;
         }
 
         if (settings.customTipRotationRandomScale) {
-          angle += (Math.random() - 0.5) * Math.PI * 2 * settings.customTipRotationRandomScale;
+          baseAngle += (Math.random() - 0.5) * Math.PI * 2 * settings.customTipRotationRandomScale;
         }
 
-        if (settings.spray?.enabled) {
-          const pCount = settings.spray.density;
-          const pSize = Math.max(1, settings.spray.size);
-          const radius = curWidth / 2;
-          for (let sp = 0; sp < pCount; sp++) {
-            const u1 = Math.random();
-            const u2 = Math.random();
-            const r = radius * Math.sqrt(u1) * (1 - (settings.spray.bias || 0) * (1 - u2));
-            const th = Math.PI * 2 * Math.random();
+        let tx = 0;
+        let ty = 0;
+        let nx = 0;
+        let ny = 0;
+        if (stepDist > 0.001) {
+          tx = dx / stepDist;
+          ty = dy / stepDist;
+          nx = -ty;
+          ny = tx;
+        } else {
+          nx = 0;
+          ny = 1;
+          tx = 1;
+          ty = 0;
+        }
+
+        for (let k = 0; k < dabCount; k++) {
+          let curDabW = curWidth;
+          if (sizeJitter > 0) {
+            curDabW *= Math.max(0.01, 1.0 - Math.random() * sizeJitter);
+          }
+          curDabW = Math.max(0.1, curDabW);
+
+          let curDabThickness = thickness;
+          if (roundnessJitter > 0) {
+            curDabThickness *= Math.max(0.05, 1.0 - Math.random() * roundnessJitter);
+          }
+
+          let curDabAngle = baseAngle;
+          if (angleJitter > 0) {
+            curDabAngle += (Math.random() - 0.5) * Math.PI * 2 * angleJitter;
+          }
+
+          let curDabX = curX;
+          let curDabY = curY;
+          if (scatter > 0) {
+            const perpDist = (Math.random() * 2 - 1) * curWidth * scatter;
+            let sOffX = nx * perpDist;
+            let sOffY = ny * perpDist;
+            if (scatterBothAxes) {
+              const tangDist = (Math.random() * 2 - 1) * curWidth * scatter;
+              sOffX += tx * tangDist;
+              sOffY += ty * tangDist;
+            }
+            curDabX += sOffX;
+            curDabY += sOffY;
+          }
+
+          let curDabAlpha = flow;
+          if (flowJitter > 0) {
+            curDabAlpha *= Math.max(0.005, 1.0 - Math.random() * flowJitter);
+          }
+
+          let dabR = rgb.r;
+          let dabG = rgb.g;
+          let dabB = rgb.b;
+          if (colorJitterEnabled && dynamics) {
+            const cd = applyColorDynamics(rgb, secondaryRgb, dynamics);
+            dabR = cd.r;
+            dabG = cd.g;
+            dabB = cd.b;
+          }
+
+          if (settings.spray?.enabled) {
+            const pCount = settings.spray.density;
+            const pSize = Math.max(1, settings.spray.size);
+            const radius = curDabW / 2;
+            for (let sp = 0; sp < pCount; sp++) {
+              const u1 = Math.random();
+              const u2 = Math.random();
+              const r = radius * Math.sqrt(u1) * (1 - (settings.spray.bias || 0) * (1 - u2));
+              const th = Math.PI * 2 * Math.random();
+              dabs.push({
+                x: curDabX + r * Math.cos(th),
+                y: curDabY + r * Math.sin(th),
+                width: pSize,
+                height: pSize * aspect * curDabThickness,
+                angle: curDabAngle,
+                r: dabR,
+                g: dabG,
+                b: dabB,
+                alpha: curDabAlpha,
+                pressure: effPressure,
+                strokeDist,
+              });
+            }
+          } else {
             dabs.push({
-              x: curX + r * Math.cos(th),
-              y: curY + r * Math.sin(th),
-              width: pSize,
-              height: pSize * aspect * thickness,
-              angle,
-              r: rgb.r,
-              g: rgb.g,
-              b: rgb.b,
-              alpha: flow,
+              x: curDabX,
+              y: curDabY,
+              width: curDabW,
+              height: curDabW * aspect * curDabThickness,
+              angle: curDabAngle,
+              r: dabR,
+              g: dabG,
+              b: dabB,
+              alpha: curDabAlpha,
               pressure: effPressure,
               strokeDist,
             });
           }
-        } else {
-          dabs.push({
-            x: curX,
-            y: curY,
-            width: curWidth,
-            height: curWidth * aspect * thickness,
-            angle,
-            r: rgb.r,
-            g: rgb.g,
-            b: rgb.b,
-            alpha: flow,
-            pressure: effPressure,
-            strokeDist,
-          });
         }
 
         accDist = 0;

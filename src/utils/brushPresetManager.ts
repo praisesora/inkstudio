@@ -1,4 +1,4 @@
-import { BrushPresetId, BrushSettings, CspBrush } from '../types/editor';
+import { BrushPresetId, BrushSettings, CspBrush, BrushDynamics } from '../types/editor';
 import { getBuiltinBrushConfig } from './presetBrushes';
 import { PENCIL_CONFIGS, PencilGrade } from './pencilEngine';
 import { getPreloadedTipImage } from './brushStorage';
@@ -49,6 +49,7 @@ export interface BrushPersistentSettings {
   textureDensity?: number;
   paperTextureScale?: number;
   paperTextureRotate?: number;
+  dynamics?: BrushDynamics;
 }
 
 export const DEFAULT_ERASER_SETTINGS: Partial<BrushSettings> = {
@@ -125,6 +126,7 @@ export function saveBrushSettingsImmediately(
   if (settings.textureDensity !== undefined) persistent.textureDensity = settings.textureDensity;
   if (settings.paperTextureScale !== undefined) persistent.paperTextureScale = settings.paperTextureScale;
   if (settings.paperTextureRotate !== undefined) persistent.paperTextureRotate = settings.paperTextureRotate;
+  if (settings.dynamics !== undefined) persistent.dynamics = settings.dynamics;
 
   all[presetId] = persistent;
   _memorySettingsCache = all;

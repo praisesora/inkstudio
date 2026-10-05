@@ -40,12 +40,15 @@ import {
   Feather,
   MessageSquare,
   Spline,
+  Shuffle,
 } from 'lucide-react';
 import {
   ToolType,
   BrushSettings,
   BrushPresetId,
   CspBrush,
+  BrushDynamics,
+  DEFAULT_BRUSH_DYNAMICS,
   FillSettings,
   TextSettings,
   FrameSettings,
@@ -162,6 +165,7 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   onInvertSelection,
 }) => {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showDynamics, setShowDynamics] = useState(false);
 
   const [customBrushes, setCustomBrushes] = useState<CspBrush[]>([]);
   const [isImportingSut, setIsImportingSut] = useState(false);
@@ -241,11 +245,33 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
         spacing: newSettings.spacing !== undefined ? newSettings.spacing : activeCustomBrush.spacing,
         hardness: newSettings.hardness !== undefined ? newSettings.hardness : activeCustomBrush.hardness,
         stabilization: newSettings.stabilization !== undefined ? newSettings.stabilization : activeCustomBrush.stabilization,
+        dynamics: newSettings.dynamics !== undefined ? newSettings.dynamics : activeCustomBrush.dynamics,
       };
       setCustomBrushes((prev) => prev.map((b) => (b.id === updatedBrush.id ? updatedBrush : b)));
       saveCustomBrush(updatedBrush).catch(() => {});
     }
   };
+
+  const handleUpdateDynamics = (patch: Partial<BrushDynamics>) => {
+    const cur = brushSettings.dynamics || DEFAULT_BRUSH_DYNAMICS;
+    handleUpdateBrushSettings({
+      dynamics: {
+        ...cur,
+        ...patch,
+      },
+    });
+  };
+
+  const isDynamicsActive = Boolean(
+    brushSettings.dynamics &&
+      (brushSettings.dynamics.sizeJitter > 0 ||
+        brushSettings.dynamics.angleJitter > 0 ||
+        brushSettings.dynamics.roundnessJitter > 0 ||
+        brushSettings.dynamics.scatter > 0 ||
+        (brushSettings.dynamics.count ?? 1) > 1 ||
+        brushSettings.dynamics.flowJitter > 0 ||
+        brushSettings.dynamics.colorJitterEnabled)
+  );
 
   const handleSelectBrushPreset = (presetId: BrushPresetId) => {
     onSelectTool('brush');
@@ -2740,6 +2766,274 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
                         />
                       </div>
                     )}
+                  </div>
+                )}
+              </div>
+
+              {/* Brush Dynamics (Multi-Axis Jitter Matrix) Accordion */}
+              <div className="pt-2 border-t border-[#2b2d31]">
+                <button
+                  type="button"
+                  onClick={() => setShowDynamics(!showDynamics)}
+                  className="w-full flex items-center justify-between text-xs text-[#8c9099] hover:text-white py-1 transition-colors cursor-pointer"
+                >
+                  <div className="flex items-center space-x-1.5">
+                    <Shuffle className="w-3.5 h-3.5 text-[#5ce1e6]" />
+                    <span className="font-medium">Brush Dynamics & Jitter</span>
+                    {isDynamicsActive && (
+                      <span className="px-1 py-0.2 rounded bg-[#5ce1e6]/15 text-[#5ce1e6] text-[9px] font-mono font-medium">
+                        ACTIVE
+                      </span>
+                    )}
+                  </div>
+                  {showDynamics ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                </button>
+
+                {showDynamics && (
+                  <div className="pt-2 space-y-3">
+                    {/* Header with Reset Button */}
+                    <div className="flex items-center justify-between pb-1 border-b border-[#26282c]">
+                      <span className="text-[10px] text-[#717682] uppercase tracking-wider font-semibold">Jitter Matrix</span>
+                      <button
+                        type="button"
+                        onClick={() => handleUpdateDynamics(DEFAULT_BRUSH_DYNAMICS)}
+                        className="text-[10px] text-[#717682] hover:text-[#5ce1e6] px-1.5 py-0.5 rounded bg-[#151618] border border-[#2e3035] transition-colors cursor-pointer"
+                        title="Reset all dynamics jitter to zero"
+                      >
+                        Reset Dynamics
+                      </button>
+                    </div>
+
+                    {/* 1. Size Jitter */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-[#8c9099]">Size Jitter</span>
+                        <span className="font-mono text-white">
+                          {Math.round((brushSettings.dynamics?.sizeJitter ?? 0) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={Math.round((brushSettings.dynamics?.sizeJitter ?? 0) * 100)}
+                        onChange={(e) => handleUpdateDynamics({ sizeJitter: Number(e.target.value) / 100 })}
+                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      />
+                    </div>
+
+                    {/* 2. Angle Jitter */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-[#8c9099]">Angle Jitter</span>
+                        <span className="font-mono text-white">
+                          {Math.round((brushSettings.dynamics?.angleJitter ?? 0) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={Math.round((brushSettings.dynamics?.angleJitter ?? 0) * 100)}
+                        onChange={(e) => handleUpdateDynamics({ angleJitter: Number(e.target.value) / 100 })}
+                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      />
+                    </div>
+
+                    {/* 3. Roundness / Thickness Jitter */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-[#8c9099]">Roundness Jitter</span>
+                        <span className="font-mono text-white">
+                          {Math.round((brushSettings.dynamics?.roundnessJitter ?? 0) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={Math.round((brushSettings.dynamics?.roundnessJitter ?? 0) * 100)}
+                        onChange={(e) => handleUpdateDynamics({ roundnessJitter: Number(e.target.value) / 100 })}
+                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      />
+                    </div>
+
+                    {/* 4. Scatter Jitter */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-[#8c9099]">Scatter</span>
+                        <span className="font-mono text-white">
+                          {(brushSettings.dynamics?.scatter ?? 0).toFixed(1)}x
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="5"
+                        step="0.1"
+                        value={brushSettings.dynamics?.scatter ?? 0}
+                        onChange={(e) => handleUpdateDynamics({ scatter: Number(e.target.value) })}
+                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      />
+                    </div>
+
+                    {/* Scatter Both Axes Toggle */}
+                    <div className="flex items-center justify-between py-1">
+                      <span className="text-xs text-[#cccccc]">Scatter Both Axes</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(brushSettings.dynamics?.scatterBothAxes)}
+                        onChange={(e) => handleUpdateDynamics({ scatterBothAxes: e.target.checked })}
+                        className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
+                      />
+                    </div>
+
+                    {/* 5. Count Slider */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-[#8c9099]">Count (Dabs per Step)</span>
+                        <span className="font-mono text-white">
+                          {brushSettings.dynamics?.count ?? 1}
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="1"
+                        max="10"
+                        step="1"
+                        value={brushSettings.dynamics?.count ?? 1}
+                        onChange={(e) => handleUpdateDynamics({ count: Number(e.target.value) })}
+                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      />
+                    </div>
+
+                    {/* 6. Flow / Opacity Jitter */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs">
+                        <span className="text-[#8c9099]">Flow / Opacity Jitter</span>
+                        <span className="font-mono text-white">
+                          {Math.round((brushSettings.dynamics?.flowJitter ?? 0) * 100)}%
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={Math.round((brushSettings.dynamics?.flowJitter ?? 0) * 100)}
+                        onChange={(e) => handleUpdateDynamics({ flowJitter: Number(e.target.value) / 100 })}
+                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      />
+                    </div>
+
+                    {/* 7. Color Dynamics Section */}
+                    <div className="pt-2 border-t border-[#26282c] space-y-2">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center space-x-1.5">
+                          <Palette className="w-3.5 h-3.5 text-cyan-400" />
+                          <span className="text-xs text-[#cccccc] font-medium">Color Dynamics</span>
+                        </div>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(brushSettings.dynamics?.colorJitterEnabled)}
+                          onChange={(e) => handleUpdateDynamics({ colorJitterEnabled: e.target.checked })}
+                          className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
+                        />
+                      </div>
+
+                      {brushSettings.dynamics?.colorJitterEnabled && (
+                        <div className="space-y-2.5 pt-1 pl-1 border-l border-[#2e3138]">
+                          {/* Color preview swatch showing foreground & secondary color */}
+                          <div className="flex items-center justify-between text-[11px] text-[#8c9099] bg-[#151618] p-1.5 rounded border border-[#2b2d32]">
+                            <span>Mix FG & BG</span>
+                            <div className="flex items-center space-x-1.5">
+                              <span
+                                className="w-3.5 h-3.5 rounded-full border border-white/20"
+                                style={{ backgroundColor: brushSettings.color }}
+                                title={`Primary (FG): ${brushSettings.color}`}
+                              />
+                              <span className="text-[10px]">⇄</span>
+                              <span
+                                className="w-3.5 h-3.5 rounded-full border border-white/20"
+                                style={{ backgroundColor: secondaryColor }}
+                                title={`Secondary (BG): ${secondaryColor}`}
+                              />
+                            </div>
+                          </div>
+
+                          {/* Foreground / Background Jitter */}
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-[#8c9099]">FG/BG Jitter</span>
+                              <span className="font-mono text-white">
+                                {Math.round((brushSettings.dynamics?.foregroundBackgroundJitter ?? 0) * 100)}%
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="0"
+                              max="100"
+                              value={Math.round((brushSettings.dynamics?.foregroundBackgroundJitter ?? 0) * 100)}
+                              onChange={(e) => handleUpdateDynamics({ foregroundBackgroundJitter: Number(e.target.value) / 100 })}
+                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                            />
+                          </div>
+
+                          {/* Hue Jitter */}
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-[#8c9099]">Hue Jitter</span>
+                              <span className="font-mono text-white">
+                                {Math.round((brushSettings.dynamics?.hueJitter ?? 0) * 100)}%
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="0"
+                              max="100"
+                              value={Math.round((brushSettings.dynamics?.hueJitter ?? 0) * 100)}
+                              onChange={(e) => handleUpdateDynamics({ hueJitter: Number(e.target.value) / 100 })}
+                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                            />
+                          </div>
+
+                          {/* Saturation Jitter */}
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-[#8c9099]">Saturation Jitter</span>
+                              <span className="font-mono text-white">
+                                {Math.round((brushSettings.dynamics?.saturationJitter ?? 0) * 100)}%
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="0"
+                              max="100"
+                              value={Math.round((brushSettings.dynamics?.saturationJitter ?? 0) * 100)}
+                              onChange={(e) => handleUpdateDynamics({ saturationJitter: Number(e.target.value) / 100 })}
+                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                            />
+                          </div>
+
+                          {/* Brightness Jitter */}
+                          <div className="space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-[#8c9099]">Brightness Jitter</span>
+                              <span className="font-mono text-white">
+                                {Math.round((brushSettings.dynamics?.brightnessJitter ?? 0) * 100)}%
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min="0"
+                              max="100"
+                              value={Math.round((brushSettings.dynamics?.brightnessJitter ?? 0) * 100)}
+                              onChange={(e) => handleUpdateDynamics({ brightnessJitter: Number(e.target.value) / 100 })}
+                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

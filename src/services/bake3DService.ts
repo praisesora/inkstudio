@@ -193,22 +193,30 @@ export interface Bake3DLTOptions {
   camera: THREE.Camera;
   dimensions: { width: number; height: number };
   activeRenderer?: THREE.WebGLRenderer | null;
+  modelName?: string;
+  targetFolderName?: string;
   baseLayerName?: string;
-  lineThreshold?: number; // 0.15 to 0.6 (default: 0.28)
-  toneBands?: 2 | 3; // 2 or 3 bands (default: 2)
-  toneFrequencies?: [number, number]; // Lines per inch [shadow, midtone]
-  toneAngles?: [number, number]; // Halftone grid angles [shadow, midtone]
-  toneDensities?: [number, number]; // Density percentage [shadow, midtone]
+  lineWidth?: number; // 1 to 5 (default: 1)
+  lineThreshold?: number; // 0.05 to 0.8 (default: 0.28)
+  toneCount?: number; // 1 to 4 tone layers (default: 2)
+  toneBands?: 2 | 3; // Backward-compatibility alias for toneCount
+  toneFrequencies?: number[]; // Lines per inch [light, deep, ...] (default: 60)
+  toneAngles?: number[]; // Halftone grid angles (default: [45, 60, ...])
+  toneDensities?: number[]; // Density normalized [0-1] (e.g. [0.20, 0.45])
+  antiAliasing?: boolean;
   disposeOnComplete?: boolean;
   onInsertLayers?: (layers: LayerItem[], canvases: HTMLCanvasElement[]) => void;
   onBroadcastLayer?: (layer: LayerItem, dataUrl: string) => void;
 }
 
 export interface Bake3DLTResult {
+  folderLayer: LayerItem;
   lineLayer: LayerItem;
   lineCanvas: HTMLCanvasElement;
   toneLayers: LayerItem[];
   toneCanvases: HTMLCanvasElement[];
+  allLayers: LayerItem[];
+  allCanvases: HTMLCanvasElement[];
 }
 
 const isLittleEndian = (() => {
@@ -218,12 +226,133 @@ const isLittleEndian = (() => {
 })();
 const SOLID_BLACK_U32 = isLittleEndian ? 0xff000000 : 0x000000ff;
 
+const sobelVertexShader = `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
+
+const sobelFragmentShader = `
+  varying vec2 vUv;
+  uniform sampler2D tNormal;
+  uniform sampler2D tDepth;
+  uniform vec2 uResolution;
+  uniform float uThreshold;
+  uniform float uLineWidth;
+  uniform float uCameraNear;
+  uniform float uCameraFar;
+  uniform int uIsPerspective;
+  uniform int uAntiAliasing;
+
+  float readDepth(vec2 coord) {
+    float z = texture2D(tDepth, coord).r;
+    if (z >= 1.0) return 1.0;
+    if (uIsPerspective == 1) {
+      return (2.0 * uCameraNear) / (uCameraFar + uCameraNear - z * (uCameraFar - uCameraNear));
+    }
+    return z;
+  }
+
+  void main() {
+    vec2 texel = (max(1.0, uLineWidth) / uResolution);
+
+    vec4 centerNorm = texture2D(tNormal, vUv);
+    if (centerNorm.a < 0.05) {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+      return;
+    }
+
+    // Outer silhouette check against 4-neighborhood background
+    float aL = texture2D(tNormal, vUv + vec2(-texel.x, 0.0)).a;
+    float aR = texture2D(tNormal, vUv + vec2(texel.x, 0.0)).a;
+    float aT = texture2D(tNormal, vUv + vec2(0.0, texel.y)).a;
+    float aB = texture2D(tNormal, vUv + vec2(0.0, -texel.y)).a;
+
+    if (aL < 0.5 || aR < 0.5 || aT < 0.5 || aB < 0.5) {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      return;
+    }
+
+    // 3x3 Sobel sample coordinates
+    vec2 uv00 = vUv + vec2(-texel.x, -texel.y);
+    vec2 uv10 = vUv + vec2(0.0, -texel.y);
+    vec2 uv20 = vUv + vec2(texel.x, -texel.y);
+    vec2 uv01 = vUv + vec2(-texel.x, 0.0);
+    vec2 uv21 = vUv + vec2(texel.x, 0.0);
+    vec2 uv02 = vUv + vec2(-texel.x, texel.y);
+    vec2 uv12 = vUv + vec2(0.0, texel.y);
+    vec2 uv22 = vUv + vec2(texel.x, texel.y);
+
+    // Normal discontinuity Sobel filter (crease detection)
+    vec3 n00 = texture2D(tNormal, uv00).rgb * 2.0 - 1.0;
+    vec3 n10 = texture2D(tNormal, uv10).rgb * 2.0 - 1.0;
+    vec3 n20 = texture2D(tNormal, uv20).rgb * 2.0 - 1.0;
+    vec3 n01 = texture2D(tNormal, uv01).rgb * 2.0 - 1.0;
+    vec3 n21 = texture2D(tNormal, uv21).rgb * 2.0 - 1.0;
+    vec3 n02 = texture2D(tNormal, uv02).rgb * 2.0 - 1.0;
+    vec3 n12 = texture2D(tNormal, uv12).rgb * 2.0 - 1.0;
+    vec3 n22 = texture2D(tNormal, uv22).rgb * 2.0 - 1.0;
+
+    vec3 gx_n = -n00 + n20 - 2.0 * n01 + 2.0 * n21 - n02 + n22;
+    vec3 gy_n = -n00 - 2.0 * n10 - n20 + n02 + 2.0 * n12 + n22;
+    float normalEdge = length(gx_n) + length(gy_n);
+
+    // Depth discontinuity Sobel filter (depth step/silhouette detection)
+    float d00 = readDepth(uv00);
+    float d10 = readDepth(uv10);
+    float d20 = readDepth(uv20);
+    float d01 = readDepth(uv01);
+    float d21 = readDepth(uv21);
+    float d02 = readDepth(uv02);
+    float d12 = readDepth(uv12);
+    float d22 = readDepth(uv22);
+
+    float gx_d = -d00 + d20 - 2.0 * d01 + 2.0 * d21 - d02 + d22;
+    float gy_d = -d00 - 2.0 * d10 - d20 + d02 + 2.0 * d12 + d22;
+    float depthEdge = sqrt(gx_d * gx_d + gy_d * gy_d) * 160.0;
+
+    float totalEdge = normalEdge * 0.45 + depthEdge * 0.55;
+
+    if (totalEdge > uThreshold) {
+      if (uAntiAliasing == 1) {
+        float alpha = clamp((totalEdge - uThreshold) / max(0.01, uThreshold * 0.25), 0.0, 1.0);
+        gl_FragColor = vec4(0.0, 0.0, 0.0, alpha);
+      } else {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      }
+    } else {
+      gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+    }
+  }
+`;
+
+const displayVertexShader = `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
+
+const displayFragmentShader = `
+  varying vec2 vUv;
+  uniform sampler2D tSource;
+  void main() {
+    gl_FragColor = texture2D(tSource, vUv);
+  }
+`;
+
 /**
- * 3D LT Line & Screentone Extraction (3D-to-2D line extraction).
+ * 3D Model LT Conversion (Automatic Line Art & Screentone Extraction).
  *
- * Renders custom depth, normal, and diffuse passes from the 3D scene, runs a Sobel
- * edge-detection filter for crisp black lineart, and quantizes diffuse lighting into
- * 2 or 3 luminance bands converted to manga screentone layers via screentoneEngine.
+ * Renders Three.js scene to offscreen render targets:
+ * - Target A: Depth texture + Surface normal buffer
+ * - Target B: Diffuse lighting buffer (grayscale luminance)
+ * Runs a GLSL fragment Sobel pass for crisp silhouettes and creases ("3D Outline"),
+ * quantizes diffuse lighting into 1 to 4 screentoned shadow tiers, and groups
+ * all layers into a manga folder "3D Extraction [Model Name]".
  */
 export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bake3DLTResult> {
   const {
@@ -231,12 +360,17 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     camera,
     dimensions,
     activeRenderer,
-    baseLayerName = '3D',
+    modelName,
+    targetFolderName,
+    baseLayerName = '3D Model',
+    lineWidth = 1,
     lineThreshold = 0.28,
-    toneBands = 2,
-    toneFrequencies = [55, 60],
-    toneAngles = [45, 60],
-    toneDensities = [0.45, 0.2],
+    toneCount: explicitToneCount,
+    toneBands,
+    toneFrequencies,
+    toneAngles,
+    toneDensities,
+    antiAliasing = true,
     disposeOnComplete = true,
     onInsertLayers,
     onBroadcastLayer,
@@ -244,6 +378,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
 
   const targetWidth = Math.max(1, Math.round(dimensions.width));
   const targetHeight = Math.max(1, Math.round(dimensions.height));
+  const resolvedToneCount = Math.max(1, Math.min(4, Math.round(explicitToneCount ?? toneBands ?? 2)));
 
   const offscreenRenderer = new THREE.WebGLRenderer({
     alpha: true,
@@ -266,14 +401,26 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   offscreenRenderer.setClearColor(0x000000, 0);
 
   const renderCamera = camera.clone();
-  if ('aspect' in renderCamera) {
-    (renderCamera as THREE.PerspectiveCamera).aspect = targetWidth / targetHeight;
-    (renderCamera as THREE.PerspectiveCamera).updateProjectionMatrix();
-  } else if ('left' in renderCamera) {
-    (renderCamera as THREE.OrthographicCamera).updateProjectionMatrix();
+  let isPerspective = 1;
+  let cameraNear = 0.1;
+  let cameraFar = 1000;
+
+  if ('isPerspectiveCamera' in renderCamera && renderCamera.isPerspectiveCamera) {
+    const pCam = renderCamera as THREE.PerspectiveCamera;
+    pCam.aspect = targetWidth / targetHeight;
+    pCam.updateProjectionMatrix();
+    cameraNear = pCam.near;
+    cameraFar = pCam.far;
+    isPerspective = 1;
+  } else if ('isOrthographicCamera' in renderCamera && renderCamera.isOrthographicCamera) {
+    const oCam = renderCamera as THREE.OrthographicCamera;
+    oCam.updateProjectionMatrix();
+    cameraNear = oCam.near;
+    cameraFar = oCam.far;
+    isPerspective = 0;
   }
 
-  // Preserve original mesh materials for safe restoration
+  // Preserve original materials for restoring after normal pass
   const savedMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
   scene.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
@@ -282,18 +429,15 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     }
   });
 
-  // Helper to capture offscreen WebGL buffer to 2D canvas imageData
-  const captureRenderPass = (): Uint8ClampedArray => {
-    const canvas = document.createElement('canvas');
-    canvas.width = renderWidth;
-    canvas.height = renderHeight;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) throw new Error('Failed to acquire 2D context for pass extraction');
-    ctx.drawImage(offscreenRenderer.domElement, 0, 0, renderWidth, renderHeight);
-    return ctx.getImageData(0, 0, renderWidth, renderHeight).data;
-  };
+  // 1. Offscreen Render Target A: Depth Texture + Surface Normal Buffer
+  const targetA = new THREE.WebGLRenderTarget(renderWidth, renderHeight, {
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    depthTexture: new THREE.DepthTexture(renderWidth, renderHeight, THREE.UnsignedIntType),
+  });
 
-  // 1. Normal Pass
   const normalMat = new THREE.MeshNormalMaterial();
   scene.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
@@ -301,284 +445,325 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
       mesh.material = normalMat;
     }
   });
-  offscreenRenderer.render(scene, renderCamera);
-  const normalData = captureRenderPass();
 
-  // 2. Depth Pass
-  const depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
-  scene.traverse((obj) => {
-    const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh) {
-      mesh.material = depthMat;
-    }
+  offscreenRenderer.setRenderTarget(targetA);
+  offscreenRenderer.clear();
+  offscreenRenderer.render(scene, renderCamera);
+
+  // 2. Offscreen Render Target B: Diffuse Lighting Buffer
+  const targetB = new THREE.WebGLRenderTarget(renderWidth, renderHeight, {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
   });
-  offscreenRenderer.render(scene, renderCamera);
-  const depthData = captureRenderPass();
 
-  // 3. Diffuse Lighting Pass (restore original materials)
   scene.traverse((obj) => {
     const mesh = obj as THREE.Mesh;
     if (mesh.isMesh && savedMaterials.has(mesh)) {
       mesh.material = savedMaterials.get(mesh)!;
     }
   });
-  offscreenRenderer.render(scene, renderCamera);
-  const diffuseData = captureRenderPass();
 
-  // 4. Sobel Edge Detection Filter
+  offscreenRenderer.setRenderTarget(targetB);
+  offscreenRenderer.clear();
+  offscreenRenderer.render(scene, renderCamera);
+
+  // 3. GLSL Fragment Sobel Edge Detection Pass over Target A (Normals + Depth)
+  const lineTarget = new THREE.WebGLRenderTarget(renderWidth, renderHeight, {
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+  });
+
+  const postScene = new THREE.Scene();
+  const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const quadGeo = new THREE.PlaneGeometry(2, 2);
+
+  const sobelMaterial = new THREE.ShaderMaterial({
+    vertexShader: sobelVertexShader,
+    fragmentShader: sobelFragmentShader,
+    uniforms: {
+      tNormal: { value: targetA.texture },
+      tDepth: { value: targetA.depthTexture },
+      uResolution: { value: new THREE.Vector2(renderWidth, renderHeight) },
+      uThreshold: { value: lineThreshold },
+      uLineWidth: { value: lineWidth },
+      uCameraNear: { value: cameraNear },
+      uCameraFar: { value: cameraFar },
+      uIsPerspective: { value: isPerspective },
+      uAntiAliasing: { value: antiAliasing ? 1 : 0 },
+    },
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+  });
+
+  const sobelQuad = new THREE.Mesh(quadGeo, sobelMaterial);
+  postScene.add(sobelQuad);
+
+  offscreenRenderer.setRenderTarget(lineTarget);
+  offscreenRenderer.clear();
+  offscreenRenderer.render(postScene, postCamera);
+
+  // Transfer rendered line target to lineCanvas at target document dimensions
   const lineCanvas = document.createElement('canvas');
   lineCanvas.width = targetWidth;
   lineCanvas.height = targetHeight;
+  const lineCtx = lineCanvas.getContext('2d', { willReadFrequently: true })!;
 
-  const tempLineCanvas = document.createElement('canvas');
-  tempLineCanvas.width = renderWidth;
-  tempLineCanvas.height = renderHeight;
-  const tempLineCtx = tempLineCanvas.getContext('2d')!;
-  const lineImageData = tempLineCtx.createImageData(renderWidth, renderHeight);
-  const lineData32 = new Uint32Array(lineImageData.data.buffer);
+  const displayMaterial = new THREE.ShaderMaterial({
+    vertexShader: displayVertexShader,
+    fragmentShader: displayFragmentShader,
+    uniforms: { tSource: { value: lineTarget.texture } },
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+  });
+  sobelQuad.material = displayMaterial;
 
-  const w = renderWidth;
-  const h = renderHeight;
+  offscreenRenderer.setRenderTarget(null);
+  offscreenRenderer.clear();
+  offscreenRenderer.render(postScene, postCamera);
+  lineCtx.drawImage(offscreenRenderer.domElement, 0, 0, targetWidth, targetHeight);
 
-  for (let y = 1; y < h - 1; y++) {
-    const rowOffset = y * w;
-    for (let x = 1; x < w - 1; x++) {
-      const idx = (rowOffset + x) * 4;
-      const alpha = normalData[idx + 3];
+  // Extract binary line pixel map to ensure screentone shading doesn't bleed into outline
+  const renderLineCanvas = document.createElement('canvas');
+  renderLineCanvas.width = renderWidth;
+  renderLineCanvas.height = renderHeight;
+  const renderLineCtx = renderLineCanvas.getContext('2d', { willReadFrequently: true })!;
+  renderLineCtx.drawImage(offscreenRenderer.domElement, 0, 0, renderWidth, renderHeight);
+  const linePixels = renderLineCtx.getImageData(0, 0, renderWidth, renderHeight);
+  const lineData32 = new Uint32Array(linePixels.data.buffer);
 
-      if (alpha === 0) continue; // background
+  // 4. Capture Diffuse Lighting Buffer for Shadow Tier Posterization
+  displayMaterial.uniforms.tSource.value = targetB.texture;
+  offscreenRenderer.setRenderTarget(null);
+  offscreenRenderer.clear();
+  offscreenRenderer.render(postScene, postCamera);
 
-      // Check outer silhouette against 4-neighborhood
-      const leftA = normalData[(rowOffset + x - 1) * 4 + 3];
-      const rightA = normalData[(rowOffset + x + 1) * 4 + 3];
-      const topA = normalData[((y - 1) * w + x) * 4 + 3];
-      const bottomA = normalData[((y + 1) * w + x) * 4 + 3];
+  const diffuseCanvas = document.createElement('canvas');
+  diffuseCanvas.width = renderWidth;
+  diffuseCanvas.height = renderHeight;
+  const diffCtx = diffuseCanvas.getContext('2d', { willReadFrequently: true })!;
+  diffCtx.drawImage(offscreenRenderer.domElement, 0, 0, renderWidth, renderHeight);
+  const diffImageData = diffCtx.getImageData(0, 0, renderWidth, renderHeight);
+  const diffData = diffImageData.data;
 
-      if (leftA === 0 || rightA === 0 || topA === 0 || bottomA === 0) {
-        lineData32[rowOffset + x] = SOLID_BLACK_U32;
-        continue;
+  // Group Folder Name Resolution
+  const rawModelName = modelName || baseLayerName || 'Model';
+  const cleanModelName = rawModelName.replace(/\.[^/.]+$/, '').trim();
+  const folderName = targetFolderName?.trim() || `3D Extraction [${cleanModelName}]`;
+  const folderId = `folder-lt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+
+  // 5. Posterize Diffuse Lighting into 1 to 4 Manga Screentone Shadow Tiers
+  // Default Tier Configurations:
+  // Tier 1 (Light shadow): 60 LPI, 20% density
+  // Tier 2 (Deep shadow): 60 LPI, 45% density
+  type ToneTierDef = {
+    threshold: number;
+    density: number;
+    frequency: number;
+    angle: number;
+    name: string;
+  };
+
+  const tierConfigs: ToneTierDef[] = [];
+  if (resolvedToneCount === 1) {
+    tierConfigs.push({
+      threshold: 0.45,
+      density: toneDensities?.[0] ?? 0.45,
+      frequency: toneFrequencies?.[0] ?? 60,
+      angle: toneAngles?.[0] ?? 45,
+      name: '3D Tone (Deep)',
+    });
+  } else if (resolvedToneCount === 2) {
+    tierConfigs.push(
+      {
+        threshold: 0.65,
+        density: toneDensities?.[0] ?? 0.20,
+        frequency: toneFrequencies?.[0] ?? 60,
+        angle: toneAngles?.[0] ?? 45,
+        name: '3D Tone 1 (Light)',
+      },
+      {
+        threshold: 0.35,
+        density: toneDensities?.[1] ?? 0.45,
+        frequency: toneFrequencies?.[1] ?? 60,
+        angle: toneAngles?.[1] ?? 60,
+        name: '3D Tone 2 (Deep)',
       }
-
-      // Sobel operator on Normal components
-      // Row -1
-      const n00_r = normalData[((y - 1) * w + (x - 1)) * 4];
-      const n00_g = normalData[((y - 1) * w + (x - 1)) * 4 + 1];
-      const n00_b = normalData[((y - 1) * w + (x - 1)) * 4 + 2];
-      const n10_r = normalData[((y - 1) * w + x) * 4];
-      const n10_g = normalData[((y - 1) * w + x) * 4 + 1];
-      const n10_b = normalData[((y - 1) * w + x) * 4 + 2];
-      const n20_r = normalData[((y - 1) * w + (x + 1)) * 4];
-      const n20_g = normalData[((y - 1) * w + (x + 1)) * 4 + 1];
-      const n20_b = normalData[((y - 1) * w + (x + 1)) * 4 + 2];
-
-      // Row 0
-      const n01_r = normalData[(rowOffset + (x - 1)) * 4];
-      const n01_g = normalData[(rowOffset + (x - 1)) * 4 + 1];
-      const n01_b = normalData[(rowOffset + (x - 1)) * 4 + 2];
-      const n21_r = normalData[(rowOffset + (x + 1)) * 4];
-      const n21_g = normalData[(rowOffset + (x + 1)) * 4 + 1];
-      const n21_b = normalData[(rowOffset + (x + 1)) * 4 + 2];
-
-      // Row +1
-      const n02_r = normalData[((y + 1) * w + (x - 1)) * 4];
-      const n02_g = normalData[((y + 1) * w + (x - 1)) * 4 + 1];
-      const n02_b = normalData[((y + 1) * w + (x - 1)) * 4 + 2];
-      const n12_r = normalData[((y + 1) * w + x) * 4];
-      const n12_g = normalData[((y + 1) * w + x) * 4 + 1];
-      const n12_b = normalData[((y + 1) * w + x) * 4 + 2];
-      const n22_r = normalData[((y + 1) * w + (x + 1)) * 4];
-      const n22_g = normalData[((y + 1) * w + (x + 1)) * 4 + 1];
-      const n22_b = normalData[((y + 1) * w + (x + 1)) * 4 + 2];
-
-      const gx_r = -n00_r + n20_r - 2 * n01_r + 2 * n21_r - n02_r + n22_r;
-      const gy_r = -n00_r - 2 * n10_r - n20_r + n02_r + 2 * n12_r + n22_r;
-
-      const gx_g = -n00_g + n20_g - 2 * n01_g + 2 * n21_g - n02_g + n22_g;
-      const gy_g = -n00_g - 2 * n10_g - n20_g + n02_g + 2 * n12_g + n22_g;
-
-      const gx_b = -n00_b + n20_b - 2 * n01_b + 2 * n21_b - n02_b + n22_b;
-      const gy_b = -n00_b - 2 * n10_b - n20_b + n02_b + 2 * n12_b + n22_b;
-
-      const normEdge = Math.hypot(gx_r, gy_r) + Math.hypot(gx_g, gy_g) + Math.hypot(gx_b, gy_b);
-
-      // Sobel operator on Depth
-      const d00 = depthData[((y - 1) * w + (x - 1)) * 4];
-      const d10 = depthData[((y - 1) * w + x) * 4];
-      const d20 = depthData[((y - 1) * w + (x + 1)) * 4];
-      const d01 = depthData[(rowOffset + (x - 1)) * 4];
-      const d21 = depthData[(rowOffset + (x + 1)) * 4];
-      const d02 = depthData[((y + 1) * w + (x - 1)) * 4];
-      const d12 = depthData[((y + 1) * w + x) * 4];
-      const d22 = depthData[((y + 1) * w + (x + 1)) * 4];
-
-      const gx_d = -d00 + d20 - 2 * d01 + 2 * d21 - d02 + d22;
-      const gy_d = -d00 - 2 * d10 - d20 + d02 + 2 * d12 + d22;
-      const depthEdge = Math.hypot(gx_d, gy_d);
-
-      const totalEdge = (normEdge / 255.0) * 0.45 + (depthEdge / 255.0) * 2.2;
-
-      if (totalEdge > lineThreshold) {
-        lineData32[rowOffset + x] = SOLID_BLACK_U32;
+    );
+  } else if (resolvedToneCount === 3) {
+    tierConfigs.push(
+      {
+        threshold: 0.70,
+        density: toneDensities?.[0] ?? 0.15,
+        frequency: toneFrequencies?.[0] ?? 60,
+        angle: toneAngles?.[0] ?? 45,
+        name: '3D Tone 1 (Light)',
+      },
+      {
+        threshold: 0.45,
+        density: toneDensities?.[1] ?? 0.30,
+        frequency: toneFrequencies?.[1] ?? 60,
+        angle: toneAngles?.[1] ?? 60,
+        name: '3D Tone 2 (Mid)',
+      },
+      {
+        threshold: 0.25,
+        density: toneDensities?.[2] ?? 0.50,
+        frequency: toneFrequencies?.[2] ?? 60,
+        angle: toneAngles?.[2] ?? 45,
+        name: '3D Tone 3 (Deep)',
       }
-    }
+    );
+  } else {
+    // 4 Tone Layers
+    tierConfigs.push(
+      {
+        threshold: 0.75,
+        density: toneDensities?.[0] ?? 0.10,
+        frequency: toneFrequencies?.[0] ?? 60,
+        angle: toneAngles?.[0] ?? 45,
+        name: '3D Tone 1 (Light)',
+      },
+      {
+        threshold: 0.55,
+        density: toneDensities?.[1] ?? 0.25,
+        frequency: toneFrequencies?.[1] ?? 60,
+        angle: toneAngles?.[1] ?? 60,
+        name: '3D Tone 2 (Mid-Light)',
+      },
+      {
+        threshold: 0.35,
+        density: toneDensities?.[2] ?? 0.40,
+        frequency: toneFrequencies?.[2] ?? 60,
+        angle: toneAngles?.[2] ?? 45,
+        name: '3D Tone 3 (Mid-Deep)',
+      },
+      {
+        threshold: 0.18,
+        density: toneDensities?.[3] ?? 0.55,
+        frequency: toneFrequencies?.[3] ?? 60,
+        angle: toneAngles?.[3] ?? 60,
+        name: '3D Tone 4 (Deep)',
+      }
+    );
   }
 
-  tempLineCtx.putImageData(lineImageData, 0, 0);
-  const lineCtx = lineCanvas.getContext('2d')!;
-  lineCtx.drawImage(tempLineCanvas, 0, 0, targetWidth, targetHeight);
-
-  // 5. Diffuse Lighting Quantization into 2 or 3 luminance bands
-  const maskCanvasShadow = document.createElement('canvas');
-  maskCanvasShadow.width = renderWidth;
-  maskCanvasShadow.height = renderHeight;
-  const shadowCtx = maskCanvasShadow.getContext('2d')!;
-  const shadowImageData = shadowCtx.createImageData(renderWidth, renderHeight);
-  const shadowData32 = new Uint32Array(shadowImageData.data.buffer);
-
-  let maskCanvasMidtone: HTMLCanvasElement | null = null;
-  let midtoneCtx: CanvasRenderingContext2D | null = null;
-  let midtoneImageData: ImageData | null = null;
-  let midtoneData32: Uint32Array | null = null;
-
-  if (toneBands === 3) {
-    maskCanvasMidtone = document.createElement('canvas');
-    maskCanvasMidtone.width = renderWidth;
-    maskCanvasMidtone.height = renderHeight;
-    midtoneCtx = maskCanvasMidtone.getContext('2d')!;
-    midtoneImageData = midtoneCtx.createImageData(renderWidth, renderHeight);
-    midtoneData32 = new Uint32Array(midtoneImageData.data.buffer);
-  }
-
-  for (let i = 0; i < renderWidth * renderHeight; i++) {
-    const pIdx = i * 4;
-    const a = diffuseData[pIdx + 3];
-    if (a === 0 || lineData32[i] !== 0) continue; // skip background and lineart
-
-    const r = diffuseData[pIdx];
-    const g = diffuseData[pIdx + 1];
-    const b = diffuseData[pIdx + 2];
-    const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
-
-    if (toneBands === 2) {
-      if (lum < 0.54) {
-        shadowData32[i] = SOLID_BLACK_U32;
-      }
-    } else {
-      if (lum < 0.35) {
-        shadowData32[i] = SOLID_BLACK_U32;
-      } else if (lum < 0.72 && midtoneData32) {
-        midtoneData32[i] = SOLID_BLACK_U32;
-      }
-    }
-  }
-
-  shadowCtx.putImageData(shadowImageData, 0, 0);
-  if (midtoneCtx && midtoneImageData) {
-    midtoneCtx.putImageData(midtoneImageData, 0, 0);
-  }
-
-  // 6. Convert diffuse bands to manga screentone layers using screentoneEngine
   const toneCanvases: HTMLCanvasElement[] = [];
   const toneLayers: LayerItem[] = [];
 
-  // Shadow Screentone Layer
-  const shadowToneRenderCanvas = document.createElement('canvas');
-  shadowToneRenderCanvas.width = renderWidth;
-  shadowToneRenderCanvas.height = renderHeight;
-  applyScreentoneCPU(maskCanvasShadow, shadowToneRenderCanvas, {
-    frequency: toneFrequencies[0],
-    angle: toneAngles[0],
-    specifiedDensity: toneDensities[0],
-    densityType: 'specified',
-    dpi: 600,
-    antiAliasing: true,
-  });
+  for (let t = 0; t < tierConfigs.length; t++) {
+    const tier = tierConfigs[t];
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = renderWidth;
+    maskCanvas.height = renderHeight;
+    const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true })!;
+    const maskImageData = maskCtx.createImageData(renderWidth, renderHeight);
+    const maskData32 = new Uint32Array(maskImageData.data.buffer);
 
-  const finalShadowCanvas = document.createElement('canvas');
-  finalShadowCanvas.width = targetWidth;
-  finalShadowCanvas.height = targetHeight;
-  const fShadowCtx = finalShadowCanvas.getContext('2d')!;
-  fShadowCtx.drawImage(shadowToneRenderCanvas, 0, 0, targetWidth, targetHeight);
-  toneCanvases.push(finalShadowCanvas);
+    for (let i = 0; i < renderWidth * renderHeight; i++) {
+      const pIdx = i * 4;
+      const alpha = diffData[pIdx + 3];
+      // Skip background pixels and lineart contours
+      if (alpha === 0 || (lineData32[i] & 0xff000000) !== 0) continue;
 
-  const shadowDataUrl = finalShadowCanvas.toDataURL('image/png');
-  const shadowLayer: LayerItem = {
-    id: `raster-lt-shadow-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-    name: `${baseLayerName} Shadow Tone (LT)`,
-    type: 'raster',
-    visible: true,
-    opacity: 1,
-    blendMode: 'multiply',
-    locked: false,
-    collapsed: false,
-    parentId: null,
-    thumbnailUrl: shadowDataUrl,
-    toneEnabled: true,
-    toneFrequency: toneFrequencies[0],
-    toneAngle: toneAngles[0],
-    toneDensity: Math.round(toneDensities[0] * 100),
-    toneDensityType: 'specified',
-  };
-  toneLayers.push(shadowLayer);
+      const r = diffData[pIdx];
+      const g = diffData[pIdx + 1];
+      const b = diffData[pIdx + 2];
+      const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
 
-  // Optional Midtone Screentone Layer (for 3 bands)
-  if (toneBands === 3 && maskCanvasMidtone) {
-    const midToneRenderCanvas = document.createElement('canvas');
-    midToneRenderCanvas.width = renderWidth;
-    midToneRenderCanvas.height = renderHeight;
-    applyScreentoneCPU(maskCanvasMidtone, midToneRenderCanvas, {
-      frequency: toneFrequencies[1],
-      angle: toneAngles[1],
-      specifiedDensity: toneDensities[1],
+      if (lum < tier.threshold) {
+        maskData32[i] = SOLID_BLACK_U32;
+      }
+    }
+
+    maskCtx.putImageData(maskImageData, 0, 0);
+
+    const toneRenderCanvas = document.createElement('canvas');
+    toneRenderCanvas.width = renderWidth;
+    toneRenderCanvas.height = renderHeight;
+
+    applyScreentoneCPU(maskCanvas, toneRenderCanvas, {
+      frequency: tier.frequency,
+      angle: tier.angle,
+      specifiedDensity: tier.density,
       densityType: 'specified',
       dpi: 600,
       antiAliasing: true,
     });
 
-    const finalMidtoneCanvas = document.createElement('canvas');
-    finalMidtoneCanvas.width = targetWidth;
-    finalMidtoneCanvas.height = targetHeight;
-    const fMidtoneCtx = finalMidtoneCanvas.getContext('2d')!;
-    fMidtoneCtx.drawImage(midToneRenderCanvas, 0, 0, targetWidth, targetHeight);
-    toneCanvases.push(finalMidtoneCanvas);
+    const finalToneCanvas = document.createElement('canvas');
+    finalToneCanvas.width = targetWidth;
+    finalToneCanvas.height = targetHeight;
+    const finalToneCtx = finalToneCanvas.getContext('2d')!;
+    finalToneCtx.drawImage(toneRenderCanvas, 0, 0, targetWidth, targetHeight);
+    toneCanvases.push(finalToneCanvas);
 
-    const midtoneDataUrl = finalMidtoneCanvas.toDataURL('image/png');
-    const midtoneLayer: LayerItem = {
-      id: `raster-lt-midtone-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      name: `${baseLayerName} Midtone Tone (LT)`,
+    const toneDataUrl = finalToneCanvas.toDataURL('image/png');
+    const toneLayer: LayerItem = {
+      id: `raster-lt-tone-${t + 1}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      name: tier.name,
       type: 'raster',
       visible: true,
       opacity: 1,
       blendMode: 'multiply',
       locked: false,
       collapsed: false,
-      parentId: null,
-      thumbnailUrl: midtoneDataUrl,
+      parentId: folderId,
+      thumbnailUrl: toneDataUrl,
       toneEnabled: true,
-      toneFrequency: toneFrequencies[1],
-      toneAngle: toneAngles[1],
-      toneDensity: Math.round(toneDensities[1] * 100),
+      toneFrequency: tier.frequency,
+      toneAngle: tier.angle,
+      toneDensity: Math.round(tier.density * 100),
       toneDensityType: 'specified',
     };
-    toneLayers.push(midtoneLayer);
+    toneLayers.push(toneLayer);
   }
 
-  // 7. Lineart Layer
+  // 6. Outline Layer ("3D Outline")
   const lineDataUrl = lineCanvas.toDataURL('image/png');
   const lineLayer: LayerItem = {
     id: `raster-lt-line-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-    name: `${baseLayerName} Lineart (LT)`,
+    name: '3D Outline',
     type: 'raster',
     visible: true,
     opacity: 1,
     blendMode: 'normal',
     locked: false,
     collapsed: false,
-    parentId: null,
+    parentId: folderId,
     thumbnailUrl: lineDataUrl,
   };
 
-  // Clean up WebGL resources
+  // 7. Folder Group Layer: "3D Extraction [Model Name]"
+  const folderLayer: LayerItem = {
+    id: folderId,
+    name: folderName,
+    type: 'folder',
+    visible: true,
+    opacity: 1,
+    blendMode: 'normal',
+    locked: false,
+    collapsed: false,
+    parentId: null,
+  };
+
+  // 8. Immediate Cleanup of Offscreen WebGL Resources
+  quadGeo.dispose();
+  sobelMaterial.dispose();
+  displayMaterial.dispose();
+  targetA.texture.dispose();
+  targetA.depthTexture?.dispose();
+  targetA.dispose();
+  targetB.texture.dispose();
+  targetB.dispose();
+  lineTarget.texture.dispose();
+  lineTarget.dispose();
+
   if (disposeOnComplete) {
     disposeThreeResources(scene, offscreenRenderer);
     if (activeRenderer) {
@@ -588,25 +773,42 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     offscreenRenderer.dispose();
   }
 
-  const allLayers = [...toneLayers, lineLayer];
-  const allCanvases = [...toneCanvases, lineCanvas];
+  // Render and Stack Hierarchy:
+  // Folder containing: 3D Outline on top, then Deep shadow tones below, then Light shadow tone
+  // In `layers` stack: [folderLayer, lineLayer, toneLayerDeep, ..., toneLayerLight]
+  // In reverse order for compositor: Tone 1 -> Tone 2 -> Lineart
+  const toneLayersStackOrder = [...toneLayers].reverse();
+  const toneCanvasesStackOrder = [...toneCanvases].reverse();
+
+  const folderCanvas = document.createElement('canvas');
+  folderCanvas.width = 1;
+  folderCanvas.height = 1;
+
+  const allLayers: LayerItem[] = [folderLayer, lineLayer, ...toneLayersStackOrder];
+  const allCanvases: HTMLCanvasElement[] = [folderCanvas, lineCanvas, ...toneCanvasesStackOrder];
 
   if (onInsertLayers) {
     onInsertLayers(allLayers, allCanvases);
   }
 
   if (onBroadcastLayer) {
+    onBroadcastLayer(folderLayer, '');
     onBroadcastLayer(lineLayer, lineDataUrl);
     toneLayers.forEach((l, i) => onBroadcastLayer(l, toneCanvases[i].toDataURL('image/png')));
   } else if (multiplayerService.isConnected()) {
+    multiplayerService.sendLayerAdd(folderLayer);
     multiplayerService.sendLayerAdd(lineLayer, lineDataUrl);
     toneLayers.forEach((l, i) => multiplayerService.sendLayerAdd(l, toneCanvases[i].toDataURL('image/png')));
   }
 
   return {
+    folderLayer,
     lineLayer,
     lineCanvas,
     toneLayers,
     toneCanvases,
+    allLayers,
+    allCanvases,
   };
 }
+

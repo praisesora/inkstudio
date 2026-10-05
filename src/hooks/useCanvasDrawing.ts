@@ -49,6 +49,7 @@ import { PaintReservoir, LayerPixelSampler } from '../utils/colorMixingEngine';
 import { applyLayerEffects } from '../utils/layerEffectsEngine';
 import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
 import { PerspectiveSnapSession } from '../utils/perspectiveSnapping';
+import { WebGlBrushEngine } from '../utils/webglBrushEngine';
 
 interface UseCanvasDrawingProps {
   tool: ToolType;
@@ -71,6 +72,7 @@ interface UseCanvasDrawingProps {
   onUpdateMaskThumbnail?: (layerId: string) => void;
   draftCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   strokeCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
+  predictedCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   onCollabStrokeStart?: (strokeId: string, layerId: string, brushSettings: BrushSettings, tool: ToolType, startPoint: Point) => void;
   onCollabStrokeChunk?: (strokeId: string, points: Point[]) => void;
   onCollabStrokeFinish?: (strokeId: string, layerId: string, endPoint: Point, dirtyRect?: DirtyRect, vectorStroke?: VectorStroke) => void;
@@ -100,6 +102,7 @@ export function useCanvasDrawing({
   onUpdateMaskThumbnail,
   draftCanvasRef,
   strokeCanvasRef,
+  predictedCanvasRef,
   onCollabStrokeStart,
   onCollabStrokeChunk,
   onCollabStrokeFinish,
@@ -119,6 +122,26 @@ export function useCanvasDrawing({
 
   // Support both draftCanvasRef and legacy strokeCanvasRef prop
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
+
+  const getPredictedCanvas = useCallback((): HTMLCanvasElement | null => {
+    if (predictedCanvasRef?.current) return predictedCanvasRef.current;
+    const draft = effectiveDraftCanvasRef?.current;
+    if (draft?.parentElement) {
+      return draft.parentElement.querySelector<HTMLCanvasElement>('canvas.predicted-overlay-canvas');
+    }
+    return null;
+  }, [effectiveDraftCanvasRef, predictedCanvasRef]);
+
+  const clearPredictedCanvas = useCallback(() => {
+    const pCanvas = getPredictedCanvas();
+    if (pCanvas) {
+      const pCtx = get2DContext(pCanvas);
+      if (pCtx) {
+        pCtx.resetTransform();
+        pCtx.clearRect(0, 0, pCanvas.width, pCanvas.height);
+      }
+    }
+  }, [getPredictedCanvas]);
 
   // Top overlay interaction reference for pointer capture and events
   const interactionRef = useRef<HTMLDivElement | null>(null);
@@ -195,7 +218,7 @@ export function useCanvasDrawing({
   const strokePointsRef = useRef<Point[]>([]);
 
   // Raw points window buffer for symmetric Gaussian FIR stabilization
-  const rawPointsBufferRef = useRef<{ x: number; y: number; pressure: number; pointerType: string; tiltX?: number; tiltY?: number; twist?: number }[]>([]);
+  const rawPointsBufferRef = useRef<{ x: number; y: number; pressure: number; pointerType: string; tiltX?: number; tiltY?: number; twist?: number; timestamp?: number }[]>([]);
 
   // Stabilizer tracking ref
   const stabilizedPointRef = useRef<Point | null>(null);
@@ -232,7 +255,7 @@ export function useCanvasDrawing({
   const lastProcessedPointRef = useRef<{ x: number; y: number } | null>(null);
 
   // Queue of incoming pointer coordinates to be batched and processed via requestAnimationFrame (rAF)
-  const pendingPointsQueueRef = useRef<{ x: number; y: number; pressure: number; pointerType: string; tiltX?: number; tiltY?: number; twist?: number }[]>([]);
+  const pendingPointsQueueRef = useRef<{ x: number; y: number; pressure: number; pointerType: string; tiltX?: number; tiltY?: number; twist?: number; timestamp?: number }[]>([]);
   const drawRafIdRef = useRef<number | null>(null);
   const clearDraftRafRef = useRef<number | null>(null);
 
@@ -465,6 +488,7 @@ export function useCanvasDrawing({
         dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
       }
     }
+    clearPredictedCanvas();
     if (drewDirectlyOnLayerCanvasRef.current && strokeBackupCanvasRef.current) {
       const currentLayerId = activeLayerIdRef.current;
       const canvas = layerCanvasesRef.current.get(currentLayerId) || getActiveCanvas();
@@ -491,7 +515,7 @@ export function useCanvasDrawing({
     activeReservoirRef.current = null;
     snapSessionRef.current.endStroke();
     onActiveConstraintAxisChangeRef.current?.(null);
-  }, [effectiveDraftCanvasRef, getActiveCanvas, layerCanvasesRef]);
+  }, [clearPredictedCanvas, effectiveDraftCanvasRef, getActiveCanvas, layerCanvasesRef]);
 
   // Jump directly to any past or future history step
   const jumpToHistoryIndex = useCallback(
@@ -908,7 +932,7 @@ export function useCanvasDrawing({
       const vRect = getViewportRect();
       const dims = dimensionsRef.current;
       const bs = brushSettingsRef.current;
-      if (!vRect) return { x: 0, y: 0, pressure: 0.5, width: bs.size };
+      if (!vRect) return { x: 0, y: 0, pressure: 0.5, width: bs.size, timestamp: e.timeStamp };
 
       const { x, y } = screenToCanvas(
         e.clientX,
@@ -942,7 +966,7 @@ export function useCanvasDrawing({
       const tiltY = e.tiltY ?? 0;
       const twist = e.twist ?? 0;
 
-      return { x, y, pressure, width, tiltX, tiltY, twist };
+      return { x, y, pressure, width, tiltX, tiltY, twist, timestamp: e.timeStamp };
     },
     [getViewportRect]
   );
@@ -1071,119 +1095,179 @@ export function useCanvasDrawing({
     const targetCtx = draftCtx;
     drewDirectlyOnLayerCanvasRef.current = false;
 
-    if (bs.customTipImage) {
-      const tipOptions: TexturedBrushOptions = {
-        size: bs.size,
-        minSizeFactor: bs.minSizeFactor,
-        opacity: bs.opacity,
-        flow: strokeFlow,
-        spacing: strokeSpacing,
-        thickness: bs.thickness,
-        thicknessVertical: bs.thicknessVertical,
-        angle: bs.customTipAngle,
-        angleDynamics: bs.customTipAngleDynamics,
-        rotationRandomScale: bs.customTipRotationRandomScale,
-        hardness: strokeHardness,
-        antiAlias: isMonochrome ? 0 : bs.antiAlias,
-        pressureCurve: bs.pressureCurve,
-        velocityCurve: bs.velocityCurve,
-        usePressure: bs.usePressure,
-        useVelocity: bs.useVelocity,
-        subTips: bs.subTips,
-        subTipOrder: bs.subTipOrder,
-        subTipImages: bs.subTipImages,
-        spray: bs.spray,
-        taper: bs.taper,
-        colorMixing: bs.colorMixing,
-        amountOfPaint: bs.amountOfPaint,
-        densityOfPaint: bs.densityOfPaint,
-        colorStretch: bs.colorStretch,
-        mixingMode: bs.mixingMode,
-        wetEdge: bs.wetEdge,
-        wetEdgeRadius: bs.wetEdgeRadius,
-        wetEdgeAlphaPower: bs.wetEdgeAlphaPower,
-        wetEdgeValuePower: bs.wetEdgeValuePower,
-        grain: bs.grain ?? bs.textureDensity,
-        paperTextureImage: bs.paperTextureImage,
-        paperTextureScale: bs.paperTextureScale,
-        paperTextureRotate: bs.paperTextureRotate,
-        useGpu: bs.useGpu,
-        underlyingCanvas: canvas || undefined,
-        sampler: layerPixelSamplerRef.current || undefined,
-        reservoir: activeReservoirRef.current || undefined,
-        isEraser: isEraser && !isBgEraser,
-        isBgEraser,
-        alphaLocked: Boolean(activeLayer?.alphaLocked),
-        isTransparentInk: Boolean(bs.isTransparentInk),
-        currentStrokeDist: strokeTotalDistanceRef.current,
+    const dims = dimensionsRef.current;
+    const gpuEngine = (bs.useGpu !== false) ? WebGlBrushEngine.getInstance() : null;
+    const canUseGpu = Boolean(
+      gpuEngine &&
+      gpuEngine.isAvailable() &&
+      !isEraser &&
+      !isPencil &&
+      !isMaskModeRef.current &&
+      !activeLayer?.alphaLocked
+    );
+
+    let renderedWithGpu = false;
+    if (canUseGpu && gpuEngine) {
+      const midT = 0.5;
+      const invMidT = 0.5;
+      const midX = invMidT * invMidT * invMidT * segStart.x + 3 * invMidT * invMidT * midT * c1.x + 3 * invMidT * midT * midT * c2.x + midT * midT * midT * segEnd.x;
+      const midY = invMidT * invMidT * invMidT * segStart.y + 3 * invMidT * invMidT * midT * c1.y + 3 * invMidT * midT * midT * c2.y + midT * midT * midT * segEnd.y;
+      const midP = 0.5 * (segStart.pressure + segEnd.pressure);
+      const midW = 0.5 * (segStart.width + segEnd.width);
+      const midPt: Point = {
+        x: midX,
+        y: midY,
+        pressure: midP,
+        width: midW,
+        tiltX: 0.5 * ((segStart.tiltX ?? 0) + (segEnd.tiltX ?? 0)),
+        tiltY: 0.5 * ((segStart.tiltY ?? 0) + (segEnd.tiltY ?? 0)),
       };
 
-      stampRemainderDistRef.current = drawTexturedCubicBezierSegment(
-        targetCtx,
-        segStart,
-        c1,
-        c2,
-        segEnd,
-        strokeColor,
-        bs.customTipImage,
-        tipOptions,
-        stampRemainderDistRef.current
-      );
-    } else if (isPencil) {
-      const grade = (bs.preset as PencilGrade) || 'pencil-2b';
-      const pFlow = bs.flow ?? 0.74;
-      const pGrain = bs.grain ?? 1.0;
-
-      stampRemainderDistRef.current = drawPencilCubicBezierSegment(
-        targetCtx,
-        segStart,
-        c1,
-        c2,
-        segEnd,
-        strokeColor,
-        grade,
-        pFlow,
-        pGrain,
-        bs.hardness,
-        stampRemainderDistRef.current,
-        Boolean(activeLayer?.alphaLocked),
-        Boolean(bs.isTransparentInk)
-      );
-    } else {
-      const radialMixingOptions: RadialMixingOptions = {
-        colorMixing: bs.colorMixing,
-        amountOfPaint: bs.amountOfPaint,
-        densityOfPaint: bs.densityOfPaint,
-        colorStretch: bs.colorStretch,
-        mixingMode: bs.mixingMode,
-        underlyingCanvas: canvas || undefined,
-        sampler: layerPixelSamplerRef.current || undefined,
-        reservoir: activeReservoirRef.current || undefined,
-        alphaLocked: Boolean(activeLayer?.alphaLocked),
-        isTransparentInk: Boolean(bs.isTransparentInk),
+      const ctrl1: Point = {
+        x: (3 * c1.x - segStart.x) / 2,
+        y: (3 * c1.y - segStart.y) / 2,
+        pressure: 0.5 * (segStart.pressure + midP),
+        width: 0.5 * (segStart.width + midW),
       };
-      stampRemainderDistRef.current = drawSmoothCubicBezierSegment(
-        targetCtx,
-        segStart,
-        c1,
-        c2,
-        segEnd,
-        strokeColor,
-        isEraser && !isBgEraser,
-        strokeHardness,
-        strokeFlow,
-        strokeSpacing,
-        stampRemainderDistRef.current,
-        bs.thickness ?? 1.0,
-        ((bs.customTipAngle ?? 0) * Math.PI) / 180,
-        radialMixingOptions
-      );
+      const ctrl2: Point = {
+        x: (3 * c2.x - segEnd.x) / 2,
+        y: (3 * c2.y - segEnd.y) / 2,
+        pressure: 0.5 * (midP + segEnd.pressure),
+        width: 0.5 * (midW + segEnd.width),
+      };
+
+      const res1 = gpuEngine.generateArcLengthDabs(segStart, ctrl1, midPt, bs, strokeColor, stampRemainderDistRef.current, strokeTotalDistanceRef.current);
+      const res2 = gpuEngine.generateArcLengthDabs(midPt, ctrl2, segEnd, bs, strokeColor, res1.remainderDist, res1.totalStrokeDist);
+      stampRemainderDistRef.current = res2.remainderDist;
+      strokeTotalDistanceRef.current = res2.totalStrokeDist;
+
+      const dabs = res1.dabs.concat(res2.dabs);
+      if (dabs.length > 0) {
+        renderedWithGpu = gpuEngine.renderDabsToContext(targetCtx, dabs, bs, toolRef.current, dims.width, dims.height, canvas || undefined);
+      } else {
+        renderedWithGpu = true;
+      }
+    }
+
+    if (!renderedWithGpu) {
+      if (bs.customTipImage) {
+        const tipOptions: TexturedBrushOptions = {
+          size: bs.size,
+          minSizeFactor: bs.minSizeFactor,
+          opacity: bs.opacity,
+          flow: strokeFlow,
+          spacing: strokeSpacing,
+          thickness: bs.thickness,
+          thicknessVertical: bs.thicknessVertical,
+          angle: bs.customTipAngle,
+          angleDynamics: bs.customTipAngleDynamics,
+          rotationRandomScale: bs.customTipRotationRandomScale,
+          hardness: strokeHardness,
+          antiAlias: isMonochrome ? 0 : bs.antiAlias,
+          pressureCurve: bs.pressureCurve,
+          velocityCurve: bs.velocityCurve,
+          usePressure: bs.usePressure,
+          useVelocity: bs.useVelocity,
+          subTips: bs.subTips,
+          subTipOrder: bs.subTipOrder,
+          subTipImages: bs.subTipImages,
+          spray: bs.spray,
+          taper: bs.taper,
+          colorMixing: bs.colorMixing,
+          amountOfPaint: bs.amountOfPaint,
+          densityOfPaint: bs.densityOfPaint,
+          colorStretch: bs.colorStretch,
+          mixingMode: bs.mixingMode,
+          wetEdge: bs.wetEdge,
+          wetEdgeRadius: bs.wetEdgeRadius,
+          wetEdgeAlphaPower: bs.wetEdgeAlphaPower,
+          wetEdgeValuePower: bs.wetEdgeValuePower,
+          grain: bs.grain ?? bs.textureDensity,
+          paperTextureImage: bs.paperTextureImage,
+          paperTextureScale: bs.paperTextureScale,
+          paperTextureRotate: bs.paperTextureRotate,
+          useGpu: bs.useGpu,
+          underlyingCanvas: canvas || undefined,
+          sampler: layerPixelSamplerRef.current || undefined,
+          reservoir: activeReservoirRef.current || undefined,
+          isEraser: isEraser && !isBgEraser,
+          isBgEraser,
+          alphaLocked: Boolean(activeLayer?.alphaLocked),
+          isTransparentInk: Boolean(bs.isTransparentInk),
+          currentStrokeDist: strokeTotalDistanceRef.current,
+          dynamics: bs.dynamics,
+          secondaryColor: bs.secondaryColor,
+        };
+
+        stampRemainderDistRef.current = drawTexturedCubicBezierSegment(
+          targetCtx,
+          segStart,
+          c1,
+          c2,
+          segEnd,
+          strokeColor,
+          bs.customTipImage,
+          tipOptions,
+          stampRemainderDistRef.current
+        );
+      } else if (isPencil) {
+        const grade = (bs.preset as PencilGrade) || 'pencil-2b';
+        const pFlow = bs.flow ?? 0.74;
+        const pGrain = bs.grain ?? 1.0;
+
+        stampRemainderDistRef.current = drawPencilCubicBezierSegment(
+          targetCtx,
+          segStart,
+          c1,
+          c2,
+          segEnd,
+          strokeColor,
+          grade,
+          pFlow,
+          pGrain,
+          bs.hardness,
+          stampRemainderDistRef.current,
+          Boolean(activeLayer?.alphaLocked),
+          Boolean(bs.isTransparentInk)
+        );
+      } else {
+        const radialMixingOptions: RadialMixingOptions = {
+          colorMixing: bs.colorMixing,
+          amountOfPaint: bs.amountOfPaint,
+          densityOfPaint: bs.densityOfPaint,
+          colorStretch: bs.colorStretch,
+          mixingMode: bs.mixingMode,
+          underlyingCanvas: canvas || undefined,
+          sampler: layerPixelSamplerRef.current || undefined,
+          reservoir: activeReservoirRef.current || undefined,
+          alphaLocked: Boolean(activeLayer?.alphaLocked),
+          isTransparentInk: Boolean(bs.isTransparentInk),
+          dynamics: bs.dynamics,
+          secondaryColor: bs.secondaryColor,
+        };
+        stampRemainderDistRef.current = drawSmoothCubicBezierSegment(
+          targetCtx,
+          segStart,
+          c1,
+          c2,
+          segEnd,
+          strokeColor,
+          isEraser && !isBgEraser,
+          strokeHardness,
+          strokeFlow,
+          strokeSpacing,
+          stampRemainderDistRef.current,
+          bs.thickness ?? 1.0,
+          ((bs.customTipAngle ?? 0) * Math.PI) / 180,
+          radialMixingOptions
+        );
+      }
     }
   }, [getActiveCanvas]);
 
   // Stabilize and render point onto draft canvas
   const applyStabilizedPointAndRender = useCallback(
-    (draftCtx: CanvasRenderingContext2D, rawX: number, rawY: number, rawPressure: number, pointerType: string, rawTiltX: number = 0, rawTiltY: number = 0, rawTwist: number = 0) => {
+    (draftCtx: CanvasRenderingContext2D, rawX: number, rawY: number, rawPressure: number, pointerType: string, rawTiltX: number = 0, rawTiltY: number = 0, rawTwist: number = 0, timestamp?: number) => {
       const bs = brushSettingsRef.current;
       const dims = dimensionsRef.current;
       const stab = Math.min(50, Math.max(0, bs.stabilization ?? 0));
@@ -1199,7 +1283,7 @@ export function useCanvasDrawing({
         velocityScale = Math.max(0.65, Math.min(1.0, 1.0 - Math.max(0, speed - 0.5) * 0.12));
       }
 
-      rawPointsBufferRef.current.push({ x: rawX, y: rawY, pressure: rawPressure, pointerType, tiltX: rawTiltX, tiltY: rawTiltY, twist: rawTwist });
+      rawPointsBufferRef.current.push({ x: rawX, y: rawY, pressure: rawPressure, pointerType, tiltX: rawTiltX, tiltY: rawTiltY, twist: rawTwist, timestamp });
 
       let pt: Point;
       if (stab <= 0) {
@@ -1214,7 +1298,7 @@ export function useCanvasDrawing({
           velocityScale,
           bs.pressureCurve
         );
-        pt = { x: rawX, y: rawY, pressure: rawPressure, width, tiltX: rawTiltX, tiltY: rawTiltY, twist: rawTwist };
+        pt = { x: rawX, y: rawY, pressure: rawPressure, width, tiltX: rawTiltX, tiltY: rawTiltY, twist: rawTwist, timestamp };
         stabilizedPointRef.current = pt;
       } else {
         const buf = rawPointsBufferRef.current;
@@ -1252,7 +1336,7 @@ export function useCanvasDrawing({
           velocityScale,
           bs.pressureCurve
         );
-        pt = { x: smoothX, y: smoothY, pressure: smoothPressure, width: smoothWidth, tiltX: smoothTiltX, tiltY: smoothTiltY, twist: smoothTwist };
+        pt = { x: smoothX, y: smoothY, pressure: smoothPressure, width: smoothWidth, tiltX: smoothTiltX, tiltY: smoothTiltY, twist: smoothTwist, timestamp };
         stabilizedPointRef.current = pt;
       }
 
@@ -1305,7 +1389,7 @@ export function useCanvasDrawing({
 
     for (let i = 0; i < batch.length; i++) {
       const item = batch[i];
-      applyStabilizedPointAndRender(draftCtx, item.x, item.y, item.pressure, item.pointerType, item.tiltX, item.tiltY, item.twist);
+      applyStabilizedPointAndRender(draftCtx, item.x, item.y, item.pressure, item.pointerType, item.tiltX, item.tiltY, item.twist, item.timestamp);
       if (allStrokePointsRef.current.length > 0) {
         const lastPt = allStrokePointsRef.current[allStrokePointsRef.current.length - 1];
         chunkPts.push(lastPt);
@@ -1390,7 +1474,7 @@ export function useCanvasDrawing({
 
   // Pointer Down handler: initialize lightweight live stroke overlay without touching base canvas
   const handlePointerDown = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+    (e: React.PointerEvent<HTMLElement>, coalescedEvents?: PointerEvent[]) => {
       const isBrushOrEraser = toolRef.current === 'brush' || toolRef.current === 'eraser';
       if (!isBrushOrEraser || disabled || e.button !== 0 || activeLayerLockedRef.current || !activeLayerVisibleRef.current) return;
       e.preventDefault();
@@ -1448,6 +1532,25 @@ export function useCanvasDrawing({
       draftCtx.rect(0, 0, dimensionsRef.current.width, dimensionsRef.current.height);
       draftCtx.clip();
 
+      clearPredictedCanvas();
+      const pCanvas = getPredictedCanvas();
+      if (pCanvas) {
+        if (pCanvas.width !== targetW || pCanvas.height !== targetH) {
+          pCanvas.width = targetW;
+          pCanvas.height = targetH;
+        }
+        const pCtx = get2DContext(pCanvas);
+        if (pCtx) {
+          pCtx.resetTransform();
+          pCtx.clearRect(0, 0, pCanvas.width, pCanvas.height);
+          pCtx.setTransform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
+          pCtx.save();
+          pCtx.beginPath();
+          pCtx.rect(0, 0, dimensionsRef.current.width, dimensionsRef.current.height);
+          pCtx.clip();
+        }
+      }
+
       const isEraser = toolRef.current === 'eraser';
       const isBgEraser = isEraser && activeLayerIdRef.current === 'layer-bg';
 
@@ -1488,7 +1591,11 @@ export function useCanvasDrawing({
       }
       activePointerIdRef.current = e.pointerId;
       isDrawingRef.current = true;
-      const rawStartPoint = getCanvasPoint(e);
+
+      const rawCoalesced = coalescedEvents ?? (e as any).coalescedEvents ?? (typeof e.nativeEvent?.getCoalescedEvents === 'function' ? e.nativeEvent.getCoalescedEvents() : null);
+      const events: PointerEvent[] = (rawCoalesced && rawCoalesced.length > 0) ? Array.from(rawCoalesced) : [e.nativeEvent];
+      const firstEvent = events[0] || e.nativeEvent;
+      const rawStartPoint = getCanvasPoint(firstEvent);
       const isAltOverride = e.altKey;
       const startPoint = snapSessionRef.current.snapPoint(rawStartPoint, rulerRef.current, isAltOverride);
       onActiveConstraintAxisChangeRef.current?.(snapSessionRef.current.getActiveAxis());
@@ -1499,10 +1606,11 @@ export function useCanvasDrawing({
         x: startPoint.x,
         y: startPoint.y,
         pressure: startPoint.pressure,
-        pointerType: e.pointerType,
+        pointerType: firstEvent.pointerType,
         tiltX: startPoint.tiltX ?? 0,
         tiltY: startPoint.tiltY ?? 0,
         twist: startPoint.twist ?? 0,
+        timestamp: startPoint.timestamp,
       }];
       stabilizedPointRef.current = { ...startPoint };
       lastProcessedPointRef.current = { x: startPoint.x, y: startPoint.y };
@@ -1515,6 +1623,30 @@ export function useCanvasDrawing({
         width: startPoint.width,
       }];
       strokeTotalDistanceRef.current = 0;
+
+      if (events.length > 1) {
+        for (let i = 1; i < events.length; i++) {
+          const cEv = events[i];
+          const rawPt = getCanvasPoint(cEv);
+          const snapped = snapSessionRef.current.processPoint({ x: rawPt.x, y: rawPt.y }, rulerRef.current, isAltOverride);
+          let cPressure = 0;
+          if (cEv.pointerType === 'mouse') {
+            cPressure = (cEv.buttons & 1) ? 0.5 : 0;
+          } else {
+            cPressure = cEv.pressure !== undefined ? Math.max(0, Math.min(1.0, cEv.pressure)) : 0;
+          }
+          pendingPointsQueueRef.current.push({
+            x: snapped.x,
+            y: snapped.y,
+            pressure: cPressure,
+            pointerType: cEv.pointerType,
+            tiltX: cEv.tiltX ?? 0,
+            tiltY: cEv.tiltY ?? 0,
+            twist: cEv.twist ?? 0,
+            timestamp: cEv.timeStamp,
+          });
+        }
+      }
 
       dispatchPointerStat(startPoint.x, startPoint.y, startPoint.pressure);
 
@@ -1655,6 +1787,8 @@ export function useCanvasDrawing({
             isBgEraser: false,
             alphaLocked: Boolean(activeLayer?.alphaLocked),
             isTransparentInk: Boolean(bs.isTransparentInk),
+            dynamics: bs.dynamics,
+            secondaryColor: bs.secondaryColor,
           };
           drawTexturedDot(draftCtx, startPoint, strokeColor, bs.customTipImage, tipOptions);
         } else if (isPencil) {
@@ -1682,6 +1816,8 @@ export function useCanvasDrawing({
             reservoir: activeReservoirRef.current || undefined,
             alphaLocked: Boolean(activeLayer?.alphaLocked),
             isTransparentInk: Boolean(bs.isTransparentInk),
+            dynamics: bs.dynamics,
+            secondaryColor: bs.secondaryColor,
           };
           drawDot(
             draftCtx,
@@ -1726,17 +1862,123 @@ export function useCanvasDrawing({
           }
         );
       }
+      if (pendingPointsQueueRef.current.length > 0 && drawRafIdRef.current === null) {
+        drawRafIdRef.current = requestAnimationFrame(flushPendingPoints);
+      }
     },
-    [disabled, dispatchPointerStat, effectiveDraftCanvasRef, getActiveCanvas, getCanvasPoint, getViewportRect, viewportRef]
+    [clearPredictedCanvas, disabled, dispatchPointerStat, effectiveDraftCanvasRef, flushPendingPoints, getActiveCanvas, getCanvasPoint, getPredictedCanvas, getViewportRect, viewportRef]
   );
 
-  // Pointer Move handler: throttled & batched coordinate ingestion via rAF
+  // Render speculative predicted head points strictly onto temporary prediction overlay canvas
+  const renderPredictedStroke = useCallback(
+    (predEvents: PointerEvent[], vRect: DOMRect) => {
+      const pCanvas = getPredictedCanvas();
+      if (!pCanvas) return;
+      const predCtx = get2DContext(pCanvas);
+      if (!predCtx) return;
+
+      predCtx.resetTransform();
+      predCtx.clearRect(0, 0, pCanvas.width, pCanvas.height);
+
+      const scaleX = pCanvas.width / vRect.width;
+      const scaleY = pCanvas.height / vRect.height;
+      const matrix = getCanvasToViewportMatrix(
+        panRef.current,
+        zoomRef.current,
+        rotationRef.current,
+        dimensionsRef.current,
+        scaleX,
+        scaleY
+      );
+      predCtx.setTransform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
+      predCtx.save();
+      predCtx.beginPath();
+      predCtx.rect(0, 0, dimensionsRef.current.width, dimensionsRef.current.height);
+      predCtx.clip();
+
+      const bs = brushSettingsRef.current;
+      const dims = dimensionsRef.current;
+      const lastPt =
+        allStrokePointsRef.current[allStrokePointsRef.current.length - 1] ||
+        stabilizedPointRef.current;
+      if (!lastPt) {
+        predCtx.restore();
+        return;
+      }
+
+      let prevPt = lastPt;
+      for (let i = 0; i < predEvents.length; i++) {
+        const pEv = predEvents[i];
+        const rawCoords = screenToCanvas(
+          pEv.clientX,
+          pEv.clientY,
+          vRect,
+          panRef.current,
+          zoomRef.current,
+          rotationRef.current,
+          dims
+        );
+
+        let pPressure = 0;
+        if (pEv.pointerType === 'mouse') {
+          pPressure = (pEv.buttons & 1) ? 0.5 : 0;
+        } else {
+          pPressure = pEv.pressure !== undefined ? Math.max(0, Math.min(1.0, pEv.pressure)) : prevPt.pressure;
+        }
+
+        const pWidth = calculateStrokeWidth(
+          bs.size,
+          pPressure,
+          bs.minSizeFactor,
+          bs.usePressure,
+          pEv.pointerType,
+          bs.pressureCurveGamma ?? 1.0,
+          1.0,
+          bs.pressureCurve
+        );
+
+        const curPt: Point = {
+          x: rawCoords.x,
+          y: rawCoords.y,
+          pressure: pPressure,
+          width: pWidth,
+          tiltX: pEv.tiltX ?? 0,
+          tiltY: pEv.tiltY ?? 0,
+          twist: pEv.twist ?? 0,
+          timestamp: pEv.timeStamp,
+        };
+
+        predCtx.save();
+        predCtx.lineCap = 'round';
+        predCtx.lineJoin = 'round';
+        predCtx.strokeStyle = bs.color;
+        predCtx.fillStyle = bs.color;
+        predCtx.globalAlpha = Math.max(0.2, (bs.opacity ?? 1.0) * (bs.flow ?? 1.0) * 0.75);
+        predCtx.lineWidth = Math.max(1, (prevPt.width + curPt.width) / 2);
+        predCtx.beginPath();
+        predCtx.moveTo(prevPt.x, prevPt.y);
+        predCtx.lineTo(curPt.x, curPt.y);
+        predCtx.stroke();
+        predCtx.restore();
+
+        prevPt = curPt;
+      }
+
+      predCtx.restore();
+    },
+    [getPredictedCanvas]
+  );
+
+  // Pointer Move handler: throttled & batched coordinate ingestion via rAF with coalesced and predicted events
   const handlePointerMove = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+    (
+      e: React.PointerEvent<HTMLElement>,
+      coalescedEvents?: PointerEvent[],
+      predictedEvents?: PointerEvent[]
+    ) => {
       const point = getCanvasPoint(e);
       dispatchPointerStat(point.x, point.y, point.pressure);
       onCollabCursorMoveRef.current?.(point.x, point.y, isDrawingRef.current, toolRef.current);
-
 
       if (!isDrawingRef.current || e.pointerId !== activePointerIdRef.current) {
         return;
@@ -1744,100 +1986,81 @@ export function useCanvasDrawing({
 
       e.preventDefault();
 
-      const nativeEvent = e.nativeEvent as PointerEvent;
+      clearPredictedCanvas();
+
       const vRect = getViewportRect();
+      if (!vRect) return;
       const dims = dimensionsRef.current;
 
-      if (typeof nativeEvent.getCoalescedEvents === 'function' && vRect) {
-        const coalesced = nativeEvent.getCoalescedEvents();
-        if (coalesced && coalesced.length > 0) {
-          for (let i = 0; i < coalesced.length; i++) {
-            const cEvent = coalesced[i];
-            const isLast = i === coalesced.length - 1;
-            const rawCoords = screenToCanvas(
-              cEvent.clientX,
-              cEvent.clientY,
-              vRect,
-              panRef.current,
-              zoomRef.current,
-              rotationRef.current,
-              dims
-            );
+      const rawCoalesced =
+        coalescedEvents ??
+        (e as any).coalescedEvents ??
+        (typeof e.nativeEvent?.getCoalescedEvents === 'function' ? e.nativeEvent.getCoalescedEvents() : null);
+      const events: PointerEvent[] =
+        rawCoalesced && rawCoalesced.length > 0 ? Array.from(rawCoalesced) : [e.nativeEvent];
 
-            const isAltOverride = e.altKey;
-            const snapRes = snapSessionRef.current.processPoint(rawCoords, rulerRef.current, isAltOverride);
-            const cx = snapRes.x;
-            const cy = snapRes.y;
-            if (snapRes.axis) {
-              onActiveConstraintAxisChangeRef.current?.(snapRes.axis);
-            }
+      const rawPredicted =
+        predictedEvents ??
+        (e as any).predictedEvents ??
+        (typeof e.nativeEvent?.getPredictedEvents === 'function' ? e.nativeEvent.getPredictedEvents() : null);
+      const predEvents: PointerEvent[] =
+        rawPredicted && rawPredicted.length > 0 ? Array.from(rawPredicted) : [];
 
-            const last = lastProcessedPointRef.current;
-            if (last && !isLast) {
-              const distSq = (cx - last.x) * (cx - last.x) + (cy - last.y) * (cy - last.y);
-              if (distSq < 2.0) {
-                continue;
-              }
-            }
+      for (let i = 0; i < events.length; i++) {
+        const cEvent = events[i];
+        const isLast = i === events.length - 1;
+        const rawCoords = screenToCanvas(
+          cEvent.clientX,
+          cEvent.clientY,
+          vRect,
+          panRef.current,
+          zoomRef.current,
+          rotationRef.current,
+          dims
+        );
 
-            lastProcessedPointRef.current = { x: cx, y: cy };
-            let cPressure = 0;
-            if (cEvent.pointerType === 'mouse') {
-              cPressure = (cEvent.buttons & 1) ? 0.5 : 0;
-            } else {
-              cPressure = cEvent.pressure !== undefined ? Math.max(0, Math.min(1.0, cEvent.pressure)) : 0;
-            }
-
-            pendingPointsQueueRef.current.push({
-              x: cx,
-              y: cy,
-              pressure: cPressure,
-              pointerType: cEvent.pointerType,
-              tiltX: cEvent.tiltX ?? 0,
-              tiltY: cEvent.tiltY ?? 0,
-              twist: cEvent.twist ?? 0,
-            });
-          }
-
-          if (drawRafIdRef.current === null) {
-            drawRafIdRef.current = requestAnimationFrame(flushPendingPoints);
-          }
-          return;
+        const isAltOverride = e.altKey;
+        const snapRes = snapSessionRef.current.processPoint(rawCoords, rulerRef.current, isAltOverride);
+        const cx = snapRes.x;
+        const cy = snapRes.y;
+        if (snapRes.axis) {
+          onActiveConstraintAxisChangeRef.current?.(snapRes.axis);
         }
-      }
 
-      const isAltOverride = e.altKey;
-      const snapRes = snapSessionRef.current.processPoint({ x: point.x, y: point.y }, rulerRef.current, isAltOverride);
-      const finalX = snapRes.x;
-      const finalY = snapRes.y;
-      if (snapRes.axis) {
-        onActiveConstraintAxisChangeRef.current?.(snapRes.axis);
-      }
-
-      const last = lastProcessedPointRef.current;
-      if (last) {
-        const distSq = (finalX - last.x) * (finalX - last.x) + (finalY - last.y) * (finalY - last.y);
-        if (distSq < 1.0) {
-          return;
+        const last = lastProcessedPointRef.current;
+        if (last && !isLast && cx === last.x && cy === last.y) {
+          continue;
         }
-      }
 
-      lastProcessedPointRef.current = { x: finalX, y: finalY };
-      pendingPointsQueueRef.current.push({
-        x: finalX,
-        y: finalY,
-        pressure: point.pressure,
-        pointerType: e.pointerType,
-        tiltX: point.tiltX ?? e.tiltX ?? 0,
-        tiltY: point.tiltY ?? e.tiltY ?? 0,
-        twist: point.twist ?? e.twist ?? 0,
-      });
+        lastProcessedPointRef.current = { x: cx, y: cy };
+        let cPressure = 0;
+        if (cEvent.pointerType === 'mouse') {
+          cPressure = (cEvent.buttons & 1) ? 0.5 : 0;
+        } else {
+          cPressure = cEvent.pressure !== undefined ? Math.max(0, Math.min(1.0, cEvent.pressure)) : 0;
+        }
+
+        pendingPointsQueueRef.current.push({
+          x: cx,
+          y: cy,
+          pressure: cPressure,
+          pointerType: cEvent.pointerType,
+          tiltX: cEvent.tiltX ?? 0,
+          tiltY: cEvent.tiltY ?? 0,
+          twist: cEvent.twist ?? 0,
+          timestamp: cEvent.timeStamp,
+        });
+      }
 
       if (drawRafIdRef.current === null) {
         drawRafIdRef.current = requestAnimationFrame(flushPendingPoints);
       }
+
+      if (predEvents.length > 0) {
+        renderPredictedStroke(predEvents, vRect);
+      }
     },
-    [dispatchPointerStat, flushPendingPoints, getCanvasPoint, getViewportRect]
+    [clearPredictedCanvas, dispatchPointerStat, flushPendingPoints, getCanvasPoint, getViewportRect, renderPredictedStroke]
   );
 
   // Pointer Up / Cancel handler: composite and bake stroke into high-res canvas at dirty rect
@@ -1848,6 +2071,7 @@ export function useCanvasDrawing({
       }
 
       e.preventDefault();
+      clearPredictedCanvas();
 
       if (interactionRef.current && interactionRef.current.hasPointerCapture(e.pointerId)) {
         try {
@@ -2003,6 +2227,8 @@ export function useCanvasDrawing({
             alphaLocked: Boolean(activeLayer?.alphaLocked),
             isTransparentInk: Boolean(bs.isTransparentInk),
             currentStrokeDist: strokeTotalDistanceRef.current,
+            dynamics: bs.dynamics,
+            secondaryColor: bs.secondaryColor,
           };
           drawTexturedCubicBezierSegment(
             targetTailCtx,
@@ -2044,6 +2270,8 @@ export function useCanvasDrawing({
             reservoir: activeReservoirRef.current || undefined,
             alphaLocked: Boolean(activeLayer?.alphaLocked),
             isTransparentInk: Boolean(bs.isTransparentInk),
+            dynamics: bs.dynamics,
+            secondaryColor: bs.secondaryColor,
           };
           drawSmoothCubicBezierSegment(
             targetTailCtx,
@@ -2432,6 +2660,7 @@ export function useCanvasDrawing({
           dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
         }
       }
+      clearPredictedCanvas();
 
       if (currentStrokeIdRef.current) {
         onCollabStrokeFinishRef.current?.(
@@ -2474,6 +2703,7 @@ export function useCanvasDrawing({
     },
     [
       applyStabilizedPointAndRender,
+      clearPredictedCanvas,
       effectiveDraftCanvasRef,
       flushPendingPoints,
       getActiveCanvas,

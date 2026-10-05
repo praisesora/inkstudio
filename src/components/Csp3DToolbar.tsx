@@ -1,4 +1,5 @@
-import React, { useRef, useCallback } from 'react';
+import React, { useRef, useCallback, useState, useEffect } from 'react';
+import { LTConversionSettings } from '../types/editor';
 
 export type Csp3DToolMode =
   | 'camera-orbit'
@@ -16,6 +17,9 @@ interface Csp3DToolbarProps {
   onDirectDrag: (mode: Csp3DToolMode, deltaX: number, deltaY: number, e: PointerEvent) => void;
   onSnapToGround: () => void;
   onResetModelTransform: () => void;
+  onExtractLineAndTone?: (settings: LTConversionSettings) => void;
+  isExtracting?: boolean;
+  modelName?: string;
 }
 
 export const Csp3DToolbar: React.FC<Csp3DToolbarProps> = ({
@@ -24,7 +28,24 @@ export const Csp3DToolbar: React.FC<Csp3DToolbarProps> = ({
   onDirectDrag,
   onSnapToGround,
   onResetModelTransform,
+  onExtractLineAndTone,
+  isExtracting = false,
+  modelName = 'Model',
 }) => {
+  const [showLTDialog, setShowLTDialog] = useState(false);
+  const [lineWidth, setLineWidth] = useState(1);
+  const [lineThreshold, setLineThreshold] = useState(0.28);
+  const [toneCount, setToneCount] = useState<number>(2);
+  const [folderName, setFolderName] = useState('');
+
+  const cleanModelName = (modelName || 'Model').replace(/\.[^/.]+$/, '').trim();
+  const defaultFolderName = `3D Extraction [${cleanModelName}]`;
+
+  useEffect(() => {
+    if (!folderName) {
+      setFolderName(defaultFolderName);
+    }
+  }, [defaultFolderName, folderName]);
   const dragRef = useRef<{
     mode: Csp3DToolMode;
     startX: number;
@@ -304,6 +325,180 @@ export const Csp3DToolbar: React.FC<Csp3DToolbarProps> = ({
           <polyline points="10 14 12 19 14 14" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" />
         </svg>
       </button>
+
+      <div className="w-[1px] h-5 bg-white/15 mx-0.5" />
+
+      {/* 10. Extract Line & Tone (LT Conversion) */}
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => {
+            if (!folderName) {
+              setFolderName(defaultFolderName);
+            }
+            setShowLTDialog((prev) => !prev);
+          }}
+          disabled={isExtracting}
+          title="Extract Line & Tone (LT Conversion of 3D Data)"
+          className={`p-1.5 px-2 rounded transition-all flex items-center space-x-1.5 text-xs font-medium ${
+            showLTDialog
+              ? 'bg-purple-600/40 text-purple-200 ring-1 ring-purple-400 shadow-sm'
+              : 'text-purple-300 hover:text-white hover:bg-purple-600/30'
+          } disabled:opacity-50 disabled:cursor-not-allowed`}
+        >
+          <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="1.75">
+            {/* Outline box */}
+            <rect x="3" y="3" width="18" height="18" rx="2" stroke="currentColor" />
+            {/* Diagonal line divider */}
+            <line x1="3" y1="21" x2="21" y2="3" stroke="currentColor" strokeWidth="1.5" />
+            {/* Screentone dots on lower half */}
+            <circle cx="8" cy="16" r="1" fill="currentColor" />
+            <circle cx="12" cy="16" r="1" fill="currentColor" />
+            <circle cx="16" cy="16" r="1" fill="currentColor" />
+            <circle cx="10" cy="19" r="1" fill="currentColor" />
+            <circle cx="14" cy="19" r="1" fill="currentColor" />
+            {/* Upper contour line */}
+            <path d="M7 8 Q12 5 17 8" stroke="currentColor" strokeWidth="1.5" fill="none" />
+          </svg>
+          <span className="text-[11px] font-medium tracking-wide">LT</span>
+        </button>
+
+        {/* LT Conversion Configuration Dialog */}
+        {showLTDialog && (
+          <div
+            className="absolute top-full mt-2 left-1/2 -translate-x-1/2 w-72 bg-[#181b22]/98 backdrop-blur-xl border border-purple-500/50 rounded-xl p-3.5 shadow-2xl z-50 text-gray-200 select-none"
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {/* Modal Header */}
+            <div className="flex items-center justify-between pb-2 border-b border-white/10">
+              <div className="flex items-center space-x-1.5">
+                <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
+                <span className="text-xs font-semibold text-purple-200 tracking-wide">
+                  LT Conversion (Line & Tone)
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowLTDialog(false)}
+                className="text-gray-400 hover:text-white p-0.5 rounded hover:bg-white/10"
+              >
+                <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2">
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {/* Edge Detection Sensitivity: Line Width & Threshold */}
+            <div className="mt-3 space-y-2.5">
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-gray-300 font-medium">Line Width</span>
+                  <span className="font-mono text-purple-300 font-bold">{lineWidth} px</span>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="5"
+                  step="1"
+                  value={lineWidth}
+                  onChange={(e) => setLineWidth(parseInt(e.target.value, 10))}
+                  className="w-full accent-purple-500 cursor-pointer h-1.5 bg-gray-700 rounded-lg"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <div className="flex justify-between text-[11px]">
+                  <span className="text-gray-300 font-medium">Line Sensitivity (Threshold)</span>
+                  <span className="font-mono text-purple-300 font-bold">
+                    {Math.round((1 - lineThreshold) * 100)}%
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="0.05"
+                  max="0.8"
+                  step="0.01"
+                  value={lineThreshold}
+                  onChange={(e) => setLineThreshold(parseFloat(e.target.value))}
+                  className="w-full accent-purple-500 cursor-pointer h-1.5 bg-gray-700 rounded-lg"
+                />
+              </div>
+            </div>
+
+            {/* Shading Tone Count: 1 to 4 Layers */}
+            <div className="mt-3 space-y-1.5">
+              <div className="flex justify-between text-[11px]">
+                <span className="text-gray-300 font-medium">Shading Tone Count</span>
+                <span className="text-[10px] text-gray-400 font-mono">60 LPI Screentone</span>
+              </div>
+              <div className="grid grid-cols-4 gap-1">
+                {([1, 2, 3, 4] as const).map((count) => (
+                  <button
+                    key={count}
+                    type="button"
+                    onClick={() => setToneCount(count)}
+                    className={`py-1 rounded text-[11px] font-medium transition-all ${
+                      toneCount === count
+                        ? 'bg-purple-600 text-white shadow-sm ring-1 ring-purple-300'
+                        : 'bg-white/5 text-gray-300 hover:bg-white/10 hover:text-white'
+                    }`}
+                  >
+                    {count} {count === 1 ? 'Tone' : 'Tones'}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[10px] text-gray-400 font-mono mt-0.5">
+                {toneCount === 1 && 'Deep Shadow (45% density)'}
+                {toneCount === 2 && 'Light (20%) + Deep Shadow (45%)'}
+                {toneCount === 3 && 'Light (15%) + Mid (30%) + Deep (50%)'}
+                {toneCount === 4 && 'Light (10%) + Mid-L (25%) + Mid-D (40%) + Deep (55%)'}
+              </p>
+            </div>
+
+            {/* Target Output Folder */}
+            <div className="mt-3 space-y-1">
+              <label className="text-[11px] text-gray-300 font-medium block">
+                Target Output Folder
+              </label>
+              <input
+                type="text"
+                value={folderName}
+                onChange={(e) => setFolderName(e.target.value)}
+                placeholder={defaultFolderName}
+                className="w-full px-2.5 py-1 text-xs bg-[#111317] border border-white/15 focus:border-purple-500 rounded text-gray-200 outline-none font-mono"
+              />
+            </div>
+
+            {/* Action Buttons */}
+            <div className="mt-4 flex items-center space-x-2">
+              <button
+                type="button"
+                onClick={() => setShowLTDialog(false)}
+                className="flex-1 py-1.5 rounded text-xs text-gray-400 hover:text-white hover:bg-white/10 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isExtracting}
+                onClick={() => {
+                  onExtractLineAndTone?.({
+                    lineWidth,
+                    lineThreshold,
+                    toneCount,
+                    folderName: folderName.trim() || defaultFolderName,
+                  });
+                  setShowLTDialog(false);
+                }}
+                className="flex-1 py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-semibold rounded text-xs transition-all shadow-lg flex items-center justify-center space-x-1 disabled:opacity-50"
+              >
+                <span>{isExtracting ? 'Extracting...' : 'Extract LT'}</span>
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="w-[1px] h-5 bg-white/15 mx-0.5" />
 

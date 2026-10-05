@@ -47,9 +47,10 @@ interface CanvasAreaProps {
   onStartRotate: (e: React.PointerEvent) => void;
   isHovering: boolean;
   cursorPos: { x: number; y: number } | null;
-  onPointerDown: (e: React.PointerEvent<HTMLElement>) => void;
-  onPointerMove: (e: React.PointerEvent<HTMLElement>) => void;
+  onPointerDown: (e: React.PointerEvent<HTMLElement>, coalesced?: PointerEvent[]) => void;
+  onPointerMove: (e: React.PointerEvent<HTMLElement>, coalesced?: PointerEvent[], predicted?: PointerEvent[]) => void;
   onPointerUp: (e: React.PointerEvent<HTMLElement>) => void;
+  predictedCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   onPointerEnter: () => void;
   onPointerLeave: () => void;
   layers: LayerItem[];
@@ -109,6 +110,32 @@ interface CanvasAreaProps {
   onSelectCelLayer?: (layerId: string) => void;
 }
 
+function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
+  const native = e.nativeEvent;
+  if (native && typeof native.getCoalescedEvents === 'function') {
+    try {
+      const coalesced = native.getCoalescedEvents();
+      if (coalesced && coalesced.length > 0) {
+        return Array.from(coalesced);
+      }
+    } catch {}
+  }
+  return [native];
+}
+
+function extractPredictedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
+  const native = e.nativeEvent;
+  if (native && typeof native.getPredictedEvents === 'function') {
+    try {
+      const predicted = native.getPredictedEvents();
+      if (predicted && predicted.length > 0) {
+        return Array.from(predicted);
+      }
+    } catch {}
+  }
+  return [];
+}
+
 export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   viewportRef,
   dimensions,
@@ -147,6 +174,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   hasOpenDocument = true,
   draftCanvasRef,
   strokeCanvasRef,
+  predictedCanvasRef,
   peers = [],
   activePings = [],
   remoteDraftCanvasesRef,
@@ -188,6 +216,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 }) => {
 
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
+  const localPredictedCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const effectivePredictedCanvasRef = predictedCanvasRef || localPredictedCanvasRef;
 
   // Resolve tip image and extract vector outline silhouette
   const activeTipImage = resolveBrushTipImage(brushSettings);
@@ -618,7 +648,24 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       }
       e.preventDefault();
     }
-    onPointerDown(e);
+    const coalesced = extractCoalescedEvents(e);
+    (e as any).coalescedEvents = coalesced;
+    if (e.nativeEvent) {
+      (e.nativeEvent as any).coalescedEvents = coalesced;
+    }
+    onPointerDown(e, coalesced);
+  };
+
+  const handleCanvasPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    const coalesced = extractCoalescedEvents(e);
+    const predicted = extractPredictedEvents(e);
+    (e as any).coalescedEvents = coalesced;
+    (e as any).predictedEvents = predicted;
+    if (e.nativeEvent) {
+      (e.nativeEvent as any).coalescedEvents = coalesced;
+      (e.nativeEvent as any).predictedEvents = predicted;
+    }
+    onPointerMove(e, coalesced, predicted);
   };
 
   // Determine cursor based on active mode
@@ -858,7 +905,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         <div
           ref={interactionRef}
           onPointerDown={handleCanvasPointerDown}
-          onPointerMove={onPointerMove}
+          onPointerMove={handleCanvasPointerMove}
           onPointerUp={onPointerUp}
           onPointerEnter={onPointerEnter}
           onPointerLeave={onPointerLeave}
@@ -873,6 +920,18 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       <canvas
         ref={effectiveDraftCanvasRef}
         className="absolute inset-0 pointer-events-none z-25"
+        style={{
+          width: '100%',
+          height: '100%',
+          opacity: brushSettings.opacity ?? 1.0,
+          display: 'block',
+        }}
+      />
+
+      {/* Temporary Stroke Head Prediction Canvas (cleared on actual hardware events) */}
+      <canvas
+        ref={effectivePredictedCanvasRef}
+        className="absolute inset-0 pointer-events-none z-26 predicted-overlay-canvas"
         style={{
           width: '100%',
           height: '100%',

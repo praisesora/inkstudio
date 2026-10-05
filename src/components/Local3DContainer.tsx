@@ -6,7 +6,7 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { LayerItem } from '../types/editor';
+import { LayerItem, LTConversionSettings } from '../types/editor';
 import { PerspectiveRuler } from '../types/perspective';
 import { calculatePerspectiveFromCamera } from '../utils/perspectiveMath';
 import { bake3DToRasterLayer, bake3DToLineAndTone, disposeThreeResources } from '../services/bake3DService';
@@ -968,7 +968,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   }, []);
 
   // 3D LT Lineart & Screentone Extraction (3D-to-2D Line Extraction)
-  const handleExtractLineAndTone = async () => {
+  const handleExtractLineAndTone = async (settings?: LTConversionSettings) => {
     if (!sceneRef.current || !cameraRef.current || !modelRootRef.current || isBaking) return;
     setIsBaking(true);
     setShowLTModal(false);
@@ -978,20 +978,31 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       if (gridHelperRef.current) gridHelperRef.current.visible = false;
       if (ikHandlesContainerRef.current) ikHandlesContainerRef.current.visible = false;
 
+      const effectiveLineWidth = settings?.lineWidth ?? 1;
+      const effectiveThreshold = settings?.lineThreshold ?? ltLineThreshold;
+      const effectiveToneCount = settings?.toneCount ?? ltToneBands;
+      const modelDisplayName = loadedFileName
+        ? loadedFileName.replace(/\.[^/.]+$/, '')
+        : isMannequinActive
+        ? 'Mannequin'
+        : '3D Model';
+      const targetFolderName = settings?.folderName?.trim() || `3D Extraction [${modelDisplayName}]`;
+
       await bake3DToLineAndTone({
         scene: sceneRef.current,
         camera: cameraRef.current,
         dimensions,
         activeRenderer: rendererRef.current,
-        baseLayerName: loadedFileName ? loadedFileName.replace(/\.[^/.]+$/, '') : '3D Model',
-        lineThreshold: ltLineThreshold,
-        toneBands: ltToneBands,
-        toneFrequencies: [55, 60],
-        toneAngles: [45, 60],
-        toneDensities: [0.45, 0.2],
+        modelName: modelDisplayName,
+        targetFolderName,
+        lineWidth: effectiveLineWidth,
+        lineThreshold: effectiveThreshold,
+        toneCount: effectiveToneCount,
+        antiAliasing: true,
         disposeOnComplete: true,
         onInsertLayers: (layers, canvases) => {
-          for (let i = 0; i < layers.length; i++) {
+          // Insert in reverse order so folder layer ends up at top in layer list
+          for (let i = layers.length - 1; i >= 0; i--) {
             onInsertRasterLayer(layers[i], canvases[i]);
           }
         },
@@ -1133,6 +1144,9 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
               onDirectDrag={(mode, dx, dy) => applyTransformDelta(mode, dx, dy)}
               onSnapToGround={handleSnapToGround}
               onResetModelTransform={handleResetModelTransform}
+              onExtractLineAndTone={handleExtractLineAndTone}
+              isExtracting={isBaking}
+              modelName={loadedFileName || (isMannequinActive ? 'Mannequin' : '3D Model')}
             />
 
             {/* Quick Turn Buttons */}
@@ -1611,7 +1625,14 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
 
                   <button
                     type="button"
-                    onClick={handleExtractLineAndTone}
+                    onClick={() =>
+                      handleExtractLineAndTone({
+                        lineWidth: 1,
+                        lineThreshold: ltLineThreshold,
+                        toneCount: ltToneBands,
+                        folderName: '',
+                      })
+                    }
                     disabled={isBaking}
                     className="w-full py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-medium rounded text-xs transition-colors shadow-lg flex items-center justify-center space-x-1.5"
                   >

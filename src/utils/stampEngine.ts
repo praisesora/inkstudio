@@ -1,4 +1,4 @@
-import { Point, CspSpraySettings, CspTaperSettings, CspSubTip } from '../types/editor';
+import { Point, CspSpraySettings, CspTaperSettings, CspSubTip, BrushDynamics } from '../types/editor';
 import {
   PaintReservoir,
   LayerPixelSampler,
@@ -55,6 +55,134 @@ export interface TexturedBrushOptions {
   strokeIndex?: number;
   totalLength?: number;
   currentStrokeDist?: number;
+  dynamics?: BrushDynamics;
+  secondaryColor?: string;
+}
+
+// -------------------------------------------------------------
+// Color Dynamics & HSV Jitter Utilities
+// -------------------------------------------------------------
+
+/**
+ * Fast RGB (normalized [0, 1]) to HSV [h: 0..360, s: 0..1, v: 0..1].
+ */
+export function rgbToHsv(r: number, g: number, b: number): [number, number, number] {
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const d = max - min;
+  let h = 0;
+  const s = max === 0 ? 0 : d / max;
+  const v = max;
+
+  if (max !== min) {
+    if (max === r) {
+      h = (g - b) / d + (g < b ? 6 : 0);
+    } else if (max === g) {
+      h = (b - r) / d + 2;
+    } else {
+      h = (r - g) / d + 4;
+    }
+    h *= 60;
+  }
+  return [h, s, v];
+}
+
+/**
+ * Fast HSV [h: 0..360, s: 0..1, v: 0..1] to RGB [0, 1].
+ */
+export function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
+  const c = v * s;
+  const hp = (((h % 360) + 360) % 360) / 60;
+  const x = c * (1 - Math.abs((hp % 2) - 1));
+  let r1 = 0;
+  let g1 = 0;
+  let b1 = 0;
+
+  if (hp >= 0 && hp < 1) {
+    r1 = c; g1 = x; b1 = 0;
+  } else if (hp >= 1 && hp < 2) {
+    r1 = x; g1 = c; b1 = 0;
+  } else if (hp >= 2 && hp < 3) {
+    r1 = 0; g1 = c; b1 = x;
+  } else if (hp >= 3 && hp < 4) {
+    r1 = 0; g1 = x; b1 = c;
+  } else if (hp >= 4 && hp < 5) {
+    r1 = x; g1 = 0; b1 = c;
+  } else if (hp >= 5 && hp < 6) {
+    r1 = c; g1 = 0; b1 = x;
+  }
+
+  const m = v - c;
+  return [
+    Math.max(0, Math.min(1, r1 + m)),
+    Math.max(0, Math.min(1, g1 + m)),
+    Math.max(0, Math.min(1, b1 + m)),
+  ];
+}
+
+/**
+ * Applies foreground/background mixing and hue/saturation/brightness jitter.
+ */
+export function applyColorDynamics(
+  primaryRgb: { r: number; g: number; b: number }, // [0, 1]
+  secondaryRgb: { r: number; g: number; b: number }, // [0, 1]
+  dynamics?: BrushDynamics
+): { r: number; g: number; b: number; hex: string } {
+  if (!dynamics || !dynamics.colorJitterEnabled) {
+    const ir = Math.round(primaryRgb.r * 255);
+    const ig = Math.round(primaryRgb.g * 255);
+    const ib = Math.round(primaryRgb.b * 255);
+    return {
+      r: primaryRgb.r,
+      g: primaryRgb.g,
+      b: primaryRgb.b,
+      hex: rgbToHex(ir, ig, ib),
+    };
+  }
+
+  let r = primaryRgb.r;
+  let g = primaryRgb.g;
+  let b = primaryRgb.b;
+
+  // 1. Foreground/Background jitter
+  if (dynamics.foregroundBackgroundJitter > 0) {
+    const mix = Math.random() * dynamics.foregroundBackgroundJitter;
+    r = r + (secondaryRgb.r - r) * mix;
+    g = g + (secondaryRgb.g - g) * mix;
+    b = b + (secondaryRgb.b - b) * mix;
+  }
+
+  // 2. HSB Jitter
+  if (dynamics.hueJitter > 0 || dynamics.saturationJitter > 0 || dynamics.brightnessJitter > 0) {
+    let [h, s, v] = rgbToHsv(r, g, b);
+
+    if (dynamics.hueJitter > 0) {
+      h = (h + (Math.random() - 0.5) * dynamics.hueJitter * 360 + 360) % 360;
+    }
+    if (dynamics.saturationJitter > 0) {
+      s = Math.max(0, Math.min(1, s * (1.0 + (Math.random() * 2 - 1) * dynamics.saturationJitter)));
+    }
+    if (dynamics.brightnessJitter > 0) {
+      v = Math.max(0, Math.min(1, v * (1.0 + (Math.random() * 2 - 1) * dynamics.brightnessJitter)));
+    }
+
+    [r, g, b] = hsvToRgb(h, s, v);
+  }
+
+  r = Math.max(0, Math.min(1, r));
+  g = Math.max(0, Math.min(1, g));
+  b = Math.max(0, Math.min(1, b));
+
+  const ir = Math.round(r * 255);
+  const ig = Math.round(g * 255);
+  const ib = Math.round(b * 255);
+
+  return {
+    r,
+    g,
+    b,
+    hex: rgbToHex(ir, ig, ib),
+  };
 }
 
 // -------------------------------------------------------------
@@ -410,45 +538,105 @@ export function drawTexturedDot(
     angleRad += (point.twist * Math.PI) / 180;
   }
 
-  if (options.spray?.enabled) {
-    const pCount = options.spray.density;
-    const pSize = Math.max(1, options.spray.size);
-    const radius = effWidth / 2;
-    for (let i = 0; i < pCount; i++) {
-      const u1 = Math.random();
-      const u2 = Math.random();
-      const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
-      const th = Math.PI * 2 * Math.random();
+  const dynamics = options.dynamics;
+  const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
+  const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
+  const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
+  const roundnessJitter = Math.max(0, Math.min(1, dynamics?.roundnessJitter ?? 0));
+  const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
+  const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
+  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+  const primRgb = colorJitterEnabled ? parseColorToRgb(effectiveColor) : null;
+  const secRgb = colorJitterEnabled ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
+
+  for (let k = 0; k < dabCount; k++) {
+    let curDabW = effWidth;
+    if (sizeJitter > 0) {
+      curDabW *= Math.max(0.01, 1.0 - Math.random() * sizeJitter);
+    }
+    curDabW = Math.max(0.1, curDabW);
+
+    let curDabThickness = thickness;
+    if (roundnessJitter > 0) {
+      curDabThickness *= Math.max(0.05, 1.0 - Math.random() * roundnessJitter);
+    }
+
+    let curDabAngle = angleRad;
+    if (angleJitter > 0) {
+      curDabAngle += (Math.random() - 0.5) * Math.PI * 2 * angleJitter;
+    }
+
+    let curDabX = point.x;
+    let curDabY = point.y;
+    if (scatter > 0) {
+      const th = Math.random() * Math.PI * 2;
+      const sDist = Math.random() * effWidth * scatter;
+      curDabX += Math.cos(th) * sDist;
+      curDabY += Math.sin(th) * sDist;
+    }
+
+    let curDabAlpha = effectiveFlow;
+    if (flowJitter > 0) {
+      curDabAlpha *= Math.max(0.005, 1.0 - Math.random() * flowJitter);
+    }
+
+    let curMaster = master;
+    if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+      const cd = applyColorDynamics(
+        { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
+        { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
+        dynamics
+      );
+      curMaster = getTintedTipMaster(activeTip, cd.hex, isColorTip);
+    }
+
+    let dotRenderW = curDabW;
+    let dotRenderH = curDabW * aspect * curDabThickness;
+    if (tiltMagnitude > 0.01) {
+      dotRenderW = curDabW * (1.0 + tiltMagnitude * 1.8);
+      dotRenderH = (curDabW * aspect * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
+    }
+
+    if (options.spray?.enabled) {
+      const pCount = options.spray.density;
+      const pSize = Math.max(1, options.spray.size);
+      const radius = curDabW / 2;
+      for (let i = 0; i < pCount; i++) {
+        const u1 = Math.random();
+        const u2 = Math.random();
+        const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
+        const th = Math.PI * 2 * Math.random();
+        drawSingleStamp(
+          ctx,
+          curMaster,
+          curDabX + r * Math.cos(th),
+          curDabY + r * Math.sin(th),
+          pSize,
+          pSize * aspect * curDabThickness,
+          curDabAngle,
+          curDabAlpha,
+          isEraser,
+          isBgEraser,
+          options.alphaLocked,
+          options.isTransparentInk
+        );
+      }
+    } else {
       drawSingleStamp(
         ctx,
-        master,
-        point.x + r * Math.cos(th),
-        point.y + r * Math.sin(th),
-        pSize,
-        pSize * aspect * thickness,
-        angleRad,
-        effectiveFlow,
+        curMaster,
+        curDabX,
+        curDabY,
+        dotRenderW,
+        dotRenderH,
+        curDabAngle,
+        curDabAlpha,
         isEraser,
         isBgEraser,
         options.alphaLocked,
         options.isTransparentInk
       );
     }
-  } else {
-    drawSingleStamp(
-      ctx,
-      master,
-      point.x,
-      point.y,
-      w,
-      h,
-      angleRad,
-      effectiveFlow,
-      isEraser,
-      isBgEraser,
-      options.alphaLocked,
-      options.isTransparentInk
-    );
   }
 }
 
@@ -712,61 +900,137 @@ export function drawTexturedCubicBezierSegment(
     const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
     const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
 
-    let stampW = curWidth;
-    let stampH = curWidth * aspect * thickness;
     let dabAngle = stampAngle;
-
-    if (tiltMagnitude > 0.01) {
-      const tiltAzimuth = Math.atan2(tiltY, tiltX);
-      stampW = curWidth * (1.0 + tiltMagnitude * 1.8);
-      stampH = (curWidth * aspect * thickness) / (1.0 + tiltMagnitude * 0.5);
-      if (tiltMagnitude > 0.05) {
-        dabAngle = tiltAzimuth;
-      }
+    if (tiltMagnitude > 0.05) {
+      dabAngle = Math.atan2(tiltY, tiltX);
     }
     if (pt.twist) {
       dabAngle += (pt.twist * Math.PI) / 180;
     }
 
-    if (options.spray?.enabled) {
-      const pCount = options.spray.density;
-      const pSize = Math.max(1, options.spray.size);
-      const radius = curWidth / 2;
-      for (let sp = 0; sp < pCount; sp++) {
-        const u1 = Math.random();
-        const u2 = Math.random();
-        const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
-        const th = Math.PI * 2 * Math.random();
+    const speed = Math.hypot(pt.dx, pt.dy);
+    let tx = 0;
+    let ty = 0;
+    let nx = 0;
+    let ny = 0;
+    if (speed > 0.001) {
+      tx = pt.dx / speed;
+      ty = pt.dy / speed;
+      nx = -ty;
+      ny = tx;
+    } else {
+      nx = 0;
+      ny = 1;
+      tx = 1;
+      ty = 0;
+    }
+
+    const dynamics = options.dynamics;
+    const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
+    const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
+    const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
+    const roundnessJitter = Math.max(0, Math.min(1, dynamics?.roundnessJitter ?? 0));
+    const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
+    const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
+    const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
+    const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+    const primRgb = colorJitterEnabled ? parseColorToRgb(dabColor) : null;
+    const secRgb = colorJitterEnabled ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
+
+    for (let k = 0; k < dabCount; k++) {
+      let curDabW = curWidth;
+      if (sizeJitter > 0) {
+        curDabW *= Math.max(0.01, 1.0 - Math.random() * sizeJitter);
+      }
+      curDabW = Math.max(0.1, curDabW);
+
+      let curDabThickness = thickness;
+      if (roundnessJitter > 0) {
+        curDabThickness *= Math.max(0.05, 1.0 - Math.random() * roundnessJitter);
+      }
+
+      let curDabAngle = dabAngle;
+      if (angleJitter > 0) {
+        curDabAngle += (Math.random() - 0.5) * Math.PI * 2 * angleJitter;
+      }
+
+      let curDabX = pt.x;
+      let curDabY = pt.y;
+      if (scatter > 0) {
+        const perpDist = (Math.random() * 2 - 1) * curWidth * scatter;
+        let sOffX = nx * perpDist;
+        let sOffY = ny * perpDist;
+        if (scatterBothAxes) {
+          const tangDist = (Math.random() * 2 - 1) * curWidth * scatter;
+          sOffX += tx * tangDist;
+          sOffY += ty * tangDist;
+        }
+        curDabX += sOffX;
+        curDabY += sOffY;
+      }
+
+      let curDabAlpha = dabAlpha;
+      if (flowJitter > 0) {
+        curDabAlpha *= Math.max(0.005, 1.0 - Math.random() * flowJitter);
+      }
+
+      let curMaster = master;
+      if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+        const cd = applyColorDynamics(
+          { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
+          { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
+          dynamics
+        );
+        curMaster = getTintedTipMaster(activeTip, cd.hex, isColorTip);
+      }
+
+      let finalW = curDabW;
+      let finalH = curDabW * aspect * curDabThickness;
+      if (tiltMagnitude > 0.01) {
+        finalW = curDabW * (1.0 + tiltMagnitude * 1.8);
+        finalH = (curDabW * aspect * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
+      }
+
+      if (options.spray?.enabled) {
+        const pCount = options.spray.density;
+        const pSize = Math.max(1, options.spray.size);
+        const radius = curDabW / 2;
+        for (let sp = 0; sp < pCount; sp++) {
+          const u1 = Math.random();
+          const u2 = Math.random();
+          const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
+          const th = Math.PI * 2 * Math.random();
+          drawSingleStamp(
+            ctx,
+            curMaster,
+            curDabX + r * Math.cos(th),
+            curDabY + r * Math.sin(th),
+            pSize,
+            pSize * aspect * curDabThickness,
+            curDabAngle,
+            curDabAlpha,
+            isEraser,
+            isBgEraser,
+            options.alphaLocked,
+            options.isTransparentInk
+          );
+        }
+      } else {
         drawSingleStamp(
           ctx,
-          master,
-          pt.x + r * Math.cos(th),
-          pt.y + r * Math.sin(th),
-          pSize,
-          pSize * aspect * thickness,
-          dabAngle,
-          dabAlpha,
+          curMaster,
+          curDabX,
+          curDabY,
+          finalW,
+          finalH,
+          curDabAngle,
+          curDabAlpha,
           isEraser,
           isBgEraser,
           options.alphaLocked,
           options.isTransparentInk
         );
       }
-    } else {
-      drawSingleStamp(
-        ctx,
-        master,
-        pt.x,
-        pt.y,
-        stampW,
-        stampH,
-        dabAngle,
-        dabAlpha,
-        isEraser,
-        isBgEraser,
-        options.alphaLocked,
-        options.isTransparentInk
-      );
     }
 
     const requiredStep = Math.max(0.2, curWidth * spacingRatio);
@@ -1000,6 +1264,8 @@ export interface RadialMixingOptions {
   reservoir?: PaintReservoir;
   alphaLocked?: boolean;
   isTransparentInk?: boolean;
+  dynamics?: BrushDynamics;
+  secondaryColor?: string;
 }
 
 /**
@@ -1069,12 +1335,10 @@ export function drawRadialDot(
   const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
 
   let dotW = w;
-  let dotH = w;
   let dotAngle = 0;
   if (tiltMagnitude > 0.01) {
     const tiltAzimuth = Math.atan2(tiltY, tiltX);
     dotW = w * (1.0 + tiltMagnitude * 1.8);
-    dotH = w / (1.0 + tiltMagnitude * 0.5);
     if (tiltMagnitude > 0.05) {
       dotAngle = tiltAzimuth;
     }
@@ -1084,20 +1348,81 @@ export function drawRadialDot(
   }
 
   const master = getRadialDabMaster(hardness, dabColor, isEraser && !isBgEraser);
-  drawSingleStamp(
-    ctx,
-    master,
-    point.x,
-    point.y,
-    dotW,
-    dotH,
-    dotAngle,
-    dabFlow,
-    isEraser,
-    isBgEraser,
-    mixingOptions?.alphaLocked,
-    mixingOptions?.isTransparentInk
-  );
+
+  const dynamics = mixingOptions?.dynamics;
+  const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
+  const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
+  const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
+  const roundnessJitter = Math.max(0, Math.min(1, dynamics?.roundnessJitter ?? 0));
+  const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
+  const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
+  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+  const primRgb = colorJitterEnabled ? parseColorToRgb(dabColor) : null;
+  const secRgb = colorJitterEnabled ? parseColorToRgb(mixingOptions?.secondaryColor || '#ffffff') : null;
+
+  for (let k = 0; k < dabCount; k++) {
+    let curDabW = dotW;
+    if (sizeJitter > 0) {
+      curDabW *= Math.max(0.01, 1.0 - Math.random() * sizeJitter);
+    }
+    curDabW = Math.max(0.1, curDabW);
+
+    let curDabThickness = 1.0;
+    if (roundnessJitter > 0) {
+      curDabThickness *= Math.max(0.05, 1.0 - Math.random() * roundnessJitter);
+    }
+
+    let curDabRot = dotAngle;
+    if (angleJitter > 0) {
+      curDabRot += (Math.random() - 0.5) * Math.PI * 2 * angleJitter;
+    }
+
+    let curDabX = point.x;
+    let curDabY = point.y;
+    if (scatter > 0) {
+      const th = Math.random() * Math.PI * 2;
+      const sDist = Math.random() * w * scatter;
+      curDabX += Math.cos(th) * sDist;
+      curDabY += Math.sin(th) * sDist;
+    }
+
+    let curDabFlow = dabFlow;
+    if (flowJitter > 0) {
+      curDabFlow *= Math.max(0.005, 1.0 - Math.random() * flowJitter);
+    }
+
+    let curMaster = master;
+    if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+      const cd = applyColorDynamics(
+        { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
+        { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
+        dynamics
+      );
+      curMaster = getRadialDabMaster(hardness, cd.hex, isEraser && !isBgEraser);
+    }
+
+    let finalW = curDabW;
+    let finalH = curDabW * curDabThickness;
+    if (tiltMagnitude > 0.01) {
+      finalW = curDabW * (1.0 + tiltMagnitude * 1.8);
+      finalH = (curDabW * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
+    }
+
+    drawSingleStamp(
+      ctx,
+      curMaster,
+      curDabX,
+      curDabY,
+      finalW,
+      finalH,
+      curDabRot,
+      curDabFlow,
+      isEraser,
+      isBgEraser,
+      mixingOptions?.alphaLocked,
+      mixingOptions?.isTransparentInk
+    );
+  }
 }
 
 /**
@@ -1137,10 +1462,21 @@ export function drawRadialCubicBezierSegment(
   const spacingRatio = Math.max(0.015, Math.min(1.0, spacing));
   let currentDist = remainderDist > 0 ? remainderDist : 0;
 
+  const dynamics = mixingOptions?.dynamics;
+  const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
+  const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
+  const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
+  const roundnessJitter = Math.max(0, Math.min(1, dynamics?.roundnessJitter ?? 0));
+  const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
+  const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
+  const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
+  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+  const primRgb = colorJitterEnabled ? parseColorToRgb(color) : null;
+  const secRgb = colorJitterEnabled ? parseColorToRgb(mixingOptions?.secondaryColor || '#ffffff') : null;
+
   while (currentDist <= totalCurveLength) {
     const pt = getCubicPointAtArcLength(p0, c1, c2, p3, currentDist, arcTable);
     const curWidth = Math.max(0.4, pt.width);
-    const curHeight = curWidth * thickness;
     const requiredStep = Math.max(0.4, curWidth * spacingRatio);
 
     const tiltX = pt.tiltX ?? 0;
@@ -1148,14 +1484,10 @@ export function drawRadialCubicBezierSegment(
     const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
     const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
 
-    let dabW = curWidth;
-    let dabH = curHeight;
     let dabRot = angleRad;
 
     if (tiltMagnitude > 0.01) {
       const tiltAzimuth = Math.atan2(tiltY, tiltX);
-      dabW = curWidth * (1.0 + tiltMagnitude * 1.8);
-      dabH = curHeight / (1.0 + tiltMagnitude * 0.5);
       if (tiltMagnitude > 0.05) {
         dabRot = tiltAzimuth;
       }
@@ -1206,21 +1538,93 @@ export function drawRadialCubicBezierSegment(
       }
     }
 
-    if (dabMaster) {
-      drawSingleStamp(
-        ctx,
-        dabMaster,
-        pt.x,
-        pt.y,
-        dabW,
-        dabH,
-        dabRot,
-        dabFlow,
-        isEraser,
-        isBgEraser,
-        mixingOptions?.alphaLocked,
-        mixingOptions?.isTransparentInk
-      );
+    const speed = Math.hypot(pt.dx, pt.dy);
+    let tx = 0;
+    let ty = 0;
+    let nx = 0;
+    let ny = 0;
+    if (speed > 0.001) {
+      tx = pt.dx / speed;
+      ty = pt.dy / speed;
+      nx = -ty;
+      ny = tx;
+    } else {
+      nx = 0;
+      ny = 1;
+      tx = 1;
+      ty = 0;
+    }
+
+    for (let k = 0; k < dabCount; k++) {
+      let curDabW = curWidth;
+      if (sizeJitter > 0) {
+        curDabW *= Math.max(0.01, 1.0 - Math.random() * sizeJitter);
+      }
+      curDabW = Math.max(0.1, curDabW);
+
+      let curDabThickness = thickness;
+      if (roundnessJitter > 0) {
+        curDabThickness *= Math.max(0.05, 1.0 - Math.random() * roundnessJitter);
+      }
+
+      let curDabRot = dabRot;
+      if (angleJitter > 0) {
+        curDabRot += (Math.random() - 0.5) * Math.PI * 2 * angleJitter;
+      }
+
+      let curDabX = pt.x;
+      let curDabY = pt.y;
+      if (scatter > 0) {
+        const perpDist = (Math.random() * 2 - 1) * curWidth * scatter;
+        let sOffX = nx * perpDist;
+        let sOffY = ny * perpDist;
+        if (scatterBothAxes) {
+          const tangDist = (Math.random() * 2 - 1) * curWidth * scatter;
+          sOffX += tx * tangDist;
+          sOffY += ty * tangDist;
+        }
+        curDabX += sOffX;
+        curDabY += sOffY;
+      }
+
+      let curDabFlow = dabFlow;
+      if (flowJitter > 0) {
+        curDabFlow *= Math.max(0.005, 1.0 - Math.random() * flowJitter);
+      }
+
+      let curMaster = dabMaster;
+      if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+        const cd = applyColorDynamics(
+          { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
+          { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
+          dynamics
+        );
+        curMaster = getRadialDabMaster(hardness, cd.hex, isEraser && !isBgEraser);
+      }
+
+      let finalW = curDabW;
+      let finalH = curDabW * curDabThickness;
+      if (tiltMagnitude > 0.01) {
+        finalW = curDabW * (1.0 + tiltMagnitude * 1.8);
+        finalH = (curDabW * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
+      }
+
+      if (curMaster) {
+        drawSingleStamp(
+          ctx,
+          curMaster,
+          curDabX,
+          curDabY,
+          finalW,
+          finalH,
+          curDabRot,
+          curDabFlow,
+          isEraser,
+          isBgEraser,
+          mixingOptions?.alphaLocked,
+          mixingOptions?.isTransparentInk
+        );
+      }
     }
 
     currentDist += requiredStep;

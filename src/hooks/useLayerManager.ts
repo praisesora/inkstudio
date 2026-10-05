@@ -1441,7 +1441,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       layerName: string = 'Pasted Layer',
       blendMode: BlendMode = 'normal',
       opacity: number = 1,
-      customId?: string
+      customId?: string,
+      layerOverrides?: Partial<LayerItem>
     ) => {
       const newId = customId || `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
@@ -1457,19 +1458,20 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       setLayers((prev) => {
         const activeIdx = prev.findIndex((l) => l.id === activeLayerId);
         const activeItem = prev[activeIdx];
-        const parentId = activeItem?.type === 'folder' ? activeItem.id : (activeItem?.parentId || null);
+        const defaultParentId = activeItem?.type === 'folder' ? activeItem.id : (activeItem?.parentId || null);
 
         const newLayer: LayerItem = {
           id: newId,
           name: layerName,
-          type: 'raster',
+          type: layerOverrides?.type || 'raster',
           visible: true,
           opacity,
           blendMode,
           locked: false,
           collapsed: false,
-          parentId,
+          parentId: layerOverrides?.parentId !== undefined ? layerOverrides.parentId : defaultParentId,
           thumbnailUrl: thumb,
+          ...layerOverrides,
         };
 
         const insertIdx = activeIdx >= 0 ? activeIdx : 0;

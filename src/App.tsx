@@ -499,6 +499,7 @@ export function App() {
       size: effective.size ?? 3.5,
       minSizeFactor: effective.minSizeFactor ?? 0.25,
       color: '#000000',
+      secondaryColor: '#ffffff',
       opacity: effective.opacity ?? 1.0,
       flow: effective.flow ?? 0.74,
       spacing: effective.spacing ?? 0.08,
@@ -1424,11 +1425,12 @@ export function App() {
     (color: string, commit = true) => {
       const effective = enforceColorMode(color, colorMode);
       setSecondaryColor(effective);
+      updateBrushSettings({ secondaryColor: effective });
       if (commit) {
         addRecentColor(effective);
       }
     },
-    [addRecentColor, colorMode]
+    [addRecentColor, colorMode, updateBrushSettings]
   );
 
   const handleSwapColors = useCallback(() => {
@@ -1436,7 +1438,7 @@ export function App() {
     setPrimaryColor((prevPrim) => {
       setSecondaryColor(prevPrim);
       const effective = enforceColorMode(secondaryColor, colorMode);
-      updateBrushSettings({ color: effective, isTransparentInk: false });
+      updateBrushSettings({ color: effective, secondaryColor: prevPrim, isTransparentInk: false });
       addRecentColor(effective);
       return effective;
     });
@@ -2494,10 +2496,14 @@ export function App() {
 
   const handleInsert3DRasterLayer = useCallback(
     (layer: LayerItem, canvas: HTMLCanvasElement) => {
-      pasteLayerFromCanvas(canvas, layer.name, layer.blendMode, layer.opacity, layer.id);
-      showToast(`Baked 3D scene into raster layer "${layer.name}".`);
+      if (layer.type === 'folder') {
+        addLayer('folder', layer.parentId, layer.name, layer.id);
+      } else {
+        pasteLayerFromCanvas(canvas, layer.name, layer.blendMode, layer.opacity, layer.id, layer);
+      }
+      showToast(`Added 3D layer "${layer.name}".`);
     },
-    [pasteLayerFromCanvas, showToast]
+    [addLayer, pasteLayerFromCanvas, showToast]
   );
 
   const handleFillScreentone = useCallback(() => {
