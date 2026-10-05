@@ -43,9 +43,10 @@ export function formatZoomPercent(zoom: number): string {
 
 interface UseCanvasNavigationProps {
   dimensions?: CanvasDimensions;
+  isWebtoonMode?: boolean;
 }
 
-export function useCanvasNavigation({ dimensions: _dimensions }: UseCanvasNavigationProps = {}) {
+export function useCanvasNavigation({ dimensions: _dimensions, isWebtoonMode = false }: UseCanvasNavigationProps = {}) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
 
   const [zoom, setZoomState] = useState<number>(1.0);
@@ -332,6 +333,14 @@ export function useCanvasNavigation({ dimensions: _dimensions }: UseCanvasNaviga
         delta *= 500; // Pages to pixels
       }
 
+      // In Webtoon mode, standard wheel scrolls canvas vertically
+      if (isWebtoonMode && !e.ctrlKey && !e.metaKey) {
+        const nextPanY = panRef.current.y - delta;
+        panRef.current = { x: panRef.current.x, y: nextPanY };
+        setPanState({ x: panRef.current.x, y: nextPanY });
+        return;
+      }
+
       // Smooth exponential zoom factor
       const zoomFactor = Math.exp(-delta * 0.0018);
       const currentZoom = zoomRef.current;
@@ -467,7 +476,7 @@ export function useCanvasNavigation({ dimensions: _dimensions }: UseCanvasNaviga
       const dy = e.clientY - panStartRef.current.clientY;
 
       const newPan = {
-        x: panStartRef.current.panX + dx,
+        x: isWebtoonMode ? panStartRef.current.panX : panStartRef.current.panX + dx,
         y: panStartRef.current.panY + dy,
       };
 

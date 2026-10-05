@@ -18,7 +18,16 @@ import {
   WandSettings,
   AdjustmentLayerData,
   FilterType,
+  BalloonSettings,
+  VectorEditSettings,
+  SpeechBalloon,
+  AnimationTimeline,
 } from './types/editor';
+import {
+  createDefaultAnimationTimeline,
+  setFrameCel,
+  removeFrameCel,
+} from './utils/animationEngine';
 import { applyLiquifyStep, createLiquifySelectionMask, DirtyRect } from './utils/liquifyEngine';
 import { PerspectiveRuler, ConstraintAxis } from './types/perspective';
 import { createDefaultPerspectiveRuler, applyWormsEyePreset } from './utils/perspectiveMath';
@@ -97,7 +106,23 @@ import {
   StrokeFinishMessage,
   MultiplayerMessage,
 } from './types/multiplayer';
-import { renderVectorStroke } from './utils/vectorEngine';
+import {
+  renderVectorStroke,
+  renderVectorLayer,
+  pinchVectorStroke,
+  modifyStrokeWidth,
+  simplifyVectorStroke,
+} from './utils/vectorEngine';
+import { renderMangaTextToCanvas } from './utils/mangaTextEngine';
+import { createDefaultSpeechBalloon, renderSpeechBalloon } from './utils/balloonEngine';
+import {
+  renderSaturatedLines,
+  renderStreamLines,
+  SaturatedLinesOptions,
+  StreamLinesOptions,
+} from './utils/mangaEffectsEngine';
+import { MangaEffectsModal } from './components/MangaEffectsModal';
+import { WebtoonExportModal } from './components/WebtoonExportModal';
 
 import {
   AppSettings,
@@ -113,6 +138,8 @@ import {
   Save,
   Download,
   Trash2,
+  Film,
+  Layers,
   Undo2,
   Redo2,
   ZoomIn,
@@ -142,6 +169,11 @@ import {
   Feather,
   BoxSelect,
   X,
+  Smartphone,
+  Archive,
+  Sparkles,
+  MessageSquare,
+  Spline,
 } from 'lucide-react';
 import { parseSutFile } from './utils/sutParser';
 import {
@@ -236,6 +268,35 @@ export function App() {
     fillColor: '#ffffff',
   });
 
+  // Speech Balloon tool settings & active placement session
+  const [balloonSettings, setBalloonSettings] = useState<BalloonSettings>({
+    shape: 'ellipse',
+    fillColor: '#ffffff',
+    strokeColor: '#000000',
+    strokeWidth: 3,
+    text: '',
+    fontFamily: "'Neucha', 'Anime Ace', 'Comic Sans MS', sans-serif",
+    fontSize: 22,
+    vertical: false,
+  });
+  const [activeBalloon, setActiveBalloon] = useState<SpeechBalloon | null>(null);
+
+  // Vector "Correct Line" tool settings
+  const [vectorEditSettings, setVectorEditSettings] = useState<VectorEditSettings>({
+    mode: 'pinch',
+    radius: 35,
+    pinchStrength: 1.0,
+    widthFactor: 1.5,
+    simplifyTolerance: 2.0,
+  });
+
+  // Webtoon Studio Mode state
+  const [isWebtoonMode, setIsWebtoonMode] = useState<boolean>(false);
+  const [isWebtoonExportModalOpen, setIsWebtoonExportModalOpen] = useState<boolean>(false);
+
+  // Manga Effect Lines Modal state
+  const [isMangaEffectsModalOpen, setIsMangaEffectsModalOpen] = useState<boolean>(false);
+
   // Liquify tool settings
   const [liquifySettings, setLiquifySettings] = useState<LiquifySettings>(() => {
     try {
@@ -269,6 +330,10 @@ export function App() {
   const prevLiquifyPointRef = useRef<{ x: number; y: number } | null>(null);
   const liquifyBeforeImageDataRef = useRef<ImageData | null>(null);
   const liquifyInitialImageDataRef = useRef<ImageData | null>(null);
+
+  const isVectorEditingRef = useRef<boolean>(false);
+  const lastVectorEditPtRef = useRef<{ x: number; y: number } | null>(null);
+  const vectorEditBeforeStrokesRef = useRef<any[] | null>(null);
   const liquifyDirtyRectRef = useRef<DirtyRect | null>(null);
   const liquifyRafIdRef = useRef<number | null>(null);
   const liquifyLastPointerPosRef = useRef<{ pt: { x: number; y: number }; pressure: number } | null>(null);
@@ -514,6 +579,65 @@ export function App() {
   // Active edit target for painting/erasing ('layer' content vs 'mask')
   const [activeEditTarget, setActiveEditTarget] = useState<'layer' | 'mask'>('layer');
 
+  // 2D Frame-by-Frame Animation Timeline State
+  const [animationTimeline, setAnimationTimeline] = useState<AnimationTimeline | null>(null);
+
+  const activeDoc = documents.find((d) => d.id === activeDocumentId);
+  const activeAnimationTimeline = activeDoc?.animation !== undefined ? activeDoc.animation : animationTimeline;
+
+  const handleUpdateAnimationTimeline = useCallback(
+    (timeline: AnimationTimeline | null) => {
+      setAnimationTimeline(timeline);
+      if (activeDocumentId) {
+        setDocuments((docs) =>
+          docs.map((d) => (d.id === activeDocumentId ? { ...d, animation: timeline } : d))
+        );
+      }
+    },
+    [activeDocumentId]
+  );
+
+  const handleAddAnimationCel = useCallback(
+    (frameIndex: number) => {
+      const newLayerId = `layer-cel-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const newCelLayer: LayerItem = {
+        id: newLayerId,
+        name: `Cel Frame ${frameIndex + 1}`,
+        type: 'raster',
+        visible: true,
+        opacity: 1,
+        blendMode: 'normal',
+        locked: false,
+        collapsed: false,
+        parentId: null,
+      };
+
+      const canvas = document.createElement('canvas');
+      canvas.width = dimensions.width;
+      canvas.height = dimensions.height;
+      registerLayerCanvas(newLayerId, canvas);
+
+      setLayers((prev) => [newCelLayer, ...prev]);
+      setActiveLayerId(newLayerId);
+
+      const currentTl = activeAnimationTimeline || createDefaultAnimationTimeline(layers);
+      const updatedTl = setFrameCel(currentTl, frameIndex, newLayerId);
+      handleUpdateAnimationTimeline(updatedTl);
+      showToast(`Cel added for frame ${frameIndex + 1}`);
+    },
+    [activeAnimationTimeline, dimensions, handleUpdateAnimationTimeline, layers, registerLayerCanvas, setActiveLayerId, setLayers, showToast]
+  );
+
+  const handleDeleteAnimationCel = useCallback(
+    (frameIndex: number) => {
+      if (!activeAnimationTimeline) return;
+      const updatedTl = removeFrameCel(activeAnimationTimeline, frameIndex);
+      handleUpdateAnimationTimeline(updatedTl);
+      showToast(`Cel removed from frame ${frameIndex + 1}`);
+    },
+    [activeAnimationTimeline, handleUpdateAnimationTimeline, showToast]
+  );
+
   // Adjustment Layer Modal state
   const [adjustmentModalState, setAdjustmentModalState] = useState<{
     isOpen: boolean;
@@ -591,6 +715,7 @@ export function App() {
     resetRotation,
   } = useCanvasNavigation({
     dimensions,
+    isWebtoonMode,
   });
 
   // Remote multiplayer draft overlays and stroke states
@@ -2266,32 +2391,18 @@ export function App() {
       const c = get2DContext(target);
       if (!c) return;
       const s = textSession.settings;
-      const lines = s.text.split('\n');
-      const fontSize = s.fontSize;
-      const fontStyle = `${s.italic ? 'italic ' : ''}${s.bold ? 'bold ' : ''}${fontSize}px ${s.fontFamily}`;
-
-      c.save();
-      c.font = fontStyle;
-      c.textAlign = s.align;
-      c.textBaseline = 'middle';
-
-      const lineHeight = fontSize * 1.25;
-      const totalH = lines.length * lineHeight;
-      const startY = textSession.y - totalH / 2 + lineHeight / 2;
-
-      lines.forEach((line, i) => {
-        const lineY = startY + i * lineHeight;
-        if (s.outline && s.outlineWidth > 0) {
-          c.strokeStyle = s.outlineColor;
-          c.lineWidth = s.outlineWidth * 2;
-          c.lineJoin = 'round';
-          c.miterLimit = 2;
-          c.strokeText(line, textSession.x, lineY);
-        }
-        c.fillStyle = s.color;
-        c.fillText(line, textSession.x, lineY);
+      renderMangaTextToCanvas(c, s.text, textSession.x, textSession.y, {
+        fontSize: s.fontSize,
+        fontFamily: s.fontFamily,
+        writingMode: s.writingMode || 'horizontal-tb',
+        bold: s.bold,
+        italic: s.italic,
+        align: s.align,
+        color: s.color,
+        outline: s.outline,
+        outlineColor: s.outlineColor,
+        outlineWidth: s.outlineWidth,
       });
-      c.restore();
     };
 
     renderTextOn(canvas);
@@ -2313,6 +2424,73 @@ export function App() {
   const handleCancelText = useCallback(() => {
     setTextSession(null);
   }, []);
+
+  const handleConfirmBalloon = useCallback(() => {
+    if (!activeBalloon) return;
+    const canvas = getActiveCanvas();
+    if (!canvas) return;
+    const ctx = get2DContext(canvas);
+    if (!ctx) return;
+
+    const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+
+    const drawOn = (target: HTMLCanvasElement) => {
+      const c = get2DContext(target);
+      if (!c) return;
+      renderSpeechBalloon(c, activeBalloon);
+    };
+
+    drawOn(canvas);
+    if (sourceCanvas) drawOn(sourceCanvas);
+
+    const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    updateLayerThumbnail(activeLayerId, true);
+    pushHistoryStep(
+      'frame',
+      'Speech Balloon',
+      beforeImageData,
+      afterImageData,
+      activeLayerId
+    );
+
+    setActiveBalloon(null);
+  }, [activeBalloon, getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
+
+  const handleDeleteBalloon = useCallback(() => {
+    setActiveBalloon(null);
+  }, []);
+
+  const handleApplyMangaEffects = useCallback(
+    (type: 'saturated' | 'stream', options: SaturatedLinesOptions | StreamLinesOptions) => {
+      const canvas = getActiveCanvas();
+      if (!canvas) return;
+      const ctx = get2DContext(canvas);
+      if (!ctx) return;
+
+      const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+
+      const renderOn = (target: HTMLCanvasElement) => {
+        const c = get2DContext(target);
+        if (!c) return;
+        if (type === 'saturated') {
+          renderSaturatedLines(c, canvas.width, canvas.height, options as SaturatedLinesOptions);
+        } else {
+          renderStreamLines(c, canvas.width, canvas.height, options as StreamLinesOptions);
+        }
+      };
+
+      renderOn(canvas);
+      if (sourceCanvas) renderOn(sourceCanvas);
+
+      const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      updateLayerThumbnail(activeLayerId, true);
+      pushHistoryStep('brush', `Manga Effect (${type})`, beforeImageData, afterImageData, activeLayerId);
+      showToast(`Applied manga ${type} lines`);
+    },
+    [getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep, showToast]
+  );
 
   const handleInsert3DRasterLayer = useCallback(
     (layer: LayerItem, canvas: HTMLCanvasElement) => {
@@ -2795,6 +2973,35 @@ export function App() {
         });
         return;
       }
+
+      if (tool === 'balloon') {
+        e.preventDefault();
+        const newBalloon = createDefaultSpeechBalloon(
+          Math.round(pt.x - 100),
+          Math.round(pt.y - 70),
+          200,
+          140,
+          balloonSettings.shape
+        );
+        newBalloon.strokeWidth = balloonSettings.strokeWidth;
+        newBalloon.strokeColor = primaryColor || '#000000';
+        newBalloon.fillColor = balloonSettings.fillColor || '#ffffff';
+        newBalloon.vertical = balloonSettings.vertical;
+        setActiveBalloon(newBalloon);
+        return;
+      }
+
+      if (tool === 'vector-edit') {
+        e.preventDefault();
+        if (!activeLayer || activeLayer.type !== 'vector' || !activeLayer.vectorStrokes) {
+          showToast('Select a Vector Layer to use Correct Line tools');
+          return;
+        }
+        isVectorEditingRef.current = true;
+        lastVectorEditPtRef.current = pt;
+        vectorEditBeforeStrokesRef.current = JSON.parse(JSON.stringify(activeLayer.vectorStrokes));
+        return;
+      }
     },
     [
       hasOpenDocument,
@@ -2836,6 +3043,57 @@ export function App() {
 
       if (tool === 'brush' || tool === 'eraser') {
         handleCanvasDrawingPointerMove(e);
+        return;
+      }
+
+      if (tool === 'vector-edit') {
+        if (!isVectorEditingRef.current || !activeLayer?.vectorStrokes) return;
+        const pt = getCanvasCoords(e);
+        const lastPt = lastVectorEditPtRef.current || pt;
+        const delta = { x: pt.x - lastPt.x, y: pt.y - lastPt.y };
+        lastVectorEditPtRef.current = pt;
+
+        const radius = vectorEditSettings.radius || 35;
+        let updated = false;
+
+        const newStrokes = activeLayer.vectorStrokes.map((stroke) => {
+          if (stroke.deleted) return stroke;
+          if (
+            pt.x < stroke.bounds.minX - radius ||
+            pt.x > stroke.bounds.maxX + radius ||
+            pt.y < stroke.bounds.minY - radius ||
+            pt.y > stroke.bounds.maxY + radius
+          ) {
+            return stroke;
+          }
+
+          if (vectorEditSettings.mode === 'pinch') {
+            if (Math.hypot(delta.x, delta.y) > 0.05) {
+              updated = true;
+              return pinchVectorStroke(stroke, pt, radius, delta);
+            }
+          } else if (vectorEditSettings.mode === 'width') {
+            updated = true;
+            return modifyStrokeWidth(stroke, pt, radius, vectorEditSettings.widthFactor);
+          } else if (vectorEditSettings.mode === 'simplify') {
+            updated = true;
+            return simplifyVectorStroke(stroke, vectorEditSettings.simplifyTolerance);
+          }
+          return stroke;
+        });
+
+        if (updated) {
+          activeLayer.vectorStrokes = newStrokes;
+          const canvas = getActiveCanvas();
+          if (canvas) {
+            const ctx = get2DContext(canvas);
+            if (ctx) {
+              ctx.clearRect(0, 0, canvas.width, canvas.height);
+              renderVectorLayer(ctx, newStrokes);
+              updateLayerThumbnail(activeLayerId, true);
+            }
+          }
+        }
         return;
       }
 
@@ -3223,6 +3481,23 @@ export function App() {
             beforeImageData,
             afterImageData,
             activeLayerId
+          );
+        }
+        return;
+      }
+
+      if (tool === 'vector-edit' && isVectorEditingRef.current) {
+        isVectorEditingRef.current = false;
+        if (activeLayer?.vectorStrokes && vectorEditBeforeStrokesRef.current) {
+          pushHistoryStep(
+            'brush',
+            `Correct Line (${vectorEditSettings.mode})`,
+            null,
+            null,
+            activeLayerId,
+            undefined,
+            undefined,
+            { before: vectorEditBeforeStrokesRef.current, after: [...activeLayer.vectorStrokes] }
           );
         }
         return;
@@ -4260,6 +4535,13 @@ export function App() {
           onClick: handleExportImage,
         },
         {
+          id: 'file-export-webtoon',
+          label: 'Export Webtoon Chapter Slices (.zip)...',
+          icon: <Archive className="w-3.5 h-3.5 text-cyan-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => setIsWebtoonExportModalOpen(true),
+        },
+        {
           id: 'file-div-2',
           label: '',
           divider: true,
@@ -5008,6 +5290,116 @@ export function App() {
               prev ? { ...prev, snapEnabled: !prev.snapEnabled } : null
             ),
         },
+        {
+          id: 'view-div-webtoon',
+          label: '',
+          divider: true,
+        },
+        {
+          id: 'view-webtoon-mode',
+          label: isWebtoonMode ? 'Exit Webtoon Studio Mode' : 'Webtoon Studio Mode (9:16 Mockup)',
+          icon: <Smartphone className="w-3.5 h-3.5 text-emerald-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => setIsWebtoonMode((prev) => !prev),
+        },
+      ],
+    },
+    {
+      id: 'manga',
+      label: 'Manga',
+      items: [
+        {
+          id: 'manga-effects-generator',
+          label: 'Manga Effect Lines Generator...',
+          icon: <Sparkles className="w-3.5 h-3.5 text-amber-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => setIsMangaEffectsModalOpen(true),
+        },
+        {
+          id: 'manga-balloon-tool',
+          label: 'Parametric Speech Balloon Tool',
+          icon: <MessageSquare className="w-3.5 h-3.5 text-cyan-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => handleSelectTool('balloon'),
+        },
+        {
+          id: 'manga-correct-line',
+          label: 'Correct Line (Vector Pinch/Width/Simplify)',
+          icon: <Spline className="w-3.5 h-3.5 text-indigo-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => handleSelectTool('vector-edit'),
+        },
+        {
+          id: 'manga-div-webtoon',
+          label: '',
+          divider: true,
+        },
+        {
+          id: 'manga-webtoon-toggle',
+          label: isWebtoonMode ? 'Exit Webtoon Studio Mode' : 'Webtoon Studio Mode (9:16 Simulator)',
+          icon: <Smartphone className="w-3.5 h-3.5 text-emerald-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => setIsWebtoonMode((prev) => !prev),
+        },
+        {
+          id: 'manga-webtoon-export',
+          label: 'Export Webtoon Chapter Slices (.zip)...',
+          icon: <Archive className="w-3.5 h-3.5 text-sky-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => setIsWebtoonExportModalOpen(true),
+        },
+      ],
+    },
+    {
+      id: 'animation',
+      label: 'Animation',
+      items: [
+        {
+          id: 'anim-toggle-timeline',
+          label: activeAnimationTimeline ? 'Hide Animation Timeline' : 'Show Animation Timeline',
+          shortcut: 'Ctrl+Alt+A',
+          icon: <Film className="w-3.5 h-3.5 text-emerald-400" />,
+          disabled: !hasOpenDocument,
+          onClick: () => {
+            if (activeAnimationTimeline) {
+              handleUpdateAnimationTimeline(null);
+            } else {
+              const tl = createDefaultAnimationTimeline(layers);
+              handleUpdateAnimationTimeline(tl);
+            }
+          },
+        },
+        {
+          id: 'anim-new-cel',
+          label: 'Add Cel to Current Frame',
+          shortcut: 'Alt+C',
+          icon: <Plus className="w-3.5 h-3.5" />,
+          disabled: !hasOpenDocument || !activeAnimationTimeline,
+          onClick: () => {
+            if (activeAnimationTimeline) {
+              handleAddAnimationCel(activeAnimationTimeline.currentFrame);
+            }
+          },
+        },
+        {
+          id: 'anim-toggle-onion',
+          label: activeAnimationTimeline?.onionSkin.enabled
+            ? 'Disable Onion Skinning'
+            : 'Enable Onion Skinning',
+          icon: <Layers className="w-3.5 h-3.5 text-purple-400" />,
+          disabled: !hasOpenDocument || !activeAnimationTimeline,
+          onClick: () => {
+            if (activeAnimationTimeline) {
+              handleUpdateAnimationTimeline({
+                ...activeAnimationTimeline,
+                onionSkin: {
+                  ...activeAnimationTimeline.onionSkin,
+                  enabled: !activeAnimationTimeline.onionSkin.enabled,
+                },
+              });
+            }
+          },
+        },
       ],
     },
     {
@@ -5213,6 +5605,11 @@ export function App() {
           onFillScreentone={handleFillScreentone}
           liquifySettings={liquifySettings}
           onUpdateLiquifySettings={handleUpdateLiquifySettings}
+          balloonSettings={balloonSettings}
+          onUpdateBalloonSettings={(newSettings) => setBalloonSettings((prev) => ({ ...prev, ...newSettings }))}
+          vectorEditSettings={vectorEditSettings}
+          onUpdateVectorEditSettings={(newSettings) => setVectorEditSettings((prev) => ({ ...prev, ...newSettings }))}
+          onOpenMangaEffects={() => setIsMangaEffectsModalOpen(true)}
           wandSettings={wandSettings}
           onUpdateWandSettings={(newSettings) => setWandSettings((prev) => ({ ...prev, ...newSettings }))}
           onExpandSelection={handleExpandSelection}
@@ -5305,6 +5702,18 @@ export function App() {
               setInitial3DFile(null);
             }}
             onInsertRasterLayer={handleInsert3DRasterLayer}
+            isWebtoonMode={isWebtoonMode}
+            onToggleWebtoonMode={() => setIsWebtoonMode((prev) => !prev)}
+            onOpenWebtoonExport={() => setIsWebtoonExportModalOpen(true)}
+            activeBalloon={activeBalloon}
+            onUpdateBalloon={(updater) => setActiveBalloon((prev) => (prev ? updater(prev) : null))}
+            onConfirmBalloon={handleConfirmBalloon}
+            onDeleteBalloon={handleDeleteBalloon}
+            animationTimeline={activeAnimationTimeline}
+            onUpdateAnimationTimeline={handleUpdateAnimationTimeline}
+            onAddAnimationCel={handleAddAnimationCel}
+            onDeleteAnimationCel={handleDeleteAnimationCel}
+            onSelectCelLayer={setActiveLayerId}
           />
         </div>
 
@@ -5512,6 +5921,25 @@ export function App() {
       <FirstTimeNameModal
         isOpen={!appSettings.hasPromptedName && !appSettings.userName}
         onSaveName={handleSaveFirstTimeName}
+      />
+
+      {/* Manga Effect Lines Generator Modal */}
+      <MangaEffectsModal
+        isOpen={isMangaEffectsModalOpen}
+        onClose={() => setIsMangaEffectsModalOpen(false)}
+        canvasWidth={dimensions.width}
+        canvasHeight={dimensions.height}
+        onApply={handleApplyMangaEffects}
+      />
+
+      {/* Webtoon Chapter Slicer & Zip Exporter Modal */}
+      <WebtoonExportModal
+        isOpen={isWebtoonExportModalOpen}
+        onClose={() => setIsWebtoonExportModalOpen(false)}
+        getActiveCanvas={getActiveCanvas}
+        canvasWidth={dimensions.width}
+        canvasHeight={dimensions.height}
+        documentTitle={documents.find((d) => d.id === activeDocumentId)?.name || 'webtoon_chapter'}
       />
     </div>
   );

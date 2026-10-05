@@ -8,6 +8,9 @@ import {
   simplifyPathPoints,
   adjustVectorStrokeWidth,
   reshapeVectorLine,
+  pinchVectorStroke,
+  modifyStrokeWidth,
+  simplifyVectorStroke,
 } from '../vectorEngine';
 import { VectorKnot, VectorStroke } from '../../types/editor';
 
@@ -231,5 +234,76 @@ describe('Vector Inking Engine & Vector Eraser', () => {
     expect(reshaped.knots[0].y).toBe(50);
     expect(reshaped.knots[2].x).toBe(100);
     expect(reshaped.knots[2].y).toBe(50);
+  });
+
+  it('pinchVectorStroke displaces knots within bell-curve radius', () => {
+    const stroke: VectorStroke = {
+      id: 'stroke-pinch',
+      layerId: 'v1',
+      tool: 'brush',
+      knots: [
+        { x: 0, y: 50, pressure: 0.5, width: 4, timestamp: 0 },
+        { x: 50, y: 50, pressure: 0.5, width: 4, timestamp: 10 },
+        { x: 100, y: 50, pressure: 0.5, width: 4, timestamp: 20 },
+      ],
+      color: '#000000',
+      baseWidth: 4,
+      opacity: 1,
+      bounds: { minX: 0, minY: 48, maxX: 100, maxY: 52 },
+    };
+
+    const pinched = pinchVectorStroke(stroke, { x: 50, y: 50 }, 30, { x: 10, y: 20 });
+    expect(pinched.knots[1].x).toBeCloseTo(60);
+    expect(pinched.knots[1].y).toBeCloseTo(70);
+    expect(pinched.knots[0].x).toBe(0);
+    expect(pinched.knots[2].x).toBe(100);
+  });
+
+  it('modifyStrokeWidth scales knot widths locally within radius', () => {
+    const stroke: VectorStroke = {
+      id: 'stroke-width',
+      layerId: 'v1',
+      tool: 'brush',
+      knots: [
+        { x: 0, y: 50, pressure: 0.5, width: 4, timestamp: 0 },
+        { x: 50, y: 50, pressure: 0.5, width: 4, timestamp: 10 },
+        { x: 100, y: 50, pressure: 0.5, width: 4, timestamp: 20 },
+      ],
+      color: '#000000',
+      baseWidth: 4,
+      opacity: 1,
+      bounds: { minX: 0, minY: 48, maxX: 100, maxY: 52 },
+    };
+
+    const modified = modifyStrokeWidth(stroke, { x: 50, y: 50 }, 30, 2.0);
+    // Center knot should be doubled from width 4 to 8
+    expect(modified.knots[1].width).toBeCloseTo(8);
+    // Knots outside radius stay 4
+    expect(modified.knots[0].width).toBe(4);
+    expect(modified.knots[2].width).toBe(4);
+  });
+
+  it('simplifyVectorStroke prunes redundant collinear knots', () => {
+    const stroke: VectorStroke = {
+      id: 'stroke-simplify',
+      layerId: 'v1',
+      tool: 'brush',
+      knots: [
+        { x: 0, y: 0, pressure: 0.5, width: 4, timestamp: 0 },
+        { x: 25, y: 0.1, pressure: 0.5, width: 4, timestamp: 5 },
+        { x: 50, y: 0, pressure: 0.5, width: 4, timestamp: 10 },
+        { x: 75, y: 0.1, pressure: 0.5, width: 4, timestamp: 15 },
+        { x: 100, y: 0, pressure: 0.5, width: 4, timestamp: 20 },
+      ],
+      color: '#000000',
+      baseWidth: 4,
+      opacity: 1,
+      bounds: { minX: 0, minY: 0, maxX: 100, maxY: 0.1 },
+    };
+
+    const simplified = simplifyVectorStroke(stroke, 1.0);
+    expect(simplified.knots.length).toBeLessThan(stroke.knots.length);
+    expect(simplified.knots[0].x).toBe(0);
+    expect(simplified.knots[simplified.knots.length - 1].x).toBe(100);
   });
 });

@@ -702,3 +702,175 @@ export function reshapeVectorLine(
     bounds: computeStrokeBounds(knots),
   };
 }
+
+/**
+ * Displaces neighboring Catmull-Rom knots within a bell-curve radius.
+ * Supports passing a VectorStroke directly or (strokeId, point, radius, delta, strokes).
+ */
+export function pinchVectorStroke(
+  stroke: VectorStroke,
+  point: Point2D,
+  radius: number,
+  delta: Point2D
+): VectorStroke;
+export function pinchVectorStroke(
+  strokeId: string,
+  point: Point2D,
+  radius: number,
+  delta: Point2D,
+  strokes: VectorStroke[]
+): VectorStroke[];
+export function pinchVectorStroke(
+  target: VectorStroke | string,
+  point: Point2D,
+  radius: number,
+  delta: Point2D,
+  strokes?: VectorStroke[]
+): VectorStroke | VectorStroke[] {
+  if (typeof target === 'string') {
+    const list = strokes || [];
+    return list.map((s) => (s.id === target ? pinchVectorStroke(s, point, radius, delta) : s));
+  }
+  const stroke = target;
+  if (!stroke.knots || stroke.knots.length === 0 || radius <= 0) return stroke;
+
+  const invRadius = 1 / radius;
+  const updatedKnots = stroke.knots.map((k) => {
+    const dist = Math.hypot(k.x - point.x, k.y - point.y);
+    if (dist >= radius) return k;
+    const factor = 0.5 * (1 + Math.cos(Math.PI * dist * invRadius));
+    return {
+      ...k,
+      x: k.x + delta.x * factor,
+      y: k.y + delta.y * factor,
+    };
+  });
+
+  return {
+    ...stroke,
+    knots: updatedKnots,
+    bounds: computeStrokeBounds(updatedKnots),
+  };
+}
+
+/**
+ * Scales knot.width locally within a bell-curve radius.
+ * Supports passing a VectorStroke directly or (strokeId, point, radius, widthFactor, strokes).
+ */
+export function modifyStrokeWidth(
+  stroke: VectorStroke,
+  point: Point2D,
+  radius: number,
+  widthFactor: number
+): VectorStroke;
+export function modifyStrokeWidth(
+  strokeId: string,
+  point: Point2D,
+  radius: number,
+  widthFactor: number,
+  strokes: VectorStroke[]
+): VectorStroke[];
+export function modifyStrokeWidth(
+  target: VectorStroke | string,
+  point: Point2D,
+  radius: number,
+  widthFactor: number,
+  strokes?: VectorStroke[]
+): VectorStroke | VectorStroke[] {
+  if (typeof target === 'string') {
+    const list = strokes || [];
+    return list.map((s) => (s.id === target ? modifyStrokeWidth(s, point, radius, widthFactor) : s));
+  }
+  const stroke = target;
+  if (!stroke.knots || stroke.knots.length === 0 || radius <= 0) return stroke;
+
+  const invRadius = 1 / radius;
+  const updatedKnots = stroke.knots.map((k) => {
+    const dist = Math.hypot(k.x - point.x, k.y - point.y);
+    if (dist >= radius) return k;
+    const factor = 0.5 * (1 + Math.cos(Math.PI * dist * invRadius));
+    const effectiveFactor = 1 + (widthFactor - 1) * factor;
+    return {
+      ...k,
+      width: Math.max(0.5, k.width * effectiveFactor),
+    };
+  });
+
+  return {
+    ...stroke,
+    knots: updatedKnots,
+    bounds: computeStrokeBounds(updatedKnots),
+  };
+}
+
+/**
+ * Applies Ramer-Douglas-Peucker reduction to prune redundant knots while preserving shape.
+ * Supports passing a VectorStroke directly or (strokeId, tolerance, strokes).
+ */
+export function simplifyVectorStroke(
+  stroke: VectorStroke,
+  tolerance: number
+): VectorStroke;
+export function simplifyVectorStroke(
+  strokeId: string,
+  tolerance: number,
+  strokes: VectorStroke[]
+): VectorStroke[];
+export function simplifyVectorStroke(
+  target: VectorStroke | string,
+  tolerance: number,
+  strokes?: VectorStroke[]
+): VectorStroke | VectorStroke[] {
+  if (typeof target === 'string') {
+    const list = strokes || [];
+    return list.map((s) => (s.id === target ? simplifyVectorStroke(s, tolerance) : s));
+  }
+  const stroke = target;
+  if (!stroke.knots || stroke.knots.length <= 2 || tolerance <= 0) return stroke;
+
+  const simplified = simplifyPathPoints(stroke.knots, tolerance);
+  const finalKnots = simplified.length >= 2 ? simplified : stroke.knots;
+
+  return {
+    ...stroke,
+    knots: finalKnots,
+    bounds: computeStrokeBounds(finalKnots),
+  };
+}
+
+/**
+ * Finds the nearest vector stroke and knot index within a maximum distance.
+ */
+export function findNearestVectorStroke(
+  strokes: VectorStroke[],
+  point: Point2D,
+  maxDist = 30
+): { stroke: VectorStroke; knotIndex: number; distance: number } | null {
+  let closest: { stroke: VectorStroke; knotIndex: number; distance: number } | null = null;
+  let minDist = maxDist;
+
+  for (const stroke of strokes) {
+    if (stroke.deleted) continue;
+    // Bounding box pre-check
+    if (
+      point.x < stroke.bounds.minX - minDist ||
+      point.x > stroke.bounds.maxX + minDist ||
+      point.y < stroke.bounds.minY - minDist ||
+      point.y > stroke.bounds.maxY + minDist
+    ) {
+      continue;
+    }
+
+    for (let i = 0; i < stroke.knots.length; i++) {
+      const k = stroke.knots[i];
+      const d = Math.hypot(k.x - point.x, k.y - point.y);
+      if (d < minDist) {
+        minDist = d;
+        closest = { stroke, knotIndex: i, distance: d };
+      }
+    }
+  }
+
+  return closest;
+}
+

@@ -13,6 +13,8 @@ export type ToolType =
   | 'fill'
   | 'text'
   | 'frame'
+  | 'balloon'
+  | 'vector-edit'
   | 'liquify';
 
 export interface Point {
@@ -180,6 +182,27 @@ export interface BrushSettings {
   isTransparentInk?: boolean; // Transparent Ink mode (CSP 'C' key toggle)
 }
 
+export interface OnionSkinSettings {
+  enabled: boolean;
+  prevFrames: number;
+  nextFrames: number;
+  prevTint: string;
+  nextTint: string;
+  opacity: number;
+}
+
+export interface AnimationTimeline {
+  fps: number;
+  totalFrames: number;
+  currentFrame: number;
+  cels: Record<number, string>; // Mapping frame index to layer ID
+  onionSkin: OnionSkinSettings;
+  isPlaying?: boolean;
+  loop?: boolean;
+}
+
+export type AnimationExportFormat = 'gif' | 'apng' | 'webm' | 'mp4' | 'png-zip';
+
 export interface DocumentTab {
   id: string;
   name: string;
@@ -197,6 +220,7 @@ export interface DocumentTab {
   historyIndex?: number;
   perspectiveRuler?: PerspectiveRuler | null;
   defaultFrequency?: number;
+  animation?: AnimationTimeline | null;
 }
 
 export type HistoryActionType =
@@ -253,6 +277,57 @@ export interface TextSettings {
   outlineColor: string;
   outlineWidth: number;
   color: string;
+  writingMode?: 'horizontal-tb' | 'vertical-rl';
+}
+
+export interface SpeechBalloonTail {
+  start: Point;
+  control1: Point;
+  control2: Point;
+  tip: Point;
+}
+
+export interface SpeechBalloon {
+  id: string;
+  shape: 'ellipse' | 'rounded-rect' | 'jagged-flash' | 'thought';
+  bounds: { x: number; y: number; width: number; height: number };
+  tail: SpeechBalloonTail;
+  fillColor: string;
+  strokeColor: string;
+  strokeWidth: number;
+  text: string;
+  fontFamily: string;
+  fontSize: number;
+  vertical: boolean;
+}
+
+export interface BalloonSettings {
+  shape: 'ellipse' | 'rounded-rect' | 'jagged-flash' | 'thought';
+  fillColor: string;
+  strokeColor: string;
+  strokeWidth: number;
+  text: string;
+  fontFamily: string;
+  fontSize: number;
+  vertical: boolean;
+}
+
+export interface WebtoonSettings {
+  enabled: boolean;
+  viewportAspect: '9:16';
+  smartphoneMockup: boolean;
+  sliceHeight: number;
+  sliceFormat: 'jpg' | 'png';
+}
+
+export type VectorEditMode = 'pinch' | 'width' | 'simplify';
+
+export interface VectorEditSettings {
+  mode: VectorEditMode;
+  radius: number;
+  pinchStrength: number;
+  widthFactor: number;
+  simplifyTolerance: number;
 }
 
 export interface FrameSettings {
@@ -492,6 +567,8 @@ export interface LayerItem {
   vectorStrokes?: VectorStroke[];
   // Comic Frame Data
   comicFrames?: ComicFrame[];
+  // Speech Balloon Data
+  balloons?: SpeechBalloon[];
   // Collaborative Layer Soft-Locking
   reservedByPeerId?: string | number;
   reservedByPeerName?: string;

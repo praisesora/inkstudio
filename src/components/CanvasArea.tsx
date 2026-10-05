@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import {
   CanvasDimensions,
   BrushSettings,
@@ -8,11 +8,14 @@ import {
   TextSettings,
   ToolType,
   LiquifySettings,
+  SpeechBalloon,
 } from '../types/editor';
 import { ROTATE_CURSOR_CSS } from '../hooks/useCanvasNavigation';
 import { SelectionOverlay } from './SelectionOverlay';
 import { TransformOverlay } from './TransformOverlay';
 import { TextEditorOverlay } from './TextEditorOverlay';
+import { SpeechBalloonOverlay } from './SpeechBalloonOverlay';
+import { SmartphoneViewportSimulator } from './SmartphoneViewportSimulator';
 import { PerspectiveRulerOverlay } from './PerspectiveRulerOverlay';
 import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
 import { Local3DContainer } from './Local3DContainer';
@@ -20,6 +23,10 @@ import { ViewportCompositor } from '../utils/compositor';
 import { globalTileGrid } from '../utils/tileEngine';
 import { getBrushTipOutline, resolveBrushTipImage, TipOutline } from '../utils/brushOutline';
 import { preloadTipImage } from '../utils/brushStorage';
+import { Smartphone, Archive } from 'lucide-react';
+import { AnimationTimeline } from './AnimationTimeline';
+import { AnimationTimeline as AnimationTimelineType } from '../types/editor';
+import { getOnionSkinFrames } from '../utils/animationEngine';
 
 const PIPETTE_CURSOR_CSS = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cg stroke='%23000000' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3Cg stroke='%23ffffff' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3C/svg%3E") 2 22, crosshair`;
 
@@ -88,6 +95,18 @@ interface CanvasAreaProps {
   onInsertRasterLayer?: (layer: LayerItem, canvas: HTMLCanvasElement) => void;
   onBake3DSuccess?: (layer: LayerItem) => void;
   liquifySettings?: LiquifySettings;
+  isWebtoonMode?: boolean;
+  onToggleWebtoonMode?: () => void;
+  onOpenWebtoonExport?: () => void;
+  activeBalloon?: SpeechBalloon | null;
+  onUpdateBalloon?: (updater: (prev: SpeechBalloon) => SpeechBalloon) => void;
+  onConfirmBalloon?: () => void;
+  onDeleteBalloon?: () => void;
+  animationTimeline?: AnimationTimelineType | null;
+  onUpdateAnimationTimeline?: (timeline: AnimationTimelineType) => void;
+  onAddAnimationCel?: (frameIndex: number) => void;
+  onDeleteAnimationCel?: (frameIndex: number) => void;
+  onSelectCelLayer?: (layerId: string) => void;
 }
 
 export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
@@ -104,6 +123,13 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   isRotating,
   onStartPan,
   onStartRotate,
+  isWebtoonMode = false,
+  onToggleWebtoonMode,
+  onOpenWebtoonExport,
+  activeBalloon = null,
+  onUpdateBalloon,
+  onConfirmBalloon,
+  onDeleteBalloon,
   isHovering: _isHovering,
   cursorPos: _cursorPos,
   onPointerDown,
@@ -154,6 +180,11 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onInsertRasterLayer,
   onBake3DSuccess,
   liquifySettings,
+  animationTimeline = null,
+  onUpdateAnimationTimeline,
+  onAddAnimationCel,
+  onDeleteAnimationCel,
+  onSelectCelLayer,
 }) => {
 
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
@@ -309,6 +340,27 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
   }, [isSpaceDown, isPanning, isRotating, isRotateModifier, isResizingBrush, viewportRef, tool]);
 
+  // Compute colored onion skin frames and active cel isolation for animation
+  const onionSkinFrames = useMemo(() => {
+    if (!animationTimeline || !animationTimeline.onionSkin?.enabled) return [];
+    return getOnionSkinFrames(animationTimeline);
+  }, [animationTimeline]);
+
+  const effectiveLayers = useMemo(() => {
+    if (!animationTimeline) return layers;
+    const currentCelId = animationTimeline.cels[animationTimeline.currentFrame];
+    const allCelIds = new Set(Object.values(animationTimeline.cels));
+    return layers.map((layer) => {
+      if (allCelIds.has(layer.id)) {
+        return {
+          ...layer,
+          visible: layer.id === currentCelId && layer.visible,
+        };
+      }
+      return layer;
+    });
+  }, [layers, animationTimeline]);
+
   // Unified GPU Viewport Compositor
   const viewportCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositorRef = useRef<ViewportCompositor | null>(null);
@@ -332,11 +384,11 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         }
         compositorRef.current.resize(w, h);
         compositorRef.current.render(
-          layers,
+          effectiveLayers,
           { pan, zoom, rotation },
           dimensions,
           globalTileGrid,
-          { dimensions, showCheckerboard, devicePixelRatio: dpr }
+          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames }
         );
       }
 
@@ -350,7 +402,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     updateCanvasSizes();
     window.addEventListener('resize', updateCanvasSizes);
     return () => window.removeEventListener('resize', updateCanvasSizes);
-  }, [viewportRef, effectiveDraftCanvasRef, layers, pan, zoom, rotation, dimensions, showCheckerboard]);
+  }, [viewportRef, effectiveDraftCanvasRef, effectiveLayers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames]);
 
   // Render scene using Unified GPU Viewport Compositor
   useEffect(() => {
@@ -380,13 +432,13 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
     const dpr = window.devicePixelRatio || 1;
     compositorRef.current.render(
-      layers,
+      effectiveLayers,
       { pan, zoom, rotation },
       dimensions,
       globalTileGrid,
-      { dimensions, showCheckerboard, devicePixelRatio: dpr }
+      { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames }
     );
-  }, [layers, pan, zoom, rotation, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas]);
+  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas, onionSkinFrames]);
 
   // Event-Driven Compositor Invalidation via SparseTileGrid subscription
   useEffect(() => {
@@ -395,11 +447,11 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       if (compositorRef.current) {
         const dpr = window.devicePixelRatio || 1;
         compositorRef.current.render(
-          layers,
+          effectiveLayers,
           { pan, zoom, rotation },
           dimensions,
           globalTileGrid,
-          { dimensions, showCheckerboard, devicePixelRatio: dpr }
+          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames }
         );
       }
     };
@@ -425,7 +477,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       unsubscribe();
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [layers, pan, zoom, rotation, dimensions, showCheckerboard]);
+  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames]);
 
   useEffect(() => {
     return () => {
@@ -773,6 +825,17 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           />
         )}
 
+        {/* Parametric Speech Balloon Overlay */}
+        {activeBalloon && (
+          <SpeechBalloonOverlay
+            balloon={activeBalloon}
+            zoom={zoom}
+            onUpdateBalloon={onUpdateBalloon || (() => {})}
+            onConfirmBalloon={onConfirmBalloon || (() => {})}
+            onDeleteBalloon={onDeleteBalloon || (() => {})}
+          />
+        )}
+
         {/* Local-Only 3D Viewport Ghost Layer (Strictly Client-Side Isolated State) */}
         {is3DLayerOpen && onClose3DLayer && onInsertRasterLayer && (
           <Local3DContainer
@@ -785,6 +848,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             onClose={onClose3DLayer}
             onInsertRasterLayer={onInsertRasterLayer}
             onBakeSuccess={onBake3DSuccess}
+            perspectiveRuler={perspectiveRuler}
+            onUpdatePerspectiveRuler={onUpdatePerspectiveRuler}
           />
         )}
 
@@ -1001,6 +1066,56 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Floating Webtoon Mode Quick-Access Bar */}
+      <div className="absolute top-3 right-4 z-40 flex items-center space-x-2 select-none">
+        <button
+          onClick={onToggleWebtoonMode}
+          className={`px-3 py-1.5 rounded-full text-xs font-medium flex items-center space-x-1.5 shadow-lg border transition-colors cursor-pointer ${
+            isWebtoonMode
+              ? 'bg-[#1e382d] text-[#55eaab] border-[#2a7a5c]'
+              : 'bg-[#222326]/90 text-[#aaaaaa] hover:text-white border-[#3b3d45]'
+          }`}
+          title="Toggle Webtoon Studio Mode (Smartphone Simulator & Vertical Scrolling)"
+        >
+          <Smartphone className="w-3.5 h-3.5" />
+          <span>Webtoon Mode</span>
+          {isWebtoonMode && <span className="w-1.5 h-1.5 rounded-full bg-[#55eaab] animate-pulse" />}
+        </button>
+
+        {isWebtoonMode && onOpenWebtoonExport && (
+          <button
+            onClick={onOpenWebtoonExport}
+            className="px-3 py-1.5 rounded-full text-xs font-medium bg-[#1a2d3e] hover:bg-[#234059] text-cyan-300 border border-[#2d5573] flex items-center space-x-1.5 shadow-lg transition-colors cursor-pointer"
+            title="Export Chapter Slices (.zip)"
+          >
+            <Archive className="w-3.5 h-3.5" />
+            <span>Export Slices</span>
+          </button>
+        )}
+      </div>
+
+      {/* Smartphone Viewport Simulator in Webtoon Mode */}
+      {isWebtoonMode && (
+        <SmartphoneViewportSimulator
+          visible={true}
+          onToggleVisible={onToggleWebtoonMode || (() => {})}
+        />
+      )}
+
+      {/* 2D Frame-by-Frame Animation Timeline Scrubber Dock */}
+      {animationTimeline && onUpdateAnimationTimeline && (
+        <AnimationTimeline
+          timeline={animationTimeline}
+          onChangeTimeline={onUpdateAnimationTimeline}
+          layers={layers}
+          layerCanvasesMap={layerCanvasesRef?.current || new Map()}
+          dimensions={dimensions}
+          onAddCel={onAddAnimationCel || (() => {})}
+          onDeleteCel={onDeleteAnimationCel || (() => {})}
+          onSelectCelLayer={onSelectCelLayer}
+        />
       )}
     </main>
   );

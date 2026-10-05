@@ -322,11 +322,18 @@ void main() {
 }
 `;
 
+export interface OnionSkinCompositorFrame {
+  layerId: string;
+  tint: string;
+  opacity: number;
+}
+
 export interface CompositorOptions {
   dimensions: CanvasDimensions;
   colorMode?: CanvasColorMode;
   showCheckerboard?: boolean;
   devicePixelRatio?: number;
+  onionSkinFrames?: OnionSkinCompositorFrame[];
 }
 
 /**
@@ -791,7 +798,25 @@ export class ViewportCompositor {
 
     gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
 
-    // Render layers in bottom-to-top order grouped by clipping masks
+    // 2. Render colored onion skin cels if active in animation mode
+    if (_options.onionSkinFrames && _options.onionSkinFrames.length > 0) {
+      for (const onion of _options.onionSkinFrames) {
+        const targetLayer = layers.find((l) => l.id === onion.layerId);
+        if (targetLayer && targetLayer.visible) {
+          const virtualOnionLayer: LayerItem = {
+            ...targetLayer,
+            opacity: onion.opacity,
+            layerColorEnabled: true,
+            layerColor: onion.tint,
+            layerSubColor: '#ffffff',
+            blendMode: 'normal',
+          };
+          this.renderSingleLayer(gl, virtualOnionLayer, dimensions, grid, frustum);
+        }
+      }
+    }
+
+    // 3. Render layers in bottom-to-top order grouped by clipping masks
     const renderOrder = layers.slice().reverse();
     const groups = groupLayersForCompositing(renderOrder);
 

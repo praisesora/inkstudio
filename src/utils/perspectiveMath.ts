@@ -449,3 +449,117 @@ export function applyWormsEyePreset(
     vps: newVps,
   };
 }
+
+/**
+ * Calculates real-time vanishing points from a Three.js PerspectiveCamera
+ * in document canvas coordinates and returns an updated PerspectiveRuler.
+ */
+export function calculatePerspectiveFromCamera(
+  camera: {
+    matrixWorldInverse: { elements: ArrayLike<number> };
+    projectionMatrix: { elements: ArrayLike<number> };
+  },
+  docWidth: number,
+  docHeight: number,
+  existingRuler?: PerspectiveRuler | null
+): PerspectiveRuler {
+  const V = camera.matrixWorldInverse.elements;
+  const P = camera.projectionMatrix.elements;
+
+  // Multiply M = P * V (column-major 4x4 matrix multiplication)
+  const M = new Float64Array(16);
+  for (let col = 0; col < 4; col++) {
+    for (let row = 0; row < 4; row++) {
+      let sum = 0;
+      for (let k = 0; k < 4; k++) {
+        sum += P[k * 4 + row] * V[col * 4 + k];
+      }
+      M[col * 4 + row] = sum;
+    }
+  }
+
+  // Project a 3D world direction vector (dx, dy, dz, 0) to document screen space
+  const projectDirection = (dx: number, dy: number, dz: number) => {
+    const cx = M[0] * dx + M[4] * dy + M[8] * dz;
+    const cy = M[1] * dx + M[5] * dy + M[9] * dz;
+    const cw = M[3] * dx + M[7] * dy + M[11] * dz;
+
+    if (Math.abs(cw) < 1e-4) {
+      return null;
+    }
+
+    const ndcX = cx / cw;
+    const ndcY = cy / cw;
+
+    const docX = (ndcX + 1.0) * 0.5 * docWidth;
+    const docY = (1.0 - ndcY) * 0.5 * docHeight;
+
+    const MAX_COORD = 50000;
+    return {
+      x: Math.max(-MAX_COORD, Math.min(MAX_COORD, Math.round(docX))),
+      y: Math.max(-MAX_COORD, Math.min(MAX_COORD, Math.round(docY))),
+      cw,
+    };
+  };
+
+  // VP1: World X direction (1, 0, 0)
+  const p1 = projectDirection(1, 0, 0);
+  // VP2: World Z direction (0, 0, 1)
+  const p2 = projectDirection(0, 0, 1);
+  // VP3: World Y direction (0, 1, 0)
+  const p3 = projectDirection(0, 1, 0);
+
+  const fallbackW = Math.max(1, docWidth);
+  const fallbackH = Math.max(1, docHeight);
+
+  const vp1: VanishingPoint = {
+    id: 'vp1',
+    x: p1 ? p1.x : -fallbackW * 0.8,
+    y: p1 ? p1.y : fallbackH * 0.5,
+    label: 'VP1 (X-Axis)',
+    color: '#06b6d4',
+  };
+
+  const vp2: VanishingPoint = {
+    id: 'vp2',
+    x: p2 ? p2.x : fallbackW * 1.8,
+    y: p2 ? p2.y : fallbackH * 0.5,
+    label: 'VP2 (Z-Axis)',
+    color: '#a855f7',
+  };
+
+  const is3Point = p3 !== null && Math.abs(p3.cw) > 0.02;
+  const vps: VanishingPoint[] = [vp1, vp2];
+
+  if (is3Point && p3) {
+    const vp3: VanishingPoint = {
+      id: 'vp3',
+      x: p3.x,
+      y: p3.y,
+      label: 'VP3 (Y-Axis)',
+      color: '#f97316',
+    };
+    vps.push(vp3);
+  }
+
+  const dx = vp2.x - vp1.x;
+  const dy = vp2.y - vp1.y;
+  const horizonAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
+
+  return {
+    id: existingRuler?.id || `ruler-cam-sync-${Date.now()}`,
+    type: is3Point ? '3-point' : '2-point',
+    enabled: true,
+    locked: existingRuler?.locked ?? false,
+    snapEnabled: existingRuler?.snapEnabled ?? true,
+    vps,
+    horizonAngle,
+    guideRayCount: existingRuler?.guideRayCount ?? 8,
+    grid: existingRuler?.grid ?? {
+      enabled: false,
+      density: 16,
+      plane: 'ground',
+      opacity: 0.25,
+    },
+  };
+}

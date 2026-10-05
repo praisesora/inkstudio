@@ -9,6 +9,7 @@ export const DEFAULT_MENU_SECTIONS: MenuSection[] = [
   { id: 'layer', label: 'Layer', items: [] },
   { id: 'ruler', label: 'Ruler', items: [] },
   { id: 'view', label: 'View', items: [] },
+  { id: 'manga', label: 'Manga', items: [] },
   { id: 'help', label: 'Help', items: [] },
 ];
 

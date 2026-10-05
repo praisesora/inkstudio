@@ -7,7 +7,18 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { LayerItem } from '../types/editor';
-import { bake3DToRasterLayer, disposeThreeResources } from '../services/bake3DService';
+import { PerspectiveRuler } from '../types/perspective';
+import { calculatePerspectiveFromCamera } from '../utils/perspectiveMath';
+import { bake3DToRasterLayer, bake3DToLineAndTone, disposeThreeResources } from '../services/bake3DService';
+import {
+  createProceduralMannequin,
+  findHumanoidBones,
+  solveTwoBoneIK,
+  createIKHandles,
+  applyPosePreset,
+  HumanoidBones,
+  PosePresetName,
+} from '../utils/mannequin3D';
 import { Csp3DToolbar, Csp3DToolMode } from './Csp3DToolbar';
 import { LightSourceWidget, LightSettings } from './LightSourceWidget';
 import {
@@ -22,6 +33,10 @@ import {
   Compass,
   Move,
   Rotate3d,
+  User,
+  Sliders,
+  Sparkles,
+  Link,
 } from 'lucide-react';
 
 export type ShadingMode = 'shaded' | 'smooth' | 'silhouette';
@@ -37,6 +52,8 @@ export interface Local3DContainerProps {
   onClose: () => void;
   onInsertRasterLayer: (layer: LayerItem, canvas: HTMLCanvasElement) => void;
   onBakeSuccess?: (layer: LayerItem) => void;
+  perspectiveRuler?: PerspectiveRuler | null;
+  onUpdatePerspectiveRuler?: (ruler: PerspectiveRuler | null) => void;
 }
 
 export const Local3DContainer: React.FC<Local3DContainerProps> = ({
@@ -49,6 +66,8 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   onClose,
   onInsertRasterLayer,
   onBakeSuccess,
+  perspectiveRuler,
+  onUpdatePerspectiveRuler,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -68,6 +87,9 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   const ambientLightRef = useRef<THREE.AmbientLight | null>(null);
   const hemiLightRef = useRef<THREE.HemisphereLight | null>(null);
   const gridHelperRef = useRef<THREE.GridHelper | null>(null);
+  const mannequinBonesRef = useRef<HumanoidBones | null>(null);
+  const ikHandlesRef = useRef<Record<string, THREE.Mesh> | null>(null);
+  const ikHandlesContainerRef = useRef<THREE.Group | null>(null);
 
   // Interaction State
   const [activeToolMode, setActiveToolMode] = useState<Csp3DToolMode>('camera-orbit');
@@ -75,6 +97,13 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   const [showGrid, setShowGrid] = useState<boolean>(true);
   const [showLightPanel, setShowLightPanel] = useState<boolean>(false);
   const [showCameraPresets, setShowCameraPresets] = useState<boolean>(false);
+  const [isMannequinActive, setIsMannequinActive] = useState<boolean>(false);
+  const [showPoseDrawer, setShowPoseDrawer] = useState<boolean>(false);
+  const [showLTModal, setShowLTModal] = useState<boolean>(false);
+  const [syncCameraPerspective, setSyncCameraPerspective] = useState<boolean>(true);
+  const [activeIKHandle, setActiveIKHandle] = useState<string | null>(null);
+  const [ltLineThreshold, setLtLineThreshold] = useState<number>(0.28);
+  const [ltToneBands, setLtToneBands] = useState<2 | 3>(2);
 
   // Viewport Settings
   const [opacity, setOpacity] = useState<number>(0.85);
@@ -305,7 +334,17 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.target.set(0, 0.3, 0);
-    controls.update();
+    controls.addEventListener('change', () => {
+      if (onUpdatePerspectiveRuler && cameraRef.current) {
+        const ruler = calculatePerspectiveFromCamera(
+          cameraRef.current,
+          dimensions.width,
+          dimensions.height,
+          perspectiveRuler
+        );
+        onUpdatePerspectiveRuler(ruler);
+      }
+    });
     controlsRef.current = controls;
 
     // 7. TransformControls for 3D In-Scene Gizmo Rings
@@ -319,6 +358,27 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     transformControls.addEventListener('dragging-changed', (event: any) => {
       if (controlsRef.current) {
         controlsRef.current.enabled = !event.value;
+      }
+    });
+
+    transformControls.addEventListener('objectChange', () => {
+      const targetObj = transformControls.object;
+      if (targetObj && targetObj.name.startsWith('IKHandle_') && mannequinBonesRef.current) {
+        const handleName = targetObj.name.replace('IKHandle_', '');
+        const bones = mannequinBonesRef.current;
+        const targetPos = targetObj.position;
+        if (handleName === 'leftHand' && bones.leftUpperArm && bones.leftLowerArm && bones.leftHand) {
+          solveTwoBoneIK(bones.leftUpperArm, bones.leftLowerArm, bones.leftHand, targetPos, new THREE.Vector3(0.6, 1.2, -0.4));
+        } else if (handleName === 'rightHand' && bones.rightUpperArm && bones.rightLowerArm && bones.rightHand) {
+          solveTwoBoneIK(bones.rightUpperArm, bones.rightLowerArm, bones.rightHand, targetPos, new THREE.Vector3(-0.6, 1.2, -0.4));
+        } else if (handleName === 'leftFoot' && bones.leftUpperLeg && bones.leftLowerLeg && bones.leftFoot) {
+          solveTwoBoneIK(bones.leftUpperLeg, bones.leftLowerLeg, bones.leftFoot, targetPos, new THREE.Vector3(0.12, 0.48, 0.5));
+        } else if (handleName === 'rightFoot' && bones.rightUpperLeg && bones.rightLowerLeg && bones.rightFoot) {
+          solveTwoBoneIK(bones.rightUpperLeg, bones.rightLowerLeg, bones.rightFoot, targetPos, new THREE.Vector3(-0.12, 0.48, 0.5));
+        } else if (handleName === 'head' && bones.neck && bones.head) {
+          bones.head.lookAt(targetPos);
+          bones.head.updateMatrixWorld(true);
+        }
       }
     });
 
@@ -746,6 +806,20 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
         applyShading(shadingMode);
         updateGizmoTarget();
 
+        // Detect humanoid skinned mesh hierarchy
+        const detectedBones = findHumanoidBones(model);
+        if (detectedBones.hips || detectedBones.leftHand || detectedBones.rightHand || detectedBones.head) {
+          mannequinBonesRef.current = detectedBones;
+          setIsMannequinActive(true);
+          const { container: handlesContainer, handles } = createIKHandles();
+          ikHandlesRef.current = handles;
+          ikHandlesContainerRef.current = handlesContainer;
+          sceneRef.current?.add(handlesContainer);
+        } else {
+          mannequinBonesRef.current = null;
+          setIsMannequinActive(false);
+        }
+
         if (cameraRef.current && controlsRef.current) {
           cameraRef.current.position.set(0, 0.5, 3.8);
           controlsRef.current.target.set(0, 0.3, 0);
@@ -818,6 +892,119 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     controlsRef.current.target.set(0, 0.3, 0);
     controlsRef.current.update();
     setPerspective(1.0);
+  };
+
+  // Load procedural humanoid drawing mannequin
+  const loadProceduralMannequin = useCallback(() => {
+    if (!sceneRef.current) return;
+    if (modelRootRef.current) {
+      if (transformControlsRef.current) transformControlsRef.current.detach();
+      disposeMeshUserData(modelRootRef.current);
+      disposeThreeResources(modelRootRef.current, null);
+      sceneRef.current.remove(modelRootRef.current);
+      modelRootRef.current = null;
+    }
+    if (ikHandlesContainerRef.current) {
+      sceneRef.current.remove(ikHandlesContainerRef.current);
+      ikHandlesContainerRef.current = null;
+    }
+
+    const { group, bones } = createProceduralMannequin();
+    const { container: handlesContainer, handles } = createIKHandles();
+
+    mannequinBonesRef.current = bones;
+    ikHandlesRef.current = handles;
+    ikHandlesContainerRef.current = handlesContainer;
+
+    group.position.set(0, 0, 0);
+    modelRootRef.current = group;
+    sceneRef.current.add(group);
+    sceneRef.current.add(handlesContainer);
+
+    setLoadedFileName('Mannequin (Rigged)');
+    setIsMannequinActive(true);
+    applyShading(shadingMode);
+
+    if (cameraRef.current && controlsRef.current) {
+      cameraRef.current.position.set(0, 1.1, 3.2);
+      controlsRef.current.target.set(0, 0.9, 0);
+      controlsRef.current.update();
+    }
+  }, [applyShading, disposeMeshUserData, shadingMode]);
+
+  // Select an IK Target limb to manipulate
+  const selectIKTarget = useCallback((targetName: string | null) => {
+    setActiveIKHandle(targetName);
+    if (!transformControlsRef.current || !ikHandlesRef.current) return;
+    if (targetName && ikHandlesRef.current[targetName]) {
+      const handleMesh = ikHandlesRef.current[targetName];
+      transformControlsRef.current.setMode('translate');
+      transformControlsRef.current.attach(handleMesh);
+      if (transformHelperRef.current) transformHelperRef.current.visible = true;
+    } else {
+      transformControlsRef.current.detach();
+      if (transformHelperRef.current) transformHelperRef.current.visible = false;
+    }
+  }, []);
+
+  // Apply Pose Presets (Standing, Action, Sitting, Fists, Relaxed Palm)
+  const handleApplyPreset = useCallback((preset: PosePresetName) => {
+    if (!mannequinBonesRef.current) return;
+    applyPosePreset(mannequinBonesRef.current, preset);
+    if (ikHandlesRef.current) {
+      const updateHandle = (name: string, bone?: THREE.Bone) => {
+        if (bone && ikHandlesRef.current![name]) {
+          const wp = new THREE.Vector3();
+          bone.getWorldPosition(wp);
+          ikHandlesRef.current![name].position.copy(wp);
+        }
+      };
+      updateHandle('head', mannequinBonesRef.current.head);
+      updateHandle('leftHand', mannequinBonesRef.current.leftHand);
+      updateHandle('rightHand', mannequinBonesRef.current.rightHand);
+      updateHandle('leftFoot', mannequinBonesRef.current.leftFoot);
+      updateHandle('rightFoot', mannequinBonesRef.current.rightFoot);
+    }
+  }, []);
+
+  // 3D LT Lineart & Screentone Extraction (3D-to-2D Line Extraction)
+  const handleExtractLineAndTone = async () => {
+    if (!sceneRef.current || !cameraRef.current || !modelRootRef.current || isBaking) return;
+    setIsBaking(true);
+    setShowLTModal(false);
+
+    try {
+      if (transformHelperRef.current) transformHelperRef.current.visible = false;
+      if (gridHelperRef.current) gridHelperRef.current.visible = false;
+      if (ikHandlesContainerRef.current) ikHandlesContainerRef.current.visible = false;
+
+      await bake3DToLineAndTone({
+        scene: sceneRef.current,
+        camera: cameraRef.current,
+        dimensions,
+        activeRenderer: rendererRef.current,
+        baseLayerName: loadedFileName ? loadedFileName.replace(/\.[^/.]+$/, '') : '3D Model',
+        lineThreshold: ltLineThreshold,
+        toneBands: ltToneBands,
+        toneFrequencies: [55, 60],
+        toneAngles: [45, 60],
+        toneDensities: [0.45, 0.2],
+        disposeOnComplete: true,
+        onInsertLayers: (layers, canvases) => {
+          for (let i = 0; i < layers.length; i++) {
+            onInsertRasterLayer(layers[i], canvases[i]);
+          }
+        },
+      });
+
+      onClose();
+    } catch (err) {
+      console.error('[3D] Failed to extract line & tone:', err);
+      setIsBaking(false);
+      if (gridHelperRef.current) gridHelperRef.current.visible = showGrid;
+      if (transformHelperRef.current && gizmoMode !== 'none') transformHelperRef.current.visible = true;
+      if (ikHandlesContainerRef.current) ikHandlesContainerRef.current.visible = true;
+    }
   };
 
   // Bake 3D to 2D Layer (Ensuring Gizmos & Grids are NOT baked into layer)
@@ -913,13 +1100,23 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
                 <p className="text-sm font-medium text-white">Import 3D Model</p>
                 <p className="text-xs text-gray-400 mt-1">Drag and drop .glb, .gltf, or .obj file, or click upload</p>
               </div>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded text-xs font-medium transition-colors shadow-lg shadow-purple-900/30"
-              >
-                Upload Model
-              </button>
+              <div className="flex items-center space-x-2">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded text-xs font-medium transition-colors shadow-lg shadow-purple-900/30"
+                >
+                  Upload Model
+                </button>
+                <button
+                  type="button"
+                  onClick={loadProceduralMannequin}
+                  className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-medium transition-colors shadow-lg shadow-blue-900/30 flex items-center space-x-1.5"
+                >
+                  <User className="w-3.5 h-3.5" />
+                  <span>Insert 3D Mannequin</span>
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -972,7 +1169,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
             className="pointer-events-auto bg-[#181b20]/95 backdrop-blur-md border border-[#3b82f6]/40 shadow-2xl rounded-lg px-3 py-1.5 flex items-center space-x-2.5 text-xs text-[#cccccc]"
             onPointerDown={(e) => e.stopPropagation()}
           >
-            {/* Model Upload Button */}
+            {/* Model & Mannequin Upload / Preset Button */}
             <div className="flex items-center space-x-1.5 bg-[#252830] rounded px-2 py-1 border border-white/10">
               <span className="text-[10px] uppercase font-semibold text-gray-400">Model</span>
               <button
@@ -980,15 +1177,28 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
                 onClick={() => fileInputRef.current?.click()}
                 title="Upload 3D Model (.glb, .gltf, .obj)"
                 className={`p-1 px-2 rounded transition-colors flex items-center space-x-1.5 ${
-                  loadedFileName
+                  loadedFileName && !isMannequinActive
                     ? 'bg-purple-600 text-white hover:bg-purple-500'
                     : 'bg-purple-600/30 text-purple-300 hover:bg-purple-600 hover:text-white'
                 }`}
               >
                 <Upload className="w-3.5 h-3.5" />
-                <span className="text-[10px] font-medium max-w-[120px] truncate">
+                <span className="text-[10px] font-medium max-w-[100px] truncate">
                   {loadedFileName || 'Upload'}
                 </span>
+              </button>
+              <button
+                type="button"
+                onClick={loadProceduralMannequin}
+                title="Load Rigged Humanoid Drawing Mannequin"
+                className={`p-1 px-2 rounded transition-colors flex items-center space-x-1.5 ${
+                  isMannequinActive
+                    ? 'bg-blue-600 text-white hover:bg-blue-500'
+                    : 'bg-blue-600/30 text-blue-300 hover:bg-blue-600 hover:text-white'
+                }`}
+              >
+                <User className="w-3.5 h-3.5" />
+                <span className="text-[10px] font-medium">Mannequin</span>
               </button>
               <input
                 ref={fileInputRef}
@@ -998,6 +1208,115 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
                 onChange={handleFileUpload}
               />
             </div>
+
+            {/* Poses Drawer Trigger (Standing, Action, Sitting, Fists, Relaxed Palm) */}
+            {isMannequinActive && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowPoseDrawer(!showPoseDrawer)}
+                  className={`flex items-center space-x-1 px-2 py-1 rounded border border-white/10 text-[10px] transition-colors ${
+                    showPoseDrawer ? 'bg-amber-600 text-white' : 'bg-[#252830] text-amber-300 hover:bg-white/10'
+                  }`}
+                  title="Humanoid Pose Presets"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  <span>Poses</span>
+                </button>
+
+                {showPoseDrawer && (
+                  <div className="absolute top-full mt-1.5 left-0 bg-[#1b1e24] border border-[#f59e0b]/40 rounded-lg p-2 shadow-2xl z-50 flex flex-col space-y-1.5 w-44">
+                    <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-1">
+                      Pose Presets
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleApplyPreset('standing');
+                        setShowPoseDrawer(false);
+                      }}
+                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
+                    >
+                      <span>Heroic Standing</span>
+                      <span className="text-[9px] text-gray-500 font-mono">Neutral</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleApplyPreset('action');
+                        setShowPoseDrawer(false);
+                      }}
+                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
+                    >
+                      <span>Manga Action</span>
+                      <span className="text-[9px] text-orange-400 font-mono">Combat</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleApplyPreset('sitting');
+                        setShowPoseDrawer(false);
+                      }}
+                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
+                    >
+                      <span>Seated Pose</span>
+                      <span className="text-[9px] text-sky-400 font-mono">Rest</span>
+                    </button>
+                    <div className="border-t border-white/10 my-0.5" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleApplyPreset('fists');
+                        setShowPoseDrawer(false);
+                      }}
+                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
+                    >
+                      <span>Hand Fists</span>
+                      <span className="text-[9px] text-gray-400 font-mono">Clenched</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        handleApplyPreset('relaxed_palm');
+                        setShowPoseDrawer(false);
+                      }}
+                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
+                    >
+                      <span>Relaxed Palm</span>
+                      <span className="text-[9px] text-gray-400 font-mono">Open</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* IK Limbs Selector */}
+            {isMannequinActive && (
+              <div className="flex items-center space-x-1 bg-[#252830] rounded px-1.5 py-1 border border-white/10">
+                <span className="text-[10px] uppercase font-semibold text-gray-400 mr-1">IK</span>
+                {(['head', 'leftHand', 'rightHand', 'leftFoot', 'rightFoot'] as const).map((limb) => (
+                  <button
+                    key={limb}
+                    type="button"
+                    onClick={() => selectIKTarget(activeIKHandle === limb ? null : limb)}
+                    title={`Manipulate ${limb} IK handle`}
+                    className={`px-1.5 py-0.5 rounded text-[10px] capitalize transition-colors ${
+                      activeIKHandle === limb ? 'bg-cyan-600 text-white font-medium' : 'text-gray-400 hover:bg-white/10'
+                    }`}
+                  >
+                    {limb === 'leftHand'
+                      ? 'L-Hand'
+                      : limb === 'rightHand'
+                      ? 'R-Hand'
+                      : limb === 'leftFoot'
+                      ? 'L-Foot'
+                      : limb === 'rightFoot'
+                      ? 'R-Foot'
+                      : 'Head'}
+                  </button>
+                ))}
+              </div>
+            )}
 
             {/* 3D Gizmo Rings Mode (Rotate / Translate / Off) */}
             <div className="flex items-center space-x-1 bg-[#252830] rounded px-1.5 py-1 border border-white/10">
@@ -1189,6 +1508,119 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
             >
               <RotateCcw className="w-3.5 h-3.5" />
             </button>
+
+            {/* Perspective Ruler Camera Sync Toggle */}
+            <button
+              type="button"
+              onClick={() => {
+                const nextSync = !syncCameraPerspective;
+                setSyncCameraPerspective(nextSync);
+                if (nextSync && cameraRef.current && onUpdatePerspectiveRuler) {
+                  const ruler = calculatePerspectiveFromCamera(
+                    cameraRef.current,
+                    dimensions.width,
+                    dimensions.height,
+                    perspectiveRuler
+                  );
+                  onUpdatePerspectiveRuler(ruler);
+                }
+              }}
+              title="Synchronize 3D camera with document Perspective Ruler"
+              className={`p-1.5 px-2 rounded transition-colors flex items-center space-x-1 ${
+                syncCameraPerspective
+                  ? 'bg-cyan-600/30 text-cyan-300 ring-1 ring-cyan-400'
+                  : 'text-gray-400 hover:bg-white/10'
+              }`}
+            >
+              <Link className="w-3.5 h-3.5" />
+              <span className="text-[10px]">Ruler Sync</span>
+            </button>
+
+            {/* 3D LT Line & Screentone Extraction */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setShowLTModal(!showLTModal)}
+                disabled={isBaking || !modelRootRef.current}
+                title="Extract Lineart and Screentones from 3D Model (LT Conversion)"
+                className="flex items-center space-x-1 bg-purple-600 hover:bg-purple-500 text-white font-medium px-2.5 py-1 rounded shadow-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                <span className="text-xs">LT Convert</span>
+              </button>
+
+              {showLTModal && (
+                <div className="absolute top-full mt-2 right-0 bg-[#1b1e24] border border-purple-500/40 rounded-xl p-3 shadow-2xl z-50 flex flex-col space-y-2.5 w-60">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-purple-300 flex items-center space-x-1">
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>LT Line & Tone Extraction</span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setShowLTModal(false)}
+                      className="text-gray-400 hover:text-white"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <div className="flex flex-col space-y-1">
+                    <div className="flex items-center justify-between text-[11px] text-gray-300">
+                      <span>Line Sensitivity</span>
+                      <span className="font-mono text-cyan-400">{Math.round((1 - ltLineThreshold) * 100)}%</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.1"
+                      max="0.6"
+                      step="0.02"
+                      value={ltLineThreshold}
+                      onChange={(e) => setLtLineThreshold(parseFloat(e.target.value))}
+                      className="w-full accent-purple-500 cursor-pointer h-1.5"
+                    />
+                  </div>
+
+                  <div className="flex flex-col space-y-1">
+                    <span className="text-[11px] text-gray-300">Screentone Quantization</span>
+                    <div className="flex space-x-2">
+                      <button
+                        type="button"
+                        onClick={() => setLtToneBands(2)}
+                        className={`flex-1 py-1 rounded text-[10px] font-medium transition-colors ${
+                          ltToneBands === 2
+                            ? 'bg-purple-600 text-white'
+                            : 'bg-white/5 text-gray-400 hover:bg-white/10'
+                        }`}
+                      >
+                        2 Bands (Shadow)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setLtToneBands(3)}
+                        className={`flex-1 py-1 rounded text-[10px] font-medium transition-colors ${
+                          ltToneBands === 3
+                            ? 'bg-purple-600 text-white'
+                            : 'bg-white/5 text-gray-400 hover:bg-white/10'
+                        }`}
+                      >
+                        3 Bands (Deep/Mid)
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleExtractLineAndTone}
+                    disabled={isBaking}
+                    className="w-full py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-medium rounded text-xs transition-colors shadow-lg flex items-center justify-center space-x-1.5"
+                  >
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Extract Line & Tone</span>
+                  </button>
+                </div>
+              )}
+            </div>
 
             {/* Bake to 2D Layer */}
             <button

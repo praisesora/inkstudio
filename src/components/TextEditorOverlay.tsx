@@ -101,6 +101,8 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
           textAlign: settings.align,
           color: settings.color,
           lineHeight: 1.25,
+          writingMode: settings.writingMode === 'vertical-rl' ? 'vertical-rl' : 'horizontal-tb',
+          textOrientation: 'mixed',
           textShadow: settings.outline
             ? `
                 -${settings.outlineWidth}px -${settings.outlineWidth}px 0 ${settings.outlineColor},
@@ -228,6 +230,28 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
                   }`}
                 >
                   <Italic className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
+              {/* Writing Direction (Horizontal vs Vertical Manga Tate-gaki) */}
+              <div className="flex items-center space-x-1 bg-[#141517] p-0.5 rounded border border-[#2b2d31]">
+                <button
+                  onClick={() => onUpdateSettings((prev) => ({ ...prev, writingMode: 'horizontal-tb' }))}
+                  title="Horizontal Layout (Left-to-Right)"
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                    settings.writingMode !== 'vertical-rl' ? 'bg-[#2b2d31] text-cyan-300' : 'text-[#888888] hover:text-white'
+                  }`}
+                >
+                  Horiz
+                </button>
+                <button
+                  onClick={() => onUpdateSettings((prev) => ({ ...prev, writingMode: 'vertical-rl' }))}
+                  title="Vertical Layout (Manga Tate-gaki: Right-to-Left columns)"
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
+                    settings.writingMode === 'vertical-rl' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40' : 'text-[#888888] hover:text-white'
+                  }`}
+                >
+                  Vert 縦
                 </button>
               </div>
 

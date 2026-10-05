@@ -38,6 +38,8 @@ import {
   Wand2,
   PenTool,
   Feather,
+  MessageSquare,
+  Spline,
 } from 'lucide-react';
 import {
   ToolType,
@@ -50,6 +52,8 @@ import {
   LiquifySettings,
   LiquifyMode,
   WandSettings,
+  BalloonSettings,
+  VectorEditSettings,
 } from '../types/editor';
 import { LiquifyIcon } from './LiquifyIcon';
 import { PENCIL_CONFIGS, PencilGrade } from '../utils/pencilEngine';
@@ -106,6 +110,11 @@ interface LeftPanelProps {
   onFillScreentone?: () => void;
   liquifySettings?: LiquifySettings;
   onUpdateLiquifySettings?: (newSettings: Partial<LiquifySettings>) => void;
+  balloonSettings?: BalloonSettings;
+  onUpdateBalloonSettings?: (newSettings: Partial<BalloonSettings>) => void;
+  vectorEditSettings?: VectorEditSettings;
+  onUpdateVectorEditSettings?: (newSettings: Partial<VectorEditSettings>) => void;
+  onOpenMangaEffects?: () => void;
   wandSettings?: WandSettings;
   onUpdateWandSettings?: (newSettings: Partial<WandSettings>) => void;
   onExpandSelection?: (pixels: number) => void;
@@ -140,6 +149,11 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   onFillScreentone: _onFillScreentone,
   liquifySettings,
   onUpdateLiquifySettings,
+  balloonSettings,
+  onUpdateBalloonSettings,
+  vectorEditSettings,
+  onUpdateVectorEditSettings,
+  onOpenMangaEffects,
   wandSettings,
   onUpdateWandSettings,
   onExpandSelection,
@@ -555,6 +569,226 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
       );
     }
 
+    if (currentTool === 'balloon') {
+      return (
+        <div className="flex-1 flex flex-col overflow-y-auto">
+          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
+            <div className="flex items-center space-x-2">
+              <MessageSquare className="w-4 h-4 text-cyan-400" />
+              <span className="text-xs font-semibold text-white">Speech Balloon Tool</span>
+            </div>
+            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="p-3 space-y-4">
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Balloon Shape:</label>
+              <div className="grid grid-cols-2 gap-1.5">
+                {(['ellipse', 'rounded-rect', 'jagged-flash', 'thought'] as const).map((shape) => (
+                  <button
+                    key={shape}
+                    type="button"
+                    onClick={() => onUpdateBalloonSettings?.({ shape })}
+                    className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer capitalize font-medium ${
+                      balloonSettings?.shape === shape
+                        ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
+                        : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                    }`}
+                  >
+                    {shape.replace('-', ' ')}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium text-[#aaaaaa] block">Writing Direction:</label>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onUpdateBalloonSettings?.({ vertical: false })}
+                  className={`py-1 px-2 rounded text-xs text-center transition-colors cursor-pointer font-medium ${
+                    !balloonSettings?.vertical
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:text-white border border-transparent'
+                  }`}
+                >
+                  Horizontal (横)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateBalloonSettings?.({ vertical: true })}
+                  className={`py-1 px-2 rounded text-xs text-center transition-colors cursor-pointer font-medium ${
+                    balloonSettings?.vertical
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:text-white border border-transparent'
+                  }`}
+                >
+                  Vertical (縦書き)
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="text-[11px] font-medium text-[#aaaaaa]">Border Width:</label>
+                <span className="text-xs font-mono text-cyan-400">{balloonSettings?.strokeWidth ?? 3}px</span>
+              </div>
+              <input
+                type="range"
+                min={1}
+                max={15}
+                value={balloonSettings?.strokeWidth ?? 3}
+                onChange={(e) => onUpdateBalloonSettings?.({ strokeWidth: Number(e.target.value) })}
+                className="w-full accent-cyan-400"
+              />
+            </div>
+
+            <div className="pt-2 border-t border-[#26282c] space-y-1 text-[11px] text-[#888888]">
+              <p>• Click on canvas to place parametric speech balloon.</p>
+              <p>• Drag handles to resize body or re-orient bezier tail.</p>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (currentTool === 'vector-edit') {
+      const activeMode = vectorEditSettings?.mode || 'pinch';
+
+      return (
+        <div className="flex-1 flex flex-col overflow-y-auto">
+          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
+            <div className="flex items-center space-x-2">
+              <Spline className="w-4 h-4 text-cyan-400" />
+              <span className="text-xs font-semibold text-white">Correct Line (Vector)</span>
+            </div>
+            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          <div className="p-3 space-y-4">
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Operation Mode:</label>
+              <div className="space-y-1">
+                <button
+                  type="button"
+                  onClick={() => onUpdateVectorEditSettings?.({ mode: 'pinch' })}
+                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
+                    activeMode === 'pinch'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <span>Pinch / Reshape Line</span>
+                  <span className="text-[10px] text-[#777777]">Bell-curve</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onUpdateVectorEditSettings?.({ mode: 'width' })}
+                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
+                    activeMode === 'width'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <span>Modify Line Width</span>
+                  <span className="text-[10px] text-[#777777]">Local scale</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onUpdateVectorEditSettings?.({ mode: 'simplify' })}
+                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
+                    activeMode === 'simplify'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <span>Simplify Vector Line</span>
+                  <span className="text-[10px] text-[#777777]">Ramer-Douglas</span>
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <label className="text-[11px] font-medium text-[#aaaaaa]">Influence Radius:</label>
+                <span className="text-xs font-mono text-cyan-400">{vectorEditSettings?.radius ?? 30}px</span>
+              </div>
+              <input
+                type="range"
+                min={5}
+                max={150}
+                value={vectorEditSettings?.radius ?? 30}
+                onChange={(e) => onUpdateVectorEditSettings?.({ radius: Number(e.target.value) })}
+                className="w-full accent-cyan-400"
+              />
+            </div>
+
+            {activeMode === 'width' && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-medium text-[#aaaaaa]">Width Factor:</label>
+                  <span className="text-xs font-mono text-cyan-400">
+                    {(vectorEditSettings?.widthFactor ?? 1.5).toFixed(1)}x
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={2}
+                  max={30}
+                  value={Math.round((vectorEditSettings?.widthFactor ?? 1.5) * 10)}
+                  onChange={(e) =>
+                    onUpdateVectorEditSettings?.({ widthFactor: Number(e.target.value) / 10 })
+                  }
+                  className="w-full accent-cyan-400"
+                />
+              </div>
+            )}
+
+            {activeMode === 'simplify' && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[11px] font-medium text-[#aaaaaa]">Reduction Tolerance:</label>
+                  <span className="text-xs font-mono text-cyan-400">
+                    {(vectorEditSettings?.simplifyTolerance ?? 2.0).toFixed(1)}px
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={5}
+                  max={80}
+                  value={Math.round((vectorEditSettings?.simplifyTolerance ?? 2.0) * 10)}
+                  onChange={(e) =>
+                    onUpdateVectorEditSettings?.({ simplifyTolerance: Number(e.target.value) / 10 })
+                  }
+                  className="w-full accent-cyan-400"
+                />
+              </div>
+            )}
+
+            {onOpenMangaEffects && (
+              <div className="pt-2 border-t border-[#26282c]">
+                <button
+                  type="button"
+                  onClick={onOpenMangaEffects}
+                  className="w-full py-2 px-3 rounded bg-[#18191c] hover:bg-[#25272b] border border-[#383a40] text-cyan-300 text-xs font-medium flex items-center justify-center space-x-2 transition-colors cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  <span>Manga Effect Lines...</span>
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     if (currentTool === 'text') {
       return (
         <div className="flex-1 flex flex-col overflow-y-auto">
@@ -584,6 +818,34 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
                 <option value="'Times New Roman', serif">Times New Roman</option>
                 <option value="Georgia, serif">Georgia</option>
               </select>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[11px] font-medium text-[#aaaaaa]">Writing Direction:</label>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onUpdateTextSettings?.({ writingMode: 'horizontal-tb' })}
+                  className={`px-2 py-1 rounded text-xs transition-colors cursor-pointer text-center font-medium ${
+                    textSettings?.writingMode !== 'vertical-rl'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
+                      : 'bg-[#202226] text-[#888888] hover:text-white border border-transparent'
+                  }`}
+                >
+                  Horizontal (横)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onUpdateTextSettings?.({ writingMode: 'vertical-rl' })}
+                  className={`px-2 py-1 rounded text-xs transition-colors cursor-pointer text-center font-medium ${
+                    textSettings?.writingMode === 'vertical-rl'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
+                      : 'bg-[#202226] text-[#888888] hover:text-white border border-transparent'
+                  }`}
+                >
+                  Vertical (縦書き)
+                </button>
+              </div>
             </div>
 
             <div className="space-y-1.5">
@@ -1349,6 +1611,38 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
             <Frame className="w-4 h-4" />
             <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
               Frame Border (F)
+            </div>
+          </button>
+
+          {/* Speech Balloon Tool (B) */}
+          <button
+            onClick={() => onSelectTool('balloon')}
+            title="Speech Balloon Tool"
+            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
+              currentTool === 'balloon'
+                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
+                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
+            }`}
+          >
+            <MessageSquare className="w-4 h-4" />
+            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
+              Speech Balloon
+            </div>
+          </button>
+
+          {/* Correct Line (Vector Edit) Tool (Y) */}
+          <button
+            onClick={() => onSelectTool('vector-edit')}
+            title="Correct Line (Vector Pinch/Width/Simplify)"
+            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
+              currentTool === 'vector-edit'
+                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
+                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
+            }`}
+          >
+            <Spline className="w-4 h-4" />
+            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
+              Correct Line (Vector)
             </div>
           </button>
         </div>
