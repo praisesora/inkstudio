@@ -66,6 +66,9 @@ interface CanvasAreaProps {
   onFillColor?: () => void;
   onClearSelection?: () => void;
   onInvertSelection?: () => void;
+  onExpandSelection?: (pixels: number) => void;
+  onContractSelection?: (pixels: number) => void;
+  onFeatherSelection?: (radius: number) => void;
   transformSession?: TransformSession | null;
   onUpdateTransformSession?: (updater: (prev: TransformSession) => TransformSession) => void;
   onApplyTransform?: () => void;
@@ -129,6 +132,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onFillColor,
   onClearSelection,
   onInvertSelection,
+  onExpandSelection,
+  onContractSelection,
+  onFeatherSelection,
   transformSession = null,
   onUpdateTransformSession,
   onApplyTransform,
@@ -261,7 +267,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         isRotating ||
         isRotateModifier ||
         isResizingBrush ||
-        (tool !== 'brush' && tool !== 'eraser' && tool !== 'liquify')
+        (tool !== 'brush' && tool !== 'eraser' && tool !== 'liquify' && tool !== 'select-pen' && tool !== 'select-eraser')
       ) {
         ring.style.display = 'none';
         return;
@@ -583,7 +589,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     if (tool === 'text') {
       return { cursor: 'text' };
     }
-    if (tool === 'select-rect' || tool === 'select-lasso' || tool === 'fill' || tool === 'frame') {
+    if (tool === 'select-rect' || tool === 'select-lasso' || tool === 'select-wand' || tool === 'fill' || tool === 'frame') {
       return { cursor: 'crosshair' };
     }
     if (tool === 'liquify') {
@@ -592,7 +598,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     if (tool === 'transform') {
       return { cursor: 'default' };
     }
-    if (tool === 'brush' || tool === 'eraser') {
+    if (tool === 'brush' || tool === 'eraser' || tool === 'select-pen' || tool === 'select-eraser') {
       return { cursor: isOverCanvas ? 'none' : 'default' };
     }
     return { cursor: isOverCanvas ? 'crosshair' : 'default' };
@@ -640,7 +646,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
       {/* Artboard Container with 2D Affine Transformation (Pan, Zoom, and Rotation) */}
       <div
-        className="absolute origin-top-left select-none"
+        className="absolute origin-top-left select-none z-20"
         style={{
           width: dimensions.width,
           height: dimensions.height,
@@ -735,6 +741,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             onFillColor={onFillColor || (() => {})}
             onClearSelection={onClearSelection || (() => {})}
             onInvertSelection={onInvertSelection || (() => {})}
+            onExpandSelection={onExpandSelection}
+            onContractSelection={onContractSelection}
+            onFeatherSelection={onFeatherSelection}
           />
         )}
 

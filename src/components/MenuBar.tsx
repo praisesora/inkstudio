@@ -5,6 +5,7 @@ import { MenuSection, MenuItem } from '../types/editor';
 export const DEFAULT_MENU_SECTIONS: MenuSection[] = [
   { id: 'file', label: 'File', items: [] },
   { id: 'edit', label: 'Edit', items: [] },
+  { id: 'select', label: 'Select', items: [] },
   { id: 'layer', label: 'Layer', items: [] },
   { id: 'ruler', label: 'Ruler', items: [] },
   { id: 'view', label: 'View', items: [] },

@@ -24,6 +24,10 @@ import {
   FolderOutput,
   Box,
   GripVertical,
+  Compass,
+  SquareDot,
+  Link2,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { HistoryItemMeta, LayerItem, BlendMode, ToolType, CanvasColorMode, ExpressionColor } from '../types/editor';
 import { BLEND_MODES } from '../utils/canvasUtils';
@@ -61,7 +65,16 @@ interface RightSidebarProps {
   onRenameLayer: (id: string, name: string) => void;
   onMoveLayer?: (id: string, direction: 'up' | 'down') => void;
   onMoveLayerToFolder: (id: string, targetFolderId: string | null) => void;
+  // Non-destructive Layer Mask & Adjustment Props
+  activeEditTarget?: 'layer' | 'mask';
+  onSelectEditTarget?: (target: 'layer' | 'mask') => void;
+  onAddLayerMask?: (layerId: string) => void;
+  onRemoveLayerMask?: (layerId: string, apply?: boolean) => void;
+  onToggleLayerMask?: (layerId: string) => void;
+  onToggleMaskLinked?: (layerId: string) => void;
+  onOpenAdjustmentModal?: (layerId?: string, initialType?: 'curves' | 'gradient-map' | 'levels' | 'color-balance') => void;
   onReorderLayers?: (draggedId: string, targetId: string, position: 'above' | 'below' | 'inside') => void;
+  onToggleReferenceLayer?: (id: string) => void;
   // Tone (Screentone) Effect Props
   onToggleTone?: (id: string) => void;
   onSetToneFrequency?: (id: string, frequency: number) => void;
@@ -195,6 +208,14 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onRenameLayer,
   onMoveLayerToFolder,
   onReorderLayers,
+  activeEditTarget = 'layer',
+  onSelectEditTarget,
+  onAddLayerMask,
+  onRemoveLayerMask,
+  onToggleLayerMask,
+  onToggleMaskLinked,
+  onOpenAdjustmentModal,
+  onToggleReferenceLayer,
   onToggleTone,
   onSetToneFrequency,
   onSetToneAngle,
@@ -236,6 +257,30 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
     window.addEventListener('mousedown', handlePointerDown);
     return () => window.removeEventListener('mousedown', handlePointerDown);
   }, [isExpressionMenuOpen]);
+
+  // Right-click layer context menu state
+  const [contextMenu, setContextMenu] = useState<{ layerId: string; x: number; y: number } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleOutsideClick = (e: MouseEvent) => {
+      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
+        setContextMenu(null);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setContextMenu(null);
+      }
+    };
+    window.addEventListener('pointerdown', handleOutsideClick);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', handleOutsideClick);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [contextMenu]);
 
   // Top Section (Color Panel) Height & Resizer
   const [topHeight, setTopHeight] = useState<number>(() => {
@@ -1259,6 +1304,25 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                   </button>
                 )}
 
+                {/* Toggle Reference Layer */}
+                {activeLayer && (
+                  <button
+                    onClick={() => onToggleReferenceLayer?.(activeLayer.id)}
+                    title={
+                      activeLayer.isReference
+                        ? 'Unset as Reference Layer'
+                        : 'Set as Reference Layer (Sampled by Magic Wand / Fill)'
+                    }
+                    className={`p-1 rounded-[2px] transition-colors ${
+                      activeLayer.isReference
+                        ? 'text-cyan-400 bg-cyan-950/50 ring-1 ring-cyan-500/60 shadow-xs'
+                        : 'text-[#888888] hover:text-white hover:bg-[#333333]'
+                    }`}
+                  >
+                    <Compass className="w-3.5 h-3.5" />
+                  </button>
+                )}
+
                 {/* Toggle Lock */}
                 {activeLayer && (
                   <button
@@ -1315,6 +1379,24 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     onClick={() => {
                       if (justDraggedRef.current) return;
                       onSelectLayer(layer.id);
+                      if (activeEditTarget === 'mask' && !layer.maskCanvas && layer.maskEnabled === undefined) {
+                        onSelectEditTarget?.('layer');
+                      }
+                    }}
+                    onDoubleClick={() => {
+                      if (layer.type === 'adjustment') {
+                        onOpenAdjustmentModal?.(layer.id, layer.adjustmentData?.type);
+                      }
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onSelectLayer(layer.id);
+                      setContextMenu({
+                        layerId: layer.id,
+                        x: e.clientX,
+                        y: e.clientY,
+                      });
                     }}
                     className={`group relative flex items-center space-x-1.5 px-2 py-1.5 rounded-[2px] transition-colors border select-none ${
                       isInsideFolder ? 'ml-4 border-l-2 border-l-[#444444]' : ''
@@ -1401,7 +1483,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                       </button>
                     )}
 
-                    {/* Layer Icon: Folder icon for folders, Layers icon for raster layers */}
+                    {/* Layer Icon: Folder icon for folders, Sliders for adjustment, Layers for raster */}
                     {isFolder ? (
                       <div className="w-4 h-4 flex items-center justify-center shrink-0 text-amber-400">
                         {layer.collapsed ? (
@@ -1410,47 +1492,142 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                           <FolderOpen className="w-4 h-4" />
                         )}
                       </div>
+                    ) : layer.type === 'adjustment' ? (
+                      <div className="w-4 h-4 flex items-center justify-center shrink-0 text-cyan-400">
+                        <SlidersHorizontal className="w-3.5 h-3.5" />
+                      </div>
                     ) : (
                       <div className="w-4 h-4 flex items-center justify-center shrink-0 text-[#888888] group-hover:text-blue-400 transition-colors">
                         <Layers className={`w-3.5 h-3.5 ${isActive ? 'text-blue-400' : ''}`} />
                       </div>
                     )}
 
-                    {/* Live Layer Thumbnail Preview next to Layer Icon (for raster layers) */}
+                    {/* Live Layer Thumbnail & Secondary Mask Thumbnail Preview */}
                     {!isFolder && (
-                      <div
-                        className="w-10 h-7 rounded-[2px] border border-[#484848] overflow-hidden shrink-0 relative flex items-center justify-center shadow-inner"
-                        style={{
-                          backgroundColor: '#1e1e1e',
-                          backgroundImage:
-                            layer.id === 'layer-bg'
-                              ? 'none'
-                              : 'conic-gradient(#2d2d2d 90deg, #1f1f1f 90deg 180deg, #2d2d2d 180deg 270deg, #1f1f1f 270deg)',
-                          backgroundSize: '6px 6px',
-                        }}
-                        title={`Layer content preview for ${layer.name}`}
-                      >
-                        {layer.thumbnailUrl ? (
-                          <img
-                            src={layer.thumbnailUrl}
-                            alt={layer.name}
-                            className="w-full h-full object-cover"
-                          />
+                      <div className="flex items-center space-x-1 shrink-0">
+                        {/* Primary Layer Thumbnail */}
+                        {layer.type === 'adjustment' ? (
+                          <div
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectLayer(layer.id);
+                              onSelectEditTarget?.('layer');
+                            }}
+                            onDoubleClick={(e) => {
+                              e.stopPropagation();
+                              onOpenAdjustmentModal?.(layer.id, layer.adjustmentData?.type);
+                            }}
+                            className={`w-10 h-7 rounded-[2px] border border-[#484848] overflow-hidden shrink-0 relative flex items-center justify-center shadow-inner cursor-pointer bg-linear-to-br from-[#1a2332] to-[#0e1726] ${
+                              isActive && activeEditTarget !== 'mask' ? 'ring-2 ring-blue-500 border-blue-400' : ''
+                            }`}
+                            title="Adjustment Layer (Double-click to edit parameters)"
+                          >
+                            <SlidersHorizontal className="w-3.5 h-3.5 text-cyan-400" />
+                          </div>
                         ) : (
                           <div
-                            className="w-full h-full"
-                            style={{
-                              backgroundColor: layer.id === 'layer-bg' ? '#ffffff' : 'transparent',
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectLayer(layer.id);
+                              onSelectEditTarget?.('layer');
                             }}
-                          />
+                            className={`w-10 h-7 rounded-[2px] border border-[#484848] overflow-hidden shrink-0 relative flex items-center justify-center shadow-inner cursor-pointer ${
+                              isActive && activeEditTarget !== 'mask' ? 'ring-2 ring-blue-500 border-blue-400' : ''
+                            }`}
+                            style={{
+                              backgroundColor: '#1e1e1e',
+                              backgroundImage:
+                                layer.id === 'layer-bg'
+                                  ? 'none'
+                                  : 'conic-gradient(#2d2d2d 90deg, #1f1f1f 90deg 180deg, #2d2d2d 180deg 270deg, #1f1f1f 270deg)',
+                              backgroundSize: '6px 6px',
+                            }}
+                            title={`Layer content preview for ${layer.name}`}
+                          >
+                            {layer.thumbnailUrl ? (
+                              <img
+                                src={layer.thumbnailUrl}
+                                alt={layer.name}
+                                className="w-full h-full object-cover"
+                              />
+                            ) : (
+                              <div
+                                className="w-full h-full"
+                                style={{
+                                  backgroundColor: layer.id === 'layer-bg' ? '#ffffff' : 'transparent',
+                                }}
+                              />
+                            )}
+
+                            {/* Clipping Mask Left Indicator Stripe (CSP style) */}
+                            {layer.clipped && (
+                              <div
+                                className="absolute left-0 top-0 bottom-0 w-1 bg-blue-500 rounded-l-[1px] z-10 shadow-xs"
+                                title="Clipped to layer below"
+                              />
+                            )}
+                          </div>
                         )}
 
-                        {/* Clipping Mask Left Indicator Stripe (CSP style) */}
-                        {layer.clipped && (
-                          <div
-                            className="absolute left-0 top-0 bottom-0 w-1 bg-blue-500 rounded-l-[1px] z-10 shadow-xs"
-                            title="Clipped to layer below"
-                          />
+                        {/* Secondary Mask Thumbnail (if layer has mask) */}
+                        {(layer.maskCanvas || layer.maskEnabled !== undefined || layer.maskThumbnailUrl) && (
+                          <>
+                            {/* Link Toggle Icon */}
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onToggleMaskLinked?.(layer.id);
+                              }}
+                              title={layer.maskLinked !== false ? 'Mask Linked to Layer (Click to Unlink)' : 'Mask Unlinked (Click to Link)'}
+                              className={`p-0.5 transition-colors ${
+                                layer.maskLinked !== false ? 'text-zinc-400 hover:text-white' : 'text-zinc-600 hover:text-zinc-400'
+                              }`}
+                            >
+                              <Link2 className={`w-2.5 h-2.5 ${layer.maskLinked === false ? 'opacity-30' : ''}`} />
+                            </button>
+
+                            {/* Mask Thumbnail */}
+                            <div
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                onSelectLayer(layer.id);
+                                onSelectEditTarget?.('mask');
+                              }}
+                              onContextMenu={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                onSelectLayer(layer.id);
+                                onSelectEditTarget?.('mask');
+                                setContextMenu({
+                                  layerId: layer.id,
+                                  x: e.clientX,
+                                  y: e.clientY,
+                                });
+                              }}
+                              className={`w-10 h-7 rounded-[2px] border border-[#484848] overflow-hidden shrink-0 relative flex items-center justify-center shadow-inner cursor-pointer bg-black ${
+                                isActive && activeEditTarget === 'mask' ? 'ring-2 ring-blue-500 border-blue-400' : ''
+                              }`}
+                              title={`Layer Mask for ${layer.name} (Click to paint on mask, Right-click to toggle enabled)`}
+                            >
+                              {layer.maskThumbnailUrl ? (
+                                <img
+                                  src={layer.maskThumbnailUrl}
+                                  alt={`${layer.name} Mask`}
+                                  className="w-full h-full object-cover"
+                                />
+                              ) : (
+                                <div className="w-full h-full bg-white" />
+                              )}
+
+                              {/* Red slash when mask is disabled */}
+                              {layer.maskEnabled === false && (
+                                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                                  <div className="w-[140%] h-[1.5px] bg-red-500 rotate-45 transform shadow-xs" />
+                                </div>
+                              )}
+                            </div>
+                          </>
                         )}
                       </div>
                     )}
@@ -1541,6 +1718,22 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                           {layer.expressionColor === 'monochrome' ? '1-bit' : 'Gray'}
                         </span>
                       )}
+
+                      {/* Adjustment Layer Tag */}
+                      {layer.type === 'adjustment' && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenAdjustmentModal?.(layer.id, layer.adjustmentData?.type);
+                          }}
+                          className="text-[9px] px-1.5 py-0.5 rounded bg-cyan-950/60 border border-cyan-600/50 text-cyan-300 font-mono flex items-center gap-1 shrink-0 hover:border-cyan-400 hover:text-cyan-200 transition-colors cursor-pointer"
+                          title="Click to edit adjustment parameters"
+                        >
+                          <SlidersHorizontal className="w-2.5 h-2.5" />
+                          <span className="capitalize">{layer.adjustmentData?.type?.replace('-', ' ') || 'Adjustment'}</span>
+                        </button>
+                      )}
                     </div>
 
                     {/* Alpha Lock Indicator Tag */}
@@ -1558,6 +1751,21 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                       </button>
                     )}
 
+                    {/* Reference Layer Indicator */}
+                    {layer.isReference && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleReferenceLayer?.(layer.id);
+                        }}
+                        className="p-0.5 text-cyan-400 hover:text-cyan-300 shrink-0"
+                        title="Reference Layer (Click to toggle)"
+                      >
+                        <Compass className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+
                     {/* Lock Indicator */}
                     {layer.locked && (
                       <Lock className="w-3 h-3 text-[#777777] shrink-0" />
@@ -1565,6 +1773,20 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
 
                     {/* Hover Quick Actions: Single-Click Duplicate, Move to/from folder, Delete */}
                     <div className="flex items-center space-x-0.5 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                      {/* Delete Layer Mask Quick Action */}
+                      {(layer.maskCanvas || layer.maskEnabled !== undefined) && onRemoveLayerMask && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveLayerMask(layer.id);
+                          }}
+                          title="Delete Layer Mask"
+                          className="p-1 hover:text-rose-400 hover:bg-[#333333] rounded-[2px] text-zinc-400"
+                        >
+                          <SquareDot className="w-3 h-3 text-rose-400/80" />
+                        </button>
+                      )}
+
                       {/* Single-Click Duplicate Button */}
                       <button
                         onClick={(e) => {
@@ -1746,6 +1968,185 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
           </div>
         )}
       </section>
+
+      {/* Right-Click Layer Context Menu */}
+      {contextMenu && (() => {
+        const targetLayer = layers.find((l) => l.id === contextMenu.layerId);
+        if (!targetLayer) return null;
+        const hasMask = Boolean(targetLayer.maskCanvas || targetLayer.maskEnabled !== undefined || targetLayer.maskThumbnailUrl);
+        const isAdj = targetLayer.type === 'adjustment';
+
+        return (
+          <div
+            ref={contextMenuRef}
+            className="fixed z-50 min-w-52 bg-[#222225] border border-[#3e3e42] rounded-md shadow-2xl py-1 text-xs text-[#cccccc] select-none animate-in fade-in duration-75"
+            style={{
+              left: Math.max(10, Math.min(contextMenu.x, window.innerWidth - 220)),
+              top: Math.max(10, Math.min(contextMenu.y, window.innerHeight - 360)),
+            }}
+            onClick={(e) => e.stopPropagation()}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            {/* Header / Layer info */}
+            <div className="px-3 py-1 text-[10px] text-[#777777] font-semibold uppercase tracking-wider border-b border-[#2d2d30] mb-0.5 truncate flex items-center justify-between">
+              <span className="truncate">{targetLayer.name}</span>
+              {isAdj && <span className="text-cyan-400 font-mono text-[9px] lowercase">adjustment</span>}
+            </div>
+
+            {/* --- MASK OPTIONS --- */}
+            {targetLayer.type !== 'folder' && (
+              <>
+                <div className="px-3 py-1 text-[10px] text-[#888888] font-semibold tracking-wide flex items-center space-x-1">
+                  <SquareDot className="w-3 h-3 text-emerald-400" />
+                  <span>Layer Mask</span>
+                </div>
+                {!hasMask ? (
+                  <button
+                    onClick={() => {
+                      onAddLayerMask?.(targetLayer.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+                  >
+                    <span>Add Layer Mask</span>
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      onClick={() => {
+                        onToggleLayerMask?.(targetLayer.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full text-left px-3 py-1.5 pl-6 flex items-center justify-between hover:bg-[#333333] hover:text-white transition-colors"
+                    >
+                      <span>{targetLayer.maskEnabled === false ? 'Enable Mask' : 'Disable Mask'}</span>
+                      <span className="text-[10px] font-mono text-zinc-400">
+                        {targetLayer.maskEnabled === false ? 'OFF' : 'ON'}
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => {
+                        onToggleMaskLinked?.(targetLayer.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full text-left px-3 py-1.5 pl-6 flex items-center justify-between hover:bg-[#333333] hover:text-white transition-colors"
+                    >
+                      <span>{targetLayer.maskLinked === false ? 'Link Mask' : 'Unlink Mask'}</span>
+                      <Link2 className={`w-3 h-3 ${targetLayer.maskLinked === false ? 'text-zinc-600' : 'text-zinc-400'}`} />
+                    </button>
+                    <button
+                      onClick={() => {
+                        onRemoveLayerMask?.(targetLayer.id);
+                        setContextMenu(null);
+                      }}
+                      className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-rose-950/40 text-rose-400 hover:text-rose-300 transition-colors"
+                    >
+                      <span>Delete Mask</span>
+                    </button>
+                  </>
+                )}
+                <div className="my-1 border-t border-[#2d2d30]" />
+              </>
+            )}
+
+            {/* --- ADJUSTMENT OPTIONS --- */}
+            {isAdj && (
+              <>
+                <button
+                  onClick={() => {
+                    onOpenAdjustmentModal?.(targetLayer.id, targetLayer.adjustmentData?.type);
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-[#333333] text-cyan-400 hover:text-cyan-300 transition-colors"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                  <span className="font-medium">Edit Adjustment Parameters...</span>
+                </button>
+                <div className="my-1 border-t border-[#2d2d30]" />
+              </>
+            )}
+
+            {onOpenAdjustmentModal && (
+              <>
+                <div className="px-3 py-1 text-[10px] text-[#888888] font-semibold tracking-wide flex items-center space-x-1">
+                  <SlidersHorizontal className="w-3 h-3 text-cyan-400" />
+                  <span>New Adjustment Layer</span>
+                </div>
+                <button
+                  onClick={() => {
+                    onOpenAdjustmentModal(undefined, 'curves');
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+                >
+                  <span>Tone Curves...</span>
+                </button>
+                <button
+                  onClick={() => {
+                    onOpenAdjustmentModal(undefined, 'gradient-map');
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+                >
+                  <span>Gradient Map...</span>
+                </button>
+                <button
+                  onClick={() => {
+                    onOpenAdjustmentModal(undefined, 'levels');
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+                >
+                  <span>Levels...</span>
+                </button>
+                <button
+                  onClick={() => {
+                    onOpenAdjustmentModal(undefined, 'color-balance');
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+                >
+                  <span>Color Balance...</span>
+                </button>
+                <div className="my-1 border-t border-[#2d2d30]" />
+              </>
+            )}
+
+            {/* --- GENERAL ACTIONS --- */}
+            <button
+              onClick={() => {
+                onDuplicateLayer(targetLayer.id);
+                setContextMenu(null);
+              }}
+              className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+            >
+              <Copy className="w-3.5 h-3.5 text-zinc-400" />
+              <span>Duplicate</span>
+            </button>
+            <button
+              onClick={() => {
+                startRename(targetLayer);
+                setContextMenu(null);
+              }}
+              className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
+            >
+              <span>Rename</span>
+            </button>
+            {targetLayer.id !== 'layer-bg' && (
+              <button
+                onClick={() => {
+                  onDeleteLayer(targetLayer.id);
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-rose-950/40 text-rose-400 hover:text-rose-300 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                <span>Delete</span>
+              </button>
+            )}
+          </div>
+        );
+      })()}
     </aside>
   );
 });

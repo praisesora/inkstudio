@@ -15,6 +15,9 @@ import {
   FrameSettings,
   ExpressionColor,
   LiquifySettings,
+  WandSettings,
+  AdjustmentLayerData,
+  FilterType,
 } from './types/editor';
 import { applyLiquifyStep, createLiquifySelectionMask, DirtyRect } from './utils/liquifyEngine';
 import { PerspectiveRuler, ConstraintAxis } from './types/perspective';
@@ -26,7 +29,21 @@ import {
   commitFloatingSelection,
   computePolygonBounds,
   getCanvasContentBounds,
+  floodSelectWand,
+  expandSelection,
+  contractSelection,
+  featherSelection,
+  invertSelection,
+  selectionToMask,
+  maskToBounds,
+  maskToSvgPath,
 } from './utils/selectionUtils';
+import {
+  renderPerspectiveQuad,
+  renderMeshWarp,
+  createDefaultPerspectiveQuad,
+  createDefaultMeshPoints,
+} from './utils/transformEngine';
 import { applyScreentone } from './utils/screentoneEngine';
 import { applyLayerEffects } from './utils/layerEffectsEngine';
 import { useCanvasDrawing } from './hooks/useCanvasDrawing';
@@ -57,6 +74,8 @@ import { ClipboardInviteToast } from './components/ClipboardInviteToast';
 import { WebLandingModal } from './components/WebLandingModal';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { FirstTimeNameModal } from './components/FirstTimeNameModal';
+import { AdjustmentModal } from './components/AdjustmentModal';
+import { applyFilter } from './utils/filterEngine';
 import { saveRecentDocument, RecentDocument } from './utils/recentDocumentsManager';
 import {
   renderCompleteStroke,
@@ -118,6 +137,11 @@ import {
   Lock,
   Unlock,
   Box,
+  Maximize2,
+  Minimize2,
+  Feather,
+  BoxSelect,
+  X,
 } from 'lucide-react';
 import { parseSutFile } from './utils/sutParser';
 import {
@@ -167,6 +191,21 @@ export function App() {
 
   // Free Transform session state
   const [transformSession, setTransformSession] = useState<TransformSession | null>(null);
+
+  // Magic Wand tool settings
+  const [wandSettings, setWandSettings] = useState<WandSettings>({
+    tolerance: 32,
+    contiguous: true,
+    antiAlias: true,
+    referMode: 'active',
+  });
+  const selectionMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const selectionPenDrawingRef = useRef<{
+    isDrawing: boolean;
+    lastPt: { x: number; y: number };
+    maskCanvas: HTMLCanvasElement;
+    ctx: CanvasRenderingContext2D;
+  } | null>(null);
 
   // Fill tool settings
   const [fillSettings, setFillSettings] = useState<FillSettings>({
@@ -410,6 +449,7 @@ export function App() {
   // Layer Management System
   const {
     layers,
+    setLayers,
     activeLayerId,
     setActiveLayerId,
     activeLayer,
@@ -462,7 +502,76 @@ export function App() {
     toggleAlphaLock,
     convertLayer,
     fillScreentoneSelection,
+    addLayerMask,
+    removeLayerMask,
+    toggleLayerMask,
+    toggleMaskLinked,
+    updateMaskThumbnail,
+    addAdjustmentLayer,
+    updateAdjustmentData,
   } = useLayerManager({ dimensions });
+
+  // Active edit target for painting/erasing ('layer' content vs 'mask')
+  const [activeEditTarget, setActiveEditTarget] = useState<'layer' | 'mask'>('layer');
+
+  // Adjustment Layer Modal state
+  const [adjustmentModalState, setAdjustmentModalState] = useState<{
+    isOpen: boolean;
+    layerId?: string | null;
+    initialType?: 'curves' | 'gradient-map' | 'levels' | 'color-balance';
+  }>({
+    isOpen: false,
+  });
+
+  const handleOpenAdjustmentModal = useCallback(
+    (layerId?: string, initialType: 'curves' | 'gradient-map' | 'levels' | 'color-balance' = 'curves') => {
+      setAdjustmentModalState({
+        isOpen: true,
+        layerId: layerId || null,
+        initialType,
+      });
+    },
+    []
+  );
+
+  const handleApplyAdjustment = useCallback(
+    (type: 'curves' | 'gradient-map' | 'levels' | 'color-balance', data: AdjustmentLayerData) => {
+      if (adjustmentModalState.layerId) {
+        updateAdjustmentData(adjustmentModalState.layerId, data);
+        showToast(`Updated ${data.type} adjustment layer`);
+      } else {
+        addAdjustmentLayer(type, data);
+        showToast(`Created new ${data.type} adjustment layer`);
+      }
+      setAdjustmentModalState({ isOpen: false });
+    },
+    [adjustmentModalState.layerId, updateAdjustmentData, addAdjustmentLayer, showToast]
+  );
+
+  const handleApplyFilter = useCallback(
+    (type: FilterType, params?: any) => {
+      if (!hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked) {
+        showToast('Select an unlocked raster layer to apply filter');
+        return;
+      }
+      const canvas = layerCanvasesRef.current.get(activeLayerId);
+      if (!canvas) return;
+      const ctx = get2DContext(canvas);
+      if (!ctx) return;
+
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const filtered = applyFilter(imgData, type, params);
+      ctx.putImageData(filtered, 0, 0);
+
+      const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
+      const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+      globalTileGrid.writeImageData(activeLayerId, filtered, 0, 0, targetFormat);
+      globalTileGrid.notifyChange(true);
+      updateLayerThumbnail(activeLayerId, true);
+      showToast(`Filter applied: ${type.replace('-', ' ')}`);
+    },
+    [hasOpenDocument, activeLayer, activeLayerId, layerCanvasesRef, colorMode, updateLayerThumbnail, showToast]
+  );
 
   const {
     viewportRef,
@@ -1066,6 +1175,8 @@ export function App() {
     layerSourceCanvasesRef,
     layers: hasOpenDocument ? layers : [],
     onUpdateLayerThumbnail: updateLayerThumbnail,
+    isMaskMode: activeEditTarget === 'mask',
+    onUpdateMaskThumbnail: updateMaskThumbnail,
     draftCanvasRef,
     strokeCanvasRef,
     onCollabStrokeStart: (strokeId, layerId, bs, t, startPt) => {
@@ -1298,7 +1409,26 @@ export function App() {
       const c = get2DContext(target);
       if (!c) return;
       c.save();
-      if (selection.type === 'rect') {
+      if (selection.mask && selection.maskWidth && selection.maskHeight) {
+        const maskCanvas = document.createElement('canvas');
+        maskCanvas.width = target.width;
+        maskCanvas.height = target.height;
+        const mCtx = maskCanvas.getContext('2d');
+        if (mCtx) {
+          const mImg = mCtx.createImageData(target.width, target.height);
+          for (let i = 0; i < selection.mask.length; i++) {
+            mImg.data[i * 4 + 3] = selection.mask[i];
+          }
+          mCtx.putImageData(mImg, 0, 0);
+          if (activeLayerId === 'layer-bg') {
+            c.fillStyle = '#ffffff';
+            c.fillRect(selection.bounds.x, selection.bounds.y, selection.bounds.width, selection.bounds.height);
+          } else {
+            c.globalCompositeOperation = 'destination-out';
+            c.drawImage(maskCanvas, 0, 0);
+          }
+        }
+      } else if (selection.type === 'rect') {
         if (activeLayerId === 'layer-bg') {
           c.fillStyle = '#ffffff';
           c.fillRect(selection.bounds.x, selection.bounds.y, selection.bounds.width, selection.bounds.height);
@@ -1352,17 +1482,34 @@ export function App() {
       const c = get2DContext(target);
       if (!c) return;
       c.save();
-      c.fillStyle = primaryColor;
-      if (selection.type === 'rect') {
-        c.fillRect(selection.bounds.x, selection.bounds.y, selection.bounds.width, selection.bounds.height);
-      } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
-        c.beginPath();
-        c.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-        for (let i = 1; i < selection.polygon.length; i++) {
-          c.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+      if (selection.mask && selection.maskWidth && selection.maskHeight) {
+        const maskCanvas = document.createElement('canvas');
+        maskCanvas.width = target.width;
+        maskCanvas.height = target.height;
+        const mCtx = maskCanvas.getContext('2d');
+        if (mCtx) {
+          mCtx.fillStyle = primaryColor;
+          mCtx.fillRect(0, 0, target.width, target.height);
+          const mImg = mCtx.getImageData(0, 0, target.width, target.height);
+          for (let i = 0; i < selection.mask.length; i++) {
+            mImg.data[i * 4 + 3] = Math.round((mImg.data[i * 4 + 3] * selection.mask[i]) / 255);
+          }
+          mCtx.putImageData(mImg, 0, 0);
+          c.drawImage(maskCanvas, 0, 0);
         }
-        c.closePath();
-        c.fill();
+      } else {
+        c.fillStyle = primaryColor;
+        if (selection.type === 'rect') {
+          c.fillRect(selection.bounds.x, selection.bounds.y, selection.bounds.width, selection.bounds.height);
+        } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+          c.beginPath();
+          c.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+          for (let i = 1; i < selection.polygon.length; i++) {
+            c.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+          }
+          c.closePath();
+          c.fill();
+        }
       }
       c.restore();
     };
@@ -1386,14 +1533,130 @@ export function App() {
     );
   }, [selection, getActiveCanvas, primaryColor, activeLayerId, activeLayer, layerSourceCanvasesRef, dimensions.dpi, updateLayerThumbnail, pushHistoryStep]);
 
+  const handleExpandSelection = useCallback(
+    (pixels = 5) => {
+      if (!selection) return;
+      const w = dimensions.width;
+      const h = dimensions.height;
+      const currentMask = selectionToMask(selection, w, h);
+      const expanded = expandSelection(currentMask, w, h, pixels);
+      const b = maskToBounds(expanded, w, h);
+      if (!b) {
+        setSelection(null);
+        return;
+      }
+      const svg = maskToSvgPath(expanded, w, h);
+      setSelection({
+        type: 'mask',
+        bounds: b,
+        mask: expanded,
+        maskWidth: w,
+        maskHeight: h,
+        svgPath: svg,
+      });
+      showToast(`Expanded Selection (+${pixels}px)`);
+    },
+    [selection, dimensions, showToast]
+  );
+
+  const handleContractSelection = useCallback(
+    (pixels = 5) => {
+      if (!selection) return;
+      const w = dimensions.width;
+      const h = dimensions.height;
+      const currentMask = selectionToMask(selection, w, h);
+      const contracted = contractSelection(currentMask, w, h, pixels);
+      const b = maskToBounds(contracted, w, h);
+      if (!b) {
+        setSelection(null);
+        showToast('Selection contracted to empty');
+        return;
+      }
+      const svg = maskToSvgPath(contracted, w, h);
+      setSelection({
+        type: 'mask',
+        bounds: b,
+        mask: contracted,
+        maskWidth: w,
+        maskHeight: h,
+        svgPath: svg,
+      });
+      showToast(`Contracted Selection (-${pixels}px)`);
+    },
+    [selection, dimensions, showToast]
+  );
+
+  const handleFeatherSelection = useCallback(
+    (radius = 5) => {
+      if (!selection) return;
+      const w = dimensions.width;
+      const h = dimensions.height;
+      const currentMask = selectionToMask(selection, w, h);
+      const feathered = featherSelection(currentMask, w, h, radius);
+      const b = maskToBounds(feathered, w, h);
+      if (!b) {
+        setSelection(null);
+        return;
+      }
+      const svg = maskToSvgPath(feathered, w, h);
+      setSelection({
+        type: 'mask',
+        bounds: b,
+        mask: feathered,
+        maskWidth: w,
+        maskHeight: h,
+        svgPath: svg,
+      });
+      showToast(`Feathered Selection (${radius}px)`);
+    },
+    [selection, dimensions, showToast]
+  );
+
   const handleInvertSelection = useCallback(() => {
-    if (!selection) return;
+    const w = dimensions.width;
+    const h = dimensions.height;
+    const currentMask = selection ? selectionToMask(selection, w, h) : new Uint8Array(w * h);
+    const inverted = invertSelection(currentMask, w, h);
+    const b = maskToBounds(inverted, w, h);
+    if (!b) {
+      setSelection(null);
+      showToast('Inverted Selection (Empty)');
+      return;
+    }
+    const svg = maskToSvgPath(inverted, w, h);
     setSelection({
-      type: 'rect',
-      bounds: { x: 0, y: 0, width: dimensions.width, height: dimensions.height },
+      type: 'mask',
+      bounds: b,
+      mask: inverted,
+      maskWidth: w,
+      maskHeight: h,
+      svgPath: svg,
     });
     showToast('Inverted Selection');
   }, [selection, dimensions, showToast]);
+
+  const handleSelectAll = useCallback(() => {
+    const w = dimensions.width;
+    const h = dimensions.height;
+    const mask = new Uint8Array(w * h);
+    mask.fill(255);
+    const svg = `M 0 0 H ${w} V ${h} H 0 Z`;
+    setSelection({
+      type: 'rect',
+      bounds: { x: 0, y: 0, width: w, height: h },
+      mask,
+      maskWidth: w,
+      maskHeight: h,
+      svgPath: svg,
+    });
+    showToast('Selected All (Ctrl+A)');
+  }, [dimensions, showToast]);
+
+  const handleToggleReferenceLayer = useCallback((layerId: string) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.id === layerId ? { ...l, isReference: !l.isReference } : l))
+    );
+  }, [setLayers]);
 
   const getTonalLabel = useCallback((type: TonalCorrectionType) => {
     switch (type) {
@@ -1780,6 +2043,7 @@ export function App() {
         updateLayerThumbnail(activeLayerId, true);
       }
 
+      const quad = createDefaultPerspectiveQuad(floatX, floatY, floatCanvas.width, floatCanvas.height, 0);
       setTransformSession({
         active: true,
         layerId: activeLayerId,
@@ -1794,6 +2058,11 @@ export function App() {
         flipH: false,
         flipV: false,
         isSelection: true,
+        mode: 'affine',
+        perspectiveQuad: quad,
+        meshCols: 4,
+        meshRows: 4,
+        meshPoints: createDefaultMeshPoints(quad, 4, 4),
       });
       setSelection(null);
     } else {
@@ -1840,6 +2109,7 @@ export function App() {
 
       updateLayerThumbnail(activeLayerId, true);
 
+      const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
       setTransformSession({
         active: true,
         layerId: activeLayerId,
@@ -1854,6 +2124,11 @@ export function App() {
         flipH: false,
         flipV: false,
         isSelection: false,
+        mode: 'affine',
+        perspectiveQuad: quad,
+        meshCols: 4,
+        meshRows: 4,
+        meshPoints: createDefaultMeshPoints(quad, 4, 4),
       });
     }
     setTool('transform');
@@ -1866,52 +2141,49 @@ export function App() {
     const ctx = get2DContext(canvas);
     if (!ctx) return;
 
-    ctx.save();
-    const cx = transformSession.x + transformSession.width / 2;
-    const cy = transformSession.y + transformSession.height / 2;
-    ctx.translate(cx, cy);
-    ctx.rotate((transformSession.rotation * Math.PI) / 180);
-    ctx.scale(transformSession.flipH ? -1 : 1, transformSession.flipV ? -1 : 1);
-    ctx.drawImage(
-      transformSession.sourceCanvas,
-      -transformSession.width / 2,
-      -transformSession.height / 2,
-      transformSession.width,
-      transformSession.height
-    );
-    ctx.restore();
-
     const sourceCanvas = layerSourceCanvasesRef.current?.get(transformSession.layerId);
-    if (sourceCanvas) {
-      const sCtx = get2DContext(sourceCanvas);
-      if (sCtx) {
-        sCtx.save();
-        sCtx.translate(cx, cy);
-        sCtx.rotate((transformSession.rotation * Math.PI) / 180);
-        sCtx.scale(transformSession.flipH ? -1 : 1, transformSession.flipV ? -1 : 1);
-        sCtx.drawImage(
+
+    const drawTransformed = (targetCtx: CanvasRenderingContext2D) => {
+      targetCtx.save();
+      if (transformSession.mode === 'perspective' && transformSession.perspectiveQuad) {
+        renderPerspectiveQuad(targetCtx, transformSession.sourceCanvas, transformSession.perspectiveQuad, 24);
+      } else if (transformSession.mode === 'mesh' && transformSession.meshPoints) {
+        renderMeshWarp(targetCtx, transformSession.sourceCanvas, transformSession.meshPoints, 6);
+      } else {
+        const cx = transformSession.x + transformSession.width / 2;
+        const cy = transformSession.y + transformSession.height / 2;
+        targetCtx.translate(cx, cy);
+        targetCtx.rotate((transformSession.rotation * Math.PI) / 180);
+        targetCtx.scale(transformSession.flipH ? -1 : 1, transformSession.flipV ? -1 : 1);
+        targetCtx.drawImage(
           transformSession.sourceCanvas,
           -transformSession.width / 2,
           -transformSession.height / 2,
           transformSession.width,
           transformSession.height
         );
-        sCtx.restore();
       }
+      targetCtx.restore();
+    };
 
-      const layer = layers.find((l) => l.id === transformSession.layerId);
-      if (layer?.toneEnabled) {
-        applyScreentone(
-          sourceCanvas,
-          canvas,
-          {
-            frequency: layer.toneFrequency ?? 60,
-            angle: layer.toneAngle ?? 45,
-            dotShape: layer.toneDotShape ?? 'circle',
-            dpi: dimensions.dpi ?? 600,
-          }
-        );
-      }
+    drawTransformed(ctx);
+    if (sourceCanvas) {
+      const sCtx = get2DContext(sourceCanvas);
+      if (sCtx) drawTransformed(sCtx);
+    }
+
+    const layer = layers.find((l) => l.id === transformSession.layerId);
+    if (layer?.toneEnabled && sourceCanvas) {
+      applyScreentone(
+        sourceCanvas,
+        canvas,
+        {
+          frequency: layer.toneFrequency ?? 60,
+          angle: layer.toneAngle ?? 45,
+          dotShape: layer.toneDotShape ?? 'circle',
+          dpi: dimensions.dpi ?? 600,
+        }
+      );
     }
 
     const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -2255,6 +2527,146 @@ export function App() {
         return;
       }
 
+      if (tool === 'select-wand') {
+        e.preventDefault();
+        if (selection?.floating) {
+          handleCommitFloatingSelection();
+        }
+
+        const px = Math.floor(pt.x);
+        const py = Math.floor(pt.y);
+        if (px < 0 || px >= dimensions.width || py < 0 || py >= dimensions.height) return;
+
+        let sampleCanvas: HTMLCanvasElement | null = null;
+        if (wandSettings.referMode === 'all') {
+          sampleCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions);
+        } else if (wandSettings.referMode === 'reference') {
+          const refLayer = layers.find((l) => l.isReference && l.visible);
+          if (refLayer) {
+            sampleCanvas = layerCanvasesRef.current.get(refLayer.id) || null;
+          } else {
+            sampleCanvas = layerCanvasesRef.current.get(activeLayerId) || getActiveCanvas();
+          }
+        } else {
+          sampleCanvas = layerCanvasesRef.current.get(activeLayerId) || getActiveCanvas();
+        }
+
+        if (!sampleCanvas) return;
+        const sCtx = get2DContext(sampleCanvas);
+        if (!sCtx) return;
+
+        const w = dimensions.width;
+        const h = dimensions.height;
+        const sampleImageData = sCtx.getImageData(0, 0, w, h);
+        const { mask, bounds } = floodSelectWand(
+          sampleImageData,
+          w,
+          h,
+          px,
+          py,
+          wandSettings
+        );
+
+        if (!bounds || bounds.width === 0 || bounds.height === 0) {
+          setSelection(null);
+          return;
+        }
+
+        const svgPath = maskToSvgPath(mask, w, h);
+        setSelection({
+          type: 'wand',
+          bounds,
+          mask,
+          maskWidth: w,
+          maskHeight: h,
+          svgPath,
+        });
+        return;
+      }
+
+      if (tool === 'select-pen' || tool === 'select-eraser') {
+        e.preventDefault();
+        if (selection?.floating) {
+          handleCommitFloatingSelection();
+        }
+
+        const w = dimensions.width;
+        const h = dimensions.height;
+        let maskCanvas = selectionMaskCanvasRef.current;
+        if (!maskCanvas || maskCanvas.width !== w || maskCanvas.height !== h) {
+          maskCanvas = document.createElement('canvas');
+          maskCanvas.width = w;
+          maskCanvas.height = h;
+          selectionMaskCanvasRef.current = maskCanvas;
+        }
+
+        const mCtx = get2DContext(maskCanvas);
+        if (!mCtx) return;
+
+        mCtx.clearRect(0, 0, w, h);
+        if (selection) {
+          const currentMask = selectionToMask(selection, w, h);
+          const imgData = mCtx.createImageData(w, h);
+          for (let i = 0; i < currentMask.length; i++) {
+            const val = currentMask[i];
+            const idx = i * 4;
+            imgData.data[idx] = val;
+            imgData.data[idx + 1] = val;
+            imgData.data[idx + 2] = val;
+            imgData.data[idx + 3] = val > 0 ? 255 : 0;
+          }
+          mCtx.putImageData(imgData, 0, 0);
+        }
+
+        const brushSize = brushSettings.size;
+        mCtx.save();
+        mCtx.lineCap = 'round';
+        mCtx.lineJoin = 'round';
+        mCtx.lineWidth = brushSize;
+        if (tool === 'select-pen') {
+          mCtx.globalCompositeOperation = 'source-over';
+          mCtx.fillStyle = '#ffffff';
+          mCtx.strokeStyle = '#ffffff';
+        } else {
+          mCtx.globalCompositeOperation = 'destination-out';
+          mCtx.fillStyle = '#000000';
+          mCtx.strokeStyle = '#000000';
+        }
+
+        mCtx.beginPath();
+        mCtx.arc(pt.x, pt.y, brushSize / 2, 0, Math.PI * 2);
+        mCtx.fill();
+        mCtx.restore();
+
+        selectionPenDrawingRef.current = {
+          isDrawing: true,
+          lastPt: pt,
+          maskCanvas,
+          ctx: mCtx,
+        };
+
+        const mImgData = mCtx.getImageData(0, 0, w, h);
+        const newMask = new Uint8Array(w * h);
+        for (let i = 0; i < newMask.length; i++) {
+          newMask[i] = mImgData.data[i * 4 + 3] > 0 ? 255 : 0;
+        }
+        const b = maskToBounds(newMask, w, h);
+        if (b) {
+          const svg = maskToSvgPath(newMask, w, h);
+          setSelection({
+            type: 'mask',
+            bounds: b,
+            mask: newMask,
+            maskWidth: w,
+            maskHeight: h,
+            svgPath: svg,
+          });
+        } else {
+          setSelection(null);
+        }
+        return;
+      }
+
       if (tool === 'select-rect' || tool === 'select-lasso') {
         e.preventDefault();
         if (selection && isPointInSelection(pt.x, pt.y, selection)) {
@@ -2406,6 +2818,9 @@ export function App() {
       pushHistoryStep,
       textSettings,
       handleSampleColor,
+      wandSettings,
+      brushSettings.size,
+      dimensions,
     ]
   );
 
@@ -2498,6 +2913,53 @@ export function App() {
 
       const pt = getCanvasCoords(e);
 
+      if ((tool === 'select-pen' || tool === 'select-eraser') && selectionPenDrawingRef.current?.isDrawing) {
+        const { ctx: mCtx, lastPt } = selectionPenDrawingRef.current;
+        const brushSize = brushSettings.size;
+        mCtx.save();
+        mCtx.lineCap = 'round';
+        mCtx.lineJoin = 'round';
+        mCtx.lineWidth = brushSize;
+        if (tool === 'select-pen') {
+          mCtx.globalCompositeOperation = 'source-over';
+          mCtx.strokeStyle = '#ffffff';
+        } else {
+          mCtx.globalCompositeOperation = 'destination-out';
+          mCtx.strokeStyle = '#000000';
+        }
+
+        mCtx.beginPath();
+        mCtx.moveTo(lastPt.x, lastPt.y);
+        mCtx.lineTo(pt.x, pt.y);
+        mCtx.stroke();
+        mCtx.restore();
+
+        selectionPenDrawingRef.current.lastPt = pt;
+
+        const w = dimensions.width;
+        const h = dimensions.height;
+        const mImgData = mCtx.getImageData(0, 0, w, h);
+        const newMask = new Uint8Array(w * h);
+        for (let i = 0; i < newMask.length; i++) {
+          newMask[i] = mImgData.data[i * 4 + 3] > 0 ? 255 : 0;
+        }
+        const b = maskToBounds(newMask, w, h);
+        if (b) {
+          const svg = maskToSvgPath(newMask, w, h);
+          setSelection({
+            type: 'mask',
+            bounds: b,
+            mask: newMask,
+            maskWidth: w,
+            maskHeight: h,
+            svgPath: svg,
+          });
+        } else {
+          setSelection(null);
+        }
+        return;
+      }
+
       if (selectionDragRef.current?.isDragging) {
         const dx = pt.x - selectionDragRef.current.startX;
         const dy = pt.y - selectionDragRef.current.startY;
@@ -2560,7 +3022,7 @@ export function App() {
         return;
       }
     },
-    [tool, handleCanvasDrawingPointerMove, getCanvasCoords, fillSettings.method, handleSampleColor]
+    [tool, handleCanvasDrawingPointerMove, getCanvasCoords, fillSettings.method, handleSampleColor, brushSettings.size, dimensions]
   );
 
   const handlePointerUp = useCallback(
@@ -2626,6 +3088,33 @@ export function App() {
       }
 
       const pt = getCanvasCoords(e);
+
+      if ((tool === 'select-pen' || tool === 'select-eraser') && selectionPenDrawingRef.current?.isDrawing) {
+        const { ctx: mCtx } = selectionPenDrawingRef.current;
+        selectionPenDrawingRef.current = null;
+        const w = dimensions.width;
+        const h = dimensions.height;
+        const mImgData = mCtx.getImageData(0, 0, w, h);
+        const newMask = new Uint8Array(w * h);
+        for (let i = 0; i < newMask.length; i++) {
+          newMask[i] = mImgData.data[i * 4 + 3] > 0 ? 255 : 0;
+        }
+        const b = maskToBounds(newMask, w, h);
+        if (b) {
+          const svg = maskToSvgPath(newMask, w, h);
+          setSelection({
+            type: 'mask',
+            bounds: b,
+            mask: newMask,
+            maskWidth: w,
+            maskHeight: h,
+            svgPath: svg,
+          });
+        } else {
+          setSelection(null);
+        }
+        return;
+      }
 
       if (selectionDragRef.current?.isDragging) {
         selectionDragRef.current = null;
@@ -2753,6 +3242,7 @@ export function App() {
       pushHistoryStep,
       frameSettings,
       handleSampleColor,
+      dimensions,
     ]
   );
 
@@ -3406,6 +3896,13 @@ export function App() {
           handleStartTransform();
           return;
         }
+        // Select All: Ctrl+A
+        if (!e.shiftKey && (key === 'a' || e.code === 'KeyA')) {
+          if (!hasOpenDocument) return;
+          e.preventDefault();
+          handleSelectAll();
+          return;
+        }
         // Deselect: Ctrl+D
         if (!e.shiftKey && (key === 'd' || e.code === 'KeyD')) {
           if (!hasOpenDocument) return;
@@ -3474,6 +3971,8 @@ export function App() {
           handleSelectTool('brush');
         } else if (key === 'e') {
           handleSelectTool('eraser');
+        } else if (key === 'w') {
+          handleSelectTool('select-wand');
         } else if (key === 'm') {
           handleSelectTool('select-rect');
         } else if (key === 'l') {
@@ -3540,6 +4039,7 @@ export function App() {
     handleUndo,
     handleStartTransform,
     handleDeselect,
+    handleSelectAll,
     handleInvertSelection,
     handleClearSelection,
     handleCancelTransform,
@@ -3940,6 +4440,75 @@ export function App() {
       ],
     },
     {
+      id: 'select',
+      label: 'Select',
+      items: [
+        {
+          id: 'select-all',
+          label: 'Select All',
+          shortcut: 'Ctrl+A',
+          icon: <BoxSelect className="w-3.5 h-3.5 text-sky-400" />,
+          disabled: !hasOpenDocument,
+          onClick: handleSelectAll,
+        },
+        {
+          id: 'select-deselect',
+          label: 'Deselect',
+          shortcut: 'Ctrl+D',
+          icon: <X className="w-3.5 h-3.5 text-rose-400" />,
+          disabled: !hasOpenDocument || !selection,
+          onClick: handleDeselect,
+        },
+        {
+          id: 'select-invert',
+          label: 'Invert Selection',
+          shortcut: 'Ctrl+Shift+I',
+          icon: <RotateCcw className="w-3.5 h-3.5 text-amber-400" />,
+          disabled: !hasOpenDocument,
+          onClick: handleInvertSelection,
+        },
+        {
+          id: 'select-div-1',
+          label: '',
+          divider: true,
+        },
+        {
+          id: 'select-expand',
+          label: 'Expand (+5px)...',
+          icon: <Maximize2 className="w-3.5 h-3.5 text-indigo-400" />,
+          disabled: !hasOpenDocument || !selection,
+          onClick: () => handleExpandSelection(5),
+        },
+        {
+          id: 'select-contract',
+          label: 'Contract (-5px)...',
+          icon: <Minimize2 className="w-3.5 h-3.5 text-emerald-400" />,
+          disabled: !hasOpenDocument || !selection,
+          onClick: () => handleContractSelection(5),
+        },
+        {
+          id: 'select-feather',
+          label: 'Feather (5px)...',
+          icon: <Feather className="w-3.5 h-3.5 text-purple-400" />,
+          disabled: !hasOpenDocument || !selection,
+          onClick: () => handleFeatherSelection(5),
+        },
+        {
+          id: 'select-div-2',
+          label: '',
+          divider: true,
+        },
+        {
+          id: 'select-transform',
+          label: 'Transform Selection',
+          shortcut: 'Ctrl+T',
+          icon: <Scaling className="w-3.5 h-3.5 text-cyan-400" />,
+          disabled: !hasOpenDocument || !selection,
+          onClick: handleStartTransform,
+        },
+      ],
+    },
+    {
       id: 'layer',
       label: 'Layer',
       items: [
@@ -3963,6 +4532,65 @@ export function App() {
           icon: <Box className="w-3.5 h-3.5 text-purple-400" />,
           disabled: !hasOpenDocument,
           onClick: () => setIs3DLayerOpen(true),
+        },
+        {
+          id: 'layer-new-adjustment',
+          label: 'New Adjustment Layer',
+          disabled: !hasOpenDocument,
+          submenu: [
+            {
+              id: 'layer-adj-curves',
+              label: 'Tone Curves...',
+              onClick: () => handleOpenAdjustmentModal(undefined, 'curves'),
+            },
+            {
+              id: 'layer-adj-gradient-map',
+              label: 'Gradient Map...',
+              onClick: () => handleOpenAdjustmentModal(undefined, 'gradient-map'),
+            },
+            {
+              id: 'layer-adj-levels',
+              label: 'Levels...',
+              onClick: () => handleOpenAdjustmentModal(undefined, 'levels'),
+            },
+            {
+              id: 'layer-adj-color-balance',
+              label: 'Color Balance...',
+              onClick: () => handleOpenAdjustmentModal(undefined, 'color-balance'),
+            },
+          ],
+        },
+        {
+          id: 'layer-mask-submenu',
+          label: 'Layer Mask',
+          disabled: !hasOpenDocument || !activeLayer || activeLayer.type === 'folder',
+          submenu: [
+            {
+              id: 'layer-mask-add',
+              label: activeLayer?.maskCanvas ? 'Mask Already Present' : 'Add Layer Mask (Reveal All)',
+              disabled: Boolean(activeLayer?.maskCanvas),
+              onClick: () => addLayerMask(activeLayerId),
+            },
+            {
+              id: 'layer-mask-delete',
+              label: 'Delete Layer Mask',
+              danger: true,
+              disabled: !activeLayer?.maskCanvas,
+              onClick: () => removeLayerMask(activeLayerId),
+            },
+            {
+              id: 'layer-mask-toggle',
+              label: activeLayer?.maskEnabled === false ? 'Enable Layer Mask' : 'Disable Layer Mask',
+              disabled: !activeLayer?.maskCanvas,
+              onClick: () => toggleLayerMask(activeLayerId),
+            },
+            {
+              id: 'layer-mask-link',
+              label: activeLayer?.maskLinked === false ? 'Link Mask to Layer' : 'Unlink Mask from Layer',
+              disabled: !activeLayer?.maskCanvas,
+              onClick: () => toggleMaskLinked(activeLayerId),
+            },
+          ],
         },
         {
           id: 'layer-duplicate',
@@ -4076,6 +4704,64 @@ export function App() {
           danger: true,
           disabled: !hasOpenDocument || layers.length <= 1,
           onClick: () => deleteLayer(activeLayerId),
+        },
+      ],
+    },
+    {
+      id: 'filter',
+      label: 'Filter',
+      items: [
+        {
+          id: 'filter-gaussian-blur',
+          label: 'Gaussian Blur...',
+          disabled: !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
+          onClick: () => {
+            const r = window.prompt('Gaussian Blur Radius (px, 1-100):', '5');
+            if (r !== null) {
+              const radius = Math.max(1, Math.min(100, parseFloat(r) || 5));
+              handleApplyFilter('gaussian-blur', { radius });
+            }
+          },
+        },
+        {
+          id: 'filter-motion-blur',
+          label: 'Motion Blur...',
+          disabled: !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
+          onClick: () => {
+            const d = window.prompt('Motion Blur Distance (px, 1-100):', '15');
+            const a = d !== null ? window.prompt('Motion Blur Angle (degrees, 0-360):', '0') : null;
+            if (d !== null && a !== null) {
+              const distance = Math.max(1, Math.min(100, parseFloat(d) || 15));
+              const angle = Math.max(0, Math.min(360, parseFloat(a) || 0));
+              handleApplyFilter('motion-blur', { distance, angle });
+            }
+          },
+        },
+        {
+          id: 'filter-unsharp-mask',
+          label: 'Unsharp Mask...',
+          disabled: !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
+          onClick: () => {
+            const r = window.prompt('Unsharp Mask Radius (px, 0.5-20):', '2');
+            const a = r !== null ? window.prompt('Amount factor (0.1-5.0):', '1.5') : null;
+            if (r !== null && a !== null) {
+              const radius = Math.max(0.5, Math.min(20, parseFloat(r) || 2));
+              const amount = Math.max(0.1, Math.min(5, parseFloat(a) || 1.5));
+              handleApplyFilter('unsharp-mask', { radius, amount, threshold: 0 });
+            }
+          },
+        },
+        {
+          id: 'filter-film-grain',
+          label: 'Film Grain...',
+          disabled: !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
+          onClick: () => {
+            const i = window.prompt('Film Grain Intensity (% 1-100):', '25');
+            if (i !== null) {
+              const intensity = Math.max(1, Math.min(100, parseFloat(i) || 25));
+              handleApplyFilter('film-grain', { intensity, size: 1, monochromatic: true });
+            }
+          },
         },
       ],
     },
@@ -4527,6 +5213,12 @@ export function App() {
           onFillScreentone={handleFillScreentone}
           liquifySettings={liquifySettings}
           onUpdateLiquifySettings={handleUpdateLiquifySettings}
+          wandSettings={wandSettings}
+          onUpdateWandSettings={(newSettings) => setWandSettings((prev) => ({ ...prev, ...newSettings }))}
+          onExpandSelection={handleExpandSelection}
+          onContractSelection={handleContractSelection}
+          onFeatherSelection={handleFeatherSelection}
+          onInvertSelection={handleInvertSelection}
         />
 
         {/* Center Workspace: Document Tab Bar (Projects) + Canvas Area */}
@@ -4585,6 +5277,9 @@ export function App() {
             onFillColor={handleFillSelectionColor}
             onClearSelection={handleClearSelection}
             onInvertSelection={handleInvertSelection}
+            onExpandSelection={handleExpandSelection}
+            onContractSelection={handleContractSelection}
+            onFeatherSelection={handleFeatherSelection}
             transformSession={transformSession}
             onUpdateTransformSession={(updater) =>
               setTransformSession((prev) => (prev ? updater(prev) : null))
@@ -4651,6 +5346,7 @@ export function App() {
           onMoveLayer={moveLayer}
           onMoveLayerToFolder={moveLayerToFolder}
           onReorderLayers={reorderLayers}
+          onToggleReferenceLayer={handleToggleReferenceLayer}
           onToggleTone={toggleTone}
           onSetToneFrequency={setToneFrequency}
           onSetToneAngle={setToneAngle}
@@ -4665,6 +5361,13 @@ export function App() {
           onSetLayerMonoExpressMode={setLayerMonoExpressMode}
           onApplyExpressionColor={handleApplyExpressionColor}
           onApplyLayerColor={handleApplyLayerColor}
+          activeEditTarget={activeEditTarget}
+          onSelectEditTarget={setActiveEditTarget}
+          onAddLayerMask={addLayerMask}
+          onRemoveLayerMask={removeLayerMask}
+          onToggleLayerMask={toggleLayerMask}
+          onToggleMaskLinked={toggleMaskLinked}
+          onOpenAdjustmentModal={handleOpenAdjustmentModal}
           width={rightSidebarWidth}
           onWidthChange={handleRightSidebarWidthChange}
         />
@@ -4726,6 +5429,22 @@ export function App() {
         onApply={handleTonalApply}
         onPreviewChange={handleTonalPreviewChange}
       />
+
+      {/* Non-destructive Adjustment Layer Modal (Curves, Gradient Map, Levels, Color Balance) */}
+      {adjustmentModalState.isOpen && (
+        <AdjustmentModal
+          isOpen={adjustmentModalState.isOpen}
+          initialType={adjustmentModalState.initialType || 'curves'}
+          initialData={
+            adjustmentModalState.layerId
+              ? layers.find((l) => l.id === adjustmentModalState.layerId)?.adjustmentData
+              : undefined
+          }
+          editingLayerId={adjustmentModalState.layerId}
+          onApply={handleApplyAdjustment}
+          onClose={() => setAdjustmentModalState({ isOpen: false })}
+        />
+      )}
 
       {/* Clip Studio Paint Simple Tone Settings Modal */}
       <SimpleToneModal

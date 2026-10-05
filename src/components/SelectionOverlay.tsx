@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import {
   CanvasSelection,
@@ -11,7 +11,11 @@ import {
   Trash2,
   Sparkles,
   RotateCcw,
+  Maximize2,
+  Minimize2,
+  Feather,
 } from 'lucide-react';
+import { maskToSvgPath } from '../utils/selectionUtils';
 
 interface SelectionOverlayProps {
   selection: CanvasSelection | null;
@@ -23,18 +27,24 @@ interface SelectionOverlayProps {
   onFillColor: () => void;
   onClearSelection: () => void;
   onInvertSelection: () => void;
+  onExpandSelection?: (pixels: number) => void;
+  onContractSelection?: (pixels: number) => void;
+  onFeatherSelection?: (radius: number) => void;
 }
 
 export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
   selection,
   dimensions,
-  zoom: _zoom,
+  zoom,
   onDeselect,
   onTransformSelection,
   onFillScreentone,
   onFillColor,
   onClearSelection,
   onInvertSelection,
+  onExpandSelection,
+  onContractSelection,
+  onFeatherSelection,
 }) => {
   const floatingCanvasContainerRef = useRef<HTMLDivElement>(null);
 
@@ -48,17 +58,29 @@ export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
     }
   }, [selection?.floating?.canvas]);
 
-  if (!selection) return null;
+  const { bounds, type, polygon, floating, mask, maskWidth, maskHeight, svgPath } = selection || {};
 
-  const { bounds, type, polygon, floating } = selection;
+  // Build SVG path for marching ants
+  const pathD = useMemo(() => {
+    if (!selection) return '';
+    if (svgPath) return svgPath;
+    if (mask) {
+      const mw = maskWidth || dimensions.width;
+      const mh = maskHeight || dimensions.height;
+      return maskToSvgPath(mask, mw, mh);
+    }
+    if (type === 'rect' && bounds) {
+      return `M ${bounds.x} ${bounds.y} H ${bounds.x + bounds.width} V ${bounds.y + bounds.height} H ${bounds.x} Z`;
+    }
+    if (type === 'lasso' && polygon && polygon.length > 2) {
+      return `M ${polygon[0].x} ${polygon[0].y} ` + polygon.slice(1).map((p) => `L ${p.x} ${p.y}`).join(' ') + ' Z';
+    }
+    return '';
+  }, [selection, svgPath, mask, maskWidth, maskHeight, type, bounds, polygon, dimensions.width, dimensions.height]);
 
-  // Build SVG path for lasso or rect
-  let pathD = '';
-  if (type === 'rect') {
-    pathD = `M ${bounds.x} ${bounds.y} H ${bounds.x + bounds.width} V ${bounds.y + bounds.height} H ${bounds.x} Z`;
-  } else if (type === 'lasso' && polygon && polygon.length > 2) {
-    pathD = `M ${polygon[0].x} ${polygon[0].y} ` + polygon.slice(1).map((p) => `L ${p.x} ${p.y}`).join(' ') + ' Z';
-  }
+  if (!selection || !bounds) return null;
+
+  const invZoom = zoom > 0 ? 1 / zoom : 1;
 
   return (
     <>
@@ -113,7 +135,82 @@ export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
         )}
       </svg>
 
-      {/* 3. CSP-Style Selection Launcher Bar (Fixed at bottom center of viewport) */}
+      {/* 3. Floating Quick-Action Bar directly above active selection */}
+      <div
+        className="absolute z-26 pointer-events-auto select-none"
+        style={{
+          left: `${bounds.x + bounds.width / 2}px`,
+          top: `${bounds.y}px`,
+          transform: `translate(-50%, calc(-100% - ${8 * invZoom}px)) scale(${invZoom})`,
+          transformOrigin: 'bottom center',
+        }}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <div className="bg-[#18191b] border border-[#33353b] rounded shadow-2xl px-2 py-1 flex items-center space-x-1 whitespace-nowrap text-xs text-[#cccccc]">
+          {/* Expand */}
+          <button
+            onClick={() => onExpandSelection?.(5)}
+            title="Expand Selection (+5px)"
+            className="px-1.5 py-0.5 hover:text-white hover:bg-[#25272a] rounded flex items-center space-x-1 cursor-pointer transition-colors"
+          >
+            <Maximize2 className="w-3 h-3 text-cyan-400" />
+            <span>Expand</span>
+          </button>
+
+          {/* Contract */}
+          <button
+            onClick={() => onContractSelection?.(5)}
+            title="Contract Selection (-5px)"
+            className="px-1.5 py-0.5 hover:text-white hover:bg-[#25272a] rounded flex items-center space-x-1 cursor-pointer transition-colors"
+          >
+            <Minimize2 className="w-3 h-3 text-cyan-400" />
+            <span>Contract</span>
+          </button>
+
+          {/* Feather */}
+          <button
+            onClick={() => onFeatherSelection?.(5)}
+            title="Feather Selection (5px)"
+            className="px-1.5 py-0.5 hover:text-white hover:bg-[#25272a] rounded flex items-center space-x-1 cursor-pointer transition-colors"
+          >
+            <Feather className="w-3 h-3 text-cyan-400" />
+            <span>Feather</span>
+          </button>
+
+          <div className="w-px h-3.5 bg-[#33353b]" />
+
+          {/* Invert */}
+          <button
+            onClick={onInvertSelection}
+            title="Invert Selection (Ctrl+Shift+I)"
+            className="px-1.5 py-0.5 hover:text-white hover:bg-[#25272a] rounded flex items-center space-x-1 cursor-pointer transition-colors"
+          >
+            <RotateCcw className="w-3 h-3 text-amber-400" />
+            <span>Invert</span>
+          </button>
+
+          {/* Transform */}
+          <button
+            onClick={onTransformSelection}
+            title="Transform Selection (Ctrl+T)"
+            className="px-1.5 py-0.5 hover:text-white hover:bg-[#25272a] rounded flex items-center space-x-1 cursor-pointer transition-colors"
+          >
+            <Scaling className="w-3 h-3 text-emerald-400" />
+            <span>Transform</span>
+          </button>
+
+          {/* Deselect */}
+          <button
+            onClick={onDeselect}
+            title="Deselect (Ctrl+D)"
+            className="p-1 hover:text-rose-400 hover:bg-[#25272a] rounded cursor-pointer transition-colors"
+          >
+            <X className="w-3.5 h-3.5 text-rose-400" />
+          </button>
+        </div>
+      </div>
+
+      {/* 4. CSP-Style Selection Launcher Bar (Fixed at bottom center of viewport) */}
       {createPortal(
         <div
           className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 bg-[#1e1f22] border border-[#383a40] rounded shadow-2xl px-2 py-1.5 flex items-center space-x-1.5 select-none animate-in fade-in slide-in-from-bottom-2 duration-150"

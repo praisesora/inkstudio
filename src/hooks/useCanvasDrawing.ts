@@ -67,6 +67,8 @@ interface UseCanvasDrawingProps {
   layerSourceCanvasesRef?: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   layers?: LayerItem[];
   onUpdateLayerThumbnail: (layerId: string) => void;
+  isMaskMode?: boolean;
+  onUpdateMaskThumbnail?: (layerId: string) => void;
   draftCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   strokeCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   onCollabStrokeStart?: (strokeId: string, layerId: string, brushSettings: BrushSettings, tool: ToolType, startPoint: Point) => void;
@@ -94,6 +96,8 @@ export function useCanvasDrawing({
   layerSourceCanvasesRef,
   layers,
   onUpdateLayerThumbnail,
+  isMaskMode = false,
+  onUpdateMaskThumbnail,
   draftCanvasRef,
   strokeCanvasRef,
   onCollabStrokeStart,
@@ -132,6 +136,8 @@ export function useCanvasDrawing({
   const activeLayerLockedRef = useRef(activeLayerLocked);
   const activeLayerVisibleRef = useRef(activeLayerVisible);
   const dimensionsRef = useRef(dimensions);
+  const isMaskModeRef = useRef(isMaskMode);
+  const onUpdateMaskThumbnailRef = useRef(onUpdateMaskThumbnail);
 
   // Synchronously keep refs fresh during render execution
   panRef.current = pan;
@@ -145,6 +151,8 @@ export function useCanvasDrawing({
   activeLayerVisibleRef.current = activeLayerVisible;
   dimensionsRef.current = dimensions;
   layersRef.current = layers;
+  isMaskModeRef.current = isMaskMode;
+  onUpdateMaskThumbnailRef.current = onUpdateMaskThumbnail;
 
   const onCollabStrokeStartRef = useRef(onCollabStrokeStart);
   const onCollabStrokeChunkRef = useRef(onCollabStrokeChunk);
@@ -169,6 +177,8 @@ export function useCanvasDrawing({
     activeLayerVisibleRef.current = activeLayerVisible;
     dimensionsRef.current = dimensions;
     layersRef.current = layers;
+    isMaskModeRef.current = isMaskMode;
+    onUpdateMaskThumbnailRef.current = onUpdateMaskThumbnail;
     rulerRef.current = perspectiveRuler;
     onActiveConstraintAxisChangeRef.current = onActiveConstraintAxisChange;
 
@@ -287,6 +297,12 @@ export function useCanvasDrawing({
 
   const getActiveCanvas = useCallback(() => {
     const targetId = activeLayerIdRef.current || activeLayerId;
+    if (isMaskModeRef.current) {
+      const activeLayer = layersRef.current?.find((l) => l.id === targetId);
+      if (activeLayer?.maskCanvas) {
+        return activeLayer.maskCanvas;
+      }
+    }
     return (
       layerCanvasesRef.current.get(targetId) ||
       layerCanvasesRef.current.get('layer-1') ||
@@ -978,7 +994,23 @@ export function useCanvasDrawing({
     const isTone = isToneStrokeRef.current;
     const sourceCanvas = isTone ? layerSourceCanvasesRef?.current?.get(currentLayerId) : null;
 
-    const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+    let strokeColor: string;
+    if (isMaskModeRef.current) {
+      if (isEraser) {
+        strokeColor = '#000000';
+      } else {
+        let clean = bs.color.replace('#', '');
+        if (clean.length === 3) clean = clean.split('').map((c) => c + c).join('');
+        const r = parseInt(clean.slice(0, 2), 16) || 0;
+        const g = parseInt(clean.slice(2, 4), 16) || 0;
+        const b = parseInt(clean.slice(4, 6), 16) || 0;
+        const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+        const hexVal = gray.toString(16).padStart(2, '0');
+        strokeColor = `#${hexVal}${hexVal}${hexVal}`;
+      }
+    } else {
+      strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+    }
     const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
     const strokeFlow = bs.flow ?? 1.0;
     const strokeSpacing = bs.spacing ?? 0.08;
@@ -1495,7 +1527,23 @@ export function useCanvasDrawing({
         maxY: Math.min(dims.height, Math.ceil(startPoint.y + r)),
       };
 
-      const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+      let strokeColor: string;
+      if (isMaskModeRef.current) {
+        if (isEraser) {
+          strokeColor = '#000000';
+        } else {
+          let clean = bs.color.replace('#', '');
+          if (clean.length === 3) clean = clean.split('').map((c) => c + c).join('');
+          const r = parseInt(clean.slice(0, 2), 16) || 0;
+          const g = parseInt(clean.slice(2, 4), 16) || 0;
+          const b = parseInt(clean.slice(4, 6), 16) || 0;
+          const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+          const hexVal = gray.toString(16).padStart(2, '0');
+          strokeColor = `#${hexVal}${hexVal}${hexVal}`;
+        }
+      } else {
+        strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+      }
       const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
       const strokeFlow = bs.flow ?? 1.0;
 
@@ -1878,7 +1926,23 @@ export function useCanvasDrawing({
         ? get2DContext(sourceCanvas)
         : (drewDirectlyOnLayerCanvasRef.current && canvas ? get2DContext(canvas) : draftCtx);
 
-      const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+      let strokeColor: string;
+      if (isMaskModeRef.current) {
+        if (isEraser) {
+          strokeColor = '#000000';
+        } else {
+          let clean = bs.color.replace('#', '');
+          if (clean.length === 3) clean = clean.split('').map((c) => c + c).join('');
+          const r = parseInt(clean.slice(0, 2), 16) || 0;
+          const g = parseInt(clean.slice(2, 4), 16) || 0;
+          const b = parseInt(clean.slice(4, 6), 16) || 0;
+          const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+          const hexVal = gray.toString(16).padStart(2, '0');
+          strokeColor = `#${hexVal}${hexVal}${hexVal}`;
+        }
+      } else {
+        strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+      }
       const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
 
       if (targetTailCtx && pts.length >= 2) {
@@ -2401,7 +2465,12 @@ export function useCanvasDrawing({
       snapSessionRef.current.endStroke();
       onActiveConstraintAxisChangeRef.current?.(null);
 
-      onUpdateLayerThumbnail(currentLayerId);
+      if (isMaskModeRef.current) {
+        onUpdateMaskThumbnailRef.current?.(currentLayerId);
+        globalTileGrid.notifyChange(true);
+      } else {
+        onUpdateLayerThumbnail(currentLayerId);
+      }
     },
     [
       applyStabilizedPointAndRender,

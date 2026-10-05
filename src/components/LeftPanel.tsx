@@ -35,6 +35,9 @@ import {
   Undo2,
   CornerUpLeft,
   CornerUpRight,
+  Wand2,
+  PenTool,
+  Feather,
 } from 'lucide-react';
 import {
   ToolType,
@@ -46,6 +49,7 @@ import {
   FrameSettings,
   LiquifySettings,
   LiquifyMode,
+  WandSettings,
 } from '../types/editor';
 import { LiquifyIcon } from './LiquifyIcon';
 import { PENCIL_CONFIGS, PencilGrade } from '../utils/pencilEngine';
@@ -102,6 +106,12 @@ interface LeftPanelProps {
   onFillScreentone?: () => void;
   liquifySettings?: LiquifySettings;
   onUpdateLiquifySettings?: (newSettings: Partial<LiquifySettings>) => void;
+  wandSettings?: WandSettings;
+  onUpdateWandSettings?: (newSettings: Partial<WandSettings>) => void;
+  onExpandSelection?: (pixels: number) => void;
+  onContractSelection?: (pixels: number) => void;
+  onFeatherSelection?: (radius: number) => void;
+  onInvertSelection?: () => void;
 }
 
 export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
@@ -130,6 +140,12 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   onFillScreentone: _onFillScreentone,
   liquifySettings,
   onUpdateLiquifySettings,
+  wandSettings,
+  onUpdateWandSettings,
+  onExpandSelection,
+  onContractSelection,
+  onFeatherSelection,
+  onInvertSelection,
 }) => {
   const [showAdvanced, setShowAdvanced] = useState(false);
 
@@ -189,6 +205,9 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
     if (currentTool === 'pipette') return 'Eyedropper';
     if (currentTool === 'select-rect') return 'Marquee';
     if (currentTool === 'select-lasso') return 'Lasso';
+    if (currentTool === 'select-wand') return 'Magic Wand';
+    if (currentTool === 'select-pen') return 'Selection Pen';
+    if (currentTool === 'select-eraser') return 'Selection Eraser';
     if (currentTool === 'fill') return 'Fill';
     if (currentTool === 'text') return 'Text';
     if (currentTool === 'frame') return 'Frame Border';
@@ -591,15 +610,42 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
       );
     }
 
-    if (currentTool === 'select-rect' || currentTool === 'select-lasso') {
+    const isSelectionTool =
+      currentTool === 'select-rect' ||
+      currentTool === 'select-lasso' ||
+      currentTool === 'select-wand' ||
+      currentTool === 'select-pen' ||
+      currentTool === 'select-eraser';
+
+    if (isSelectionTool) {
+      const activeWand = wandSettings || {
+        tolerance: 32,
+        contiguous: true,
+        antiAlias: true,
+        referMode: 'active' as const,
+      };
+
+      const selectionTitle =
+        currentTool === 'select-rect'
+          ? 'Rectangular Marquee (M)'
+          : currentTool === 'select-lasso'
+          ? 'Lasso Selection (L)'
+          : currentTool === 'select-wand'
+          ? 'Magic Wand (W)'
+          : currentTool === 'select-pen'
+          ? 'Selection Pen'
+          : 'Selection Eraser';
+
       return (
         <div className="flex-1 flex flex-col overflow-y-auto">
           <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
             <div className="flex items-center space-x-2">
-              {currentTool === 'select-rect' ? <BoxSelect className="w-4 h-4 text-cyan-400" /> : <Lasso className="w-4 h-4 text-cyan-400" />}
-              <span className="text-xs font-semibold text-white">
-                {currentTool === 'select-rect' ? 'Rectangular Marquee (M)' : 'Lasso Selection (L)'}
-              </span>
+              {currentTool === 'select-rect' && <BoxSelect className="w-4 h-4 text-cyan-400" />}
+              {currentTool === 'select-lasso' && <Lasso className="w-4 h-4 text-cyan-400" />}
+              {currentTool === 'select-wand' && <Wand2 className="w-4 h-4 text-cyan-400" />}
+              {currentTool === 'select-pen' && <PenTool className="w-4 h-4 text-cyan-400" />}
+              {currentTool === 'select-eraser' && <Eraser className="w-4 h-4 text-cyan-400" />}
+              <span className="text-xs font-semibold text-white">{selectionTitle}</span>
             </div>
             <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
               <X className="w-3.5 h-3.5" />
@@ -619,7 +665,7 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
                   }`}
                 >
                   <BoxSelect className="w-3.5 h-3.5" />
-                  <span>Rectangle</span>
+                  <span>Marquee</span>
                 </button>
 
                 <button
@@ -633,16 +679,184 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
                   <Lasso className="w-3.5 h-3.5" />
                   <span>Lasso</span>
                 </button>
+
+                <button
+                  onClick={() => onSelectTool('select-wand')}
+                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
+                    currentTool === 'select-wand'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <Wand2 className="w-3.5 h-3.5" />
+                  <span>Wand</span>
+                </button>
+
+                <button
+                  onClick={() => onSelectTool('select-pen')}
+                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
+                    currentTool === 'select-pen'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <PenTool className="w-3.5 h-3.5" />
+                  <span>Sel Pen</span>
+                </button>
+
+                <button
+                  onClick={() => onSelectTool('select-eraser')}
+                  className={`col-span-2 py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
+                    currentTool === 'select-eraser'
+                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                  }`}
+                >
+                  <Eraser className="w-3.5 h-3.5" />
+                  <span>Selection Eraser</span>
+                </button>
               </div>
             </div>
 
-            <div className="space-y-2 pt-2 border-t border-[#26282c]">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block">Selection Actions:</label>
+            {/* Magic Wand Specific Settings */}
+            {currentTool === 'select-wand' && (
+              <div className="space-y-3 pt-2 border-t border-[#26282c]">
+                <div>
+                  <div className="flex items-center justify-between text-xs mb-1">
+                    <span className="text-[#aaaaaa]">Tolerance:</span>
+                    <span className="text-white font-mono">{activeWand.tolerance}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="255"
+                    value={activeWand.tolerance}
+                    onChange={(e) => onUpdateWandSettings?.({ tolerance: Number(e.target.value) })}
+                    className="w-full accent-cyan-400"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between text-xs py-1">
+                  <span className="text-[#cccccc]">Contiguous</span>
+                  <input
+                    type="checkbox"
+                    checked={activeWand.contiguous}
+                    onChange={(e) => onUpdateWandSettings?.({ contiguous: e.target.checked })}
+                    className="accent-cyan-400 rounded cursor-pointer"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between text-xs py-1">
+                  <span className="text-[#cccccc]">Anti-Aliasing</span>
+                  <input
+                    type="checkbox"
+                    checked={activeWand.antiAlias}
+                    onChange={(e) => onUpdateWandSettings?.({ antiAlias: e.target.checked })}
+                    className="accent-cyan-400 rounded cursor-pointer"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <span className="text-[11px] text-[#aaaaaa] block">Reference Source:</span>
+                  <div className="grid grid-cols-3 gap-1">
+                    {(['active', 'all', 'reference'] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        onClick={() => onUpdateWandSettings?.({ referMode: mode })}
+                        className={`py-1 px-1.5 rounded text-[11px] text-center capitalize cursor-pointer transition-colors ${
+                          activeWand.referMode === mode
+                            ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
+                            : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white'
+                        }`}
+                      >
+                        {mode === 'active' ? 'Active' : mode === 'all' ? 'All' : 'Ref Layer'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Selection Pen / Eraser Size */}
+            {(currentTool === 'select-pen' || currentTool === 'select-eraser') && (
+              <div className="space-y-3 pt-2 border-t border-[#26282c]">
+                <div>
+                  <div className="flex items-center justify-between text-xs mb-1">
+                    <span className="text-[#aaaaaa]">Pen Size:</span>
+                    <span className="text-white font-mono">{Math.round(brushSettings.size)} px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="300"
+                    value={brushSettings.size}
+                    onChange={(e) => onUpdateBrushSettings({ size: Number(e.target.value) })}
+                    className="w-full accent-cyan-400"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between text-xs mb-1">
+                    <span className="text-[#aaaaaa]">Stabilization:</span>
+                    <span className="text-white font-mono">{brushSettings.stabilization ?? 10}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="50"
+                    value={brushSettings.stabilization ?? 10}
+                    onChange={(e) => onUpdateBrushSettings({ stabilization: Number(e.target.value) })}
+                    className="w-full accent-cyan-400"
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Selection Boundary Modifiers & Actions */}
+            <div className="space-y-1.5 pt-2 border-t border-[#26282c]">
+              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Boundary Modifiers:</label>
+              <div className="grid grid-cols-3 gap-1">
+                <button
+                  onClick={() => onExpandSelection?.(5)}
+                  title="Expand Selection by 5px"
+                  className="py-1.5 px-1 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-[11px] transition-colors flex items-center justify-center space-x-1 cursor-pointer border border-[#2f323a]"
+                >
+                  <Maximize2 className="w-3 h-3 text-cyan-400" />
+                  <span>Expand</span>
+                </button>
+
+                <button
+                  onClick={() => onContractSelection?.(5)}
+                  title="Contract Selection by 5px"
+                  className="py-1.5 px-1 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-[11px] transition-colors flex items-center justify-center space-x-1 cursor-pointer border border-[#2f323a]"
+                >
+                  <Minimize2 className="w-3 h-3 text-cyan-400" />
+                  <span>Contract</span>
+                </button>
+
+                <button
+                  onClick={() => onFeatherSelection?.(5)}
+                  title="Feather Selection (5px)"
+                  className="py-1.5 px-1 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-[11px] transition-colors flex items-center justify-center space-x-1 cursor-pointer border border-[#2f323a]"
+                >
+                  <Feather className="w-3 h-3 text-cyan-400" />
+                  <span>Feather</span>
+                </button>
+              </div>
+
+              <button
+                onClick={onInvertSelection}
+                className="w-full py-1.5 px-2 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-xs transition-colors flex items-center justify-center space-x-1.5 cursor-pointer border border-[#2f323a]"
+              >
+                <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
+                <span>Invert Selection (Ctrl+Shift+I)</span>
+              </button>
+
               <button
                 onClick={onTransformSelection}
                 className="w-full py-1.5 px-2 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-xs transition-colors flex items-center justify-center space-x-1.5 cursor-pointer border border-[#2f323a]"
               >
-                <Scaling className="w-3.5 h-3.5 text-cyan-400" />
+                <Scaling className="w-3.5 h-3.5 text-emerald-400" />
                 <span>Transform Selection (Ctrl+T)</span>
               </button>
 
@@ -1037,6 +1251,54 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
             <Lasso className="w-4 h-4" />
             <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
               Lasso Tool (L)
+            </div>
+          </button>
+
+          {/* Magic Wand (W) */}
+          <button
+            onClick={() => onSelectTool('select-wand')}
+            title="Magic Wand (W)"
+            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
+              currentTool === 'select-wand'
+                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
+                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
+            }`}
+          >
+            <Wand2 className="w-4 h-4" />
+            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
+              Magic Wand (W)
+            </div>
+          </button>
+
+          {/* Selection Pen */}
+          <button
+            onClick={() => onSelectTool('select-pen')}
+            title="Selection Pen"
+            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
+              currentTool === 'select-pen'
+                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
+                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
+            }`}
+          >
+            <PenTool className="w-4 h-4" />
+            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
+              Selection Pen
+            </div>
+          </button>
+
+          {/* Selection Eraser */}
+          <button
+            onClick={() => onSelectTool('select-eraser')}
+            title="Selection Eraser"
+            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
+              currentTool === 'select-eraser'
+                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
+                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
+            }`}
+          >
+            <Eraser className="w-4 h-4" />
+            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
+              Selection Eraser
             </div>
           </button>
 

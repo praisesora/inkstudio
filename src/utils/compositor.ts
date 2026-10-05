@@ -10,6 +10,13 @@
 
 import { LayerItem, CanvasDimensions, BlendMode, CanvasColorMode } from '../types/editor';
 import { SparseTileGrid, TILE_SIZE, TileBuffer, globalTileGrid } from './tileEngine';
+import {
+  buildCurvesCombinedLut,
+  buildGradientMapLut,
+  buildLevelsLut,
+  evaluateColorBalancePixel,
+  applyAdjustment,
+} from './tonalEngine';
 
 export interface ViewportTransform {
   pan: { x: number; y: number };
@@ -138,6 +145,11 @@ uniform int u_layerColorEnabled;
 uniform vec3 u_layerColor;
 uniform vec3 u_layerSubColor;
 
+// Layer Mask Uniforms
+uniform vec2 u_docDimensions;
+uniform sampler2D u_maskTexture;
+uniform int u_maskEnabled;
+
 out vec4 fragColor;
 
 float fractVal(float x) {
@@ -239,6 +251,13 @@ void main() {
     finalColor = applyLayerTint(finalColor);
   }
 
+  if (u_maskEnabled == 1) {
+    vec2 maskCoord = clamp(v_docCoord / u_docDimensions, 0.0, 1.0);
+    vec4 maskPixel = texture(u_maskTexture, maskCoord);
+    float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
+    finalColor.a *= maskLum;
+  }
+
   finalColor.a *= u_layerOpacity;
 
   if (finalColor.a < 0.002) {
@@ -246,6 +265,60 @@ void main() {
   }
 
   fragColor = vec4(finalColor.rgb * finalColor.a, finalColor.a);
+}
+`;
+
+// Fragment Shader: Non-Destructive Adjustment Layers with Real-Time LUT Transform
+export const ADJUSTMENT_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_texCoord;
+in vec2 v_docCoord;
+
+uniform sampler2D u_snapshotTexture;
+uniform sampler2D u_lutTexture;
+uniform int u_adjMode; // 0: per-channel LUT (Curves/Levels), 1: luminance mapping (Gradient Map)
+uniform float u_layerOpacity;
+uniform int u_maskEnabled;
+uniform sampler2D u_maskTexture;
+uniform vec2 u_docDimensions;
+uniform vec2 u_viewportSize;
+
+out vec4 fragColor;
+
+void main() {
+  vec2 screenUV = gl_FragCoord.xy / u_viewportSize;
+  vec4 baseColor = texture(u_snapshotTexture, screenUV);
+
+  if (baseColor.a < 0.001) {
+    discard;
+  }
+
+  vec3 unPremult = baseColor.rgb / max(0.001, baseColor.a);
+  vec3 adjusted;
+
+  if (u_adjMode == 1) {
+    // Gradient map: map luminance to LUT
+    float lum = clamp(dot(unPremult, vec3(0.299, 0.587, 0.114)), 0.0, 1.0);
+    adjusted = texture(u_lutTexture, vec2(lum, 0.5)).rgb;
+  } else {
+    // Curves / Levels / Color Balance
+    float r = texture(u_lutTexture, vec2(clamp(unPremult.r, 0.0, 1.0), 0.5)).r;
+    float g = texture(u_lutTexture, vec2(clamp(unPremult.g, 0.0, 1.0), 0.5)).g;
+    float b = texture(u_lutTexture, vec2(clamp(unPremult.b, 0.0, 1.0), 0.5)).b;
+    adjusted = vec3(r, g, b);
+  }
+
+  float maskFactor = u_layerOpacity;
+  if (u_maskEnabled == 1) {
+    vec2 maskCoord = clamp(v_docCoord / u_docDimensions, 0.0, 1.0);
+    vec4 maskPixel = texture(u_maskTexture, maskCoord);
+    float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
+    maskFactor *= maskLum;
+  }
+
+  vec3 finalRgb = mix(unPremult, adjusted, maskFactor);
+  fragColor = vec4(finalRgb * baseColor.a, baseColor.a);
 }
 `;
 
@@ -354,6 +427,33 @@ export class ViewportCompositor {
   private uLayerColorLoc: WebGLUniformLocation | null = null;
   private uLayerSubColorLoc: WebGLUniformLocation | null = null;
 
+  // Mask uniform locations
+  private uMaskTextureLoc: WebGLUniformLocation | null = null;
+  private uMaskEnabledLoc: WebGLUniformLocation | null = null;
+  private maskTextureCache: Map<string, { texture: WebGLTexture }> = new Map();
+
+  // Adjustment program & uniforms
+  private adjProgram: WebGLProgram | null = null;
+  private uAdjTileOriginLoc: WebGLUniformLocation | null = null;
+  private uAdjTileSizeLoc: WebGLUniformLocation | null = null;
+  private uAdjDocDimensionsLoc: WebGLUniformLocation | null = null;
+  private uAdjViewportSizeLoc: WebGLUniformLocation | null = null;
+  private uAdjPanLoc: WebGLUniformLocation | null = null;
+  private uAdjZoomLoc: WebGLUniformLocation | null = null;
+  private uAdjRotationRadLoc: WebGLUniformLocation | null = null;
+  private uAdjDprLoc: WebGLUniformLocation | null = null;
+  private uAdjSnapshotLoc: WebGLUniformLocation | null = null;
+  private uAdjLutLoc: WebGLUniformLocation | null = null;
+  private uAdjModeLoc: WebGLUniformLocation | null = null;
+  private uAdjOpacityLoc: WebGLUniformLocation | null = null;
+  private uAdjMaskEnabledLoc: WebGLUniformLocation | null = null;
+  private uAdjMaskTextureLoc: WebGLUniformLocation | null = null;
+
+  private snapshotTexture: WebGLTexture | null = null;
+  private snapshotWidth: number = 0;
+  private snapshotHeight: number = 0;
+  private lutTexture: WebGLTexture | null = null;
+
   // Tile texture cache: tileKey -> { texture, version }
   private textureCache: Map<string, { texture: WebGLTexture; version: number; lastUsed: number }> = new Map();
   private fallbackTileCanvas: HTMLCanvasElement | null = null;
@@ -440,6 +540,43 @@ export class ViewportCompositor {
       this.uLayerColorEnabledLoc = gl.getUniformLocation(prog, 'u_layerColorEnabled');
       this.uLayerColorLoc = gl.getUniformLocation(prog, 'u_layerColor');
       this.uLayerSubColorLoc = gl.getUniformLocation(prog, 'u_layerSubColor');
+
+      this.uMaskTextureLoc = gl.getUniformLocation(prog, 'u_maskTexture');
+      this.uMaskEnabledLoc = gl.getUniformLocation(prog, 'u_maskEnabled');
+
+      // Compile Adjustment Shader Program
+      const adjFs = gl.createShader(gl.FRAGMENT_SHADER);
+      if (adjFs) {
+        gl.shaderSource(adjFs, ADJUSTMENT_FRAGMENT_SHADER);
+        gl.compileShader(adjFs);
+        if (gl.getShaderParameter(adjFs, gl.COMPILE_STATUS)) {
+          const aProg = gl.createProgram();
+          if (aProg) {
+            gl.attachShader(aProg, vs);
+            gl.attachShader(aProg, adjFs);
+            gl.linkProgram(aProg);
+            if (gl.getProgramParameter(aProg, gl.LINK_STATUS)) {
+              this.adjProgram = aProg;
+              this.uAdjTileOriginLoc = gl.getUniformLocation(aProg, 'u_tileOrigin');
+              this.uAdjTileSizeLoc = gl.getUniformLocation(aProg, 'u_tileSize');
+              this.uAdjDocDimensionsLoc = gl.getUniformLocation(aProg, 'u_docDimensions');
+              this.uAdjViewportSizeLoc = gl.getUniformLocation(aProg, 'u_viewportSize');
+              this.uAdjPanLoc = gl.getUniformLocation(aProg, 'u_pan');
+              this.uAdjZoomLoc = gl.getUniformLocation(aProg, 'u_zoom');
+              this.uAdjRotationRadLoc = gl.getUniformLocation(aProg, 'u_rotationRad');
+              this.uAdjDprLoc = gl.getUniformLocation(aProg, 'u_dpr');
+              this.uAdjSnapshotLoc = gl.getUniformLocation(aProg, 'u_snapshotTexture');
+              this.uAdjLutLoc = gl.getUniformLocation(aProg, 'u_lutTexture');
+              this.uAdjModeLoc = gl.getUniformLocation(aProg, 'u_adjMode');
+              this.uAdjOpacityLoc = gl.getUniformLocation(aProg, 'u_layerOpacity');
+              this.uAdjMaskEnabledLoc = gl.getUniformLocation(aProg, 'u_maskEnabled');
+              this.uAdjMaskTextureLoc = gl.getUniformLocation(aProg, 'u_maskTexture');
+            }
+          }
+        } else {
+          console.error('Adjustment FS error:', gl.getShaderInfoLog(adjFs));
+        }
+      }
 
       // Create Unit Quad Buffer [0, 1]
       const quad = gl.createBuffer();
@@ -664,6 +801,19 @@ export class ViewportCompositor {
         continue;
       }
 
+      if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
+        this.renderAdjustmentLayer(
+          gl,
+          baseLayer,
+          transform,
+          dimensions,
+          viewportW,
+          viewportH,
+          dpr
+        );
+        continue;
+      }
+
       const activeClippedLayers = group.clippedLayers.filter(
         (cl) => cl.visible && cl.opacity > 0.001 && cl.type !== 'folder'
       );
@@ -700,6 +850,170 @@ export class ViewportCompositor {
     if (this.textureCache.size > 2000) {
       this.evictStaleTextures();
     }
+  }
+
+  /**
+   * Get or upload a WebGLTexture for a layer's mask canvas.
+   */
+  private getMaskTexture(layer: LayerItem): WebGLTexture | null {
+    if (!this.gl || !layer.maskCanvas) return null;
+    const gl = this.gl;
+    let cached = this.maskTextureCache.get(layer.id);
+    if (!cached) {
+      const tex = gl.createTexture();
+      if (!tex) return null;
+      cached = { texture: tex };
+      this.maskTextureCache.set(layer.id, cached);
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, cached.texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      layer.maskCanvas
+    );
+
+    return cached.texture;
+  }
+
+  /**
+   * Evaluates non-destructive adjustment layers via GPU snapshot and real-time LUT evaluation.
+   */
+  private renderAdjustmentLayer(
+    gl: WebGL2RenderingContext,
+    layer: LayerItem,
+    transform: ViewportTransform,
+    dimensions: CanvasDimensions,
+    viewportW: number,
+    viewportH: number,
+    dpr: number
+  ): void {
+    if (!this.adjProgram || !layer.adjustmentData) return;
+
+    // 1. Snapshot lower composite
+    if (!this.snapshotTexture || this.snapshotWidth !== viewportW || this.snapshotHeight !== viewportH) {
+      if (this.snapshotTexture) gl.deleteTexture(this.snapshotTexture);
+      this.snapshotTexture = gl.createTexture();
+      this.snapshotWidth = viewportW;
+      this.snapshotHeight = viewportH;
+      gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, viewportW, viewportH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, viewportW, viewportH);
+
+    // 2. Prepare 256x1 LUT
+    if (!this.lutTexture) {
+      this.lutTexture = gl.createTexture();
+    }
+    const adj = layer.adjustmentData;
+    let lutData: Uint8Array;
+    let adjMode = 0; // 0 = per-channel, 1 = gradient map
+
+    if (adj.type === 'curves') {
+      const { rLut, gLut, bLut } = buildCurvesCombinedLut(adj.curves);
+      lutData = new Uint8Array(256 * 4);
+      for (let i = 0; i < 256; i++) {
+        const off = i * 4;
+        lutData[off] = rLut[i];
+        lutData[off + 1] = gLut[i];
+        lutData[off + 2] = bLut[i];
+        lutData[off + 3] = 255;
+      }
+    } else if (adj.type === 'gradient-map') {
+      adjMode = 1;
+      const gMap = buildGradientMapLut(adj.stops, adj.interpolation || 'linear');
+      lutData = new Uint8Array(gMap.buffer, gMap.byteOffset, gMap.byteLength);
+    } else if (adj.type === 'levels') {
+      const lLut = buildLevelsLut(adj.blackPoint, adj.whitePoint, adj.gamma, adj.outputMin ?? 0, adj.outputMax ?? 255);
+      lutData = new Uint8Array(256 * 4);
+      for (let i = 0; i < 256; i++) {
+        const off = i * 4;
+        lutData[off] = lLut[i];
+        lutData[off + 1] = lLut[i];
+        lutData[off + 2] = lLut[i];
+        lutData[off + 3] = 255;
+      }
+    } else { // color-balance
+      lutData = new Uint8Array(256 * 4);
+      for (let i = 0; i < 256; i++) {
+        const [r, g, b] = evaluateColorBalancePixel(i, i, i, adj);
+        const off = i * 4;
+        lutData[off] = r;
+        lutData[off + 1] = g;
+        lutData[off + 2] = b;
+        lutData[off + 3] = 255;
+      }
+    }
+
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutData);
+
+    // 3. Switch to Adjustment Program
+    gl.useProgram(this.adjProgram);
+
+    // Uniforms
+    gl.uniform2f(this.uAdjViewportSizeLoc, viewportW, viewportH);
+    gl.uniform2f(this.uAdjDocDimensionsLoc, dimensions.width, dimensions.height);
+    gl.uniform2f(this.uAdjPanLoc, transform.pan.x, transform.pan.y);
+    gl.uniform1f(this.uAdjZoomLoc, transform.zoom);
+    const rotRad = (transform.rotation * Math.PI) / 180;
+    gl.uniform1f(this.uAdjRotationRadLoc, rotRad);
+    gl.uniform1f(this.uAdjDprLoc, dpr);
+
+    gl.uniform2f(this.uAdjTileOriginLoc, 0, 0);
+    gl.uniform2f(this.uAdjTileSizeLoc, dimensions.width, dimensions.height);
+
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
+    gl.uniform1i(this.uAdjSnapshotLoc, 2);
+
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
+    gl.uniform1i(this.uAdjLutLoc, 3);
+
+    gl.uniform1i(this.uAdjModeLoc, adjMode);
+    gl.uniform1f(this.uAdjOpacityLoc, layer.opacity);
+
+    // Mask for adjustment layer
+    const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
+    gl.uniform1i(this.uAdjMaskEnabledLoc, hasMask ? 1 : 0);
+    if (hasMask && layer.maskCanvas) {
+      const maskTex = this.getMaskTexture(layer);
+      if (maskTex) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.uniform1i(this.uAdjMaskTextureLoc, 1);
+      }
+    }
+
+    // Blend: overwrite lower composite with filtered result
+    gl.blendFunc(gl.ONE, gl.ZERO);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Revert program and blend func
+    gl.useProgram(this.program);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
   }
 
   /**
@@ -747,6 +1061,20 @@ export class ViewportCompositor {
       gl.uniform3f(this.uLayerSubColorLoc, sub[0], sub[1], sub[2]);
     }
 
+    // Configure Layer Mask
+    const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
+    gl.uniform1i(this.uMaskEnabledLoc, hasMask ? 1 : 0);
+    if (hasMask && layer.maskCanvas) {
+      const maskTex = this.getMaskTexture(layer);
+      if (maskTex) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, maskTex);
+        gl.uniform1i(this.uMaskTextureLoc, 1);
+      } else {
+        gl.uniform1i(this.uMaskEnabledLoc, 0);
+      }
+    }
+
     // Query tiles intersecting frustum
     const visibleTiles = grid.getTilesInBounds(
       layer.id,
@@ -766,6 +1094,10 @@ export class ViewportCompositor {
 
       gl.uniform2f(this.uTileOriginLoc, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+
+    if (hasMask) {
+      gl.uniform1i(this.uMaskEnabledLoc, 0);
     }
   }
 
@@ -802,11 +1134,26 @@ export class ViewportCompositor {
       'source-over';
 
     const tiles = grid.getLayerTiles(layer.id);
+    const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
+    const maskCtx = hasMask && layer.maskCanvas ? layer.maskCanvas.getContext('2d', { willReadFrequently: true }) : null;
+
     for (const tile of tiles) {
       if (!tileCtx || !this.fallbackTileCanvas) continue;
       const rgba = grid.getTileAsRGBA(tile);
       const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
       imgData.data.set(rgba);
+
+      if (hasMask && maskCtx) {
+        const maskImgData = maskCtx.getImageData(tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+        const md = maskImgData.data;
+        const d = imgData.data;
+        for (let i = 0; i < d.length; i += 4) {
+          if (d[i + 3] === 0) continue;
+          const maskLum = (0.299 * md[i] + 0.587 * md[i + 1] + 0.114 * md[i + 2]) / 255 * (md[i + 3] / 255);
+          d[i + 3] = Math.round(d[i + 3] * maskLum);
+        }
+      }
+
       tileCtx.putImageData(imgData, 0, 0);
       targetCtx.drawImage(this.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
     }
@@ -859,6 +1206,13 @@ export class ViewportCompositor {
     for (const group of groups) {
       const baseLayer = group.baseLayer;
       if (!baseLayer.visible || baseLayer.opacity <= 0.001 || baseLayer.type === 'folder') continue;
+
+      if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
+        const imgData = ctx.getImageData(0, 0, viewportW, viewportH);
+        applyAdjustment(imgData, baseLayer.adjustmentData, baseLayer.maskCanvas, baseLayer.opacity);
+        ctx.putImageData(imgData, 0, 0);
+        continue;
+      }
 
       const activeClipped = group.clippedLayers.filter(
         (cl) => cl.visible && cl.opacity > 0.001 && cl.type !== 'folder'
@@ -925,6 +1279,18 @@ export class ViewportCompositor {
         this.gl.deleteTexture(item.texture);
       }
       this.textureCache.clear();
+      for (const item of this.maskTextureCache.values()) {
+        this.gl.deleteTexture(item.texture);
+      }
+      this.maskTextureCache.clear();
+      if (this.snapshotTexture) {
+        this.gl.deleteTexture(this.snapshotTexture);
+        this.snapshotTexture = null;
+      }
+      if (this.lutTexture) {
+        this.gl.deleteTexture(this.lutTexture);
+        this.lutTexture = null;
+      }
       if (this.quadBuffer) {
         this.gl.deleteBuffer(this.quadBuffer);
         this.quadBuffer = null;
@@ -932,6 +1298,10 @@ export class ViewportCompositor {
       if (this.program) {
         this.gl.deleteProgram(this.program);
         this.program = null;
+      }
+      if (this.adjProgram) {
+        this.gl.deleteProgram(this.adjProgram);
+        this.adjProgram = null;
       }
     }
     if (this.fallbackTileCanvas) {

@@ -7,6 +7,9 @@ export type ToolType =
   | 'transform'
   | 'select-rect'
   | 'select-lasso'
+  | 'select-wand'
+  | 'select-pen'
+  | 'select-eraser'
   | 'fill'
   | 'text'
   | 'frame'
@@ -258,10 +261,28 @@ export interface FrameSettings {
   fillColor: string;
 }
 
+export interface WandSettings {
+  tolerance: number; // 0 - 255
+  contiguous: boolean;
+  antiAlias: boolean;
+  referMode: 'active' | 'all' | 'reference';
+}
+
+export interface Point2D {
+  x: number;
+  y: number;
+}
+
+export type TransformMode = 'affine' | 'perspective' | 'mesh';
+
 export interface CanvasSelection {
-  type: 'rect' | 'lasso';
+  type: 'rect' | 'lasso' | 'wand' | 'mask';
   bounds: { x: number; y: number; width: number; height: number };
   polygon?: Array<{ x: number; y: number }>;
+  mask?: Uint8Array;
+  maskWidth?: number;
+  maskHeight?: number;
+  svgPath?: string;
   floating?: {
     canvas: HTMLCanvasElement;
     x: number;
@@ -287,6 +308,11 @@ export interface TransformSession {
   flipH: boolean;
   flipV: boolean;
   isSelection?: boolean;
+  mode: TransformMode;
+  perspectiveQuad?: [Point2D, Point2D, Point2D, Point2D];
+  meshCols?: number;
+  meshRows?: number;
+  meshPoints?: Point2D[][];
 }
 
 export type BlendMode =
@@ -376,10 +402,59 @@ export interface HistoryItem extends HistoryItemMeta {
 
 export type ExpressionColor = 'color' | 'gray' | 'monochrome';
 
+export type FilterType = 'gaussian-blur' | 'motion-blur' | 'unsharp-mask' | 'film-grain';
+
+export interface ToneCurvePoints {
+  rgb: [number, number][];
+  r: [number, number][];
+  g: [number, number][];
+  b: [number, number][];
+}
+
+export interface GradientStop {
+  position: number; // 0.0 to 1.0
+  color: string;    // hex color (#rrggbb)
+}
+
+export interface CurvesAdjustmentData {
+  type: 'curves';
+  curves: ToneCurvePoints;
+}
+
+export interface GradientMapAdjustmentData {
+  type: 'gradient-map';
+  stops: GradientStop[];
+  interpolation?: 'linear' | 'smooth';
+}
+
+export interface LevelsAdjustmentData {
+  type: 'levels';
+  blackPoint: number; // 0 to 253
+  gamma: number;      // 0.1 to 9.99
+  whitePoint: number; // 2 to 255
+  outputMin?: number; // 0 to 255
+  outputMax?: number; // 0 to 255
+  channel?: 'rgb' | 'r' | 'g' | 'b';
+}
+
+export interface ColorBalanceAdjustmentData {
+  type: 'color-balance';
+  shadows: [number, number, number];    // Cyan-Red, Magenta-Green, Yellow-Blue (-100 to 100)
+  midtones: [number, number, number];   // Cyan-Red, Magenta-Green, Yellow-Blue (-100 to 100)
+  highlights: [number, number, number]; // Cyan-Red, Magenta-Green, Yellow-Blue (-100 to 100)
+  preserveLuminosity?: boolean;
+}
+
+export type AdjustmentLayerData =
+  | CurvesAdjustmentData
+  | GradientMapAdjustmentData
+  | LevelsAdjustmentData
+  | ColorBalanceAdjustmentData;
+
 export interface LayerItem {
   id: string;
   name: string;
-  type: 'raster' | 'folder' | 'vector' | 'frame';
+  type: 'raster' | 'folder' | 'vector' | 'frame' | 'adjustment';
   visible: boolean;
   opacity: number; // 0.0 to 1.0
   blendMode: BlendMode;
@@ -389,6 +464,7 @@ export interface LayerItem {
   collapsed?: boolean;
   parentId: string | null; // null for root, or folder id
   thumbnailUrl?: string; // live layer thumbnail data URL
+  isReference?: boolean; // Clip Studio Paint Reference Layer toggle
   // Screentone (CSP Tone Effect)
   toneEnabled?: boolean;
   toneFrequency?: number; // Lines / LPI (20 to 85, default: 60)
@@ -405,6 +481,13 @@ export interface LayerItem {
   monoThreshold?: number; // 1 to 255 (default: 128)
   monoExpressBlack?: boolean; // Express black in monochrome (default: true)
   monoExpressWhite?: boolean; // Express white in monochrome (default: true)
+  // Non-destructive Layer Mask
+  maskCanvas?: HTMLCanvasElement;
+  maskEnabled?: boolean;
+  maskLinked?: boolean;
+  maskThumbnailUrl?: string;
+  // Non-destructive Adjustment Layer
+  adjustmentData?: AdjustmentLayerData;
   // Vector Layer Data
   vectorStrokes?: VectorStroke[];
   // Comic Frame Data
