@@ -561,6 +561,38 @@ export type AdjustmentLayerData =
   | LevelsAdjustmentData
   | ColorBalanceAdjustmentData;
 
+export interface LayerStyleStroke {
+  enabled: boolean;
+  size: number;
+  color: string;
+  position: 'outside' | 'inside' | 'center';
+  opacity: number;
+}
+
+export interface LayerStyleDropShadow {
+  enabled: boolean;
+  color: string;
+  opacity: number;
+  angle: number; // degrees
+  distance: number;
+  blur: number;
+  spread: number;
+}
+
+export interface LayerStyleOuterGlow {
+  enabled: boolean;
+  color: string;
+  opacity: number;
+  blur: number;
+  spread: number;
+}
+
+export interface LayerStyles {
+  stroke?: LayerStyleStroke;
+  dropShadow?: LayerStyleDropShadow;
+  outerGlow?: LayerStyleOuterGlow;
+}
+
 export interface LayerItem {
   id: string;
   name: string;
@@ -598,6 +630,8 @@ export interface LayerItem {
   maskThumbnailUrl?: string;
   // Non-destructive Adjustment Layer
   adjustmentData?: AdjustmentLayerData;
+  // Non-destructive Layer Styles (Stroke, Drop Shadow, Outer Glow)
+  styles?: LayerStyles;
   // Vector Layer Data
   vectorStrokes?: VectorStroke[];
   // Comic Frame Data

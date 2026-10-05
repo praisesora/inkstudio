@@ -84,6 +84,7 @@ import { WebLandingModal } from './components/WebLandingModal';
 import { WelcomeScreen } from './components/WelcomeScreen';
 import { FirstTimeNameModal } from './components/FirstTimeNameModal';
 import { AdjustmentModal } from './components/AdjustmentModal';
+import { LayerStylesModal } from './components/LayerStylesModal';
 import { applyFilter } from './utils/filterEngine';
 import { saveRecentDocument, RecentDocument } from './utils/recentDocumentsManager';
 import {
@@ -575,6 +576,7 @@ export function App() {
     updateMaskThumbnail,
     addAdjustmentLayer,
     updateAdjustmentData,
+    updateLayerStyles,
   } = useLayerManager({ dimensions });
 
   // Active edit target for painting/erasing ('layer' content vs 'mask')
@@ -671,6 +673,38 @@ export function App() {
       setAdjustmentModalState({ isOpen: false });
     },
     [adjustmentModalState.layerId, updateAdjustmentData, addAdjustmentLayer, showToast]
+  );
+
+  // Non-Destructive GPU Layer Styles Modal State (Stroke, Drop Shadow, Outer Glow)
+  const [layerStylesModalState, setLayerStylesModalState] = useState<{
+    isOpen: boolean;
+    layerId?: string | null;
+  }>({
+    isOpen: false,
+  });
+
+  const handleOpenLayerStylesModal = useCallback(
+    (layerId?: string) => {
+      const targetId = layerId || activeLayerId;
+      if (targetId) {
+        setLayerStylesModalState({
+          isOpen: true,
+          layerId: targetId,
+        });
+      }
+    },
+    [activeLayerId]
+  );
+
+  const handleApplyLayerStyles = useCallback(
+    (styles: any) => {
+      if (layerStylesModalState.layerId) {
+        updateLayerStyles(layerStylesModalState.layerId, styles);
+        showToast('Updated Layer Styles');
+      }
+      setLayerStylesModalState({ isOpen: false });
+    },
+    [layerStylesModalState.layerId, updateLayerStyles, showToast]
   );
 
   const handleApplyFilter = useCallback(
@@ -4893,6 +4927,12 @@ export function App() {
           divider: true,
         },
         {
+          id: 'layer-styles',
+          label: 'Layer Style (Stroke, Shadow, Glow)...',
+          disabled: !hasOpenDocument || !activeLayer || activeLayer.type === 'folder' || activeLayer.type === 'adjustment',
+          onClick: () => handleOpenLayerStylesModal(activeLayerId),
+        },
+        {
           id: 'layer-toggle-tint',
           label: activeLayer?.layerColorEnabled ? 'Disable Layer Color (Tint)' : 'Enable Layer Color (Tint)',
           disabled: !hasOpenDocument || !activeLayer || activeLayer.type === 'folder',
@@ -5783,6 +5823,7 @@ export function App() {
           onToggleLayerMask={toggleLayerMask}
           onToggleMaskLinked={toggleMaskLinked}
           onOpenAdjustmentModal={handleOpenAdjustmentModal}
+          onOpenLayerStylesModal={handleOpenLayerStylesModal}
           width={rightSidebarWidth}
           onWidthChange={handleRightSidebarWidthChange}
         />
@@ -5858,6 +5899,17 @@ export function App() {
           editingLayerId={adjustmentModalState.layerId}
           onApply={handleApplyAdjustment}
           onClose={() => setAdjustmentModalState({ isOpen: false })}
+        />
+      )}
+
+      {/* Non-destructive GPU Layer Styles Modal (Stroke, Drop Shadow, Outer Glow) */}
+      {layerStylesModalState.isOpen && (
+        <LayerStylesModal
+          isOpen={layerStylesModalState.isOpen}
+          layerName={layers.find((l) => l.id === layerStylesModalState.layerId)?.name || 'Layer'}
+          initialStyles={layers.find((l) => l.id === layerStylesModalState.layerId)?.styles}
+          onClose={() => setLayerStylesModalState({ isOpen: false })}
+          onApply={handleApplyLayerStyles}
         />
       )}
 

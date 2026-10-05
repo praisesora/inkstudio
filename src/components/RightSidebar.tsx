@@ -28,6 +28,7 @@ import {
   SquareDot,
   Link2,
   SlidersHorizontal,
+  Sparkles,
 } from 'lucide-react';
 import { HistoryItemMeta, LayerItem, BlendMode, ToolType, CanvasColorMode, ExpressionColor } from '../types/editor';
 import { BLEND_MODES } from '../utils/canvasUtils';
@@ -73,6 +74,7 @@ interface RightSidebarProps {
   onToggleLayerMask?: (layerId: string) => void;
   onToggleMaskLinked?: (layerId: string) => void;
   onOpenAdjustmentModal?: (layerId?: string, initialType?: 'curves' | 'gradient-map' | 'levels' | 'color-balance') => void;
+  onOpenLayerStylesModal?: (layerId: string) => void;
   onReorderLayers?: (draggedId: string, targetId: string, position: 'above' | 'below' | 'inside') => void;
   onToggleReferenceLayer?: (id: string) => void;
   // Tone (Screentone) Effect Props
@@ -215,6 +217,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onToggleLayerMask,
   onToggleMaskLinked,
   onOpenAdjustmentModal,
+  onOpenLayerStylesModal,
   onToggleReferenceLayer,
   onToggleTone,
   onSetToneFrequency,
@@ -1254,6 +1257,19 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     <span className="text-[10px]">3D</span>
                   </button>
                 )}
+
+                {/* Layer Styles (Blending Options) Button */}
+                {onOpenLayerStylesModal && (
+                  <button
+                    onClick={() => activeLayerId && onOpenLayerStylesModal(activeLayerId)}
+                    title="Layer Styles (Stroke, Drop Shadow, Outer Glow)"
+                    disabled={!activeLayerId || activeLayer?.type === 'folder' || activeLayer?.type === 'adjustment'}
+                    className="flex items-center space-x-1 px-1.5 py-0.5 hover:text-white hover:bg-[#333333] disabled:opacity-40 rounded-[2px] transition-colors text-amber-400"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span className="text-[10px] font-bold">fx</span>
+                  </button>
+                )}
               </div>
 
               <div className="flex items-center space-x-0.5">
@@ -1386,6 +1402,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     onDoubleClick={() => {
                       if (layer.type === 'adjustment') {
                         onOpenAdjustmentModal?.(layer.id, layer.adjustmentData?.type);
+                      } else if (layer.type !== 'folder') {
+                        onOpenLayerStylesModal?.(layer.id);
                       }
                     }}
                     onContextMenu={(e) => {
@@ -1732,6 +1750,26 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                         >
                           <SlidersHorizontal className="w-2.5 h-2.5" />
                           <span className="capitalize">{layer.adjustmentData?.type?.replace('-', ' ') || 'Adjustment'}</span>
+                        </button>
+                      )}
+
+                      {/* Non-Destructive Layer Styles fx Indicator Tag */}
+                      {Boolean(
+                        (layer.styles?.stroke?.enabled && layer.styles.stroke.size > 0 && layer.styles.stroke.opacity > 0) ||
+                        (layer.styles?.dropShadow?.enabled && layer.styles.dropShadow.opacity > 0) ||
+                        (layer.styles?.outerGlow?.enabled && layer.styles.outerGlow.opacity > 0)
+                      ) && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenLayerStylesModal?.(layer.id);
+                          }}
+                          className="text-[9px] px-1 py-0.5 rounded bg-amber-500/20 border border-amber-500/40 text-amber-300 font-mono font-bold flex items-center gap-0.5 shrink-0 hover:border-amber-400 hover:text-amber-200 hover:bg-amber-500/30 transition-colors cursor-pointer"
+                          title="Layer Styles (Stroke, Drop Shadow, Outer Glow) active. Click to edit."
+                        >
+                          <Sparkles className="w-2.5 h-2.5 text-amber-400" />
+                          <span>fx</span>
                         </button>
                       )}
                     </div>
@@ -2107,6 +2145,23 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                   className="w-full text-left px-3 py-1.5 pl-6 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors"
                 >
                   <span>Color Balance...</span>
+                </button>
+                <div className="my-1 border-t border-[#2d2d30]" />
+              </>
+            )}
+
+            {/* --- LAYER STYLES / BLENDING OPTIONS --- */}
+            {targetLayer.type !== 'folder' && targetLayer.type !== 'adjustment' && onOpenLayerStylesModal && (
+              <>
+                <button
+                  onClick={() => {
+                    onOpenLayerStylesModal(targetLayer.id);
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-[#333333] text-amber-400 hover:text-amber-300 transition-colors"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span className="font-medium">Blending Options / Layer Styles...</span>
                 </button>
                 <div className="my-1 border-t border-[#2d2d30]" />
               </>

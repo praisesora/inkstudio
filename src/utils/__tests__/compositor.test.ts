@@ -110,4 +110,68 @@ describe('Unified GPU Viewport Compositor', () => {
     expect(groups[2].baseLayer.id).toBe('base-3');
     expect(groups[2].clippedLayers).toHaveLength(0);
   });
+
+  describe('Non-Destructive GPU Layer Styles Engine', () => {
+    it('accurately identifies active layer styles', async () => {
+      const { hasActiveLayerStyles } = await import('../compositor');
+
+      expect(hasActiveLayerStyles(undefined)).toBe(false);
+      expect(hasActiveLayerStyles({})).toBe(false);
+
+      // Disabled stroke
+      expect(
+        hasActiveLayerStyles({
+          stroke: { enabled: false, size: 5, color: '#000', position: 'outside', opacity: 1 },
+        })
+      ).toBe(false);
+
+      // Active stroke
+      expect(
+        hasActiveLayerStyles({
+          stroke: { enabled: true, size: 3, color: '#ff0000', position: 'outside', opacity: 1 },
+        })
+      ).toBe(true);
+
+      // Active drop shadow
+      expect(
+        hasActiveLayerStyles({
+          dropShadow: { enabled: true, color: '#000000', opacity: 0.8, angle: 90, distance: 5, blur: 10, spread: 0 },
+        })
+      ).toBe(true);
+
+      // Active outer glow
+      expect(
+        hasActiveLayerStyles({
+          outerGlow: { enabled: true, color: '#ffff00', opacity: 0.9, blur: 15, spread: 20 },
+        })
+      ).toBe(true);
+    });
+
+    it('contains valid Layer Styles shader uniforms and structures', async () => {
+      const { LAYER_STYLES_VERTEX_SHADER, LAYER_STYLES_FRAGMENT_SHADER } = await import('../compositor');
+
+      // Vertex shader quad mapping
+      expect(LAYER_STYLES_VERTEX_SHADER).toContain('a_quadPos');
+      expect(LAYER_STYLES_VERTEX_SHADER).toContain('v_uv');
+      expect(LAYER_STYLES_VERTEX_SHADER).toContain('a_quadPos.x * 2.0 - 1.0');
+
+      // Fragment shader uniforms
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_layerTexture');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_strokeEnabled');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_strokeSize');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_strokePosition');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_glowEnabled');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_glowBlur');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_shadowEnabled');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_shadowOffset');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('u_shadowBlur');
+
+      // Photoshop compositing order
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('// 1. Drop Shadow Pass');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('// 2. Outer Glow Pass');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('// 3. Stroke Pass');
+      expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('POISSON_KERNEL');
+    });
+  });
 });
+

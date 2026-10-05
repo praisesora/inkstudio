@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { LayerItem, BlendMode, CanvasDimensions, CanvasColorMode, LoadedDocument, ExpressionColor, CanvasSelection, DirtyRect, AdjustmentLayerData } from '../types/editor';
+import { LayerItem, BlendMode, CanvasDimensions, CanvasColorMode, LoadedDocument, ExpressionColor, CanvasSelection, DirtyRect, AdjustmentLayerData, LayerStyles } from '../types/editor';
 import { ResizeCanvasOptions } from '../types/settings';
 import { createCanvasThumbnail, get2DContext } from '../utils/canvasUtils';
 import { applyLayerEffects, applyExpressionColorToImageData } from '../utils/layerEffectsEngine';
@@ -1877,6 +1877,15 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   // Get active layer object
   const activeLayer = layers.find((l) => l.id === activeLayerId) || layers[0];
 
+  // Update Layer Styles (Stroke, Drop Shadow, Outer Glow)
+  const updateLayerStyles = useCallback((id: string, styles: LayerStyles) => {
+    setLayers((prev) => {
+      const target = prev.find((l) => l.id === id);
+      if (!target || target.type === 'folder') return prev;
+      return prev.map((l) => (l.id === id ? { ...l, styles } : l));
+    });
+  }, []);
+
   return {
     layers,
     setLayers,
@@ -1942,6 +1951,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
     updateMaskThumbnail,
     addAdjustmentLayer,
     updateAdjustmentData,
+    updateLayerStyles,
   };
 }
 

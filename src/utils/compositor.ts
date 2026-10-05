@@ -8,7 +8,7 @@
  * anti-moiré screentones, vector layers, and comic frame clipping.
  */
 
-import { LayerItem, CanvasDimensions, BlendMode, CanvasColorMode } from '../types/editor';
+import { LayerItem, CanvasDimensions, BlendMode, CanvasColorMode, LayerStyles } from '../types/editor';
 import { SparseTileGrid, TILE_SIZE, TileBuffer, globalTileGrid } from './tileEngine';
 import {
   buildCurvesCombinedLut,
@@ -322,6 +322,259 @@ void main() {
 }
 `;
 
+export function hasActiveLayerStyles(styles?: LayerStyles): boolean {
+  if (!styles) return false;
+  const hasStroke = Boolean(styles.stroke?.enabled && styles.stroke.size > 0 && styles.stroke.opacity > 0);
+  const hasShadow = Boolean(styles.dropShadow?.enabled && styles.dropShadow.opacity > 0);
+  const hasGlow = Boolean(styles.outerGlow?.enabled && styles.outerGlow.opacity > 0);
+  return hasStroke || hasShadow || hasGlow;
+}
+
+// Vertex Shader: Fullscreen quad for Layer Styles post-processing
+export const LAYER_STYLES_VERTEX_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 a_quadPos; // [0, 1] x [0, 1]
+out vec2 v_uv;
+
+void main() {
+  v_uv = a_quadPos;
+  gl_Position = vec4(a_quadPos.x * 2.0 - 1.0, a_quadPos.y * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+// Fragment Shader: Real-Time Non-Destructive Stroke, Outer Glow, and Drop Shadow
+export const LAYER_STYLES_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_layerTexture;
+uniform vec2 u_viewportSize;
+uniform float u_layerOpacity;
+
+// Stroke Uniforms
+uniform int u_strokeEnabled;
+uniform float u_strokeSize; // in physical screen pixels
+uniform vec4 u_strokeColor; // rgba (includes stroke opacity)
+uniform int u_strokePosition; // 0: outside, 1: inside, 2: center
+
+// Outer Glow Uniforms
+uniform int u_glowEnabled;
+uniform vec4 u_glowColor; // rgba (includes glow opacity)
+uniform float u_glowBlur; // in physical screen pixels
+uniform float u_glowSpread; // 0.0 to 1.0
+
+// Drop Shadow Uniforms
+uniform int u_shadowEnabled;
+uniform vec4 u_shadowColor; // rgba (includes shadow opacity)
+uniform vec2 u_shadowOffset; // in physical screen pixels (dx, dy)
+uniform float u_shadowBlur; // in physical screen pixels
+uniform float u_shadowSpread; // 0.0 to 1.0
+
+out vec4 fragColor;
+
+// 16 Poisson disk sample offsets
+const vec2 POISSON_KERNEL[16] = vec2[](
+  vec2(-0.326212, -0.405805),
+  vec2(-0.840144, -0.073580),
+  vec2(-0.695914,  0.457137),
+  vec2(-0.203345,  0.620716),
+  vec2( 0.962340, -0.194983),
+  vec2( 0.473434, -0.480026),
+  vec2( 0.519456,  0.767022),
+  vec2( 0.185461, -0.893124),
+  vec2( 0.507431,  0.064425),
+  vec2( 0.896420,  0.412458),
+  vec2(-0.321940, -0.932615),
+  vec2(-0.791559, -0.597705),
+  vec2(-0.504245, -0.007671),
+  vec2( 0.052445,  0.375489),
+  vec2( 0.284245, -0.052445),
+  vec2(-0.052445, -0.284245)
+);
+
+float computeStrokeCoverage(vec2 uv, float centerAlpha, float R, int position, vec2 texel) {
+  if (R <= 0.0) return 0.0;
+
+  // Outside stroke
+  if (position == 0) {
+    if (centerAlpha >= 0.99) return 0.0;
+    float minInsideDist = R + 1.0;
+    for (int i = 0; i < 16; i++) {
+      float ang = float(i) * 0.39269908;
+      vec2 dir = vec2(cos(ang), sin(ang));
+      for (int j = 1; j <= 4; j++) {
+        float dist = R * (float(j) / 4.0);
+        vec2 sUv = uv + dir * (dist * texel);
+        if (texture(u_layerTexture, sUv).a > 0.5) {
+          if (dist < minInsideDist) minInsideDist = dist;
+          break;
+        }
+      }
+    }
+    if (minInsideDist <= R) {
+      return clamp(R - minInsideDist + 1.0, 0.0, 1.0) * (1.0 - centerAlpha);
+    }
+    return 0.0;
+  }
+
+  // Inside stroke
+  if (position == 1) {
+    if (centerAlpha < 0.01) return 0.0;
+    float minOutsideDist = R + 1.0;
+    for (int i = 0; i < 16; i++) {
+      float ang = float(i) * 0.39269908;
+      vec2 dir = vec2(cos(ang), sin(ang));
+      for (int j = 1; j <= 4; j++) {
+        float dist = R * (float(j) / 4.0);
+        vec2 sUv = uv + dir * (dist * texel);
+        if (texture(u_layerTexture, sUv).a < 0.5) {
+          if (dist < minOutsideDist) minOutsideDist = dist;
+          break;
+        }
+      }
+    }
+    if (minOutsideDist <= R) {
+      return clamp(R - minOutsideDist + 1.0, 0.0, 1.0) * centerAlpha;
+    }
+    return 0.0;
+  }
+
+  // Center stroke (half outside, half inside)
+  float halfR = max(0.5, R * 0.5);
+  if (centerAlpha < 0.5) {
+    float minInsideDist = halfR + 1.0;
+    for (int i = 0; i < 16; i++) {
+      float ang = float(i) * 0.39269908;
+      vec2 dir = vec2(cos(ang), sin(ang));
+      for (int j = 1; j <= 4; j++) {
+        float dist = halfR * (float(j) / 4.0);
+        vec2 sUv = uv + dir * (dist * texel);
+        if (texture(u_layerTexture, sUv).a >= 0.5) {
+          if (dist < minInsideDist) minInsideDist = dist;
+          break;
+        }
+      }
+    }
+    if (minInsideDist <= halfR) {
+      return clamp(halfR - minInsideDist + 1.0, 0.0, 1.0);
+    }
+    return 0.0;
+  } else {
+    float minOutsideDist = halfR + 1.0;
+    for (int i = 0; i < 16; i++) {
+      float ang = float(i) * 0.39269908;
+      vec2 dir = vec2(cos(ang), sin(ang));
+      for (int j = 1; j <= 4; j++) {
+        float dist = halfR * (float(j) / 4.0);
+        vec2 sUv = uv + dir * (dist * texel);
+        if (texture(u_layerTexture, sUv).a < 0.5) {
+          if (dist < minOutsideDist) minOutsideDist = dist;
+          break;
+        }
+      }
+    }
+    if (minOutsideDist <= halfR) {
+      return clamp(halfR - minOutsideDist + 1.0, 0.0, 1.0);
+    }
+    return 0.0;
+  }
+}
+
+void main() {
+  vec2 texel = 1.0 / u_viewportSize;
+  vec4 centerSample = texture(u_layerTexture, v_uv);
+  float centerAlpha = centerSample.a;
+
+  // 1. Drop Shadow Pass
+  float shadowAlpha = 0.0;
+  if (u_shadowEnabled == 1) {
+    vec2 shadowUV = v_uv - u_shadowOffset * texel;
+    if (u_shadowBlur <= 0.5) {
+      shadowAlpha = texture(u_layerTexture, shadowUV).a;
+    } else {
+      float rad = max(1.0, u_shadowBlur);
+      float accum = 0.0;
+      for (int k = 0; k < 16; k++) {
+        vec2 sUv = shadowUV + POISSON_KERNEL[k] * (rad * texel);
+        accum += texture(u_layerTexture, sUv).a;
+      }
+      accum /= 16.0;
+      float spreadFactor = max(0.01, 1.0 - u_shadowSpread * 0.95);
+      shadowAlpha = clamp(accum / spreadFactor, 0.0, 1.0);
+    }
+    shadowAlpha *= u_shadowColor.a;
+  }
+
+  // 2. Outer Glow Pass
+  float glowAlpha = 0.0;
+  if (u_glowEnabled == 1 && centerAlpha < 0.99) {
+    float rad = max(1.0, u_glowBlur);
+    float accum = 0.0;
+    for (int k = 0; k < 16; k++) {
+      vec2 sUv = v_uv + POISSON_KERNEL[k] * (rad * texel);
+      accum += texture(u_layerTexture, sUv).a;
+    }
+    accum /= 16.0;
+    float spreadFactor = max(0.01, 1.0 - u_glowSpread * 0.95);
+    float glowVal = clamp(accum / spreadFactor, 0.0, 1.0);
+    glowAlpha = glowVal * (1.0 - centerAlpha) * u_glowColor.a;
+  }
+
+  // 3. Stroke Pass
+  float strokeCov = 0.0;
+  if (u_strokeEnabled == 1) {
+    strokeCov = computeStrokeCoverage(v_uv, centerAlpha, u_strokeSize, u_strokePosition, texel);
+  }
+
+  // Composite layers in standard Photoshop order: Drop Shadow -> Outer Glow -> Outside Stroke -> Layer Body -> Inside Stroke
+  vec4 composite = vec4(0.0);
+
+  // Drop Shadow
+  if (u_shadowEnabled == 1 && shadowAlpha > 0.001) {
+    composite = vec4(u_shadowColor.rgb * shadowAlpha, shadowAlpha);
+  }
+
+  // Outer Glow
+  if (u_glowEnabled == 1 && glowAlpha > 0.001) {
+    vec4 glow = vec4(u_glowColor.rgb * glowAlpha, glowAlpha);
+    composite = glow + composite * (1.0 - glow.a);
+  }
+
+  // Outside / Outer Center Stroke
+  bool isOutsideOrCenter = (u_strokePosition == 0 || (u_strokePosition == 2 && centerAlpha < 0.5));
+  if (u_strokeEnabled == 1 && isOutsideOrCenter && strokeCov > 0.001) {
+    float sA = strokeCov * u_strokeColor.a;
+    vec4 strk = vec4(u_strokeColor.rgb * sA, sA);
+    composite = strk + composite * (1.0 - strk.a);
+  }
+
+  // Layer Content
+  if (centerSample.a > 0.001) {
+    composite = centerSample + composite * (1.0 - centerSample.a);
+  }
+
+  // Inside / Inner Center Stroke
+  bool isInsideOrCenter = (u_strokePosition == 1 || (u_strokePosition == 2 && centerAlpha >= 0.5));
+  if (u_strokeEnabled == 1 && isInsideOrCenter && strokeCov > 0.001) {
+    float sA = strokeCov * u_strokeColor.a;
+    vec4 strk = vec4(u_strokeColor.rgb * sA, sA);
+    composite = strk + composite * (1.0 - strk.a);
+  }
+
+  // Overall Layer Opacity
+  composite *= u_layerOpacity;
+
+  if (composite.a < 0.002) {
+    discard;
+  }
+
+  fragColor = composite;
+}
+`;
+
+
 export interface OnionSkinCompositorFrame {
   layerId: string;
   tint: string;
@@ -461,6 +714,31 @@ export class ViewportCompositor {
   private snapshotHeight: number = 0;
   private lutTexture: WebGLTexture | null = null;
 
+  // Layer Styles program, FBO & uniforms
+  private stylesProgram: WebGLProgram | null = null;
+  private stylesQuadBuffer: WebGLBuffer | null = null;
+  private layerFbo: WebGLFramebuffer | null = null;
+  private layerTexture: WebGLTexture | null = null;
+  private layerFboWidth: number = 0;
+  private layerFboHeight: number = 0;
+
+  private uStylesLayerTextureLoc: WebGLUniformLocation | null = null;
+  private uStylesViewportSizeLoc: WebGLUniformLocation | null = null;
+  private uStylesLayerOpacityLoc: WebGLUniformLocation | null = null;
+  private uStylesStrokeEnabledLoc: WebGLUniformLocation | null = null;
+  private uStylesStrokeSizeLoc: WebGLUniformLocation | null = null;
+  private uStylesStrokeColorLoc: WebGLUniformLocation | null = null;
+  private uStylesStrokePositionLoc: WebGLUniformLocation | null = null;
+  private uStylesGlowEnabledLoc: WebGLUniformLocation | null = null;
+  private uStylesGlowColorLoc: WebGLUniformLocation | null = null;
+  private uStylesGlowBlurLoc: WebGLUniformLocation | null = null;
+  private uStylesGlowSpreadLoc: WebGLUniformLocation | null = null;
+  private uStylesShadowEnabledLoc: WebGLUniformLocation | null = null;
+  private uStylesShadowColorLoc: WebGLUniformLocation | null = null;
+  private uStylesShadowOffsetLoc: WebGLUniformLocation | null = null;
+  private uStylesShadowBlurLoc: WebGLUniformLocation | null = null;
+  private uStylesShadowSpreadLoc: WebGLUniformLocation | null = null;
+
   // Tile texture cache: tileKey -> { texture, version }
   private textureCache: Map<string, { texture: WebGLTexture; version: number; lastUsed: number }> = new Map();
   private fallbackTileCanvas: HTMLCanvasElement | null = null;
@@ -583,6 +861,64 @@ export class ViewportCompositor {
         } else {
           console.error('Adjustment FS error:', gl.getShaderInfoLog(adjFs));
         }
+      }
+
+      // Compile Layer Styles Shader Program
+      const stylesVs = gl.createShader(gl.VERTEX_SHADER);
+      const stylesFs = gl.createShader(gl.FRAGMENT_SHADER);
+      if (stylesVs && stylesFs) {
+        gl.shaderSource(stylesVs, LAYER_STYLES_VERTEX_SHADER);
+        gl.compileShader(stylesVs);
+        gl.shaderSource(stylesFs, LAYER_STYLES_FRAGMENT_SHADER);
+        gl.compileShader(stylesFs);
+        if (gl.getShaderParameter(stylesVs, gl.COMPILE_STATUS) && gl.getShaderParameter(stylesFs, gl.COMPILE_STATUS)) {
+          const sProg = gl.createProgram();
+          if (sProg) {
+            gl.attachShader(sProg, stylesVs);
+            gl.attachShader(sProg, stylesFs);
+            gl.linkProgram(sProg);
+            if (gl.getProgramParameter(sProg, gl.LINK_STATUS)) {
+              this.stylesProgram = sProg;
+              this.uStylesLayerTextureLoc = gl.getUniformLocation(sProg, 'u_layerTexture');
+              this.uStylesViewportSizeLoc = gl.getUniformLocation(sProg, 'u_viewportSize');
+              this.uStylesLayerOpacityLoc = gl.getUniformLocation(sProg, 'u_layerOpacity');
+              this.uStylesStrokeEnabledLoc = gl.getUniformLocation(sProg, 'u_strokeEnabled');
+              this.uStylesStrokeSizeLoc = gl.getUniformLocation(sProg, 'u_strokeSize');
+              this.uStylesStrokeColorLoc = gl.getUniformLocation(sProg, 'u_strokeColor');
+              this.uStylesStrokePositionLoc = gl.getUniformLocation(sProg, 'u_strokePosition');
+              this.uStylesGlowEnabledLoc = gl.getUniformLocation(sProg, 'u_glowEnabled');
+              this.uStylesGlowColorLoc = gl.getUniformLocation(sProg, 'u_glowColor');
+              this.uStylesGlowBlurLoc = gl.getUniformLocation(sProg, 'u_glowBlur');
+              this.uStylesGlowSpreadLoc = gl.getUniformLocation(sProg, 'u_glowSpread');
+              this.uStylesShadowEnabledLoc = gl.getUniformLocation(sProg, 'u_shadowEnabled');
+              this.uStylesShadowColorLoc = gl.getUniformLocation(sProg, 'u_shadowColor');
+              this.uStylesShadowOffsetLoc = gl.getUniformLocation(sProg, 'u_shadowOffset');
+              this.uStylesShadowBlurLoc = gl.getUniformLocation(sProg, 'u_shadowBlur');
+              this.uStylesShadowSpreadLoc = gl.getUniformLocation(sProg, 'u_shadowSpread');
+            }
+          }
+        } else {
+          console.error('Layer Styles shader compile error:', gl.getShaderInfoLog(stylesFs));
+        }
+      }
+
+      // Create Layer Styles Quad Buffer [0, 1]
+      const stylesQuad = gl.createBuffer();
+      if (stylesQuad) {
+        gl.bindBuffer(gl.ARRAY_BUFFER, stylesQuad);
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          new Float32Array([
+            0.0, 0.0,
+            1.0, 0.0,
+            0.0, 1.0,
+            0.0, 1.0,
+            1.0, 0.0,
+            1.0, 1.0,
+          ]),
+          gl.STATIC_DRAW
+        );
+        this.stylesQuadBuffer = stylesQuad;
       }
 
       // Create Unit Quad Buffer [0, 1]
@@ -843,6 +1179,8 @@ export class ViewportCompositor {
         (cl) => cl.visible && cl.opacity > 0.001 && cl.type !== 'folder'
       );
 
+      const baseHasStyles = hasActiveLayerStyles(baseLayer.styles);
+
       if (activeClippedLayers.length > 0) {
         // Group successive clipped layers: record base silhouette in stencil buffer
         gl.enable(gl.STENCIL_TEST);
@@ -850,24 +1188,72 @@ export class ViewportCompositor {
         gl.stencilMask(0xFF);
         gl.stencilFunc(gl.ALWAYS, 1, 0xFF);
         gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
-      } else {
-        gl.disable(gl.STENCIL_TEST);
-      }
 
-      // Draw base layer
-      this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum);
+        if (baseHasStyles) {
+          // Record base layer silhouette in stencil without writing colors to canvas
+          gl.colorMask(false, false, false, false);
+          this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum);
+          gl.colorMask(true, true, true, true);
 
-      if (activeClippedLayers.length > 0) {
+          // Now draw base layer with styles (don't overwrite stencil with shadow/glow)
+          gl.stencilMask(0x00);
+          this.renderLayerWithStyles(
+            gl,
+            baseLayer,
+            dimensions,
+            grid,
+            frustum,
+            viewportW,
+            viewportH,
+            transform,
+            dpr
+          );
+          gl.stencilMask(0xFF);
+        } else {
+          this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum);
+        }
+
         // Render clipped layers: only draw over the opaque pixels of the base layer
         gl.stencilMask(0x00);
         gl.stencilFunc(gl.EQUAL, 1, 0xFF);
         gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
 
         for (const clippedLayer of activeClippedLayers) {
-          this.renderSingleLayer(gl, clippedLayer, dimensions, grid, frustum);
+          if (hasActiveLayerStyles(clippedLayer.styles)) {
+            this.renderLayerWithStyles(
+              gl,
+              clippedLayer,
+              dimensions,
+              grid,
+              frustum,
+              viewportW,
+              viewportH,
+              transform,
+              dpr
+            );
+          } else {
+            this.renderSingleLayer(gl, clippedLayer, dimensions, grid, frustum);
+          }
         }
 
         gl.disable(gl.STENCIL_TEST);
+      } else {
+        gl.disable(gl.STENCIL_TEST);
+        if (baseHasStyles) {
+          this.renderLayerWithStyles(
+            gl,
+            baseLayer,
+            dimensions,
+            grid,
+            frustum,
+            viewportW,
+            viewportH,
+            transform,
+            dpr
+          );
+        } else {
+          this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum);
+        }
       }
     }
 
@@ -1127,6 +1513,179 @@ export class ViewportCompositor {
   }
 
   /**
+   * Ensures an offscreen framebuffer and texture exist for isolated layer style rendering.
+   */
+  private ensureLayerFbo(width: number, height: number): boolean {
+    if (!this.gl) return false;
+    const gl = this.gl;
+
+    if (this.layerFbo && this.layerTexture && this.layerFboWidth === width && this.layerFboHeight === height) {
+      return true;
+    }
+
+    if (!this.layerFbo) {
+      this.layerFbo = gl.createFramebuffer();
+    }
+    if (!this.layerTexture) {
+      this.layerTexture = gl.createTexture();
+    }
+
+    this.layerFboWidth = width;
+    this.layerFboHeight = height;
+
+    gl.bindTexture(gl.TEXTURE_2D, this.layerTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.layerTexture, 0);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.error('Layer FBO incomplete:', status);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Evaluates non-destructive GPU layer styles (Stroke, Drop Shadow, Outer Glow)
+   * by rendering the layer into an isolated FBO and processing through LAYER_STYLES_FRAGMENT_SHADER.
+   */
+  private renderLayerWithStyles(
+    gl: WebGL2RenderingContext,
+    layer: LayerItem,
+    dimensions: CanvasDimensions,
+    grid: SparseTileGrid,
+    frustum: { minX: number; minY: number; maxX: number; maxY: number },
+    viewportW: number,
+    viewportH: number,
+    transform: ViewportTransform,
+    dpr: number
+  ): void {
+    if (!this.ensureLayerFbo(viewportW, viewportH) || !this.stylesProgram) {
+      this.renderSingleLayer(gl, layer, dimensions, grid, frustum);
+      return;
+    }
+
+    const styles = layer.styles;
+    if (!styles) {
+      this.renderSingleLayer(gl, layer, dimensions, grid, frustum);
+      return;
+    }
+
+    let maxStyleMargin = 0;
+    if (styles.stroke?.enabled) {
+      maxStyleMargin = Math.max(maxStyleMargin, styles.stroke.size || 0);
+    }
+    if (styles.dropShadow?.enabled) {
+      maxStyleMargin = Math.max(maxStyleMargin, (styles.dropShadow.distance || 0) + (styles.dropShadow.blur || 0));
+    }
+    if (styles.outerGlow?.enabled) {
+      maxStyleMargin = Math.max(maxStyleMargin, styles.outerGlow.blur || 0);
+    }
+
+    const expandedFrustum = {
+      minX: Math.max(0, frustum.minX - maxStyleMargin),
+      minY: Math.max(0, frustum.minY - maxStyleMargin),
+      maxX: Math.min(dimensions.width, frustum.maxX + maxStyleMargin),
+      maxY: Math.min(dimensions.height, frustum.maxY + maxStyleMargin),
+    };
+
+    // 1. Render layer into isolated FBO with opacity 1.0 (opacity is modulated by stylesProgram)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
+    gl.viewport(0, 0, viewportW, viewportH);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    const virtualLayer: LayerItem = { ...layer, opacity: 1.0, blendMode: 'normal' };
+    this.renderSingleLayer(gl, virtualLayer, dimensions, grid, expandedFrustum);
+
+    // 2. Restore default framebuffer (canvas)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, viewportW, viewportH);
+
+    // 3. Set layer blend mode
+    this.setGLBlendMode(layer.blendMode);
+
+    // 4. Activate styles program and bind uniforms
+    gl.useProgram(this.stylesProgram);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer);
+    const posAttr = gl.getAttribLocation(this.stylesProgram, 'a_quadPos');
+    gl.enableVertexAttribArray(posAttr);
+    gl.vertexAttribPointer(posAttr, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.layerTexture);
+    gl.uniform1i(this.uStylesLayerTextureLoc, 0);
+
+    gl.uniform2f(this.uStylesViewportSizeLoc, viewportW, viewportH);
+    gl.uniform1f(this.uStylesLayerOpacityLoc, layer.opacity);
+
+    // Stroke uniforms
+    const stroke = styles.stroke;
+    const strokeActive = Boolean(stroke?.enabled && stroke.size > 0 && stroke.opacity > 0);
+    gl.uniform1i(this.uStylesStrokeEnabledLoc, strokeActive ? 1 : 0);
+    if (strokeActive && stroke) {
+      const strokePx = stroke.size * transform.zoom * dpr;
+      gl.uniform1f(this.uStylesStrokeSizeLoc, strokePx);
+      const [sr, sg, sb] = this.parseHexColor(stroke.color || '#000000');
+      gl.uniform4f(this.uStylesStrokeColorLoc, sr, sg, sb, stroke.opacity);
+      const posCode = stroke.position === 'inside' ? 1 : stroke.position === 'center' ? 2 : 0;
+      gl.uniform1i(this.uStylesStrokePositionLoc, posCode);
+    }
+
+    // Outer Glow uniforms
+    const glow = styles.outerGlow;
+    const glowActive = Boolean(glow?.enabled && glow.opacity > 0 && glow.blur > 0);
+    gl.uniform1i(this.uStylesGlowEnabledLoc, glowActive ? 1 : 0);
+    if (glowActive && glow) {
+      const glowBlurPx = glow.blur * transform.zoom * dpr;
+      gl.uniform1f(this.uStylesGlowBlurLoc, glowBlurPx);
+      const [gr, gg, gb] = this.parseHexColor(glow.color || '#ffff00');
+      gl.uniform4f(this.uStylesGlowColorLoc, gr, gg, gb, glow.opacity);
+      gl.uniform1f(this.uStylesGlowSpreadLoc, (glow.spread || 0) / 100);
+    }
+
+    // Drop Shadow uniforms
+    const shadow = styles.dropShadow;
+    const shadowActive = Boolean(shadow?.enabled && shadow.opacity > 0);
+    gl.uniform1i(this.uStylesShadowEnabledLoc, shadowActive ? 1 : 0);
+    if (shadowActive && shadow) {
+      const rad = ((shadow.angle || 0) * Math.PI) / 180;
+      const distPx = (shadow.distance || 0) * transform.zoom * dpr;
+      const dx = Math.cos(rad) * distPx;
+      const dy = Math.sin(rad) * distPx;
+      gl.uniform2f(this.uStylesShadowOffsetLoc, dx, -dy);
+      const shadowBlurPx = (shadow.blur || 0) * transform.zoom * dpr;
+      gl.uniform1f(this.uStylesShadowBlurLoc, shadowBlurPx);
+      const [dr, dg, db] = this.parseHexColor(shadow.color || '#000000');
+      gl.uniform4f(this.uStylesShadowColorLoc, dr, dg, db, shadow.opacity);
+      gl.uniform1f(this.uStylesShadowSpreadLoc, (shadow.spread || 0) / 100);
+    }
+
+    // 5. Draw fullscreen quad
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // 6. Restore standard program and quad buffer
+    if (this.program) {
+      gl.useProgram(this.program);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      const mainPosAttrib = gl.getAttribLocation(this.program, 'a_quadPos');
+      gl.enableVertexAttribArray(mainPosAttrib);
+      gl.vertexAttribPointer(mainPosAttrib, 2, gl.FLOAT, false, 0, 0);
+    }
+  }
+
+
+  /**
    * Evict least recently used tile textures when texture cache exceeds threshold.
    */
   private evictStaleTextures(): void {
@@ -1162,26 +1721,61 @@ export class ViewportCompositor {
     const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
     const maskCtx = hasMask && layer.maskCanvas ? layer.maskCanvas.getContext('2d', { willReadFrequently: true }) : null;
 
-    for (const tile of tiles) {
-      if (!tileCtx || !this.fallbackTileCanvas) continue;
-      const rgba = grid.getTileAsRGBA(tile);
-      const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
-      imgData.data.set(rgba);
+    // Helper to render tiles into target context
+    const drawTiles = (ctx: CanvasRenderingContext2D) => {
+      for (const tile of tiles) {
+        if (!tileCtx || !this.fallbackTileCanvas) continue;
+        const rgba = grid.getTileAsRGBA(tile);
+        const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
+        imgData.data.set(rgba);
 
-      if (hasMask && maskCtx) {
-        const maskImgData = maskCtx.getImageData(tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE, TILE_SIZE, TILE_SIZE);
-        const md = maskImgData.data;
-        const d = imgData.data;
-        for (let i = 0; i < d.length; i += 4) {
-          if (d[i + 3] === 0) continue;
-          const maskLum = (0.299 * md[i] + 0.587 * md[i + 1] + 0.114 * md[i + 2]) / 255 * (md[i + 3] / 255);
-          d[i + 3] = Math.round(d[i + 3] * maskLum);
+        if (hasMask && maskCtx) {
+          const maskImgData = maskCtx.getImageData(tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE, TILE_SIZE, TILE_SIZE);
+          const md = maskImgData.data;
+          const d = imgData.data;
+          for (let i = 0; i < d.length; i += 4) {
+            if (d[i + 3] === 0) continue;
+            const maskLum = (0.299 * md[i] + 0.587 * md[i + 1] + 0.114 * md[i + 2]) / 255 * (md[i + 3] / 255);
+            d[i + 3] = Math.round(d[i + 3] * maskLum);
+          }
         }
-      }
 
-      tileCtx.putImageData(imgData, 0, 0);
-      targetCtx.drawImage(this.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+        tileCtx.putImageData(imgData, 0, 0);
+        ctx.drawImage(this.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+      }
+    };
+
+    const styles = layer.styles;
+    const hasStyles = hasActiveLayerStyles(styles);
+
+    // 2D Layer Styles: Draw Drop Shadow
+    if (hasStyles && styles?.dropShadow?.enabled && styles.dropShadow.opacity > 0) {
+      targetCtx.save();
+      const rad = ((styles.dropShadow.angle || 0) * Math.PI) / 180;
+      const dist = styles.dropShadow.distance || 0;
+      targetCtx.shadowColor = styles.dropShadow.color || '#000000';
+      targetCtx.shadowBlur = styles.dropShadow.blur || 0;
+      targetCtx.shadowOffsetX = Math.cos(rad) * dist;
+      targetCtx.shadowOffsetY = Math.sin(rad) * dist;
+      targetCtx.globalAlpha = layer.opacity * styles.dropShadow.opacity;
+      drawTiles(targetCtx);
+      targetCtx.restore();
     }
+
+    // 2D Layer Styles: Draw Outer Glow
+    if (hasStyles && styles?.outerGlow?.enabled && styles.outerGlow.opacity > 0) {
+      targetCtx.save();
+      targetCtx.shadowColor = styles.outerGlow.color || '#ffff00';
+      targetCtx.shadowBlur = styles.outerGlow.blur || 0;
+      targetCtx.shadowOffsetX = 0;
+      targetCtx.shadowOffsetY = 0;
+      targetCtx.globalAlpha = layer.opacity * styles.outerGlow.opacity;
+      drawTiles(targetCtx);
+      targetCtx.restore();
+    }
+
+    // Draw main layer content
+    drawTiles(targetCtx);
     targetCtx.restore();
   }
 
@@ -1327,6 +1921,22 @@ export class ViewportCompositor {
       if (this.adjProgram) {
         this.gl.deleteProgram(this.adjProgram);
         this.adjProgram = null;
+      }
+      if (this.stylesProgram) {
+        this.gl.deleteProgram(this.stylesProgram);
+        this.stylesProgram = null;
+      }
+      if (this.layerFbo) {
+        this.gl.deleteFramebuffer(this.layerFbo);
+        this.layerFbo = null;
+      }
+      if (this.layerTexture) {
+        this.gl.deleteTexture(this.layerTexture);
+        this.layerTexture = null;
+      }
+      if (this.stylesQuadBuffer) {
+        this.gl.deleteBuffer(this.stylesQuadBuffer);
+        this.stylesQuadBuffer = null;
       }
     }
     if (this.fallbackTileCanvas) {
