@@ -17,21 +17,22 @@ export interface Point {
   y: number;
   pressure: number;
   width: number;
+  tiltX?: number;
+  tiltY?: number;
+  twist?: number;
 }
 
 export type BrushPresetId =
   | 'round'
   | 'g-pen'
+  | 'maru-pen'
+  | 'turnip-pen'
+  | 'airbrush-soft'
   | 'pencil-f'
   | 'pencil-hb'
   | 'pencil-2b'
   | 'pencil-4b'
-  | 'oil-thick'
-  | 'oil-glaze'
-  | 'chalk-rough'
-  | 'chalk-pastel'
   | 'square-digital'
-  | 'blend-smudge'
   | string;
 
 export interface CspEffectorCurvePoint {
@@ -173,6 +174,7 @@ export interface BrushSettings {
   pressureCurveGamma?: number; // 0.4 (soft) to 2.5 (hard) response curve
   velocityDynamics?: boolean;
   useGpu?: boolean; // Run brush mathematics on GPU video card by default
+  isTransparentInk?: boolean; // Transparent Ink mode (CSP 'C' key toggle)
 }
 
 export interface DocumentTab {
@@ -318,12 +320,58 @@ export interface DirtyRect {
   height: number;
 }
 
+export interface VectorKnot {
+  x: number;
+  y: number;
+  pressure: number;
+  width: number;
+  angle?: number;
+  timestamp: number;
+}
+
+export interface VectorStroke {
+  id: string;
+  layerId: string;
+  tool: 'brush' | 'pencil' | 'eraser';
+  knots: VectorKnot[];
+  color: string;
+  baseWidth: number;
+  opacity: number;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
+  deleted?: boolean;
+}
+
+export interface ComicFrame {
+  id: string;
+  layerId: string;
+  polygon: Array<{ x: number; y: number }>;
+  borderWidth: number;
+  gutterVertical: number;
+  gutterHorizontal: number;
+  clipChildren: boolean;
+}
+
+export interface TileDelta {
+  key: string; // layerId:tileX:tileY
+  format: 'monochrome-1bit' | 'grayscale-8bit' | 'color-32bit';
+  beforeData?: Uint8Array | null;
+  afterData?: Uint8Array | null;
+}
+
 export interface HistoryItem extends HistoryItemMeta {
   imageData?: ImageData;
   beforeImageData?: ImageData | null;
   afterImageData?: ImageData | null;
   layerId?: string;
   dirtyRect?: DirtyRect;
+  // Tile-delta history support (drastically reduces undo memory at 600 DPI)
+  tileDeltas?: TileDelta[];
+  vectorStrokesDelta?: {
+    before: VectorStroke[];
+    after: VectorStroke[];
+  };
+  peerId?: string | number;
+  strokeId?: string;
 }
 
 export type ExpressionColor = 'color' | 'gray' | 'monochrome';
@@ -331,11 +379,13 @@ export type ExpressionColor = 'color' | 'gray' | 'monochrome';
 export interface LayerItem {
   id: string;
   name: string;
-  type: 'raster' | 'folder';
+  type: 'raster' | 'folder' | 'vector' | 'frame';
   visible: boolean;
   opacity: number; // 0.0 to 1.0
   blendMode: BlendMode;
   locked: boolean;
+  alphaLocked?: boolean; // Lock Transparent Pixels
+  clipped?: boolean; // Clip to Layer Below (Clipping Mask)
   collapsed?: boolean;
   parentId: string | null; // null for root, or folder id
   thumbnailUrl?: string; // live layer thumbnail data URL
@@ -343,7 +393,7 @@ export interface LayerItem {
   toneEnabled?: boolean;
   toneFrequency?: number; // Lines / LPI (20 to 85, default: 60)
   toneAngle?: number; // Angle in degrees (0 to 90, default: 45)
-  toneDotShape?: 'circle' | 'euclidean' | 'line'; // Default: circle
+  toneDotShape?: 'circle' | 'euclidean' | 'line' | 'diamond'; // Default: circle
   toneDensity?: number; // Density percentage (1 to 100, default: 40)
   toneDensityType?: 'specified' | 'image'; // 'specified' ("Use specified density") or 'image' ("Use image brightness")
   // Clip Studio Paint Style Layer Color (Tint Effect)
@@ -355,6 +405,13 @@ export interface LayerItem {
   monoThreshold?: number; // 1 to 255 (default: 128)
   monoExpressBlack?: boolean; // Express black in monochrome (default: true)
   monoExpressWhite?: boolean; // Express white in monochrome (default: true)
+  // Vector Layer Data
+  vectorStrokes?: VectorStroke[];
+  // Comic Frame Data
+  comicFrames?: ComicFrame[];
+  // Collaborative Layer Soft-Locking
+  reservedByPeerId?: string | number;
+  reservedByPeerName?: string;
 }
 
 export type Layer = LayerItem;

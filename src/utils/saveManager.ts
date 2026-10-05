@@ -5,6 +5,7 @@ import {
   BlendMode,
 } from '../types/editor';
 import { getCanvasCompositeOperation } from './canvasUtils';
+import { groupLayersForCompositing } from './compositor';
 
 export interface SavedFileInfo {
   handle?: any; // FileSystemFileHandle
@@ -62,18 +63,56 @@ export function compositeCanvas(
     ctx.fillRect(0, 0, dimensions.width, dimensions.height);
   }
 
-  // Render layers bottom-to-top
+  // Render layers bottom-to-top grouped by clipping masks
   const renderOrder = layers.slice().reverse();
-  for (const layer of renderOrder) {
-    if (layer.type === 'folder' || !isLayerEffectivelyVisible(layer)) continue;
-    const lCanvas = layerCanvasesMap.get(layer.id);
-    if (!lCanvas) continue;
+  const groups = groupLayersForCompositing(renderOrder);
 
-    ctx.save();
-    ctx.globalAlpha = getEffectiveOpacity(layer);
-    ctx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
-    ctx.drawImage(lCanvas, 0, 0);
-    ctx.restore();
+  for (const group of groups) {
+    const baseLayer = group.baseLayer;
+    if (baseLayer.type === 'folder' || !isLayerEffectivelyVisible(baseLayer)) continue;
+    const baseCanvas = layerCanvasesMap.get(baseLayer.id);
+    if (!baseCanvas) continue;
+
+    const activeClipped = group.clippedLayers.filter(
+      (cl) => cl.type !== 'folder' && isLayerEffectivelyVisible(cl)
+    );
+
+    if (activeClipped.length === 0) {
+      ctx.save();
+      ctx.globalAlpha = getEffectiveOpacity(baseLayer);
+      ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+      ctx.drawImage(baseCanvas, 0, 0);
+      ctx.restore();
+    } else {
+      // Group isolated offscreen canvas for base + clipped layers
+      const groupCanvas = document.createElement('canvas');
+      groupCanvas.width = dimensions.width;
+      groupCanvas.height = dimensions.height;
+      const gCtx = groupCanvas.getContext('2d');
+      if (!gCtx) continue;
+
+      gCtx.save();
+      gCtx.globalAlpha = getEffectiveOpacity(baseLayer);
+      gCtx.drawImage(baseCanvas, 0, 0);
+      gCtx.restore();
+
+      for (const clipped of activeClipped) {
+        const cCanvas = layerCanvasesMap.get(clipped.id);
+        if (!cCanvas) continue;
+
+        gCtx.save();
+        gCtx.globalAlpha = getEffectiveOpacity(clipped);
+        gCtx.globalCompositeOperation = 'source-atop';
+        gCtx.drawImage(cCanvas, 0, 0);
+        gCtx.restore();
+      }
+
+      ctx.save();
+      ctx.globalAlpha = 1.0;
+      ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+      ctx.drawImage(groupCanvas, 0, 0);
+      ctx.restore();
+    }
   }
 
   return exportCanvas;

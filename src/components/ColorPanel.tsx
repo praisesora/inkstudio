@@ -20,6 +20,7 @@ export interface ColorPanelProps {
   onSelectTool?: (tool: ToolType) => void;
   recentColors?: string[];
   containerWidth?: number;
+  containerHeight?: number;
 }
 
 // Clip Studio Paint style 3-slider horizontal icon
@@ -45,6 +46,7 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
   onSelectTool,
   recentColors = [],
   containerWidth = 320,
+  containerHeight,
 }) => {
   // Active palette tab: 'wheel' | 'slider'
   const [activeTab, setActiveTab] = useState<'wheel' | 'slider'>(() => {
@@ -91,11 +93,12 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
 
   // Determine if tab labels should be compact icon-only when narrow
   const isNarrow = containerWidth < 275;
+  const contentHeight = containerHeight ? Math.max(80, containerHeight - 30) : undefined;
 
   return (
-    <div className="flex flex-col select-none text-[#cccccc] text-xs">
+    <div className="flex flex-col select-none text-[#cccccc] text-xs h-full">
       {/* Clip Studio Paint Palette Tab Header Bar */}
-      <div className="bg-[#242426] px-2 py-0 border-b border-[#333333] flex items-center justify-between h-[30px] relative">
+      <div className="bg-[#242426] px-2 py-0 border-b border-[#333333] flex items-center justify-between h-[30px] shrink-0 relative">
         {/* Left: Menu & Palette Tabs */}
         <div className="flex items-center space-x-1.5 h-full">
           {/* Hamburger Menu Button */}
@@ -241,48 +244,9 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
       </div>
 
       {/* Palette Content Area */}
-      {viewMode === 'tabbed' ? (
-        activeTab === 'wheel' ? (
-          <ColorWheel
-            primaryColor={primaryColor}
-            secondaryColor={secondaryColor}
-            onPrimaryColorChange={onPrimaryColorChange}
-            onSecondaryColorChange={onSecondaryColorChange}
-            onSwapColors={onSwapColors}
-            colorMode={colorMode}
-            currentTool={currentTool}
-            onSelectTool={onSelectTool}
-            recentColors={recentColors}
-            containerWidth={containerWidth}
-            activeTarget={activeTarget}
-            onActiveTargetChange={setActiveTarget}
-            hideHeader={true}
-          />
-        ) : (
-          <ColorSlider
-            primaryColor={primaryColor}
-            secondaryColor={secondaryColor}
-            onPrimaryColorChange={onPrimaryColorChange}
-            onSecondaryColorChange={onSecondaryColorChange}
-            onSwapColors={onSwapColors}
-            colorMode={colorMode}
-            currentTool={currentTool}
-            onSelectTool={onSelectTool}
-            recentColors={recentColors}
-            containerWidth={containerWidth}
-            activeTarget={activeTarget}
-            onActiveTargetChange={setActiveTarget}
-            hideHeader={true}
-          />
-        )
-      ) : (
-        /* Split View Mode: Both Color Wheel & Color Slider Stacked */
-        <div className="divide-y divide-[#333333]">
-          <div className="pb-1">
-            <div className="px-3 py-1 bg-[#1e1e20] text-[10px] font-semibold text-[#888888] uppercase tracking-wider flex items-center space-x-1">
-              <Disc className="w-3 h-3 text-[#5ce1e6]" />
-              <span>Color Wheel</span>
-            </div>
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        {viewMode === 'tabbed' ? (
+          activeTab === 'wheel' ? (
             <ColorWheel
               primaryColor={primaryColor}
               secondaryColor={secondaryColor}
@@ -292,19 +256,14 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
               colorMode={colorMode}
               currentTool={currentTool}
               onSelectTool={onSelectTool}
-              recentColors={[]}
+              recentColors={recentColors}
               containerWidth={containerWidth}
+              containerHeight={contentHeight}
               activeTarget={activeTarget}
               onActiveTargetChange={setActiveTarget}
               hideHeader={true}
             />
-          </div>
-
-          <div className="pt-1">
-            <div className="px-3 py-1 bg-[#1e1e20] text-[10px] font-semibold text-[#888888] uppercase tracking-wider flex items-center space-x-1">
-              <ColorSliderIcon className="w-3 h-3 text-[#5ce1e6]" />
-              <span>Color Slider</span>
-            </div>
+          ) : (
             <ColorSlider
               primaryColor={primaryColor}
               secondaryColor={secondaryColor}
@@ -316,13 +275,63 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
               onSelectTool={onSelectTool}
               recentColors={recentColors}
               containerWidth={containerWidth}
+              containerHeight={contentHeight}
               activeTarget={activeTarget}
               onActiveTargetChange={setActiveTarget}
               hideHeader={true}
             />
+          )
+        ) : (
+          /* Split View Mode: Both Color Wheel & Color Slider Stacked */
+          <div className="divide-y divide-[#333333]">
+            <div className="pb-1">
+              <div className="px-3 py-1 bg-[#1e1e20] text-[10px] font-semibold text-[#888888] uppercase tracking-wider flex items-center space-x-1">
+                <Disc className="w-3 h-3 text-[#5ce1e6]" />
+                <span>Color Wheel</span>
+              </div>
+              <ColorWheel
+                primaryColor={primaryColor}
+                secondaryColor={secondaryColor}
+                onPrimaryColorChange={onPrimaryColorChange}
+                onSecondaryColorChange={onSecondaryColorChange}
+                onSwapColors={onSwapColors}
+                colorMode={colorMode}
+                currentTool={currentTool}
+                onSelectTool={onSelectTool}
+                recentColors={[]}
+                containerWidth={containerWidth}
+                containerHeight={contentHeight ? Math.max(80, Math.floor(contentHeight / 2) - 20) : undefined}
+                activeTarget={activeTarget}
+                onActiveTargetChange={setActiveTarget}
+                hideHeader={true}
+              />
+            </div>
+
+            <div className="pt-1">
+              <div className="px-3 py-1 bg-[#1e1e20] text-[10px] font-semibold text-[#888888] uppercase tracking-wider flex items-center space-x-1">
+                <ColorSliderIcon className="w-3 h-3 text-[#5ce1e6]" />
+                <span>Color Slider</span>
+              </div>
+              <ColorSlider
+                primaryColor={primaryColor}
+                secondaryColor={secondaryColor}
+                onPrimaryColorChange={onPrimaryColorChange}
+                onSecondaryColorChange={onSecondaryColorChange}
+                onSwapColors={onSwapColors}
+                colorMode={colorMode}
+                currentTool={currentTool}
+                onSelectTool={onSelectTool}
+                recentColors={recentColors}
+                containerWidth={containerWidth}
+                containerHeight={contentHeight ? Math.max(80, Math.floor(contentHeight / 2) - 20) : undefined}
+                activeTarget={activeTarget}
+                onActiveTargetChange={setActiveTarget}
+                hideHeader={true}
+              />
+            </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 };

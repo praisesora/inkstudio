@@ -3,7 +3,6 @@ import {
   Menu,
   Pencil,
   Paintbrush,
-  Palette,
   Square,
   Eraser,
   RotateCcw,
@@ -56,9 +55,6 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
     }
     if (presetId?.startsWith('pencil')) {
       return <Pencil className="w-3.5 h-3.5 text-amber-400 shrink-0" />;
-    }
-    if (presetId === 'oil-thick' || presetId === 'oil-glaze' || presetId === 'blend-smudge') {
-      return <Palette className="w-3.5 h-3.5 text-emerald-400 shrink-0" />;
     }
     if (presetId === 'square-digital') {
       return <Square className="w-3.5 h-3.5 text-teal-400 shrink-0" />;

@@ -1,17 +1,25 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   X,
   Palette,
   Layers,
   Paintbrush,
   Keyboard,
-  Sparkles,
+  Info,
   RotateCcw,
   Check,
   Search,
+  User,
   Settings as SettingsIcon,
+  Sparkles,
 } from 'lucide-react';
-import { AppSettings, DEFAULT_APP_SETTINGS } from '../types/settings';
+import {
+  AppSettings,
+  DEFAULT_APP_SETTINGS,
+  ModernAccentColor,
+  MODERN_ACCENTS,
+  resolveModernAccentColor,
+} from '../types/settings';
 import { CanvasColorMode } from '../types/editor';
 import { DPI_PRESETS } from './NewCanvasModal';
 
@@ -73,6 +81,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [localSettings, setLocalSettings] = useState<AppSettings>(settings);
   const [searchQuery, setSearchQuery] = useState<string>('');
 
+  useEffect(() => {
+    setLocalSettings(settings);
+  }, [settings]);
+
   if (!isOpen) return null;
 
   const handleChange = <K extends keyof AppSettings>(key: K, value: AppSettings[K]) => {
@@ -102,18 +114,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         if (e.key === 'Escape') onClose();
       }}
     >
-      <div className="bg-[#222224] border border-[#3e3e42] rounded-lg shadow-2xl w-full max-w-3xl flex flex-col overflow-hidden text-xs text-[#cccccc] h-[580px]">
+      <div className="bg-[#444447] border border-[#242426] rounded-[2px] shadow-[0_8px_24px_rgba(0,0,0,0.7)] w-full max-w-3xl flex flex-col overflow-hidden text-xs text-[#d6d6da] h-[580px]">
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3.5 bg-[#2a2a2d] border-b border-[#38383a] shrink-0">
-          <div className="flex items-center space-x-2.5">
-            <div className="w-5 h-5 rounded-[3px] bg-[#007acc]/20 border border-[#007acc]/40 flex items-center justify-center text-[#38bdf8]">
-              <SettingsIcon className="w-3.5 h-3.5" />
-            </div>
-            <h2 className="text-sm font-semibold text-white tracking-wide">Application Settings</h2>
+        <div className="flex items-center justify-between px-4 py-2.5 bg-gradient-to-b from-[#525255] to-[#3e3e40] border-b border-[#242426] shrink-0">
+          <div className="flex items-center space-x-2">
+            <SettingsIcon className="w-4 h-4 text-[#93c5fd]" />
+            <h2 className="text-xs font-semibold text-[#f0f0f4] tracking-wide">Application Preferences</h2>
           </div>
           <button
             onClick={onClose}
-            className="p-1 rounded hover:bg-[#38383a] text-[#888888] hover:text-white transition-colors"
+            className="p-1 rounded-[2px] hover:bg-[#525255] text-[#a0a0a5] hover:text-white transition-colors"
             title="Close (Esc)"
           >
             <X className="w-4 h-4" />
@@ -123,75 +133,75 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {/* Body: Left Tabs + Right Content */}
         <div className="flex flex-1 overflow-hidden">
           {/* Left Tabs Bar */}
-          <div className="w-48 bg-[#1a1a1c] border-r border-[#333336] p-2 space-y-1 shrink-0 flex flex-col justify-between">
+          <div className="w-44 bg-[#37373a] border-r border-[#242426] p-2 space-y-1 shrink-0 flex flex-col justify-between">
             <div className="space-y-1">
               <button
                 type="button"
                 onClick={() => setActiveTab('appearance')}
-                className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded text-left transition-colors ${
+                className={`w-full flex items-center space-x-2 px-2.5 py-1.5 rounded-[2px] text-left transition-colors border ${
                   activeTab === 'appearance'
-                    ? 'bg-[#007acc] text-white font-medium shadow-xs'
-                    : 'text-[#aaaaaa] hover:bg-[#252528] hover:text-white'
+                    ? 'bg-gradient-to-b from-[#376590] to-[#204264] border-[#4a8fc7] text-white font-medium shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]'
+                    : 'border-transparent text-[#b0b0b5] hover:bg-[#424245] hover:text-white'
                 }`}
               >
-                <Palette className="w-4 h-4 shrink-0" />
+                <Palette className="w-3.5 h-3.5 shrink-0" />
                 <span>Appearance</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('canvas')}
-                className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded text-left transition-colors ${
+                className={`w-full flex items-center space-x-2 px-2.5 py-1.5 rounded-[2px] text-left transition-colors border ${
                   activeTab === 'canvas'
-                    ? 'bg-[#007acc] text-white font-medium shadow-xs'
-                    : 'text-[#aaaaaa] hover:bg-[#252528] hover:text-white'
+                    ? 'bg-gradient-to-b from-[#376590] to-[#204264] border-[#4a8fc7] text-white font-medium shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]'
+                    : 'border-transparent text-[#b0b0b5] hover:bg-[#424245] hover:text-white'
                 }`}
               >
-                <Layers className="w-4 h-4 shrink-0" />
+                <Layers className="w-3.5 h-3.5 shrink-0" />
                 <span>Canvas Defaults</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('brush')}
-                className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded text-left transition-colors ${
+                className={`w-full flex items-center space-x-2 px-2.5 py-1.5 rounded-[2px] text-left transition-colors border ${
                   activeTab === 'brush'
-                    ? 'bg-[#007acc] text-white font-medium shadow-xs'
-                    : 'text-[#aaaaaa] hover:bg-[#252528] hover:text-white'
+                    ? 'bg-gradient-to-b from-[#376590] to-[#204264] border-[#4a8fc7] text-white font-medium shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]'
+                    : 'border-transparent text-[#b0b0b5] hover:bg-[#424245] hover:text-white'
                 }`}
               >
-                <Paintbrush className="w-4 h-4 shrink-0" />
+                <Paintbrush className="w-3.5 h-3.5 shrink-0" />
                 <span>Brush & Stylus</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('shortcuts')}
-                className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded text-left transition-colors ${
+                className={`w-full flex items-center space-x-2 px-2.5 py-1.5 rounded-[2px] text-left transition-colors border ${
                   activeTab === 'shortcuts'
-                    ? 'bg-[#007acc] text-white font-medium shadow-xs'
-                    : 'text-[#aaaaaa] hover:bg-[#252528] hover:text-white'
+                    ? 'bg-gradient-to-b from-[#376590] to-[#204264] border-[#4a8fc7] text-white font-medium shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]'
+                    : 'border-transparent text-[#b0b0b5] hover:bg-[#424245] hover:text-white'
                 }`}
               >
-                <Keyboard className="w-4 h-4 shrink-0" />
+                <Keyboard className="w-3.5 h-3.5 shrink-0" />
                 <span>Shortcuts</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setActiveTab('about')}
-                className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded text-left transition-colors ${
+                className={`w-full flex items-center space-x-2 px-2.5 py-1.5 rounded-[2px] text-left transition-colors border ${
                   activeTab === 'about'
-                    ? 'bg-[#007acc] text-white font-medium shadow-xs'
-                    : 'text-[#aaaaaa] hover:bg-[#252528] hover:text-white'
+                    ? 'bg-gradient-to-b from-[#376590] to-[#204264] border-[#4a8fc7] text-white font-medium shadow-[inset_0_1px_2px_rgba(0,0,0,0.5)]'
+                    : 'border-transparent text-[#b0b0b5] hover:bg-[#424245] hover:text-white'
                 }`}
               >
-                <Sparkles className="w-4 h-4 shrink-0 text-amber-400" />
+                <Info className="w-3.5 h-3.5 shrink-0" />
                 <span>About</span>
               </button>
             </div>
 
-            <div className="pt-2 border-t border-[#2e2e32]">
+            <div className="pt-2 border-t border-[#2a2a2d]">
               <button
                 type="button"
                 onClick={handleResetDefaults}
@@ -210,26 +220,248 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             {activeTab === 'appearance' && (
               <div className="space-y-5">
                 <div>
-                  <h3 className="text-sm font-semibold text-white">Appearance & Interface</h3>
-                  <p className="text-[11px] text-[#888888]">Choose interface styling and workspace overlays</p>
+                  <h3 className="text-sm font-semibold text-white">Appearance & Profile</h3>
+                  <p className="text-[11px] text-[#888888]">Personalize your workspace, profile, and theme settings</p>
+                </div>
+
+                {/* User Profile */}
+                <div className="bg-[#1a1a1c] border border-[#333336] rounded-md p-3.5 space-y-2.5">
+                  <div className="flex items-center space-x-2">
+                    <User className="w-3.5 h-3.5 text-[#38bdf8]" />
+                    <span className="text-[11px] font-semibold text-[#aaaaaa] uppercase tracking-wider block">
+                      User Profile
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-[#888888]">
+                    Displayed on the Welcome Screen and in collaboration sessions
+                  </p>
+                  <div>
+                    <label className="text-[11px] text-[#cccccc] block mb-1">Display Name</label>
+                    <input
+                      type="text"
+                      value={localSettings.userName || ''}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        handleChange('userName', val);
+                        try {
+                          localStorage.setItem('sora_paint_nickname', val);
+                        } catch {
+                          // ignore
+                        }
+                      }}
+                      placeholder="Enter your name"
+                      className="w-full bg-[#141416] border border-[#3a3a3d] focus:border-[#007acc] rounded px-3 py-1.5 text-xs text-white placeholder-[#555555] outline-hidden transition-colors"
+                    />
+                  </div>
                 </div>
 
                 {/* Interface Theme Switcher */}
-                <div className="bg-[#1a1a1c] border border-[#333336] rounded-md p-3.5 space-y-2.5">
-                  <span className="text-[11px] font-semibold text-[#aaaaaa] uppercase tracking-wider block">
-                    Theme Preset
-                  </span>
+                <div className="bg-[#1a1a1c] border border-[#333336] rounded-md p-3.5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-[#aaaaaa] uppercase tracking-wider block">
+                      Theme Preset
+                    </span>
+                    <span className="text-[10px] text-[#777777] font-mono">
+                      {localSettings.themePreset === 'modern' ? 'Minimalist Sleek' : 'Vintage DCC'}
+                    </span>
+                  </div>
                   <div className="grid grid-cols-2 gap-2.5">
                     <button
                       type="button"
                       onClick={() => handleChange('themePreset', 'vintage-manga')}
-                      className="flex items-center justify-center space-x-2 py-2.5 px-3 rounded text-xs font-medium border transition-colors cursor-pointer bg-[#293d45] border-[#5ce1e6] text-[#5ce1e6] shadow-xs"
+                      className={`flex items-center justify-between py-2.5 px-3 rounded text-xs font-medium border transition-all cursor-pointer ${
+                        localSettings.themePreset === 'vintage-manga'
+                          ? 'bg-[#293d45] border-[#5ce1e6] text-[#5ce1e6] shadow-xs'
+                          : 'bg-[#222225] border-[#38383c] text-[#bbbbbb] hover:bg-[#28282c] hover:text-white'
+                      }`}
                     >
-                      <Check className="w-3.5 h-3.5 shrink-0" />
-                      <span>Old Studio</span>
+                      <div className="flex items-center space-x-2">
+                        <span className="font-semibold text-xs">Old Studio</span>
+                      </div>
+                      {localSettings.themePreset === 'vintage-manga' && <Check className="w-3.5 h-3.5 shrink-0" />}
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleChange('themePreset', 'modern')}
+                      className={`flex items-center justify-between py-2.5 px-3 rounded text-xs font-medium border transition-all cursor-pointer ${
+                        localSettings.themePreset === 'modern'
+                          ? 'bg-[var(--modern-accent-subtle,#1e293b)] border-[var(--modern-accent,#3b82f6)] text-[var(--modern-accent,#3b82f6)] shadow-xs'
+                          : 'bg-[#222225] border-[#38383c] text-[#bbbbbb] hover:bg-[#28282c] hover:text-white'
+                      }`}
+                    >
+                      <div className="flex items-center space-x-2">
+                        <Sparkles className="w-3.5 h-3.5 shrink-0 text-[var(--modern-accent,#3b82f6)]" />
+                        <span className="font-semibold text-xs">Modern</span>
+                      </div>
+                      {localSettings.themePreset === 'modern' && <Check className="w-3.5 h-3.5 shrink-0" />}
                     </button>
                   </div>
                 </div>
+
+                {/* Modern Accent Colors (When Modern design is selected) */}
+                {localSettings.themePreset === 'modern' && (
+                  <div className="bg-[#1a1a1c] border border-[#333336] rounded-md p-3.5 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="text-[11px] font-semibold text-[#aaaaaa] uppercase tracking-wider block">
+                          Accent Color
+                        </span>
+                        <span className="text-[10px] text-[#888888]">
+                          Select accent color for active tools, highlights, buttons, and sliders
+                        </span>
+                      </div>
+                      <div
+                        className="w-4 h-4 rounded-full border border-white/20 shadow-xs shrink-0"
+                        style={{
+                          backgroundColor: resolveModernAccentColor(
+                            localSettings.modernAccent,
+                            localSettings.modernCustomColor
+                          ),
+                        }}
+                        title={`Current Accent: ${localSettings.modernAccent}`}
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2">
+                      {(Object.keys(MODERN_ACCENTS) as Array<Exclude<ModernAccentColor, 'custom'>>).map((accKey) => {
+                        const acc = MODERN_ACCENTS[accKey];
+                        const isSelected = localSettings.modernAccent === accKey;
+                        return (
+                          <button
+                            key={accKey}
+                            type="button"
+                            onClick={() => handleChange('modernAccent', accKey)}
+                            className={`flex items-center space-x-2 px-2.5 py-2 rounded border text-xs transition-all cursor-pointer ${
+                              isSelected
+                                ? 'bg-[#26272c] border-white/30 text-white font-medium ring-1 ring-white/20'
+                                : 'bg-[#202125] border-[#35363b] text-[#aaaaaa] hover:bg-[#28292f] hover:text-white'
+                            }`}
+                          >
+                            <span
+                              className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border border-black/20"
+                              style={{ backgroundColor: acc.hex }}
+                            />
+                            <span className="truncate">{acc.label}</span>
+                            {isSelected && <Check className="w-3 h-3 ml-auto text-white shrink-0" />}
+                          </button>
+                        );
+                      })}
+
+                      {/* Custom color option */}
+                      <button
+                        type="button"
+                        onClick={() => handleChange('modernAccent', 'custom')}
+                        className={`flex items-center space-x-2 px-2.5 py-2 rounded border text-xs transition-all cursor-pointer ${
+                          localSettings.modernAccent === 'custom'
+                            ? 'bg-[#26272c] border-white/30 text-white font-medium ring-1 ring-white/20'
+                            : 'bg-[#202125] border-[#35363b] text-[#aaaaaa] hover:bg-[#28292f] hover:text-white'
+                        }`}
+                      >
+                        <span
+                          className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border border-black/20"
+                          style={{
+                            backgroundColor: localSettings.modernCustomColor || '#3b82f6',
+                          }}
+                        />
+                        <span className="truncate">Custom</span>
+                        {localSettings.modernAccent === 'custom' && (
+                          <Check className="w-3 h-3 ml-auto text-white shrink-0" />
+                        )}
+                      </button>
+                    </div>
+
+                    {/* Custom Color Picker Input */}
+                    {localSettings.modernAccent === 'custom' && (
+                      <div className="p-2.5 rounded bg-[#141416] border border-[#303136] flex items-center space-x-3">
+                        <div className="relative w-8 h-8 rounded-full overflow-hidden border border-white/20 shadow-xs shrink-0 cursor-pointer">
+                          <input
+                            type="color"
+                            value={localSettings.modernCustomColor || '#3b82f6'}
+                            onChange={(e) => {
+                              const hex = e.target.value;
+                              const updated = {
+                                ...localSettings,
+                                modernAccent: 'custom' as ModernAccentColor,
+                                modernCustomColor: hex,
+                              };
+                              setLocalSettings(updated);
+                              onUpdateSettings(updated);
+                            }}
+                            className="absolute -inset-2 w-12 h-12 cursor-pointer opacity-0"
+                            title="Pick custom accent color"
+                          />
+                          <div
+                            className="w-full h-full"
+                            style={{ backgroundColor: localSettings.modernCustomColor || '#3b82f6' }}
+                          />
+                        </div>
+
+                        <div className="flex-1 space-y-1">
+                          <label className="text-[10px] text-[#888888] block">Custom Hex Value</label>
+                          <input
+                            type="text"
+                            value={localSettings.modernCustomColor || '#3b82f6'}
+                            onChange={(e) => {
+                              const val = e.target.value;
+                              const updated = {
+                                ...localSettings,
+                                modernAccent: 'custom' as ModernAccentColor,
+                                modernCustomColor: val,
+                              };
+                              setLocalSettings(updated);
+                              if (/^#[0-9a-fA-F]{6}$/i.test(val)) {
+                                onUpdateSettings(updated);
+                              }
+                            }}
+                            placeholder="#3b82f6"
+                            maxLength={7}
+                            className="w-full bg-[#1e1f23] border border-[#3a3b40] focus:border-[#3b82f6] rounded px-2.5 py-1 font-mono text-xs text-white outline-hidden"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Dark Tone Selector */}
+                    <div className="pt-2 border-t border-[#2d2e33]">
+                      <div className="flex items-center justify-between mb-2">
+                        <span className="text-[11px] font-semibold text-[#aaaaaa] uppercase tracking-wider block">
+                          Surface Tone
+                        </span>
+                        <span className="text-[10px] text-[#777777] font-mono capitalize">
+                          {localSettings.uiTone || 'slate'}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2">
+                        {([
+                          { id: 'slate', label: 'Slate', desc: 'Cold tech' },
+                          { id: 'charcoal', label: 'Charcoal', desc: 'Neutral grey' },
+                          { id: 'oled', label: 'OLED Black', desc: 'Pure ink black' },
+                        ] as const).map((tone) => {
+                          const isSelected = (localSettings.uiTone || 'slate') === tone.id;
+                          return (
+                            <button
+                              key={tone.id}
+                              type="button"
+                              onClick={() => handleChange('uiTone', tone.id)}
+                              className={`px-2.5 py-1.5 rounded border text-left text-xs transition-all cursor-pointer ${
+                                isSelected
+                                  ? 'bg-[#26272c] border-white/30 text-white font-medium ring-1 ring-white/20'
+                                  : 'bg-[#202125] border-[#35363b] text-[#aaaaaa] hover:bg-[#28292f] hover:text-white'
+                              }`}
+                            >
+                              <div className="flex items-center justify-between">
+                                <span className="font-medium text-xs text-white">{tone.label}</span>
+                                {isSelected && <Check className="w-3 h-3 text-white shrink-0" />}
+                              </div>
+                              <span className="text-[10px] text-[#777777] block mt-0.5">{tone.desc}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Toggles */}
                 <div className="bg-[#1a1a1c] border border-[#333336] rounded-md p-3.5 space-y-3">
@@ -575,14 +807,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-5 py-3 bg-[#2a2a2d] border-t border-[#38383a] shrink-0">
-          <span className="text-[11px] text-[#777777]">Changes save automatically</span>
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#3a3a3d] border-t border-[#242426] shrink-0">
+          <span className="text-[11px] text-[#8c8c92]">Preferences save automatically</span>
           <button
             type="button"
             onClick={onClose}
-            className="flex items-center space-x-1.5 px-5 py-1.5 rounded bg-[#007acc] hover:bg-[#008be5] active:bg-[#006bb3] text-white font-medium shadow-sm transition-colors ml-auto"
+            className="flex items-center space-x-1.5 px-4 py-1.5 rounded-[2px] bg-gradient-to-b from-[#56565a] to-[#424245] hover:from-[#626266] hover:to-[#4b4b4e] border border-[#242426] text-xs font-medium text-[#f0f0f4] shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_1px_1px_rgba(0,0,0,0.3)] cursor-pointer ml-auto"
           >
-            <Check className="w-4 h-4" />
+            <Check className="w-3.5 h-3.5 text-emerald-400" />
             <span>Close</span>
           </button>
         </div>

@@ -1,4 +1,4 @@
-import { Point, BrushSettings, ToolType, DirtyRect, CanvasDimensions, CanvasColorMode, LayerItem } from './editor';
+import { Point, BrushSettings, ToolType, DirtyRect, CanvasDimensions, CanvasColorMode, LayerItem, VectorStroke } from './editor';
 
 export interface CollabPeer {
   id: string | number;
@@ -31,7 +31,9 @@ export type MultiplayerMessageType =
   | 'LAYER_OPACITY'
   | 'DOC_SYNC_REQUEST'
   | 'DOC_SYNC_RESPONSE'
-  | 'CANVAS_PING';
+  | 'CANVAS_PING'
+  | 'BINARY_TILE'
+  | 'SELECTIVE_UNDO';
 
 export interface BaseMultiplayerMessage {
   type: MultiplayerMessageType;
@@ -67,6 +69,11 @@ export interface PeerJoinedMessage extends BaseMultiplayerMessage {
 
 export interface PeerLeftMessage extends BaseMultiplayerMessage {
   type: 'PEER_LEFT';
+  peerId: string | number;
+}
+
+export interface PeerDisconnectedMessage extends BaseMultiplayerMessage {
+  type: 'PEER_DISCONNECTED';
   peerId: string | number;
 }
 
@@ -107,6 +114,7 @@ export interface StrokeFinishMessage extends BaseMultiplayerMessage {
   layerId: string;
   endPoint: Point;
   dirtyRect?: DirtyRect;
+  vectorStroke?: VectorStroke;
 }
 
 export interface LayerActionMessage extends BaseMultiplayerMessage {
@@ -141,9 +149,21 @@ export interface CanvasPingMessage extends BaseMultiplayerMessage {
   timestamp: number;
 }
 
-export interface PeerDisconnectedMessage extends BaseMultiplayerMessage {
-  type: 'PEER_DISCONNECTED';
-  clientId: number;
+export interface TileStreamMessage extends BaseMultiplayerMessage {
+  type: 'BINARY_TILE';
+  layerId: string;
+  tileX: number;
+  tileY: number;
+  format: 'monochrome-1bit' | 'grayscale-8bit' | 'color-32bit';
+  version: number;
+  data: Uint8Array;
+}
+
+export interface SelectiveUndoMessage extends BaseMultiplayerMessage {
+  type: 'SELECTIVE_UNDO';
+  strokeId: string;
+  peerId: string | number;
+  lamport: number;
 }
 
 export type MultiplayerMessage =
@@ -160,7 +180,9 @@ export type MultiplayerMessage =
   | LayerActionMessage
   | DocSyncRequestMessage
   | DocSyncResponseMessage
-  | CanvasPingMessage;
+  | CanvasPingMessage
+  | TileStreamMessage
+  | SelectiveUndoMessage;
 
 
 export interface SessionHostInfo {

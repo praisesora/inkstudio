@@ -70,6 +70,186 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   themePreset = 'vintage-manga',
   activeDocumentTitle,
 }) => {
+  if (themePreset === 'modern') {
+    return (
+      <header
+        data-tauri-drag-region
+        className="h-10 px-3 flex items-center justify-between text-xs select-none z-30 shrink-0 cursor-default bg-[#121318] border-b border-white/[0.08] text-[#e0e0e3]"
+      >
+        {/* Brand, Menus & Document Info */}
+        <div className="flex items-center space-x-3 min-w-0">
+          <div className="flex items-center space-x-2" title="Ink Studio">
+            <div className="w-5 h-5 flex items-center justify-center">
+              <img
+                src="/app-icon.png"
+                alt="Studio Logo"
+                className="w-4 h-4 object-contain select-none pointer-events-none drop-shadow-xs"
+              />
+            </div>
+            <span className="font-semibold text-xs text-white tracking-tight hidden sm:inline">Ink Studio</span>
+          </div>
+
+          <span className="text-white/15">|</span>
+
+          {/* Menu Bar Sections: File, Edit, Layer, View, Help */}
+          <MenuBar sections={menuSections} />
+
+          {hasOpenDocument && (
+            <>
+              <span className="text-white/15">|</span>
+
+              <div className="flex items-center space-x-2 truncate">
+                <span
+                  className="text-white/90 font-medium text-xs truncate max-w-[280px]"
+                  title={`${activeDocumentTitle || 'New canvas*'} (${dimensions.width}×${dimensions.height}px ${dimensions.dpi ? `${dimensions.dpi}dpi ` : ''}${formatZoomPercent(zoom)})`}
+                >
+                  {activeDocumentTitle || 'New canvas*'}
+                </span>
+                <span className="text-[10px] text-white/40 font-mono hidden md:inline">
+                  {dimensions.width}×{dimensions.height}px
+                </span>
+
+                <span
+                  className={`text-[9px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider ${
+                    colorMode === 'monochrome'
+                      ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
+                      : colorMode === 'grayscale'
+                      ? 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
+                      : 'bg-[var(--modern-accent-subtle)] text-[var(--modern-accent)] border border-[var(--modern-accent-border)]'
+                  }`}
+                  title={`Active Canvas Color Mode: ${colorMode}`}
+                >
+                  {colorMode === 'monochrome' ? 'Manga' : colorMode}
+                </span>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Action Tools & Zoom */}
+        <div className="flex items-center space-x-2">
+          {/* Undo / Redo */}
+          <div className="flex items-center rounded-lg p-0.5 space-x-0.5 bg-white/[0.04] border border-white/[0.08]">
+            <button
+              onClick={onUndo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+              className={`p-1 rounded-md transition-colors ${
+                canUndo
+                  ? 'text-white/80 hover:text-white hover:bg-white/10 cursor-pointer'
+                  : 'text-white/20 cursor-not-allowed'
+              }`}
+            >
+              <Undo2 className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onRedo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Y)"
+              className={`p-1 rounded-md transition-colors ${
+                canRedo
+                  ? 'text-white/80 hover:text-white hover:bg-white/10 cursor-pointer'
+                  : 'text-white/20 cursor-not-allowed'
+              }`}
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
+
+          {/* Zoom Controls */}
+          <div
+            className={`flex items-center space-x-0.5 rounded-lg px-1 py-0.5 bg-white/[0.04] border border-white/[0.08] ${
+              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
+            }`}
+          >
+            <button
+              onClick={onZoomOut}
+              title="Zoom Out (Ctrl + Minus)"
+              className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onResetZoom}
+              title="Reset Zoom & Center (Ctrl + 0)"
+              className="font-mono text-xs px-1.5 text-white/90 hover:text-white hover:bg-white/10 rounded-md transition-colors cursor-pointer"
+            >
+              {formatZoomPercent(zoom)}
+            </button>
+            <button
+              onClick={onZoomIn}
+              title="Zoom In (Ctrl + Plus)"
+              className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onResetZoom}
+              title="Reset to 100% & Center (Ctrl + 0)"
+              className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3" />
+            </button>
+          </div>
+
+          {/* Rotation Controls */}
+          <div
+            className={`flex items-center space-x-0.5 rounded-lg px-1 py-0.5 bg-white/[0.04] border border-white/[0.08] ${
+              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
+            }`}
+          >
+            <RotateCw className="w-3.5 h-3.5 text-white/40 ml-0.5" />
+            <button
+              onClick={onResetRotation}
+              onDoubleClick={onResetRotation}
+              title="Canvas Rotation (Double-click or Ctrl+Alt+0 to Reset 0°)"
+              className="font-mono text-xs px-1.5 text-white/90 hover:text-white hover:bg-white/10 rounded-md transition-colors cursor-pointer"
+            >
+              {formatRotationDegrees(rotation)}
+            </button>
+            {Math.abs(rotation % 360) > 0.05 && (
+              <button
+                onClick={onResetRotation}
+                title="Reset Rotation to 0° (Ctrl+Alt+0)"
+                className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+
+          <span className="text-white/15">|</span>
+
+          {/* Multiplayer Host / Connection Indicator */}
+          <button
+            onClick={onOpenCollabModal}
+            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
+              isCollabConnected
+                ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 shadow-xs'
+                : 'bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-white/80 hover:text-white'
+            }`}
+            title={isCollabConnected ? `Collaborative Room (${collabPeerCount} online)` : 'Start Collaborative Session (Host)'}
+          >
+            {isCollabConnected ? (
+              <>
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span>{collabPeerCount} online</span>
+              </>
+            ) : (
+              <>
+                <Users className="w-3.5 h-3.5 text-white/60" />
+                <span>Collab</span>
+              </>
+            )}
+          </button>
+
+          {/* Desktop Native Window Controls (Minimize, Maximize, Close) */}
+          <WindowControls themePreset={themePreset} />
+        </div>
+      </header>
+    );
+  }
+
   return (
     <header
       data-tauri-drag-region

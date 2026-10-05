@@ -1,6 +1,6 @@
 import { DirtyRect } from '../types/editor';
 
-export type HalftoneDotShape = 'circle' | 'euclidean' | 'line';
+export type HalftoneDotShape = 'circle' | 'euclidean' | 'line' | 'diamond';
 
 export interface ScreentoneOptions {
   /**
@@ -60,6 +60,12 @@ export interface ScreentoneOptions {
    * Specified density normalized to [0.0, 1.0], where 0.4 = 40% (default: 0.4)
    */
   specifiedDensity?: number;
+
+  /**
+   * Viewport zoom scale. When zoom < 1.0, automatically crossfades into equivalent
+   * continuous grayscale luminance to eliminate spatial aliasing and moiré patterns.
+   */
+  zoom?: number;
 }
 
 // Runtime system endianness check for ultra-fast 32-bit pixel writes
@@ -124,6 +130,11 @@ export function evaluateHalftoneDot(
 
   if (dotShape === 'line') {
     const spot = 1.0 - 2.0 * Math.abs(u);
+    return spot >= (1.0 - density);
+  }
+
+  if (dotShape === 'diamond') {
+    const spot = 1.0 - (Math.abs(u) + Math.abs(v));
     return spot >= (1.0 - density);
   }
 
@@ -221,6 +232,7 @@ export function applyScreentoneCPU(
   const invCellSize = 1.0 / cellSize;
   const dotShape = options.dotShape ?? 'circle';
   const isLine = dotShape === 'line';
+  const isDiamond = dotShape === 'diamond';
   const solidBlackAtMax = options.solidBlackAtMax !== false;
   const antiAliasing = options.antiAliasing !== false;
   const isSpecified = options.densityType !== 'image';
@@ -233,6 +245,10 @@ export function applyScreentoneCPU(
 
   let srcIdx = 0;
   let dstIdx = 0;
+
+  const zoom = options.zoom ?? 1.0;
+  const isDownscaled = zoom < 0.95;
+  const moireBlend = isDownscaled ? Math.max(0, Math.min(1, (zoom - 0.35) / 0.6)) : 1.0;
 
   for (let y = minY; y < maxY; y++) {
     const ySinT = y * sinT;
@@ -302,6 +318,8 @@ export function applyScreentoneCPU(
       let spot: number;
       if (isLine) {
         spot = 1.0 - 2.0 * Math.abs(u);
+      } else if (isDiamond) {
+        spot = 1.0 - (Math.abs(u) + Math.abs(v));
       } else {
         const absU = Math.abs(u);
         const absV = Math.abs(v);
@@ -317,7 +335,11 @@ export function applyScreentoneCPU(
       const diff = spot - oneMinusDensity;
 
       if (antiAliasing) {
-        const coverage = diff * invTwoAaHalfSpan + 0.5;
+        let coverage = Math.max(0, Math.min(1, diff * invTwoAaHalfSpan + 0.5));
+        if (isDownscaled) {
+          const contDensity = 1.0 - oneMinusDensity;
+          coverage = contDensity * (1.0 - moireBlend) + coverage * moireBlend;
+        }
         if (coverage <= 0.0) {
           dstData32[dstIdx] = TRANSPARENT_U32;
         } else if (coverage >= 1.0) {
@@ -361,6 +383,7 @@ uniform int u_solidBlackAtMax;
 uniform int u_antiAliasing;
 uniform int u_densityType;
 uniform float u_specifiedDensity;
+uniform float u_zoom;
 
 varying vec2 v_texCoord;
 
@@ -406,6 +429,8 @@ void main() {
   float spot;
   if (u_dotShape == 2) {
     spot = 1.0 - 2.0 * abs(u);
+  } else if (u_dotShape == 3) {
+    spot = 1.0 - (abs(u) + abs(v));
   } else {
     float absU = abs(u);
     float absV = abs(v);
@@ -419,17 +444,26 @@ void main() {
   }
 
   float diff = spot - (1.0 - density);
+  vec4 halftoneColor;
+
   if (u_antiAliasing == 1) {
     float halfSpan = min(0.25, 0.75 / u_cellSize);
     float coverage = clamp(diff / (2.0 * halfSpan) + 0.5, 0.0, 1.0);
-    gl_FragColor = vec4(0.0, 0.0, 0.0, coverage);
+    halftoneColor = vec4(0.0, 0.0, 0.0, coverage);
   } else {
     if (diff >= 0.0) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+      halftoneColor = vec4(0.0, 0.0, 0.0, 1.0);
     } else {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+      halftoneColor = vec4(0.0, 0.0, 0.0, 0.0);
     }
   }
+
+  // Clip Studio Paint style Anti-Moiré Viewport Downsampling:
+  // When viewport zoom Z < 1.0, high-frequency dots alias against screen pixels.
+  // Smoothstep crossfade from discrete dot pattern to continuous grayscale luminance.
+  float moireBlend = smoothstep(0.35, 0.95, u_zoom);
+  vec4 contColor = vec4(0.0, 0.0, 0.0, density);
+  gl_FragColor = mix(contColor, halftoneColor, moireBlend);
 }
 `;
 
@@ -525,6 +559,7 @@ class WebGLHalftonePipeline {
       this.uAntiAliasingLoc = gl.getUniformLocation(prog, 'u_antiAliasing');
       this.uDensityTypeLoc = gl.getUniformLocation(prog, 'u_densityType');
       this.uSpecifiedDensityLoc = gl.getUniformLocation(prog, 'u_specifiedDensity');
+      this.uZoomLoc = gl.getUniformLocation(prog, 'u_zoom');
 
       this.texture = gl.createTexture();
       return true;
@@ -532,6 +567,8 @@ class WebGLHalftonePipeline {
       return false;
     }
   }
+
+  private uZoomLoc: WebGLUniformLocation | null = null;
 
   public render(
     sourceCanvas: HTMLCanvasElement,
@@ -636,12 +673,15 @@ class WebGLHalftonePipeline {
     gl.uniform2f(this.uRegionSizeLoc, regionW, regionH);
     gl.uniform1f(this.uAngleRadLoc, rad);
     gl.uniform1f(this.uCellSizeLoc, cellSize);
-    const dotShapeVal = options.dotShape === 'line' ? 2 : (options.dotShape === 'euclidean' ? 1 : 0);
+    const dotShapeVal = options.dotShape === 'line' ? 2 : options.dotShape === 'diamond' ? 3 : (options.dotShape === 'euclidean' ? 1 : 0);
     gl.uniform1i(this.uDotShapeLoc, dotShapeVal);
     gl.uniform1i(this.uSolidBlackAtMaxLoc, options.solidBlackAtMax !== false ? 1 : 0);
     gl.uniform1i(this.uAntiAliasingLoc, options.antiAliasing !== false ? 1 : 0);
     gl.uniform1i(this.uDensityTypeLoc, options.densityType === 'image' ? 1 : 0);
     gl.uniform1f(this.uSpecifiedDensityLoc, Math.max(0, Math.min(1, options.specifiedDensity ?? 0.4)));
+    if (this.uZoomLoc) {
+      gl.uniform1f(this.uZoomLoc, options.zoom ?? 1.0);
+    }
 
     // Render to GL canvas
     gl.drawArrays(gl.TRIANGLES, 0, 6);

@@ -32,6 +32,7 @@ export interface ColorWheelProps {
   onSelectTool?: (tool: ToolType) => void;
   recentColors?: string[];
   containerWidth?: number;
+  containerHeight?: number;
   activeTarget?: 'primary' | 'secondary';
   onActiveTargetChange?: (target: 'primary' | 'secondary') => void;
   hideHeader?: boolean;
@@ -51,6 +52,7 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
   onSelectTool,
   recentColors = [],
   containerWidth = 320,
+  containerHeight,
   activeTarget: controlledActiveTarget,
   onActiveTargetChange,
   hideHeader = false,
@@ -107,38 +109,50 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
     }
   }, [activeColor]);
 
-  const [measuredWidth, setMeasuredWidth] = useState<number>(containerWidth);
+  const [measuredSize, setMeasuredSize] = useState<{ width: number; height: number }>({
+    width: containerWidth,
+    height: containerHeight || 0,
+  });
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
     const ro = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        const w = entry.contentRect.width;
-        if (w > 0) {
-          setMeasuredWidth(Math.round(w));
-        }
+        const { width: w, height: h } = entry.contentRect;
+        setMeasuredSize({
+          width: w > 0 ? Math.round(w) : containerWidth,
+          height: h > 0 ? Math.round(h) : (containerHeight || 0),
+        });
       }
     });
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [containerWidth, containerHeight]);
 
-  // Dynamically compute canvas diameter to fit sidebar neatly
-  const effectiveWidth = measuredWidth || containerWidth;
+  // Dynamically compute canvas diameter to fit sidebar neatly and adapt to size
+  const effectiveWidth = measuredSize.width || containerWidth || 280;
+  const effectiveHeight = containerHeight || measuredSize.height || 0;
+
   const wheelSize = useMemo(() => {
-    const pad = 28;
-    const available = effectiveWidth > 0 ? effectiveWidth - pad : 250;
-    return Math.max(180, Math.min(270, available));
-  }, [effectiveWidth]);
+    const pad = 24;
+    const availableWidth = Math.max(90, effectiveWidth - pad);
+    if (effectiveHeight > 0) {
+      const headerSpace = hideHeader ? 0 : 32;
+      const bottomControlsSpace = 80 + (recentColors.length > 0 ? 32 : 0) + (showAdvanced ? 82 : 0);
+      const availableHeight = Math.max(90, effectiveHeight - headerSpace - bottomControlsSpace - 14);
+      return Math.round(Math.min(availableWidth, availableHeight));
+    }
+    return Math.round(availableWidth);
+  }, [effectiveWidth, effectiveHeight, hideHeader, recentColors.length, showAdvanced]);
 
   // Dimensions & radiuses
   const cx = wheelSize / 2;
   const cy = wheelSize / 2;
-  const outerRadius = wheelSize / 2 - 8;
-  const ringThickness = Math.max(18, Math.round(wheelSize * 0.088));
+  const outerRadius = Math.max(20, wheelSize / 2 - 8);
+  const ringThickness = Math.max(14, Math.round(wheelSize * 0.088));
   const innerRadius = outerRadius - ringThickness;
-  const squareSize = Math.floor((innerRadius - 10) * Math.SQRT2);
+  const squareSize = Math.max(10, Math.floor((innerRadius - 8) * Math.SQRT2));
   const sqX = cx - squareSize / 2;
   const sqY = cy - squareSize / 2;
 
@@ -218,7 +232,7 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
 
     const midRadius = (outerRadius + innerRadius) / 2;
     const indicatorSpan = ringThickness + 6;
-    const indicatorWidth = 10;
+    const indicatorWidth = Math.max(6, Math.min(14, Math.round(wheelSize * 0.045)));
     const indX = midRadius - indicatorSpan / 2;
     const indY = -indicatorWidth / 2;
 
@@ -270,15 +284,16 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
       const curX = sqX + hsv.s * squareSize;
       const curY = sqY + (1 - hsv.v) * squareSize;
 
+      const cursorRadius = Math.max(3.5, Math.min(6, wheelSize * 0.025));
       // Double ring for 100% visibility over any color
       ctx.beginPath();
-      ctx.arc(curX, curY, 5.5, 0, Math.PI * 2);
+      ctx.arc(curX, curY, cursorRadius, 0, Math.PI * 2);
       ctx.strokeStyle = '#000000';
       ctx.lineWidth = 2.5;
       ctx.stroke();
 
       ctx.beginPath();
-      ctx.arc(curX, curY, 5.5, 0, Math.PI * 2);
+      ctx.arc(curX, curY, cursorRadius, 0, Math.PI * 2);
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 1.5;
       ctx.stroke();
@@ -357,14 +372,15 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
       const curX = wA * pTip.x + wB * pWhite.x + wC * pBlack.x;
       const curY = wA * pTip.y + wB * pWhite.y + wC * pBlack.y;
 
+      const cursorRadius = Math.max(3.5, Math.min(6, wheelSize * 0.025));
       ctx.beginPath();
-      ctx.arc(curX, curY, 5.5, 0, Math.PI * 2);
+      ctx.arc(curX, curY, cursorRadius, 0, Math.PI * 2);
       ctx.strokeStyle = '#000000';
       ctx.lineWidth = 2.5;
       ctx.stroke();
 
       ctx.beginPath();
-      ctx.arc(curX, curY, 5.5, 0, Math.PI * 2);
+      ctx.arc(curX, curY, cursorRadius, 0, Math.PI * 2);
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 1.5;
       ctx.stroke();
@@ -585,7 +601,7 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
   };
 
   return (
-    <div ref={containerRef} className="flex flex-col select-none text-[#cccccc] text-xs">
+    <div ref={containerRef} className="flex flex-col select-none text-[#cccccc] text-xs h-full">
       {/* Header Bar matching Clip Studio Paint Color Wheel */}
       {!hideHeader && (
         <div className="bg-[#2a2a2a] px-3 py-1.5 border-b border-[#333333] flex items-center justify-between">
@@ -630,7 +646,7 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
 
         {/* Clip Studio Paint Bottom Controls: Dual Swatches + Transparent Swatch + H S V Readout + Mode Toggle */}
         <div
-          style={{ width: wheelSize }}
+          style={{ width: '100%', maxWidth: Math.max(wheelSize, 280) }}
           className="flex items-center justify-between mt-1 px-1 pt-1 pb-1"
         >
           {/* Left: Dual Primary/Secondary Swatches & Transparent Checker Button */}

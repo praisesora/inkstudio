@@ -1,7 +1,16 @@
 import { Point, CanvasDimensions, BlendMode, ToolType, BrushSettings, CanvasColorMode, LayerItem } from '../types/editor';
 import { enforceColorMode } from './colorUtils';
 import { drawPencilCubicBezierSegment, drawPencilDot, PencilGrade } from './pencilEngine';
-import { renderCompleteTexturedStroke, TexturedBrushOptions } from './stampEngine';
+import {
+  renderCompleteTexturedStroke,
+  TexturedBrushOptions,
+  drawRadialCubicBezierSegment,
+  drawRadialDot,
+  centripetalCatmullRomToBezier,
+  renderCompleteRadialStroke,
+  RadialMixingOptions,
+} from './stampEngine';
+import { LayerPixelSampler, PaintReservoir } from './colorMixingEngine';
 import { evaluateCspSpline } from './sutParser';
 
 export const CANVAS_2D_CONTEXT_OPTIONS: CanvasRenderingContext2DSettings = {
@@ -98,7 +107,7 @@ export function getQuadraticBezierPoint(
 /**
  * Converts 4 Catmull-Rom spline knots (p0, p1, p2, p3) into cubic Bézier control points (c1, c2)
  * for the segment from p1 to p2.
- * Includes centripetal chord bounding to prevent overshooting or loops on tight turns.
+ * Uses centripetal parameterization (alpha = 0.5) to prevent overshooting or loops on tight turns.
  */
 export function catmullRomToBezier(
   p0: Point,
@@ -106,50 +115,12 @@ export function catmullRomToBezier(
   p2: Point,
   p3: Point
 ): { c1: Point; c2: Point } {
-  const dChord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-
-  let dx1 = (p2.x - p0.x) / 6;
-  let dy1 = (p2.y - p0.y) / 6;
-  let dx2 = (p3.x - p1.x) / 6;
-  let dy2 = (p3.y - p1.y) / 6;
-
-  // Prevent overshoot on tight turns or uneven knot spacing
-  if (dChord > 0.001) {
-    const maxHandle = dChord * 0.5;
-    const len1 = Math.hypot(dx1, dy1);
-    if (len1 > maxHandle) {
-      const s = maxHandle / len1;
-      dx1 *= s;
-      dy1 *= s;
-    }
-    const len2 = Math.hypot(dx2, dy2);
-    if (len2 > maxHandle) {
-      const s = maxHandle / len2;
-      dx2 *= s;
-      dy2 *= s;
-    }
-  }
-
-  const c1: Point = {
-    x: p1.x + dx1,
-    y: p1.y + dy1,
-    pressure: p1.pressure + (p2.pressure - p0.pressure) / 6,
-    width: p1.width + (p2.width - p0.width) / 6,
-  };
-
-  const c2: Point = {
-    x: p2.x - dx2,
-    y: p2.y - dy2,
-    pressure: p2.pressure - (p3.pressure - p1.pressure) / 6,
-    width: p2.width - (p3.width - p1.width) / 6,
-  };
-
-  return { c1, c2 };
+  return centripetalCatmullRomToBezier(p0, p1, p2, p3);
 }
 
 /**
- * Draws a smooth tapered segment along a cubic Bézier curve.
- * Gives 120+ FPS instantaneous rendering like Clip Studio Paint.
+ * Draws a smooth tapered segment along a cubic Bézier curve using analytical radial dabbing.
+ * Delivers professional Clip Studio Paint / Photoshop quality without line banding or shadowBlur.
  */
 export function drawSmoothCubicBezierSegment(
   ctx: CanvasRenderingContext2D,
@@ -161,76 +132,29 @@ export function drawSmoothCubicBezierSegment(
   isEraser: boolean = false,
   hardness: number = 1.0,
   flow: number = 1.0,
-  _spacing: number = 0.1
-) {
-  const dx = p3.x - p0.x;
-  const dy = p3.y - p0.y;
-  const dist = Math.hypot(dx, dy);
-
-  if (dist < 0.15) return;
-
-  const avgWidth = (p0.width + p3.width) / 2;
-  const widthDiff = Math.abs(p3.width - p0.width);
-
-  ctx.save();
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-
-  if (flow < 0.999) {
-    ctx.globalAlpha = Math.max(0.01, Math.min(1.0, flow));
-  }
-
-  if (isEraser) {
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.strokeStyle = 'rgba(0, 0, 0, 1)';
-  } else {
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.strokeStyle = color;
-  }
-
-  const effectiveHardness = Math.min(Math.max(hardness, 0.05), 1.0);
-  if (effectiveHardness < 0.98) {
-    ctx.shadowBlur = (1 - effectiveHardness) * Math.max(1, avgWidth * 0.45);
-    ctx.shadowColor = isEraser ? 'rgba(0, 0, 0, 1)' : color;
-  }
-
-  // Fast-path: native cubic Bézier when width change is small
-  if (widthDiff <= 1.5 || dist <= 12) {
-    ctx.beginPath();
-    ctx.lineWidth = avgWidth;
-    ctx.moveTo(p0.x, p0.y);
-    ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, p3.x, p3.y);
-    ctx.stroke();
-    ctx.restore();
-    return;
-  }
-
-  // Tapered stroke when width changes significantly: adaptive cubic steps
-  const steps = dist > 32 ? 4 : 2;
-  let prevPt = { x: p0.x, y: p0.y, width: p0.width };
-
-  for (let i = 1; i <= steps; i++) {
-    const t = i / steps;
-    const invT = 1.0 - t;
-    const invT2 = invT * invT;
-    const invT3 = invT2 * invT;
-    const t2 = t * t;
-    const t3 = t2 * t;
-
-    const currX = invT3 * p0.x + 3.0 * invT2 * t * c1.x + 3.0 * invT * t2 * c2.x + t3 * p3.x;
-    const currY = invT3 * p0.y + 3.0 * invT2 * t * c1.y + 3.0 * invT * t2 * c2.y + t3 * p3.y;
-    const currWidth = invT * p0.width + t * p3.width;
-
-    ctx.beginPath();
-    ctx.lineWidth = (prevPt.width + currWidth) / 2;
-    ctx.moveTo(prevPt.x, prevPt.y);
-    ctx.lineTo(currX, currY);
-    ctx.stroke();
-
-    prevPt = { x: currX, y: currY, width: currWidth };
-  }
-
-  ctx.restore();
+  spacing: number = 0.06,
+  remainderDist: number = 0,
+  thickness: number = 1.0,
+  angleRad: number = 0,
+  mixingOptions?: RadialMixingOptions
+): number {
+  return drawRadialCubicBezierSegment(
+    ctx,
+    p0,
+    c1,
+    c2,
+    p3,
+    color,
+    hardness,
+    flow,
+    spacing,
+    isEraser,
+    false,
+    remainderDist,
+    thickness,
+    angleRad,
+    mixingOptions
+  );
 }
 
 /**
@@ -245,8 +169,9 @@ export function drawSmoothBezierSegment(
   isEraser: boolean = false,
   hardness: number = 1.0,
   flow: number = 1.0,
-  spacing: number = 0.1
-) {
+  spacing: number = 0.06,
+  remainderDist: number = 0
+): number {
   const c1: Point = {
     x: start.x + (2.0 / 3.0) * (control.x - start.x),
     y: start.y + (2.0 / 3.0) * (control.y - start.y),
@@ -259,7 +184,7 @@ export function drawSmoothBezierSegment(
     pressure: end.pressure + (2.0 / 3.0) * (control.pressure - end.pressure),
     width: end.width + (2.0 / 3.0) * (control.width - end.width),
   };
-  drawSmoothCubicBezierSegment(ctx, start, c1, c2, end, color, isEraser, hardness, flow, spacing);
+  return drawSmoothCubicBezierSegment(ctx, start, c1, c2, end, color, isEraser, hardness, flow, spacing, remainderDist);
 }
 
 /**
@@ -271,30 +196,10 @@ export function drawDot(
   color: string,
   isEraser: boolean = false,
   hardness: number = 1.0,
-  flow: number = 1.0
+  flow: number = 1.0,
+  mixingOptions?: RadialMixingOptions
 ) {
-  ctx.save();
-  if (flow < 0.999) {
-    ctx.globalAlpha = Math.max(0.01, Math.min(1.0, flow));
-  }
-  if (isEraser) {
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.fillStyle = 'rgba(0, 0, 0, 1)';
-  } else {
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = color;
-  }
-
-  const effectiveHardness = Math.min(Math.max(hardness, 0.05), 1.0);
-  if (effectiveHardness < 0.98) {
-    ctx.shadowBlur = (1 - effectiveHardness) * Math.max(1, point.width * 0.45);
-    ctx.shadowColor = isEraser ? 'rgba(0, 0, 0, 1)' : color;
-  }
-
-  ctx.beginPath();
-  ctx.arc(point.x, point.y, Math.max(0.5, point.width / 2), 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
+  drawRadialDot(ctx, point, color, hardness, flow, isEraser, false, mixingOptions);
 }
 
 let _sharedThumbCanvas: HTMLCanvasElement | null = null;
@@ -552,13 +457,69 @@ export function getReusableBakeCanvas(minWidth: number, minHeight: number): HTML
  * Renders an entire completed stroke path onto the target Canvas2D context.
  * Used for baking finished strokes into the high-resolution base canvas at native DPI.
  */
+/**
+ * Applies parametric in/out tapering to a stroke's point array.
+ * Smooths out stroke endings when lifting the pen quickly, or when in/out taper dynamics are active.
+ */
+export function applyParametricTaper(
+  points: Point[],
+  options?: {
+    useIn?: boolean;
+    useOut?: boolean;
+    inCount?: number;
+    outCount?: number;
+    minSizeFactor?: number;
+    exitSpeed?: number;
+  }
+): Point[] {
+  if (points.length < 2) return points;
+
+  const minRatio = Math.max(0.01, Math.min(1.0, options?.minSizeFactor ?? 0.05));
+  const n = points.length;
+
+  // In-taper (lead-in)
+  if (options?.useIn) {
+    const inCount = Math.min(Math.floor(n / 2), options.inCount ?? Math.min(8, n));
+    for (let i = 0; i < inCount; i++) {
+      const u = (i + 1) / (inCount + 1);
+      const taper = Math.sin((u * Math.PI) / 2);
+      const factor = minRatio + (1.0 - minRatio) * taper;
+      points[i].width *= factor;
+      points[i].pressure *= factor;
+    }
+  }
+
+  // Out-taper (exit / lift-off)
+  const useOut = options?.useOut ?? true;
+  if (useOut) {
+    let outCount = options?.outCount ?? 6;
+    if (options?.exitSpeed && options.exitSpeed > 0.8) {
+      outCount = Math.min(Math.floor(n / 2), Math.round(outCount * Math.min(2.5, options.exitSpeed)));
+    }
+    outCount = Math.min(Math.floor(n / 2), Math.max(2, outCount));
+    const startIdx = n - outCount;
+    for (let i = startIdx; i < n; i++) {
+      const step = n - 1 - i; // 0 for the very last point
+      const u = (step + 1) / (outCount + 1);
+      const taper = Math.sin((u * Math.PI) / 2);
+      const factor = minRatio + (1.0 - minRatio) * taper;
+      points[i].width *= factor;
+      points[i].pressure *= factor;
+    }
+  }
+
+  return points;
+}
+
 export function renderCompleteStroke(
   ctx: CanvasRenderingContext2D,
   points: Point[],
   brushSettings: BrushSettings,
   tool: ToolType,
   colorMode: CanvasColorMode = 'color',
-  isBgEraser: boolean = false
+  isBgEraser: boolean = false,
+  underlyingCanvas?: HTMLCanvasElement,
+  alphaLocked: boolean = false
 ) {
   if (!points || points.length === 0) return;
 
@@ -568,6 +529,7 @@ export function renderCompleteStroke(
   const strokeHardness = colorMode === 'monochrome' ? 1.0 : (brushSettings.hardness ?? 1.0);
   const strokeFlow = brushSettings.flow ?? 1.0;
   const strokeSpacing = brushSettings.spacing ?? 0.08;
+  const isTransparentInk = Boolean(brushSettings.isTransparentInk);
 
   // Textured Custom Tip (Clip Studio Paint SUT Brush)
   if (brushSettings.customTipImage) {
@@ -606,9 +568,13 @@ export function renderCompleteStroke(
       paperTextureScale: brushSettings.paperTextureScale,
       paperTextureRotate: brushSettings.paperTextureRotate,
       useGpu: false,
-      underlyingCanvas: ctx.canvas,
+      underlyingCanvas: underlyingCanvas || ctx.canvas,
+      sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
       isEraser: isEraser && !isBgEraser,
       isBgEraser,
+      alphaLocked,
+      isTransparentInk,
     };
     renderCompleteTexturedStroke(ctx, points, strokeColor, brushSettings.customTipImage, tipOptions);
     return;
@@ -624,16 +590,32 @@ export function renderCompleteStroke(
       grade,
       brushSettings.flow ?? 0.74,
       brushSettings.grain ?? 1.0,
-      brushSettings.hardness
+      brushSettings.hardness,
+      alphaLocked,
+      isTransparentInk
     );
   } else {
+    const radialMixing: RadialMixingOptions = {
+      colorMixing: brushSettings.colorMixing,
+      amountOfPaint: brushSettings.amountOfPaint,
+      densityOfPaint: brushSettings.densityOfPaint,
+      colorStretch: brushSettings.colorStretch,
+      mixingMode: brushSettings.mixingMode,
+      underlyingCanvas: underlyingCanvas || ctx.canvas,
+      sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
+      alphaLocked,
+      isTransparentInk,
+    };
+
     drawDot(
       ctx,
       points[0],
       strokeColor,
       isEraser && !isBgEraser,
       strokeHardness,
-      strokeFlow
+      strokeFlow,
+      radialMixing
     );
   }
 
@@ -650,7 +632,7 @@ export function renderCompleteStroke(
       const p0 = points[0];
       const p1 = points[1];
       const { c1, c2 } = catmullRomToBezier(p0, p0, p1, p1);
-      drawPencilCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+      drawPencilCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
       return;
     }
 
@@ -658,11 +640,11 @@ export function renderCompleteStroke(
     const p1 = points[1];
     const p2 = points[2];
     const first = catmullRomToBezier(p0, p0, p1, p2);
-    drawPencilCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+    drawPencilCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
 
     for (let i = 2; i < points.length - 1; i++) {
       const seg = catmullRomToBezier(points[i - 2], points[i - 1], points[i], points[i + 1]);
-      drawPencilCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
+      drawPencilCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
     }
 
     const n = points.length;
@@ -670,61 +652,34 @@ export function renderCompleteStroke(
     const pPrev = points[n - 2];
     const pLast = points[n - 1];
     const last = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
-    drawPencilCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, grade, pFlow, pGrain, brushSettings.hardness);
-  } else if (brushSettings.smoothing) {
-    if (points.length === 2) {
-      const p0 = points[0];
-      const p1 = points[1];
-      const { c1, c2 } = catmullRomToBezier(p0, p0, p1, p1);
-      drawSmoothCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
-      return;
-    }
-
-    const p0 = points[0];
-    const p1 = points[1];
-    const p2 = points[2];
-    const first = catmullRomToBezier(p0, p0, p1, p2);
-    drawSmoothCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
-
-    for (let i = 2; i < points.length - 1; i++) {
-      const seg = catmullRomToBezier(points[i - 2], points[i - 1], points[i], points[i + 1]);
-      drawSmoothCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
-    }
-
-    const n = points.length;
-    const pPrev2 = points[n - 3];
-    const pPrev = points[n - 2];
-    const pLast = points[n - 1];
-    const last = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
-    drawSmoothCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, isEraser && !isBgEraser, strokeHardness, strokeFlow, strokeSpacing);
+    drawPencilCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
   } else {
-    ctx.save();
-    ctx.lineCap = 'round';
-    ctx.lineJoin = 'round';
-    if (strokeFlow < 0.999) {
-      ctx.globalAlpha = Math.max(0.01, Math.min(1.0, strokeFlow));
-    }
-    if (isBgEraser) {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = '#ffffff';
-    } else if (isEraser) {
-      ctx.globalCompositeOperation = 'destination-out';
-      ctx.strokeStyle = 'rgba(0, 0, 0, 1)';
-    } else {
-      ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = strokeColor;
-    }
+    const radialMixing: RadialMixingOptions = {
+      colorMixing: brushSettings.colorMixing,
+      amountOfPaint: brushSettings.amountOfPaint,
+      densityOfPaint: brushSettings.densityOfPaint,
+      colorStretch: brushSettings.colorStretch,
+      mixingMode: brushSettings.mixingMode,
+      underlyingCanvas: underlyingCanvas || ctx.canvas,
+      sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
+      alphaLocked,
+      isTransparentInk,
+    };
 
-    for (let i = 1; i < points.length; i++) {
-      const pPrev = points[i - 1];
-      const pCurr = points[i];
-      ctx.lineWidth = (pPrev.width + pCurr.width) / 2;
-      ctx.beginPath();
-      ctx.moveTo(pPrev.x, pPrev.y);
-      ctx.lineTo(pCurr.x, pCurr.y);
-      ctx.stroke();
-    }
-    ctx.restore();
+    renderCompleteRadialStroke(
+      ctx,
+      points,
+      strokeColor,
+      strokeHardness,
+      strokeFlow,
+      strokeSpacing,
+      isEraser && !isBgEraser,
+      isBgEraser,
+      brushSettings.thickness ?? 1.0,
+      ((brushSettings.customTipAngle ?? 0) * Math.PI) / 180,
+      radialMixing
+    );
   }
 }
 

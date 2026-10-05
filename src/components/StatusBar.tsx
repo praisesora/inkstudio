@@ -66,6 +66,94 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(({
     };
   }, []);
 
+  if (_themePreset === 'modern') {
+    return (
+      <footer className="h-7 bg-[#0f1015] border-t border-white/[0.08] px-3 text-white/70 flex items-center justify-between text-xs select-none z-20 shrink-0">
+        {/* Tool & Smoothing Status */}
+        <div className="flex items-center space-x-2">
+          <div className="bg-white/[0.04] border border-white/[0.06] px-2 py-0.5 rounded-md flex items-center space-x-2">
+            <span className="text-white capitalize font-medium text-[11px]">{tool}</span>
+            <span className="text-white/20">|</span>
+            {hasOpenDocument ? (
+              <span
+                className={`font-mono text-[10px] font-medium ${
+                  colorMode === 'monochrome'
+                    ? 'text-amber-400'
+                    : colorMode === 'grayscale'
+                    ? 'text-slate-300'
+                    : 'text-[var(--modern-accent)]'
+                }`}
+                title={`Active Document Color Mode: ${colorMode}`}
+              >
+                {colorMode === 'monochrome' ? '1-bit Manga' : colorMode === 'grayscale' ? 'Grayscale' : 'Color RGB'}
+              </span>
+            ) : (
+              <span className="text-white/30 italic text-[10px]">No active document</span>
+            )}
+            <span className="text-white/20">|</span>
+            <span className="text-[10px] font-mono text-white/60">
+              {brushSettings.smoothing ? 'Bézier' : 'Direct'}
+            </span>
+            <span className="text-white/20">|</span>
+            <span className="text-[var(--modern-accent)] font-mono text-[10px]">
+              Stab: {brushSettings.stabilization ?? 0}
+            </span>
+          </div>
+        </div>
+
+        {/* Real-time Pointer Stats */}
+        <div className="flex items-center space-x-2 font-mono text-xs">
+          {/* Coordinates */}
+          {showCursorCoordinates && (
+            <div className="bg-white/[0.04] border border-white/[0.06] px-2 py-0.5 rounded-md flex items-center space-x-1.5">
+              <span className="text-white/40 text-[10px]">Pos:</span>
+              <span ref={posTextRef} className="text-white/90 text-[11px]">
+                — , —
+              </span>
+            </div>
+          )}
+
+          {/* Stylus Pressure Bar */}
+          {showPressureInStatusBar && (
+            <div className="bg-white/[0.04] border border-white/[0.06] px-2 py-0.5 rounded-md flex items-center space-x-2">
+              <span className="text-white/40 text-[10px]">Pressure:</span>
+              <div className="w-14 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                <div
+                  ref={pressureBarRef}
+                  className="h-full bg-[var(--modern-accent)] transition-all duration-75"
+                  style={{ width: `0%` }}
+                />
+              </div>
+              <span ref={pressureTextRef} className="w-7 text-right text-white/80 text-[10px]">0%</span>
+            </div>
+          )}
+
+          {/* Rotation */}
+          <div
+            onClick={hasOpenDocument ? onResetRotation : undefined}
+            onDoubleClick={hasOpenDocument ? onResetRotation : undefined}
+            className={`bg-white/[0.04] border border-white/[0.06] px-2 py-0.5 rounded-md flex items-center space-x-1.5 ${
+              hasOpenDocument ? 'cursor-pointer hover:bg-white/[0.08] text-white/90 hover:text-white' : 'opacity-40 pointer-events-none'
+            }`}
+            title="Canvas Rotation (Click or Double-click to Reset 0°)"
+          >
+            <span className="text-white/40 text-[10px]">Angle:</span>
+            <span className="text-white/90 font-medium text-[11px]">{hasOpenDocument ? formatRotationDegrees(rotation) : '0°'}</span>
+          </div>
+
+          {/* Zoom */}
+          <div
+            className={`bg-white/[0.04] border border-white/[0.06] px-2 py-0.5 rounded-md flex items-center space-x-1.5 ${hasOpenDocument ? '' : 'opacity-40'}`}
+            title="Canvas Zoom Level"
+          >
+            <span className="text-white/40 text-[10px]">Zoom:</span>
+            <span className="text-white/90 font-medium text-[11px]">{hasOpenDocument ? formatZoomPercent(zoom) : '—'}</span>
+          </div>
+        </div>
+      </footer>
+    );
+  }
+
   return (
     <footer className="h-7 bg-gradient-to-b from-[#464649] to-[#363638] border-t border-[#232325] px-2.5 text-[#b0b0b6] flex items-center justify-between text-xs select-none z-20 shrink-0 transition-colors">
       {/* Tool & Smoothing Status */}

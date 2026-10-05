@@ -4,6 +4,7 @@ import { ResizeCanvasOptions } from '../types/settings';
 import { createCanvasThumbnail, get2DContext } from '../utils/canvasUtils';
 import { applyLayerEffects, applyExpressionColorToImageData } from '../utils/layerEffectsEngine';
 import { HalftoneDotShape } from '../utils/screentoneEngine';
+import { globalTileGrid } from '../utils/tileEngine';
 
 interface UseLayerManagerProps {
   dimensions: CanvasDimensions;
@@ -48,6 +49,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   // Default initial layers: starts empty until a document is created or opened
   const [layers, setLayers] = useState<LayerItem[]>([]);
   const [activeLayerId, setActiveLayerId] = useState<string>('');
+  const layersRef = useRef(layers);
+  layersRef.current = layers;
 
   // Register or unregister canvas element for a layer
   const registerLayerCanvas = useCallback((id: string, canvas: HTMLCanvasElement | null) => {
@@ -97,6 +100,13 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         }
       }
 
+      // Ingest into globalTileGrid if unindexed
+      if (!globalTileGrid.hasTile(id, 0, 0) && globalTileGrid.getLayerTiles(id).length === 0) {
+        const layer = layersRef.current.find((l) => l.id === id);
+        const isMono = layer?.expressionColor === 'monochrome';
+        globalTileGrid.ingestCanvas(id, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      }
+
       // Defer initial thumbnail generation to avoid triggering re-render during ref attachment
       requestAnimationFrame(() => {
         const c = layerCanvasesRef.current.get(id);
@@ -109,8 +119,30 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       });
     } else {
       layerCanvasesRef.current.delete(id);
+      globalTileGrid.clearLayer(id);
     }
   }, []);
+
+  // Automatically instantiate and manage offscreen backing canvases for all layers
+  useEffect(() => {
+    layers.forEach((layer) => {
+      if ((layer.type === 'raster' || layer.type === 'vector' || layer.type === 'frame') && !layerCanvasesRef.current.has(layer.id)) {
+        const offscreen = document.createElement('canvas');
+        offscreen.width = _dimensions.width;
+        offscreen.height = _dimensions.height;
+        registerLayerCanvas(layer.id, offscreen);
+      }
+    });
+
+    // When a layer is removed, delete its canvas from layerCanvasesRef.current
+    const currentLayerIds = new Set(layers.map((l) => l.id));
+    for (const id of Array.from(layerCanvasesRef.current.keys())) {
+      if (!currentLayerIds.has(id)) {
+        layerCanvasesRef.current.delete(id);
+        globalTileGrid.clearLayer(id);
+      }
+    }
+  }, [layers, _dimensions, registerLayerCanvas]);
 
   const thumbDebounceTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
@@ -144,7 +176,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   // Add a new raster layer or folder
   const addLayer = useCallback(
     (
-      type: 'raster' | 'folder' = 'raster',
+      type: 'raster' | 'folder' | 'vector' | 'frame' = 'raster',
       explicitParentId?: string | null,
       customName?: string,
       customId?: string
@@ -171,7 +203,10 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         let name = customName;
         if (!name) {
           let count = 1;
-          const prefix = type === 'folder' ? 'Folder ' : 'Layer ';
+          const prefix =
+            type === 'folder' ? 'Folder ' :
+            type === 'vector' ? 'Vector ' :
+            type === 'frame' ? 'Frame ' : 'Layer ';
           prev.forEach((l) => {
             if (l.type === type && l.name.startsWith(prefix)) {
               const num = parseInt(l.name.replace(prefix, ''), 10);
@@ -433,6 +468,24 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   const toggleCollapse = useCallback((id: string) => {
     setLayers((prev) =>
       prev.map((l) => (l.id === id ? { ...l, collapsed: !l.collapsed } : l))
+    );
+  }, []);
+
+  // Toggle clipping mask state (Clip to Layer Below)
+  const toggleClipping = useCallback((id: string) => {
+    setLayers((prev) => {
+      const idx = prev.findIndex((l) => l.id === id);
+      if (idx === -1 || idx === prev.length - 1 || id === 'layer-bg') {
+        return prev;
+      }
+      return prev.map((l) => (l.id === id ? { ...l, clipped: !l.clipped } : l));
+    });
+  }, []);
+
+  // Toggle alpha locked state (Lock Transparent Pixels)
+  const toggleAlphaLock = useCallback((id: string) => {
+    setLayers((prev) =>
+      prev.map((l) => (l.id === id ? { ...l, alphaLocked: !l.alphaLocked } : l))
     );
   }, []);
 
@@ -950,26 +1003,55 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       const draggedItem = { ...prev[draggedIdx] };
       const targetItem = prev[targetIdx];
 
+      // Prevent dropping a folder into itself or its descendants
+      if (draggedItem.type === 'folder') {
+        let curr: LayerItem | undefined = targetItem;
+        while (curr) {
+          if (curr.id === draggedId) return prev;
+          curr = prev.find((l) => l.id === curr?.parentId);
+        }
+      }
+
+      // Collect all descendant IDs of the dragged item
+      const getDescendantIds = (parentId: string): string[] => {
+        const ids: string[] = [];
+        for (const item of prev) {
+          if (item.parentId === parentId) {
+            ids.push(item.id);
+            ids.push(...getDescendantIds(item.id));
+          }
+        }
+        return ids;
+      };
+
+      const movingIds = new Set([draggedId, ...getDescendantIds(draggedId)]);
+
       if (position === 'inside' && targetItem.type === 'folder') {
         draggedItem.parentId = targetItem.id;
       } else {
         draggedItem.parentId = targetItem.parentId;
       }
 
-      const next = [...prev];
-      next.splice(draggedIdx, 1);
+      // Extract moving items preserving their relative order
+      const movingItems = prev
+        .filter((l) => movingIds.has(l.id))
+        .map((l) => (l.id === draggedId ? draggedItem : l));
 
-      const newTargetIdx = next.findIndex((l) => l.id === targetId);
+      // Remaining items without the moving items
+      const remaining = prev.filter((l) => !movingIds.has(l.id));
+
+      const newTargetIdx = remaining.findIndex((l) => l.id === targetId);
+      if (newTargetIdx < 0) return prev;
+
       let insertIdx = newTargetIdx;
-
       if (position === 'above') {
         insertIdx = newTargetIdx;
       } else if (position === 'below' || position === 'inside') {
         insertIdx = newTargetIdx + 1;
       }
 
-      next.splice(insertIdx, 0, draggedItem);
-      return next;
+      remaining.splice(insertIdx, 0, ...movingItems);
+      return remaining;
     });
   }, []);
 
@@ -1117,7 +1199,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   // Internal Layer Clipboard
   const layerClipboardRef = useRef<{
     name: string;
-    type: 'raster' | 'folder';
+    type: LayerItem['type'];
     blendMode: BlendMode;
     opacity: number;
     canvas: HTMLCanvasElement;
@@ -1606,6 +1688,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
     setOpacity,
     setBlendMode,
     toggleLock,
+    toggleAlphaLock,
+    toggleClipping,
     toggleCollapse,
     renameLayer,
     moveLayer,

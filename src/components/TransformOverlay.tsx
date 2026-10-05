@@ -221,6 +221,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
     }));
   };
 
+  const invZoom = zoom > 0 ? 1 / zoom : 1;
   const handleSize = 8;
 
   return (
@@ -255,7 +256,11 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
 
       {/* Rotation Stem & Handle */}
       <div
-        className="absolute left-1/2 -top-6 -translate-x-1/2 flex flex-col items-center pointer-events-auto"
+        className="absolute left-1/2 top-0 flex flex-col items-center pointer-events-auto"
+        style={{
+          transform: `translateX(-50%) translateY(calc(-100% - ${4 * invZoom}px)) scale(${invZoom})`,
+          transformOrigin: 'bottom center',
+        }}
         onPointerDown={(e) => startDrag('rotate', e)}
         title="Drag to Rotate (Shift snaps to 15°)"
       >
@@ -264,61 +269,127 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
       </div>
 
       {/* Center Pivot Point */}
-      <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-2 h-2 rounded-full border border-cyan-400 bg-white pointer-events-none shadow-xs" />
+      <div
+        className="absolute left-1/2 top-1/2 w-2 h-2 rounded-full border border-cyan-400 bg-white pointer-events-none shadow-xs"
+        style={{
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
+      />
 
       {/* 8 Resize Scale Handles */}
       {/* Top-Left */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'nw')}
-        className="absolute -top-1.5 -left-1.5 bg-white border border-cyan-500 shadow-sm cursor-nwse-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-nwse-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: 0,
+          top: 0,
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Top-Middle */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'n')}
-        className="absolute -top-1.5 left-1/2 -translate-x-1/2 bg-white border border-cyan-500 shadow-sm cursor-ns-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-ns-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: '50%',
+          top: 0,
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Top-Right */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'ne')}
-        className="absolute -top-1.5 -right-1.5 bg-white border border-cyan-500 shadow-sm cursor-nesw-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-nesw-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: '100%',
+          top: 0,
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Right-Middle */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'e')}
-        className="absolute top-1/2 -right-1.5 -translate-y-1/2 bg-white border border-cyan-500 shadow-sm cursor-ew-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-ew-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: '100%',
+          top: '50%',
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Bottom-Right */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'se')}
-        className="absolute -bottom-1.5 -right-1.5 bg-white border border-cyan-500 shadow-sm cursor-nwse-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-nwse-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: '100%',
+          top: '100%',
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Bottom-Middle */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 's')}
-        className="absolute -bottom-1.5 left-1/2 -translate-x-1/2 bg-white border border-cyan-500 shadow-sm cursor-ns-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-ns-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: '50%',
+          top: '100%',
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Bottom-Left */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'sw')}
-        className="absolute -bottom-1.5 -left-1.5 bg-white border border-cyan-500 shadow-sm cursor-nesw-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-nesw-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: 0,
+          top: '100%',
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
       {/* Left-Middle */}
       <div
         onPointerDown={(e) => startDrag('scale', e, 'w')}
-        className="absolute top-1/2 -left-1.5 -translate-y-1/2 bg-white border border-cyan-500 shadow-sm cursor-ew-resize hover:scale-125 pointer-events-auto"
-        style={{ width: `${handleSize}px`, height: `${handleSize}px` }}
+        className="absolute bg-white border border-cyan-500 shadow-sm cursor-ew-resize hover:scale-125 pointer-events-auto"
+        style={{
+          left: 0,
+          top: '50%',
+          width: `${handleSize}px`,
+          height: `${handleSize}px`,
+          transform: `translate(-50%, -50%) scale(${invZoom})`,
+          transformOrigin: 'center',
+        }}
       />
 
       {/* Floating Action Bar (Directly below transform box) */}
       <div
-        className="absolute left-1/2 -bottom-12 -translate-x-1/2 bg-[#1b1c1e] border border-[#33353b] rounded shadow-xl px-2 py-1 flex items-center space-x-1.5 z-40 whitespace-nowrap"
+        className="absolute left-1/2 top-full bg-[#1b1c1e] border border-[#33353b] rounded shadow-xl px-2 py-1 flex items-center space-x-1.5 z-40 whitespace-nowrap"
+        style={{
+          transform: `translateX(-50%) translateY(${16 * invZoom}px) scale(${invZoom})`,
+          transformOrigin: 'top center',
+        }}
         onPointerDown={(e) => e.stopPropagation()}
       >
         {/* Confirm (Enter) */}

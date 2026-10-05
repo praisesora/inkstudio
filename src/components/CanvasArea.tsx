@@ -16,6 +16,10 @@ import { TextEditorOverlay } from './TextEditorOverlay';
 import { PerspectiveRulerOverlay } from './PerspectiveRulerOverlay';
 import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
 import { Local3DContainer } from './Local3DContainer';
+import { ViewportCompositor } from '../utils/compositor';
+import { globalTileGrid } from '../utils/tileEngine';
+import { getBrushTipOutline, resolveBrushTipImage, TipOutline } from '../utils/brushOutline';
+import { preloadTipImage } from '../utils/brushStorage';
 
 const PIPETTE_CURSOR_CSS = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cg stroke='%23000000' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3Cg stroke='%23ffffff' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3C/svg%3E") 2 22, crosshair`;
 
@@ -42,6 +46,7 @@ interface CanvasAreaProps {
   onPointerEnter: () => void;
   onPointerLeave: () => void;
   layers: LayerItem[];
+  layerCanvasesRef?: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   registerLayerCanvas: (id: string, canvas: HTMLCanvasElement | null) => void;
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
@@ -104,9 +109,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onPointerEnter,
   onPointerLeave,
   layers,
+  layerCanvasesRef,
   registerLayerCanvas,
-  getEffectiveOpacity,
-  isLayerEffectivelyVisible,
+  getEffectiveOpacity: _getEffectiveOpacity,
+  isLayerEffectivelyVisible: _isLayerEffectivelyVisible,
   interactionRef,
   showCheckerboard = true,
   hasOpenDocument = true,
@@ -145,9 +151,73 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 }) => {
 
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
-  // Cursor preview diameter scaled to screen pixels
+
+  // Resolve tip image and extract vector outline silhouette
+  const activeTipImage = resolveBrushTipImage(brushSettings);
+  const [tipOutline, setTipOutline] = useState<TipOutline | null>(() => {
+    return activeTipImage ? getBrushTipOutline(activeTipImage) : null;
+  });
+
+  useEffect(() => {
+    let isCancelled = false;
+
+    if (activeTipImage) {
+      if (activeTipImage.complete && activeTipImage.naturalWidth > 0) {
+        setTipOutline(getBrushTipOutline(activeTipImage));
+      } else {
+        const handleLoad = () => {
+          if (!isCancelled) {
+            setTipOutline(getBrushTipOutline(activeTipImage));
+          }
+        };
+        activeTipImage.addEventListener('load', handleLoad, { once: true });
+      }
+      return () => {
+        isCancelled = true;
+      };
+    }
+
+    if (brushSettings.customTipDataUrl) {
+      preloadTipImage(brushSettings.customTipDataUrl)
+        .then((img) => {
+          if (!isCancelled) {
+            setTipOutline(getBrushTipOutline(img));
+          }
+        })
+        .catch(() => {
+          if (!isCancelled) {
+            setTipOutline(null);
+          }
+        });
+      return () => {
+        isCancelled = true;
+      };
+    }
+
+    setTipOutline(null);
+  }, [activeTipImage, brushSettings.customTipDataUrl, brushSettings.preset]);
+
+  // Dynamic cursor dimensions according to brush tip shape, aspect ratio, and thickness
+  const isCustomTip = Boolean(tipOutline && (tool === 'brush' || tool === 'eraser'));
+  const isSquare = brushSettings.preset === 'square-digital' && !tipOutline;
+  const tipAspect = isCustomTip && tipOutline ? tipOutline.height / tipOutline.width : 1.0;
+
   const activeToolSize = tool === 'liquify' && liquifySettings ? liquifySettings.size : brushSettings.size;
-  const cursorDiameter = Math.max(4, activeToolSize * zoom);
+  const cursorBaseWidth = Math.max(4, activeToolSize * zoom);
+  const thicknessRatio = tool === 'brush' ? (brushSettings.thickness ?? 1.0) : 1.0;
+
+  const cursorWidth = brushSettings.thicknessVertical && tool === 'brush'
+    ? Math.max(2, cursorBaseWidth * thicknessRatio)
+    : cursorBaseWidth;
+  const cursorHeight = brushSettings.thicknessVertical && tool === 'brush'
+    ? Math.max(2, cursorBaseWidth * tipAspect)
+    : Math.max(2, cursorBaseWidth * tipAspect * thicknessRatio);
+
+  // Brush tip rotation: tip angle relative to canvas + viewport canvas rotation
+  const totalAngleDeg = (tool === 'brush' ? (brushSettings.customTipAngle ?? 0) : 0) + rotation;
+  const totalAngleRef = useRef(totalAngleDeg);
+  totalAngleRef.current = totalAngleDeg;
+  const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
 
   // Dynamic on-canvas brush resizing via Ctrl + Alt + Drag
   const [isCtrlAltDown, setIsCtrlAltDown] = useState(false);
@@ -158,8 +228,17 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     hardness: brushSettings.hardness ?? 1.0,
   });
 
-  // Zero-latency direct DOM cursor preview ring
+  // Zero-latency direct DOM cursor preview element
   const cursorRingRef = useRef<HTMLDivElement | null>(null);
+
+  // Update cursor rotation in-place when viewport rotates or brush tip angle changes while hovering
+  useEffect(() => {
+    const ring = cursorRingRef.current;
+    const pos = lastPointerPosRef.current;
+    if (ring && pos && ring.style.display !== 'none') {
+      ring.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0) translate(-50%, -50%) rotate(${totalAngleDeg}deg)`;
+    }
+  }, [totalAngleDeg]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -199,13 +278,16 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         return;
       }
 
-      ring.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%)`;
+      lastPointerPosRef.current = { x, y };
+      const currentAngle = totalAngleRef.current;
+      ring.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%) rotate(${currentAngle}deg)`;
       if (ring.style.display !== 'block') {
         ring.style.display = 'block';
       }
     };
 
     const handlePointerLeave = () => {
+      lastPointerPosRef.current = null;
       if (cursorRingRef.current) {
         cursorRingRef.current.style.display = 'none';
       }
@@ -219,28 +301,134 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       viewport.removeEventListener('pointermove', handleWindowPointerMove);
       viewport.removeEventListener('pointerleave', handlePointerLeave);
     };
-  }, [isSpaceDown, isPanning, isRotating, isRotateModifier, isResizingBrush, viewportRef]);
+  }, [isSpaceDown, isPanning, isRotating, isRotateModifier, isResizingBrush, viewportRef, tool]);
 
-  // Synchronize draft overlay canvas resolution with the screen viewport
+  // Unified GPU Viewport Compositor
+  const viewportCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const compositorRef = useRef<ViewportCompositor | null>(null);
+
+  // Synchronize viewport and draft overlay canvas resolution with the screen viewport
   useEffect(() => {
-    const updateDraftCanvasSize = () => {
+    const updateCanvasSizes = () => {
       const viewport = viewportRef.current;
-      const draftCanvas = effectiveDraftCanvasRef?.current;
-      if (!viewport || !draftCanvas) return;
+      if (!viewport) return;
       const rect = viewport.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
       const w = Math.max(1, Math.ceil(rect.width * dpr));
       const h = Math.max(1, Math.ceil(rect.height * dpr));
-      if (draftCanvas.width !== w || draftCanvas.height !== h) {
+
+      const vCanvas = viewportCanvasRef.current;
+      if (vCanvas && (vCanvas.width !== w || vCanvas.height !== h)) {
+        vCanvas.width = w;
+        vCanvas.height = h;
+        if (!compositorRef.current) {
+          compositorRef.current = new ViewportCompositor(vCanvas);
+        }
+        compositorRef.current.resize(w, h);
+        compositorRef.current.render(
+          layers,
+          { pan, zoom, rotation },
+          dimensions,
+          globalTileGrid,
+          { dimensions, showCheckerboard, devicePixelRatio: dpr }
+        );
+      }
+
+      const draftCanvas = effectiveDraftCanvasRef?.current;
+      if (draftCanvas && (draftCanvas.width !== w || draftCanvas.height !== h)) {
         draftCanvas.width = w;
         draftCanvas.height = h;
       }
     };
 
-    updateDraftCanvasSize();
-    window.addEventListener('resize', updateDraftCanvasSize);
-    return () => window.removeEventListener('resize', updateDraftCanvasSize);
-  }, [viewportRef, effectiveDraftCanvasRef]);
+    updateCanvasSizes();
+    window.addEventListener('resize', updateCanvasSizes);
+    return () => window.removeEventListener('resize', updateCanvasSizes);
+  }, [viewportRef, effectiveDraftCanvasRef, layers, pan, zoom, rotation, dimensions, showCheckerboard]);
+
+  // Render scene using Unified GPU Viewport Compositor
+  useEffect(() => {
+    if (!viewportCanvasRef.current) return;
+    if (!compositorRef.current) {
+      compositorRef.current = new ViewportCompositor(viewportCanvasRef.current);
+    }
+
+    // Ingest unindexed layer canvases into globalTileGrid
+    if (layerCanvasesRef?.current) {
+      for (const layer of layers) {
+        if (layer.type === 'raster' || layer.type === 'vector' || layer.type === 'frame') {
+          let c = layerCanvasesRef.current.get(layer.id);
+          if (!c) {
+            c = document.createElement('canvas');
+            c.width = dimensions.width;
+            c.height = dimensions.height;
+            registerLayerCanvas(layer.id, c);
+          }
+          if (c && !globalTileGrid.hasTile(layer.id, 0, 0) && globalTileGrid.getLayerTiles(layer.id).length === 0) {
+            const isMono = layer.expressionColor === 'monochrome';
+            globalTileGrid.ingestCanvas(layer.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+          }
+        }
+      }
+    }
+
+    const dpr = window.devicePixelRatio || 1;
+    compositorRef.current.render(
+      layers,
+      { pan, zoom, rotation },
+      dimensions,
+      globalTileGrid,
+      { dimensions, showCheckerboard, devicePixelRatio: dpr }
+    );
+  }, [layers, pan, zoom, rotation, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas]);
+
+  // Event-Driven Compositor Invalidation via SparseTileGrid subscription
+  useEffect(() => {
+    let rafId: number | null = null;
+    const renderCompositor = () => {
+      if (compositorRef.current) {
+        const dpr = window.devicePixelRatio || 1;
+        compositorRef.current.render(
+          layers,
+          { pan, zoom, rotation },
+          dimensions,
+          globalTileGrid,
+          { dimensions, showCheckerboard, devicePixelRatio: dpr }
+        );
+      }
+    };
+
+    const handleGridChange = (immediate?: boolean) => {
+      if (immediate) {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        renderCompositor();
+        return;
+      }
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        renderCompositor();
+      });
+    };
+
+    const unsubscribe = globalTileGrid.subscribe(handleGridChange);
+    return () => {
+      unsubscribe();
+      if (rafId !== null) cancelAnimationFrame(rafId);
+    };
+  }, [layers, pan, zoom, rotation, dimensions, showCheckerboard]);
+
+  useEffect(() => {
+    return () => {
+      if (compositorRef.current) {
+        compositorRef.current.dispose();
+        compositorRef.current = null;
+      }
+    };
+  }, []);
 
   // Track Ctrl + Alt key combinations globally
   useEffect(() => {
@@ -399,10 +587,13 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       return { cursor: 'crosshair' };
     }
     if (tool === 'liquify') {
-      return { cursor: 'crosshair' };
+      return { cursor: isOverCanvas ? 'none' : 'default' };
     }
     if (tool === 'transform') {
       return { cursor: 'default' };
+    }
+    if (tool === 'brush' || tool === 'eraser') {
+      return { cursor: isOverCanvas ? 'none' : 'default' };
     }
     return { cursor: isOverCanvas ? 'crosshair' : 'default' };
   };
@@ -426,9 +617,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     );
   }
 
-  // Render order: bottom-to-top (reverse of UI list)
-  const renderOrderLayers = layers.slice().reverse();
-
   return (
     <main
       ref={viewportRef}
@@ -439,6 +627,17 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         ...getCursorStyle(false),
       }}
     >
+      {/* Unified GPU Viewport Canvas (WebGL2 with Frustum Culling & Shaders) */}
+      <canvas
+        ref={viewportCanvasRef}
+        className="absolute inset-0 pointer-events-none z-10"
+        style={{
+          width: '100%',
+          height: '100%',
+          display: 'block',
+        }}
+      />
+
       {/* Artboard Container with 2D Affine Transformation (Pan, Zoom, and Rotation) */}
       <div
         className="absolute origin-top-left select-none"
@@ -450,53 +649,24 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           boxShadow: '0 0 0 1px #161616, 0 10px 40px rgba(0, 0, 0, 0.55)',
           willChange: 'transform',
           imageRendering: zoom > 1 ? 'pixelated' : 'auto',
-          backgroundColor: '#1c1c1c',
-          backgroundImage: showCheckerboard
-            ? `conic-gradient(#282828 90deg, #202020 90deg 180deg, #282828 180deg 270deg, #202020 270deg)`
-            : 'none',
-          backgroundSize: '16px 16px',
+          backgroundColor: 'transparent',
+          backgroundImage: 'none',
         }}
       >
-        {/* Layer Canvas Stack rendered from Bottom to Top */}
-        {renderOrderLayers.map((layer) => {
-          if (layer.type === 'folder') return null;
-
-          return (
-            <canvas
-              key={layer.id}
-              ref={(el) => registerLayerCanvas(layer.id, el)}
-              width={dimensions.width}
-              height={dimensions.height}
-              className="absolute inset-0 block pointer-events-none"
-              style={{
-                opacity: getEffectiveOpacity(layer),
-                mixBlendMode: layer.blendMode,
-                display: isLayerEffectivelyVisible(layer) ? 'block' : 'none',
-                imageRendering: zoom > 1 ? 'pixelated' : 'auto',
-              }}
-            />
-          );
-        })}
-
-        {/* Remote Peer Draft Canvases (rendered per active peer while peer is drawing) */}
+        {/* Remote Peer Live Stroke Draft Overlay Canvases */}
         {peers.map((peer) => (
           <canvas
             key={`peer-canvas-${peer.id}`}
             ref={(el) => {
               if (remoteDraftCanvasesRef) {
-                if (el) {
-                  remoteDraftCanvasesRef.current.set(peer.id, el);
-                } else {
-                  remoteDraftCanvasesRef.current.delete(peer.id);
-                }
+                if (el) remoteDraftCanvasesRef.current.set(peer.id, el);
+                else remoteDraftCanvasesRef.current.delete(peer.id);
               }
             }}
             width={dimensions.width}
             height={dimensions.height}
             className="absolute inset-0 block pointer-events-none z-15"
-            style={{
-              imageRendering: zoom > 1 ? 'pixelated' : 'auto',
-            }}
+            style={{ imageRendering: zoom > 1 ? 'pixelated' : 'auto' }}
           />
         ))}
 
@@ -653,57 +823,157 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         />
       )}
 
-      {/* Dynamic Dual-Tone Brush Size Outline Ring (CSP / Photoshop style) */}
+      {/* Dynamic Dual-Tone Brush Silhouette Outline Cursor (CSP / Photoshop style) */}
       <div
         ref={cursorRingRef}
-        className="pointer-events-none absolute top-0 left-0 rounded-full z-30 select-none"
+        className="pointer-events-none absolute top-0 left-0 z-30 select-none"
         style={{
           display: 'none',
-          width: `${cursorDiameter}px`,
-          height: `${cursorDiameter}px`,
-          border: '1px solid rgba(0, 0, 0, 0.75)',
-          boxShadow: '0 0 0 1px rgba(255, 255, 255, 0.75)',
+          width: `${cursorWidth}px`,
+          height: `${cursorHeight}px`,
           willChange: 'transform',
+          transformOrigin: 'center center',
         }}
-      />
+      >
+        <svg
+          viewBox={isCustomTip && tipOutline ? tipOutline.viewBox : '0 0 100 100'}
+          className="w-full h-full overflow-visible pointer-events-none select-none"
+          style={{ display: 'block' }}
+        >
+          {isCustomTip && tipOutline ? (
+            <>
+              <path
+                d={tipOutline.path}
+                fill="none"
+                stroke="rgba(255, 255, 255, 0.85)"
+                strokeWidth="2.5"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                vectorEffect="non-scaling-stroke"
+              />
+              <path
+                d={tipOutline.path}
+                fill="none"
+                stroke="rgba(0, 0, 0, 0.85)"
+                strokeWidth="1"
+                strokeLinejoin="round"
+                strokeLinecap="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            </>
+          ) : isSquare ? (
+            <>
+              <rect
+                x="1"
+                y="1"
+                width="98"
+                height="98"
+                fill="none"
+                stroke="rgba(255, 255, 255, 0.85)"
+                strokeWidth="2.5"
+                vectorEffect="non-scaling-stroke"
+              />
+              <rect
+                x="1"
+                y="1"
+                width="98"
+                height="98"
+                fill="none"
+                stroke="rgba(0, 0, 0, 0.85)"
+                strokeWidth="1"
+                vectorEffect="non-scaling-stroke"
+              />
+            </>
+          ) : (
+            <>
+              <ellipse
+                cx="50"
+                cy="50"
+                rx="49.5"
+                ry="49.5"
+                fill="none"
+                stroke="rgba(255, 255, 255, 0.85)"
+                strokeWidth="2.5"
+                vectorEffect="non-scaling-stroke"
+              />
+              <ellipse
+                cx="50"
+                cy="50"
+                rx="49.5"
+                ry="49.5"
+                fill="none"
+                stroke="rgba(0, 0, 0, 0.85)"
+                strokeWidth="1"
+                vectorEffect="non-scaling-stroke"
+              />
+            </>
+          )}
+        </svg>
+      </div>
 
-      {/* Floating Visual Preview Circle for On-Canvas Brush Resizing (Ctrl + Alt + Drag) */}
+      {/* Floating Visual Preview for On-Canvas Brush Resizing (Ctrl + Alt + Drag) */}
       {isResizingBrush && (
         <div
           className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 z-50 flex items-center justify-center"
           style={{
             left: `${resizePreviewX}px`,
             top: `${resizePreviewY}px`,
-            width: `${cursorDiameter}px`,
-            height: `${cursorDiameter}px`,
+            width: `${cursorWidth}px`,
+            height: `${cursorHeight}px`,
+            transform: `translate(-50%, -50%) rotate(${totalAngleDeg}deg)`,
+            transformOrigin: 'center center',
           }}
         >
-          {/* Outer diameter & hardness preview circle */}
-          <div
-            className="w-full h-full rounded-full border-2 border-white shadow-[0_0_0_1px_rgba(0,0,0,0.8),0_4px_16px_rgba(0,0,0,0.5)] transition-[width,height] duration-75"
-            style={{
-              background:
-                (brushSettings.hardness ?? 1.0) < 0.98
-                  ? `radial-gradient(circle, rgba(239, 68, 68, 0.45) 0%, rgba(239, 68, 68, 0.45) ${Math.round(
-                      (brushSettings.hardness ?? 1.0) * 100
-                    )}%, rgba(239, 68, 68, 0.05) 100%)`
-                  : 'rgba(239, 68, 68, 0.38)',
-            }}
-          />
+          {isCustomTip && tipOutline ? (
+            <svg
+              viewBox={tipOutline.viewBox}
+              className="w-full h-full overflow-visible pointer-events-none"
+              style={{ display: 'block' }}
+            >
+              <path
+                d={tipOutline.path}
+                fill="rgba(239, 68, 68, 0.35)"
+                stroke="rgba(255, 255, 255, 0.95)"
+                strokeWidth="2.5"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+              <path
+                d={tipOutline.path}
+                fill="none"
+                stroke="rgba(0, 0, 0, 0.9)"
+                strokeWidth="1"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            </svg>
+          ) : (
+            <>
+              {/* Outer diameter & hardness preview circle */}
+              <div
+                className={`w-full h-full ${isSquare ? 'rounded-none' : 'rounded-full'} border-2 border-white shadow-[0_0_0_1px_rgba(0,0,0,0.8),0_4px_16px_rgba(0,0,0,0.5)] transition-[width,height] duration-75`}
+                style={{
+                  background:
+                    (brushSettings.hardness ?? 1.0) < 0.98
+                      ? `radial-gradient(circle, rgba(239, 68, 68, 0.45) 0%, rgba(239, 68, 68, 0.45) ${Math.round(
+                          (brushSettings.hardness ?? 1.0) * 100
+                        )}%, rgba(239, 68, 68, 0.05) 100%)`
+                      : 'rgba(239, 68, 68, 0.38)',
+                }}
+              />
 
-          {/* Inner hardness boundary indicator if soft brush */}
-          {(brushSettings.hardness ?? 1.0) < 0.98 && (
-            <div
-              className="absolute rounded-full border border-dashed border-white/80 pointer-events-none"
-              style={{
-                width: `${Math.max(2, cursorDiameter * (brushSettings.hardness ?? 1.0))}px`,
-                height: `${Math.max(2, cursorDiameter * (brushSettings.hardness ?? 1.0))}px`,
-              }}
-            />
+              {/* Inner hardness boundary indicator if soft brush */}
+              {(brushSettings.hardness ?? 1.0) < 0.98 && (
+                <div
+                  className={`absolute ${isSquare ? 'rounded-none' : 'rounded-full'} border border-dashed border-white/80 pointer-events-none`}
+                  style={{
+                    width: `${Math.max(2, cursorWidth * (brushSettings.hardness ?? 1.0))}px`,
+                    height: `${Math.max(2, cursorHeight * (brushSettings.hardness ?? 1.0))}px`,
+                  }}
+                />
+              )}
+            </>
           )}
-
-          {/* Anchor center crosshair */}
-          <div className="absolute w-2 h-2 rounded-full bg-white border border-black pointer-events-none shadow-sm" />
 
           {/* Floating HUD Tooltip Card */}
           <div

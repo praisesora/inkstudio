@@ -1,6 +1,6 @@
 import { BrushPresetId, CspSpraySettings } from '../types/editor';
-import { PENCIL_CONFIGS, PencilGrade, getPaperGrain, parseRgba } from './pencilEngine';
-import { getTintedTipMaster } from './stampEngine';
+import { PENCIL_CONFIGS, PencilGrade, getPaperGrain, getGraphiteTipMaster } from './pencilEngine';
+import { getTintedTipMaster, getRadialDabMaster, drawSingleStamp } from './stampEngine';
 import { getBuiltinBrushConfig } from './presetBrushes';
 import { evaluateCspSpline } from './sutParser';
 
@@ -11,6 +11,7 @@ export interface BrushPreviewOptions {
   opacity?: number;
   grain?: number;
   hardness?: number;
+  spacing?: number;
   minSizeFactor?: number;
   usePressure?: boolean;
   color?: string; // default '#ffffff' for neutral preview
@@ -33,31 +34,6 @@ export interface BrushPreviewOptions {
 // Offscreen canvas cache to guarantee zero-latency 120 FPS rendering
 const previewCache = new Map<string, HTMLCanvasElement>();
 const MAX_CACHE_ENTRIES = 60;
-
-/**
- * Deterministic pseudo-random generator (mulberry32)
- * Ensures paper grain and flake distribution never flickers across re-renders.
- */
-function createPrng(seed: number) {
-  let s = seed >>> 0;
-  return function () {
-    s = (s + 0x6d2b79f5) >>> 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/**
- * Generates an integer seed from a string identifier.
- */
-function hashString(str: string): number {
-  let hash = 5381;
-  for (let i = 0; i < str.length; i++) {
-    hash = ((hash << 5) + hash + str.charCodeAt(i)) >>> 0;
-  }
-  return hash;
-}
 
 /**
  * Clamps a number between min and max.
@@ -115,19 +91,22 @@ export function renderBrushStrokePreview(
   if (!ctx) return;
 
   const preset = options.preset || 'pencil-2b';
+  const builtinCfg = !options.customTipImage && options.preset ? getBuiltinBrushConfig(options.preset) : null;
   const isPencil = preset.startsWith('pencil');
   const pencilConfig = isPencil ? PENCIL_CONFIGS[preset as PencilGrade] : null;
 
-  const size = options.size ?? (pencilConfig ? pencilConfig.defaultSize : 14);
-  const flow = options.flow ?? (pencilConfig ? pencilConfig.flow : 0.85);
-  const opacity = options.opacity ?? 1.0;
-  const grain = options.grain ?? (pencilConfig ? pencilConfig.grain : 0);
-  const hardness = options.hardness ?? (pencilConfig ? pencilConfig.hardness : 1.0);
-  const minSizeFactor = options.minSizeFactor ?? (pencilConfig ? pencilConfig.minSizeFactor : 0.15);
+  const size = options.size ?? pencilConfig?.defaultSize ?? builtinCfg?.size ?? 14;
+  const flow = options.flow ?? pencilConfig?.flow ?? builtinCfg?.flow ?? 0.85;
+  const opacity = options.opacity ?? builtinCfg?.opacity ?? 1.0;
+  const grain = options.grain ?? pencilConfig?.grain ?? builtinCfg?.grain ?? 0;
+  const hardness = options.hardness ?? pencilConfig?.hardness ?? builtinCfg?.hardness ?? 1.0;
+  const minSizeFactor = options.minSizeFactor ?? pencilConfig?.minSizeFactor ?? builtinCfg?.minSizeFactor ?? 0.15;
+  const thickness = options.thickness ?? builtinCfg?.thickness ?? 1.0;
+  const customTipAngle = options.customTipAngle ?? builtinCfg?.customTipAngle ?? 0;
+  const spacing = options.spacing ?? builtinCfg?.spacing ?? (isPencil ? 0.07 : 0.045);
   const isEraser = options.tool === 'eraser';
   const strokeColor = options.color || '#ffffff';
   const bgColor = options.backgroundColor || 'transparent';
-  const builtinCfg = !options.customTipImage && options.preset ? getBuiltinBrushConfig(options.preset) : null;
   const tipImage = options.customTipImage || builtinCfg?.customTipImage;
 
   // Cache key
@@ -138,10 +117,11 @@ export function renderBrushStrokePreview(
     opacity.toFixed(2),
     grain.toFixed(2),
     hardness.toFixed(2),
-    (options.thickness ?? 1.0).toFixed(2),
+    thickness.toFixed(2),
+    customTipAngle.toFixed(1),
+    spacing.toFixed(3),
     options.antiAlias !== undefined ? String(options.antiAlias) : '2',
     options.spray?.enabled ? 'spray' : 'dab',
-    options.customTipAngle?.toFixed(1) || '0',
     tipImage ? 'custom-tip' : 'std',
     isEraser ? '1' : '0',
     options.wetEdge?.toFixed(2) || '0',
@@ -188,7 +168,6 @@ export function renderBrushStrokePreview(
   const amp = Math.max(4, maxAmp);
 
   const displayWidth = calculatePreviewWidth(size, cssHeight, isLiveCard);
-  const [rCol, gCol, bCol] = parseRgba(strokeColor);
 
   // Sample points along the S-curve
   const numSteps = Math.min(120, Math.max(60, Math.round(cssWidth * 0.65)));
@@ -209,7 +188,7 @@ export function renderBrushStrokePreview(
 
     // Dynamic tip taper for authentic pen release at the ends
     const tipFactor = Math.min(1.0, Math.sin(Math.PI * u) * 2.8);
-    const effMinSize = Math.max(0.08, minSizeFactor * tipFactor);
+    const effMinSize = Math.max(0.02, minSizeFactor * tipFactor);
     const tipAlpha = Math.min(1.0, Math.sin(Math.PI * u) * 4.2);
 
     // Taper width from effMinSize to full displayWidth
@@ -220,115 +199,88 @@ export function renderBrushStrokePreview(
 
   if (isEraser) {
     // ERASER PREVIEW:
-    // Render a subtle tone band or grid, with the eraser cleanly carving through it
+    // Render a subtle tone band, with the eraser cleanly carving through it
     offCtx.save();
-    offCtx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+    offCtx.fillStyle = 'rgba(255, 255, 255, 0.18)';
     offCtx.fillRect(padX - 4, centerY - amp - 4, strokeLength + 8, (amp + 4) * 2);
 
-    offCtx.globalCompositeOperation = 'destination-out';
-    offCtx.lineCap = 'round';
-    offCtx.lineJoin = 'round';
-    offCtx.strokeStyle = 'rgba(0, 0, 0, 1)';
+    const eraserMaster = getRadialDabMaster(hardness, '#000000', true);
+    const baseAngleRad = (customTipAngle * Math.PI) / 180;
+    const effSpacing = Math.max(0.02, Math.min(0.2, spacing));
 
+    let distanceAcc = 0;
     for (let i = 0; i < pts.length - 1; i++) {
       const p1 = pts[i];
       const p2 = pts[i + 1];
-      offCtx.beginPath();
-      offCtx.lineWidth = (p1.width + p2.width) / 2;
-      offCtx.moveTo(p1.x, p1.y);
-      offCtx.lineTo(p2.x, p2.y);
-      offCtx.stroke();
+      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const stepCount = Math.max(1, Math.ceil(segDist / 0.5));
+      for (let s = 0; s < stepCount; s++) {
+        const t = s / stepCount;
+        const curX = p1.x + t * (p2.x - p1.x);
+        const curY = p1.y + t * (p2.y - p1.y);
+        const curW = p1.width + t * (p2.width - p1.width);
+        const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
+
+        const requiredStep = Math.max(0.5, curW * effSpacing);
+        distanceAcc += segDist / stepCount;
+        if (distanceAcc >= requiredStep) {
+          distanceAcc = 0;
+          const stampW = Math.max(1.0, curW);
+          const stampH = stampW * thickness;
+          const alpha = clamp(opacity * flow * curTipAlpha, 0.05, 1.0);
+          drawSingleStamp(offCtx, eraserMaster, curX, curY, stampW, stampH, baseAngleRad, alpha, true, false);
+        }
+      }
     }
     offCtx.restore();
   } else if (isPencil && pencilConfig) {
     // PENCIL PHYSICS PREVIEW:
     // Authentic cold-press paper grain tooth & micro-graphite flake distribution
-    const seed = hashString(preset) ^ (Math.round(size * 10) << 8);
-    const rand = createPrng(seed);
-
-    const baseThreshold = pencilConfig.thresholdBase;
-    const sens = pencilConfig.thresholdPressureSensitivity;
-    const pDensity = pencilConfig.particleDensity;
-    const pSize = Math.max(1, pencilConfig.particleSize);
-    const effectiveFlow = flow * pencilConfig.flow;
-    const effectiveGrain = grain;
-
     offCtx.save();
     offCtx.globalAlpha = clamp(opacity, 0.05, 1.0);
 
-    // 1. Soft underlying graphite lead tone for rich core
+    const graphiteMaster = getGraphiteTipMaster(preset as PencilGrade, strokeColor);
+    const baseThreshold = pencilConfig.thresholdBase;
+    const sens = pencilConfig.thresholdPressureSensitivity;
+    const effFlow = flow * pencilConfig.flow;
+    const effSpacing = Math.max(0.02, Math.min(0.12, spacing));
+
+    let distanceAcc = 0;
     for (let i = 0; i < pts.length - 1; i++) {
       const p1 = pts[i];
       const p2 = pts[i + 1];
-      const avgP = (p1.pressure + p2.pressure) / 2;
-      const avgW = Math.max(0.8, (p1.width + p2.width) * 0.45);
-      const segTipAlpha = (p1.tipAlpha + p2.tipAlpha) / 2;
-      const coreAlpha = clamp(
-        effectiveFlow * avgP * 0.35 * (1.1 - effectiveGrain * 0.3) * segTipAlpha,
-        0.02,
-        0.7
-      );
+      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const stepCount = Math.max(1, Math.ceil(segDist / 0.6));
+      for (let s = 0; s < stepCount; s++) {
+        const t = s / stepCount;
+        const curX = p1.x + t * (p2.x - p1.x);
+        const curY = p1.y + t * (p2.y - p1.y);
+        const curW = p1.width + t * (p2.width - p1.width);
+        const curP = p1.pressure + t * (p2.pressure - p1.pressure);
+        const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
 
-      offCtx.beginPath();
-      offCtx.lineCap = 'round';
-      offCtx.lineJoin = 'round';
-      offCtx.lineWidth = avgW;
-      offCtx.strokeStyle = `rgba(${rCol}, ${gCol}, ${bCol}, ${coreAlpha.toFixed(3)})`;
-      offCtx.moveTo(p1.x, p1.y);
-      offCtx.lineTo(p2.x, p2.y);
-      offCtx.stroke();
-    }
-
-    // 2. Cold-press paper tooth ridges catching micro-graphite flakes
-    const stampStep = Math.max(1, Math.round(pts.length / 55));
-    for (let i = 0; i < pts.length; i += stampStep) {
-      const pt = pts[i];
-      const radius = Math.max(0.8, pt.width / 2);
-      const pressure = clamp(pt.pressure, 0.05, 1.0);
-
-      const effectiveThreshold = Math.max(
-        15,
-        baseThreshold - pressure * sens + (1 - effectiveGrain) * 45
-      );
-
-      // Flake count scales with pencil grade density and pressure
-      const count = Math.max(
-        3,
-        Math.round(radius * 3.6 * (pDensity / 12) * (0.55 + pressure * 0.65))
-      );
-
-      for (let p = 0; p < count; p++) {
-        // Gaussian radial dispersion
-        const u1 = Math.max(0.0001, rand());
-        const u2 = rand();
-        const r = radius * Math.sqrt(-2.0 * Math.log(u1)) * 0.46;
-        const theta = 2.0 * Math.PI * u2;
-
-        const flakeSize = Math.max(0.9, pSize);
-        const px = pt.x + r * Math.cos(theta);
-        const py = pt.y + r * Math.sin(theta);
-
-        // World-anchored cold-press paper grain lookup
-        // Coords scaled by 1.6 so paper tooth is clearly visible in preview
-        const paperHeight = getPaperGrain(px * 1.6, py * 1.6);
-
-        if (paperHeight >= effectiveThreshold) {
-          const heightFactor = Math.min(1.0, (paperHeight - effectiveThreshold + 24) / 52);
-          const distFactor = Math.max(0.12, 1 - r / (radius * 1.25));
-          const flakeJitter = 0.86 + rand() * 0.28;
-          const alpha = clamp(
-            effectiveFlow * pressure * heightFactor * distFactor * flakeJitter * 0.95 * pt.tipAlpha,
-            0.03,
-            1.0
+        const requiredStep = Math.max(0.4, curW * effSpacing);
+        distanceAcc += segDist / stepCount;
+        if (distanceAcc >= requiredStep) {
+          distanceAcc = 0;
+          const paperHeight = getPaperGrain(curX * 1.6, curY * 1.6);
+          const effThreshold = Math.max(
+            15,
+            baseThreshold - curP * sens + (1 - grain) * 40
           );
 
-          offCtx.fillStyle = `rgba(${rCol}, ${gCol}, ${bCol}, ${alpha.toFixed(3)})`;
-          offCtx.fillRect(
-            px - flakeSize / 2,
-            py - flakeSize / 2,
-            flakeSize,
-            flakeSize
-          );
+          if (paperHeight >= effThreshold) {
+            const heightFactor = Math.min(1.0, (paperHeight - effThreshold + 25) / 55);
+            const dabAlpha = clamp(
+              effFlow * (0.35 + 0.65 * curP) * heightFactor * curTipAlpha,
+              0.04,
+              1.0
+            );
+            drawSingleStamp(offCtx, graphiteMaster, curX, curY, curW, curW, 0, dabAlpha);
+          } else if (curP > 0.55) {
+            const dabAlpha = clamp(effFlow * 0.16 * curP * curTipAlpha, 0.02, 1.0);
+            drawSingleStamp(offCtx, graphiteMaster, curX, curY, curW, curW, 0, dabAlpha);
+          }
         }
       }
     }
@@ -336,104 +288,121 @@ export function renderBrushStrokePreview(
   } else if (tipImage) {
     // TEXTURED CUSTOM BRUSH PREVIEW (Clip Studio Paint Tip & Builtin Presets):
     const tip = tipImage;
-    const thickness = options.thickness ?? 1.0;
     const aspect =
       ((tip.naturalHeight || tip.height || 1) / (tip.naturalWidth || tip.width || 1)) * thickness;
-    const effFlow = clamp(flow, 0.05, 1.0);
     const baseAngleRad = (((options.customTipAngle ?? 0)) * Math.PI) / 180;
     const master = getTintedTipMaster(tip, strokeColor);
+    const effSpacing = Math.max(0.02, Math.min(0.2, spacing));
 
     offCtx.save();
     if (options.antiAlias === 0) {
       offCtx.imageSmoothingEnabled = false;
     }
-    const stepInterval = Math.max(1, Math.round(pts.length / 45));
 
-    for (let i = 0; i < pts.length; i += stepInterval) {
-      const pt = pts[i];
-      const stampW = Math.max(1.5, pt.width);
-      const stampH = stampW * aspect;
-      const alpha = clamp(opacity * effFlow * pt.tipAlpha, 0.03, 1.0);
-
-      offCtx.save();
-      offCtx.globalAlpha = alpha;
-
-      if (options.spray?.enabled) {
-        const pSize = Math.max(1, options.spray.size || 2);
-        const radius = stampW / 2;
-        const count = Math.max(1, options.spray.density || 4);
-        for (let sp = 0; sp < count; sp++) {
-          const r = radius * Math.sqrt(Math.random());
-          const th = Math.random() * Math.PI * 2;
-          offCtx.drawImage(
-            master,
-            pt.x + r * Math.cos(th) - pSize / 2,
-            pt.y + r * Math.sin(th) - (pSize * aspect) / 2,
-            pSize,
-            pSize * aspect
-          );
-        }
-      } else {
-        offCtx.translate(pt.x, pt.y);
-        if (baseAngleRad !== 0) {
-          offCtx.rotate(baseAngleRad);
-        }
-        offCtx.drawImage(master, -stampW / 2, -stampH / 2, stampW, stampH);
-      }
-      offCtx.restore();
-    }
-    offCtx.restore();
-  } else {
-    // ROUND INK BRUSH PREVIEW:
-    // Smooth, solid, clean line with tapered ends and hardness falloff
-    offCtx.save();
-    offCtx.lineCap = 'round';
-    offCtx.lineJoin = 'round';
-
-    const effHardness = clamp(hardness, 0.05, 1.0);
-    const effFlow = clamp(flow, 0.05, 1.0);
-    offCtx.globalAlpha = clamp(opacity * effFlow, 0.05, 1.0);
-
-    if (effHardness < 0.96) {
-      // Soft / feathered edge (airbrush-like)
-      offCtx.shadowBlur = (1 - effHardness) * Math.max(1, displayWidth * 0.6);
-      offCtx.shadowColor = `rgba(${rCol}, ${gCol}, ${bCol}, ${(effFlow * 0.9).toFixed(3)})`;
-    }
-
-    offCtx.strokeStyle = strokeColor;
-
-    // CSP Wet Edge (Water Edge) rim effect in preview
-    if (options.wetEdge && options.wetEdge > 0.05) {
-      offCtx.save();
-      offCtx.strokeStyle = `rgba(${Math.round(rCol * 0.6)}, ${Math.round(gCol * 0.6)}, ${Math.round(bCol * 0.6)}, ${(clamp(opacity * effFlow, 0.1, 1.0) * (0.35 + options.wetEdge * 0.55)).toFixed(3)})`;
-      for (let i = 0; i < pts.length - 1; i++) {
-        const p1 = pts[i];
-        const p2 = pts[i + 1];
-        const avgW = (p1.width + p2.width) / 2;
-        offCtx.beginPath();
-        offCtx.lineWidth = avgW + 1.2;
-        offCtx.moveTo(p1.x, p1.y);
-        offCtx.lineTo(p2.x, p2.y);
-        offCtx.stroke();
-      }
-      offCtx.restore();
-    }
-
-    // Draw tapered segments with calligraphic tip alpha
+    let distanceAcc = 0;
     for (let i = 0; i < pts.length - 1; i++) {
       const p1 = pts[i];
       const p2 = pts[i + 1];
-      const avgW = (p1.width + p2.width) / 2;
-      const segTipAlpha = (p1.tipAlpha + p2.tipAlpha) / 2;
+      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const stepCount = Math.max(1, Math.ceil(segDist / 0.6));
+      for (let s = 0; s < stepCount; s++) {
+        const t = s / stepCount;
+        const curX = p1.x + t * (p2.x - p1.x);
+        const curY = p1.y + t * (p2.y - p1.y);
+        const curW = p1.width + t * (p2.width - p1.width);
+        const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
 
-      offCtx.save();
-      offCtx.globalAlpha = clamp(opacity * effFlow * segTipAlpha, 0.05, 1.0);
-      offCtx.beginPath();
-      offCtx.lineWidth = avgW;
-      offCtx.moveTo(p1.x, p1.y);
-      offCtx.lineTo(p2.x, p2.y);
-      offCtx.stroke();
-      offCtx.restore();
+        const requiredStep = Math.max(0.6, curW * effSpacing);
+        distanceAcc += segDist / stepCount;
+        if (distanceAcc >= requiredStep) {
+          distanceAcc = 0;
+          const stampW = Math.max(1.5, curW);
+          const stampH = stampW * aspect;
+          const alpha = clamp(opacity * flow * curTipAlpha, 0.03, 1.0);
+
+          if (options.spray?.enabled) {
+            const pSize = Math.max(1, options.spray.size || 2);
+            const radius = stampW / 2;
+            const count = Math.max(1, options.spray.density || 4);
+            for (let sp = 0; sp < count; sp++) {
+              const r = radius * Math.sqrt(Math.random());
+              const th = Math.random() * Math.PI * 2;
+              offCtx.drawImage(
+                master,
+                curX + r * Math.cos(th) - pSize / 2,
+                curY + r * Math.sin(th) - (pSize * aspect) / 2,
+                pSize,
+                pSize * aspect
+              );
+            }
+          } else {
+            drawSingleStamp(offCtx, master, curX, curY, stampW, stampH, baseAngleRad, alpha);
+          }
+        }
+      }
+    }
+    offCtx.restore();
+  } else {
+    // ROUND INK & ANALYTICAL DAB BRUSH PREVIEW (Airbrush, G-Pen, Maru Pen, Turnip Pen, Flat Marker, Round):
+    offCtx.save();
+    const effHardness = clamp(hardness, 0.0, 1.0);
+    const effFlow = clamp(flow, 0.01, 1.0);
+    const master = getRadialDabMaster(effHardness, strokeColor);
+    const baseAngleRad = (customTipAngle * Math.PI) / 180;
+    const effSpacing = Math.max(0.02, Math.min(0.2, spacing));
+
+    // Optional CSP Wet Edge rim
+    if (options.wetEdge && options.wetEdge > 0.05) {
+      const rimMaster = getRadialDabMaster(Math.min(1.0, effHardness + 0.1), strokeColor);
+      let wetAcc = 0;
+      for (let i = 0; i < pts.length - 1; i++) {
+        const p1 = pts[i];
+        const p2 = pts[i + 1];
+        const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+        const stepCount = Math.max(1, Math.ceil(segDist / 0.6));
+        for (let s = 0; s < stepCount; s++) {
+          const t = s / stepCount;
+          const curX = p1.x + t * (p2.x - p1.x);
+          const curY = p1.y + t * (p2.y - p1.y);
+          const curW = (p1.width + t * (p2.width - p1.width)) * (1.0 + options.wetEdge * 0.22);
+          const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
+
+          const requiredStep = Math.max(0.6, curW * effSpacing * 1.5);
+          wetAcc += segDist / stepCount;
+          if (wetAcc >= requiredStep) {
+            wetAcc = 0;
+            const stampW = Math.max(1.2, curW);
+            const stampH = stampW * thickness;
+            const rimAlpha = clamp(opacity * effFlow * curTipAlpha * (0.2 + options.wetEdge * 0.4), 0.02, 1.0);
+            drawSingleStamp(offCtx, rimMaster, curX, curY, stampW, stampH, baseAngleRad, rimAlpha);
+          }
+        }
+      }
+    }
+
+    let distanceAcc = 0;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const stepCount = Math.max(1, Math.ceil(segDist / 0.6));
+      for (let s = 0; s < stepCount; s++) {
+        const t = s / stepCount;
+        const curX = p1.x + t * (p2.x - p1.x);
+        const curY = p1.y + t * (p2.y - p1.y);
+        const curW = p1.width + t * (p2.width - p1.width);
+        const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
+
+        const requiredStep = Math.max(0.5, curW * effSpacing);
+        distanceAcc += segDist / stepCount;
+        if (distanceAcc >= requiredStep) {
+          distanceAcc = 0;
+          const stampW = Math.max(0.8, curW);
+          const stampH = stampW * thickness;
+          const alpha = clamp(opacity * effFlow * curTipAlpha, 0.02, 1.0);
+          drawSingleStamp(offCtx, master, curX, curY, stampW, stampH, baseAngleRad, alpha);
+        }
+      }
     }
     offCtx.restore();
   }

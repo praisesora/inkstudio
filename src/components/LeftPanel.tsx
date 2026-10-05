@@ -83,6 +83,8 @@ interface LeftPanelProps {
   onPrimaryColorChange?: (color: string) => void;
   onSecondaryColorChange?: (color: string) => void;
   onSwapColors: () => void;
+  isTransparentColor?: boolean;
+  onToggleTransparentColor?: () => void;
   recentColors?: string[];
   width: number;
   onWidthChange: (newWidth: number) => void;
@@ -110,6 +112,8 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   primaryColor,
   secondaryColor,
   onSwapColors,
+  isTransparentColor = false,
+  onToggleTransparentColor,
   width,
   onWidthChange,
   isHidden,
@@ -1101,20 +1105,30 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
 
             {/* Primary Color Swatch (top-left) */}
             <div
-              onClick={onSwapColors}
-              title={`Primary Active Color: ${primaryColor} (Click to swap)`}
-              className="absolute top-0 left-0 w-5 h-5 rounded-[1px] border border-white cursor-pointer shadow-md z-10"
+              onClick={() => {
+                if (isTransparentColor) {
+                  onToggleTransparentColor?.();
+                } else {
+                  onSwapColors();
+                }
+              }}
+              title={`Primary Active Color: ${primaryColor} (Click to select/swap)`}
+              className={`absolute top-0 left-0 w-5 h-5 rounded-[1px] cursor-pointer shadow-md z-10 transition-all ${
+                !isTransparentColor
+                  ? 'border border-white ring-1 ring-white/40'
+                  : 'border border-[#44464c] hover:border-white opacity-80'
+              }`}
               style={{ backgroundColor: primaryColor }}
             />
           </div>
 
-          {/* Transparent / Erasing Color Swatch (Classic Manga Studio / CSP style) */}
+          {/* Transparent Color Swatch (Clip Studio Paint style 'C' key toggle) */}
           <div
-            onClick={() => onSelectTool('eraser')}
-            title="Transparent Color / Eraser (C / E)"
+            onClick={onToggleTransparentColor}
+            title="Transparent Ink / Color (C) - Brush as textured eraser"
             className={`w-7 h-3 rounded-[1px] border cursor-pointer relative overflow-hidden transition-all ${
-              currentTool === 'eraser'
-                ? 'border-[#38bdf8] ring-1 ring-[#38bdf8] shadow-xs'
+              isTransparentColor
+                ? 'border-[#38bdf8] ring-1 ring-[#38bdf8] shadow-xs scale-105'
                 : 'border-[#44464c] hover:border-white opacity-80 hover:opacity-100'
             }`}
             style={{
@@ -1354,7 +1368,7 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
                 </div>
               )}
 
-              {/* Category: Color & Paint (Oil, Chalk, Square Color Brush) */}
+              {/* Category: Color & Paint (Soft Airbrush, Square Color Brush) */}
               {(selectedCategory === 'all' || selectedCategory === 'color-paint') && (
                 <div className={`space-y-1.5 ${selectedCategory === 'all' ? 'pt-2' : ''}`}>
                   {selectedCategory === 'all' && (

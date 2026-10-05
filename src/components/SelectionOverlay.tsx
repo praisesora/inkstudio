@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   CanvasSelection,
   CanvasDimensions,
@@ -113,70 +114,73 @@ export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
       </svg>
 
       {/* 3. CSP-Style Selection Launcher Bar (Fixed at bottom center of viewport) */}
-      <div
-        className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 bg-[#1e1f22] border border-[#383a40] rounded shadow-2xl px-2 py-1.5 flex items-center space-x-1.5 select-none animate-in fade-in slide-in-from-bottom-2 duration-150"
-        onPointerDown={(e) => e.stopPropagation()}
-      >
-        {/* Deselect */}
-        <button
-          onClick={onDeselect}
-          title="Deselect (Ctrl+D)"
-          className="p-1.5 text-[#999999] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
+      {createPortal(
+        <div
+          className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 bg-[#1e1f22] border border-[#383a40] rounded shadow-2xl px-2 py-1.5 flex items-center space-x-1.5 select-none animate-in fade-in slide-in-from-bottom-2 duration-150"
+          onPointerDown={(e) => e.stopPropagation()}
         >
-          <X className="w-4 h-4 text-red-400" />
-          <span className="hidden sm:inline">Deselect</span>
-        </button>
+          {/* Deselect */}
+          <button
+            onClick={onDeselect}
+            title="Deselect (Ctrl+D)"
+            className="p-1.5 text-[#999999] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
+          >
+            <X className="w-4 h-4 text-red-400" />
+            <span className="hidden sm:inline">Deselect</span>
+          </button>
 
-        <div className="w-px h-4 bg-[#383a40]" />
+          <div className="w-px h-4 bg-[#383a40]" />
 
-        {/* Screen Tone Fill (CSP Halftone Fill) */}
-        <button
-          onClick={onFillScreentone}
-          title="Fill Screentone into New Layer (CSP Tone Effect)"
-          className="p-1.5 bg-[#293d45] hover:bg-[#344d57] text-[#5ce1e6] border border-[#3e5e6b] rounded transition-colors cursor-pointer flex items-center space-x-1.5 text-xs font-medium shadow-xs"
-        >
-          <Sparkles className="w-4 h-4 text-[#5ce1e6]" />
-          <span>Screentone Fill</span>
-        </button>
+          {/* Screen Tone Fill (CSP Halftone Fill) */}
+          <button
+            onClick={onFillScreentone}
+            title="Fill Screentone into New Layer (CSP Tone Effect)"
+            className="p-1.5 bg-[#293d45] hover:bg-[#344d57] text-[#5ce1e6] border border-[#3e5e6b] rounded transition-colors cursor-pointer flex items-center space-x-1.5 text-xs font-medium shadow-xs"
+          >
+            <Sparkles className="w-4 h-4 text-[#5ce1e6]" />
+            <span>Screentone Fill</span>
+          </button>
 
-        {/* Transform Selection (Ctrl+T) */}
-        <button
-          onClick={onTransformSelection}
-          title="Transform Selection (Ctrl+T)"
-          className="p-1.5 text-[#cccccc] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
-        >
-          <Scaling className="w-4 h-4 text-cyan-400" />
-          <span>Transform</span>
-        </button>
+          {/* Transform Selection (Ctrl+T) */}
+          <button
+            onClick={onTransformSelection}
+            title="Transform Selection (Ctrl+T)"
+            className="p-1.5 text-[#cccccc] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
+          >
+            <Scaling className="w-4 h-4 text-cyan-400" />
+            <span>Transform</span>
+          </button>
 
-        {/* Fill with Foreground Color */}
-        <button
-          onClick={onFillColor}
-          title="Fill with Foreground Color (Alt+Del)"
-          className="p-1.5 text-[#cccccc] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
-        >
-          <PaintBucket className="w-4 h-4 text-amber-400" />
-          <span className="hidden sm:inline">Fill</span>
-        </button>
+          {/* Fill with Foreground Color */}
+          <button
+            onClick={onFillColor}
+            title="Fill with Foreground Color (Alt+Del)"
+            className="p-1.5 text-[#cccccc] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
+          >
+            <PaintBucket className="w-4 h-4 text-amber-400" />
+            <span className="hidden sm:inline">Fill</span>
+          </button>
 
-        {/* Clear Selection Pixels */}
-        <button
-          onClick={onClearSelection}
-          title="Clear / Delete Selected Pixels (Del)"
-          className="p-1.5 text-[#cccccc] hover:text-red-400 hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
-        >
-          <Trash2 className="w-4 h-4" />
-        </button>
+          {/* Clear Selection Pixels */}
+          <button
+            onClick={onClearSelection}
+            title="Clear / Delete Selected Pixels (Del)"
+            className="p-1.5 text-[#cccccc] hover:text-red-400 hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
 
-        {/* Invert Selection */}
-        <button
-          onClick={onInvertSelection}
-          title="Invert Selection (Ctrl+Shift+I)"
-          className="p-1.5 text-[#cccccc] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
-        >
-          <RotateCcw className="w-4 h-4" />
-        </button>
-      </div>
+          {/* Invert Selection */}
+          <button
+            onClick={onInvertSelection}
+            title="Invert Selection (Ctrl+Shift+I)"
+            className="p-1.5 text-[#cccccc] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer flex items-center space-x-1 text-xs"
+          >
+            <RotateCcw className="w-4 h-4" />
+          </button>
+        </div>,
+        document.body
+      )}
     </>
   );
 };

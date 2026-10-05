@@ -31,6 +31,7 @@ export interface ColorSliderProps {
   onSelectTool?: (tool: ToolType) => void;
   recentColors?: string[];
   containerWidth?: number;
+  containerHeight?: number;
   activeTarget?: 'primary' | 'secondary';
   onActiveTargetChange?: (target: 'primary' | 'secondary') => void;
   hideHeader?: boolean;
@@ -58,7 +59,8 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
   currentTool = 'brush',
   onSelectTool,
   recentColors = [],
-  containerWidth: _containerWidth = 320,
+  containerWidth = 320,
+  containerHeight,
   activeTarget: controlledActiveTarget,
   onActiveTargetChange,
   hideHeader = false,
@@ -91,6 +93,34 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
   const [rgbValues, setRgbValues] = useState(() => hexToRgb(activeColor));
   const [hsvValues, setHsvValues] = useState(() => hexToHsv(activeColor));
   const [cmykValues, setCmykValues] = useState(() => hexToCmyk(activeColor));
+
+  // Container sizing
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [measuredSize, setMeasuredSize] = useState<{ width: number; height: number }>({
+    width: containerWidth,
+    height: containerHeight || 0,
+  });
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width: w, height: h } = entry.contentRect;
+        setMeasuredSize({
+          width: w > 0 ? Math.round(w) : containerWidth,
+          height: h > 0 ? Math.round(h) : (containerHeight || 0),
+        });
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [containerWidth, containerHeight]);
+
+  const effectiveHeight = containerHeight || measuredSize.height || 0;
+  const trackHeight = effectiveHeight > 340 ? 12 : effectiveHeight > 260 ? 10 : 8;
+  const swatchHeight = effectiveHeight > 300 ? 'h-7' : 'h-6';
+  const spacingClass = effectiveHeight > 320 ? 'space-y-3' : effectiveHeight > 240 ? 'space-y-2' : 'space-y-1';
 
   // Sync color representation when external activeColor changes (if not dragging)
   useEffect(() => {
@@ -338,10 +368,10 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
   };
 
   return (
-    <div className="flex flex-col select-none text-[#cccccc] text-xs">
+    <div ref={containerRef} className="flex flex-col select-none text-[#cccccc] text-xs h-full justify-between">
       {/* Optional Standalone Header if rendered outside ColorPanel */}
       {!hideHeader && (
-        <div className="bg-[#2a2a2a] px-3 py-1.5 border-b border-[#333333] flex items-center justify-between">
+        <div className="bg-[#2a2a2a] px-3 py-1.5 border-b border-[#333333] flex items-center justify-between shrink-0">
           <div className="flex items-center space-x-2 text-xs font-medium text-[#cccccc]">
             <Menu className="w-3.5 h-3.5 text-[#888888] cursor-pointer hover:text-white transition-colors" />
             <div className="flex items-center space-x-1.5">
@@ -364,7 +394,7 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
       )}
 
       {/* Main Slider Area matching Clip Studio Paint Photo 2 */}
-      <div className="p-3 space-y-3">
+      <div className="p-2.5 flex-1 flex flex-col justify-between space-y-2">
         {/* Sliders Container with Left Vertical Mode Selector Strip */}
         <div className="flex items-stretch">
           {/* Vertical Color Model Selector (CMYK, HSV, RGB rotated -90deg matching screenshot) */}
@@ -416,7 +446,7 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
           </div>
 
           {/* Main Slider Box */}
-          <div className="flex-1 bg-[#2b2b2e] border border-[#3e3e42] rounded-r-[3px] p-2.5 space-y-2">
+          <div className={`flex-1 bg-[#2b2b2e] border border-[#3e3e42] rounded-r-[3px] p-2.5 ${spacingClass}`}>
             {channels.map((channel) => (
               <div key={channel.id} className="flex items-center space-x-2">
                 {/* Channel Label (R, G, B, H, S, V, C, M, Y, K) */}
@@ -432,13 +462,13 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
                   onPointerUp={(e) => handlePointerUp(channel.id, e)}
                   onPointerCancel={(e) => handlePointerUp(channel.id, e)}
                 >
-                  {/* Track Bar (h-2, rounded-[1px], dynamic gradient) */}
+                  {/* Track Bar (dynamic height, rounded-[1px], dynamic gradient) */}
                   <div
                     ref={(el) => {
                       trackRefs.current[channel.id] = el;
                     }}
-                    style={{ background: channel.gradient }}
-                    className="relative h-2 w-full rounded-[1px] border border-[#1b1b1b] shadow-inner"
+                    style={{ background: channel.gradient, height: trackHeight }}
+                    className="relative w-full rounded-[1px] border border-[#1b1b1b] shadow-inner"
                   />
 
                   {/* Caret Row (triangle pointing straight UP into the track matching Photo 2) */}
@@ -506,7 +536,7 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
               if (currentTool === 'eraser' && onSelectTool) onSelectTool('brush');
             }}
             title={`Primary Color: ${primaryColor} (Click to select & edit)`}
-            className={`flex-1 h-6 rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
+            className={`flex-1 ${swatchHeight} rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
               activeTarget === 'primary' && !isTransparentActive
                 ? 'ring-2 ring-[#7c91c0] ring-offset-1 ring-offset-[#252526] border border-black/80 shadow-sm z-10 scale-[1.02]'
                 : 'border border-[#555555] hover:border-[#888888]'
@@ -521,7 +551,7 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
               if (currentTool === 'eraser' && onSelectTool) onSelectTool('brush');
             }}
             title={`Secondary Color: ${secondaryColor} (Click to select & edit)`}
-            className={`flex-1 h-6 rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
+            className={`flex-1 ${swatchHeight} rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
               activeTarget === 'secondary' && !isTransparentActive
                 ? 'ring-2 ring-[#7c91c0] ring-offset-1 ring-offset-[#252526] border border-black/80 shadow-sm z-10 scale-[1.02]'
                 : 'border border-[#555555] hover:border-[#888888]'
@@ -533,7 +563,7 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
           <button
             onClick={handleToggleTransparent}
             title="Transparent Color / Eraser Mode (C)"
-            className={`flex-1 h-6 rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
+            className={`flex-1 ${swatchHeight} rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
               isTransparentActive
                 ? 'ring-2 ring-[#7c91c0] ring-offset-1 ring-offset-[#252526] border border-black/80 shadow-sm z-10 scale-[1.02]'
                 : 'border border-[#555555] hover:border-[#888888]'

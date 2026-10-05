@@ -23,6 +23,7 @@ import {
   FolderInput,
   FolderOutput,
   Box,
+  GripVertical,
 } from 'lucide-react';
 import { HistoryItemMeta, LayerItem, BlendMode, ToolType, CanvasColorMode, ExpressionColor } from '../types/editor';
 import { BLEND_MODES } from '../utils/canvasUtils';
@@ -54,9 +55,11 @@ interface RightSidebarProps {
   onSetOpacity: (id: string, opacity: number) => void;
   onSetBlendMode: (id: string, blendMode: BlendMode) => void;
   onToggleLock: (id: string) => void;
+  onToggleAlphaLock?: (id: string) => void;
+  onToggleClipping?: (id: string) => void;
   onToggleCollapse: (id: string) => void;
   onRenameLayer: (id: string, name: string) => void;
-  onMoveLayer: (id: string, direction: 'up' | 'down') => void;
+  onMoveLayer?: (id: string, direction: 'up' | 'down') => void;
   onMoveLayerToFolder: (id: string, targetFolderId: string | null) => void;
   onReorderLayers?: (draggedId: string, targetId: string, position: 'above' | 'below' | 'inside') => void;
   // Tone (Screentone) Effect Props
@@ -132,6 +135,32 @@ export const CspLayerColorIcon: React.FC<{ className?: string; color?: string }>
   </svg>
 );
 
+// Clip Studio Paint / Photoshop style "Clip to Layer Below" Indent Arrow icon
+export const ClipToLayerIcon: React.FC<{ className?: string }> = ({ className = 'w-3.5 h-3.5' }) => (
+  <svg viewBox="0 0 16 16" fill="currentColor" className={className}>
+    <path
+      d="M3 2v6a2 2 0 0 0 2 2h4.5v2.5L14 9l-4.5-3.5V8H5V2H3z"
+      stroke="currentColor"
+      strokeWidth="0.5"
+    />
+  </svg>
+);
+
+// Clip Studio Paint / Photoshop style "Lock Transparent Pixels" (Alpha Lock) icon
+export const AlphaLockIcon: React.FC<{ className?: string }> = ({ className = 'w-3.5 h-3.5' }) => (
+  <svg viewBox="0 0 16 16" className={className} fill="none">
+    {/* Checkered pattern background */}
+    <rect x="1.5" y="1.5" width="13" height="13" rx="1.5" stroke="currentColor" strokeWidth="1" />
+    <rect x="2.5" y="2.5" width="5.5" height="5.5" fill="#888" opacity="0.6" />
+    <rect x="8" y="8" width="5.5" height="5.5" fill="#888" opacity="0.6" />
+    <rect x="8" y="2.5" width="5.5" height="5.5" fill="#ddd" opacity="0.4" />
+    <rect x="2.5" y="8" width="5.5" height="5.5" fill="#ddd" opacity="0.4" />
+    {/* Centered lock badge */}
+    <rect x="5.5" y="7.5" width="5" height="4.5" rx="1" fill="currentColor" />
+    <path d="M6.5 7.5V6a1.5 1.5 0 0 1 3 0v1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+  </svg>
+);
+
 export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   primaryColor,
   secondaryColor,
@@ -160,9 +189,10 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onSetOpacity,
   onSetBlendMode,
   onToggleLock,
+  onToggleAlphaLock,
+  onToggleClipping,
   onToggleCollapse,
   onRenameLayer,
-  onMoveLayer,
   onMoveLayerToFolder,
   onReorderLayers,
   onToggleTone,
@@ -295,6 +325,195 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
     setEditingLayerId(null);
   };
 
+  const layerListContainerRef = useRef<HTMLDivElement>(null);
+  const dragRef = useRef<{
+    active: boolean;
+    layerId: string | null;
+    startX: number;
+    startY: number;
+  }>({
+    active: false,
+    layerId: null,
+    startX: 0,
+    startY: 0,
+  });
+  const dropIndicatorRef = useRef<{ id: string; position: 'above' | 'below' | 'inside' } | null>(null);
+  const justDraggedRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    return () => {
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+    };
+  }, []);
+
+  const handleLayerPointerDown = (e: React.PointerEvent<HTMLDivElement>, layerId: string) => {
+    if (e.button !== 0) return;
+    if (editingLayerId !== null) return;
+    const target = e.target as HTMLElement | null;
+    if (target?.closest('button, input, select, textarea, [data-no-drag]')) {
+      return;
+    }
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    dragRef.current = {
+      active: false,
+      layerId,
+      startX,
+      startY,
+    };
+    dropIndicatorRef.current = null;
+
+    let autoScrollTimer: number | null = null;
+    const stopAutoScroll = () => {
+      if (autoScrollTimer !== null) {
+        window.clearInterval(autoScrollTimer);
+        autoScrollTimer = null;
+      }
+    };
+
+    const handlePointerMove = (moveEvt: PointerEvent) => {
+      const dx = moveEvt.clientX - dragRef.current.startX;
+      const dy = moveEvt.clientY - dragRef.current.startY;
+
+      if (!dragRef.current.active) {
+        if (dx * dx + dy * dy >= 16) {
+          dragRef.current.active = true;
+          setDraggedLayerId(layerId);
+          document.body.style.userSelect = 'none';
+          document.body.style.cursor = 'grabbing';
+        } else {
+          return;
+        }
+      }
+
+      // Autoscroll container when dragging near top or bottom edges
+      const container = layerListContainerRef.current;
+      if (container) {
+        const cRect = container.getBoundingClientRect();
+        const topDist = moveEvt.clientY - cRect.top;
+        const bottomDist = cRect.bottom - moveEvt.clientY;
+
+        stopAutoScroll();
+        if (topDist < 32 && topDist > -30 && container.scrollTop > 0) {
+          autoScrollTimer = window.setInterval(() => {
+            container.scrollTop -= 7;
+          }, 16);
+        } else if (bottomDist < 32 && bottomDist > -30 && container.scrollTop + container.clientHeight < container.scrollHeight) {
+          autoScrollTimer = window.setInterval(() => {
+            container.scrollTop += 7;
+          }, 16);
+        }
+      }
+
+      const hovered = document.elementFromPoint(moveEvt.clientX, moveEvt.clientY) as HTMLElement | null;
+      const row = hovered?.closest('[data-layer-id]') as HTMLElement | null;
+
+      if (!row) {
+        if (dropIndicatorRef.current) {
+          dropIndicatorRef.current = null;
+          setDropIndicator(null);
+        }
+        return;
+      }
+
+      const targetId = row.dataset.layerId;
+      if (!targetId || targetId === layerId) {
+        if (dropIndicatorRef.current) {
+          dropIndicatorRef.current = null;
+          setDropIndicator(null);
+        }
+        return;
+      }
+
+      const targetLayer = layers.find((l) => l.id === targetId);
+      if (!targetLayer) {
+        if (dropIndicatorRef.current) {
+          dropIndicatorRef.current = null;
+          setDropIndicator(null);
+        }
+        return;
+      }
+
+      // Prevent dragging a folder into its own subtree
+      const draggedItem = layers.find((l) => l.id === layerId);
+      if (draggedItem?.type === 'folder') {
+        let isDescendant = false;
+        let curr: LayerItem | undefined = targetLayer;
+        while (curr) {
+          if (curr.id === layerId) {
+            isDescendant = true;
+            break;
+          }
+          curr = layers.find((l) => l.id === curr?.parentId);
+        }
+        if (isDescendant) {
+          if (dropIndicatorRef.current) {
+            dropIndicatorRef.current = null;
+            setDropIndicator(null);
+          }
+          return;
+        }
+      }
+
+      const rect = row.getBoundingClientRect();
+      const yRatio = (moveEvt.clientY - rect.top) / rect.height;
+
+      let position: 'above' | 'below' | 'inside';
+      if (targetLayer.type === 'folder') {
+        if (yRatio > 0.25 && yRatio < 0.75) {
+          position = 'inside';
+        } else if (yRatio <= 0.25) {
+          position = 'above';
+        } else {
+          position = 'below';
+        }
+      } else {
+        if (yRatio <= 0.5) {
+          position = 'above';
+        } else {
+          position = 'below';
+        }
+      }
+
+      const nextIndicator = { id: targetId, position };
+      dropIndicatorRef.current = nextIndicator;
+      setDropIndicator(nextIndicator);
+    };
+
+    const handlePointerUp = () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+      window.removeEventListener('pointercancel', handlePointerUp);
+      stopAutoScroll();
+
+      document.body.style.userSelect = '';
+      document.body.style.cursor = '';
+
+      if (dragRef.current.active) {
+        justDraggedRef.current = true;
+        setTimeout(() => {
+          justDraggedRef.current = false;
+        }, 100);
+
+        const currentIndicator = dropIndicatorRef.current;
+        if (currentIndicator && currentIndicator.id !== layerId && onReorderLayers) {
+          onReorderLayers(layerId, currentIndicator.id, currentIndicator.position);
+        }
+      }
+
+      dragRef.current = { active: false, layerId: null, startX: 0, startY: 0 };
+      dropIndicatorRef.current = null;
+      setDraggedLayerId(null);
+      setDropIndicator(null);
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    window.addEventListener('pointercancel', handlePointerUp);
+  };
+
   return (
     <aside
       style={{ width }}
@@ -311,7 +530,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
       {/* Scrollable Upper Section: Color & Brush Properties */}
       <div style={{ height: topHeight }} className="overflow-y-auto shrink-0 border-b border-[#333333]">
         {/* 1. Full-Featured Color Palette Panel: Color Wheel & Color Slider (Clip Studio Paint style) */}
-        <section className="bg-[#252526]">
+        <section className="bg-[#252526] h-full">
           <ColorPanel
             primaryColor={primaryColor}
             secondaryColor={secondaryColor}
@@ -323,6 +542,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
             onSelectTool={onSelectTool}
             recentColors={recentColors}
             containerWidth={width}
+            containerHeight={topHeight}
           />
         </section>
       </div>
@@ -1001,23 +1221,43 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                   <Copy className="w-3.5 h-3.5 text-emerald-400" />
                 </button>
 
-                {/* Move Up */}
-                <button
-                  onClick={() => onMoveLayer(activeLayerId, 'up')}
-                  title="Move Layer Up"
-                  className="p-1 text-[#888888] hover:text-white hover:bg-[#333333] rounded-[2px] transition-colors"
-                >
-                  <ChevronUp className="w-3.5 h-3.5" />
-                </button>
+                {/* Toggle Alpha Lock (Lock Transparent Pixels) */}
+                {activeLayer && activeLayer.type !== 'folder' && (
+                  <button
+                    onClick={() => onToggleAlphaLock?.(activeLayer.id)}
+                    title={
+                      activeLayer.alphaLocked
+                        ? 'Unlock Transparent Pixels (Alpha Lock ON)'
+                        : 'Lock Transparent Pixels (Alpha Lock OFF)'
+                    }
+                    className={`p-1 rounded-[2px] transition-colors ${
+                      activeLayer.alphaLocked
+                        ? 'text-amber-400 bg-amber-950/50 ring-1 ring-amber-500/60 shadow-xs'
+                        : 'text-[#888888] hover:text-white hover:bg-[#333333]'
+                    }`}
+                  >
+                    <AlphaLockIcon className="w-3.5 h-3.5" />
+                  </button>
+                )}
 
-                {/* Move Down */}
-                <button
-                  onClick={() => onMoveLayer(activeLayerId, 'down')}
-                  title="Move Layer Down"
-                  className="p-1 text-[#888888] hover:text-white hover:bg-[#333333] rounded-[2px] transition-colors"
-                >
-                  <ChevronDown className="w-3.5 h-3.5" />
-                </button>
+                {/* Toggle Clip to Layer Below (Clipping Mask) */}
+                {activeLayer && activeLayer.id !== 'layer-bg' && (
+                  <button
+                    onClick={() => onToggleClipping?.(activeLayer.id)}
+                    title={
+                      activeLayer.clipped
+                        ? 'Release Clipping Mask (Clip to Layer Below)'
+                        : 'Clip to Layer Below (Clipping Mask)'
+                    }
+                    className={`p-1 rounded-[2px] transition-colors ${
+                      activeLayer.clipped
+                        ? 'text-blue-400 bg-blue-950/50 ring-1 ring-blue-500/60 shadow-xs'
+                        : 'text-[#888888] hover:text-white hover:bg-[#333333]'
+                    }`}
+                  >
+                    <ClipToLayerIcon className="w-3.5 h-3.5" />
+                  </button>
+                )}
 
                 {/* Toggle Lock */}
                 {activeLayer && (
@@ -1048,7 +1288,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
             </div>
 
             {/* Scrollable Layer Stack List */}
-            <div className="flex-1 overflow-y-auto p-1.5 space-y-1 min-h-0">
+            <div ref={layerListContainerRef} className="flex-1 overflow-y-auto p-1.5 space-y-1 min-h-0">
               {layers.map((layer) => {
                 // If parent folder is collapsed, hide child layers
                 if (layer.parentId) {
@@ -1065,69 +1305,46 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                 const isDropInside = isTarget && dropIndicator.position === 'inside';
                 const isDropAbove = isTarget && dropIndicator.position === 'above';
                 const isDropBelow = isTarget && dropIndicator.position === 'below';
+                const isBeingDragged = draggedLayerId === layer.id;
 
                 return (
                   <div
                     key={layer.id}
-                    draggable={editingLayerId !== layer.id}
-                    onDragStart={(e) => {
-                      e.dataTransfer.setData('text/plain', layer.id);
-                      e.dataTransfer.effectAllowed = 'move';
-                      setDraggedLayerId(layer.id);
+                    data-layer-id={layer.id}
+                    onPointerDown={(e) => handleLayerPointerDown(e, layer.id)}
+                    onClick={() => {
+                      if (justDraggedRef.current) return;
+                      onSelectLayer(layer.id);
                     }}
-                    onDragEnd={() => {
-                      setDraggedLayerId(null);
-                      setDropIndicator(null);
-                    }}
-                    onDragOver={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      if (!draggedLayerId || draggedLayerId === layer.id) return;
-                      const rect = e.currentTarget.getBoundingClientRect();
-                      const yRatio = (e.clientY - rect.top) / rect.height;
-
-                      if (isFolder) {
-                        if (yRatio > 0.25 && yRatio < 0.75) {
-                          setDropIndicator({ id: layer.id, position: 'inside' });
-                        } else if (yRatio <= 0.25) {
-                          setDropIndicator({ id: layer.id, position: 'above' });
-                        } else {
-                          setDropIndicator({ id: layer.id, position: 'below' });
-                        }
-                      } else {
-                        if (yRatio <= 0.5) {
-                          setDropIndicator({ id: layer.id, position: 'above' });
-                        } else {
-                          setDropIndicator({ id: layer.id, position: 'below' });
-                        }
-                      }
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      e.stopPropagation();
-                      const sourceId = e.dataTransfer.getData('text/plain') || draggedLayerId;
-                      if (!sourceId || sourceId === layer.id || !dropIndicator) return;
-                      if (onReorderLayers) {
-                        onReorderLayers(sourceId, layer.id, dropIndicator.position);
-                      }
-                      setDropIndicator(null);
-                      setDraggedLayerId(null);
-                    }}
-                    onClick={() => onSelectLayer(layer.id)}
-                    className={`group relative flex items-center space-x-1.5 px-2 py-1.5 rounded-[2px] cursor-pointer transition-colors border ${
+                    className={`group relative flex items-center space-x-1.5 px-2 py-1.5 rounded-[2px] transition-colors border select-none ${
                       isInsideFolder ? 'ml-4 border-l-2 border-l-[#444444]' : ''
+                    } ${
+                      layer.clipped ? 'ml-3 pl-2 border-l-2 border-l-blue-500 bg-blue-950/20 shadow-xs' : ''
                     } ${
                       isDropInside
                         ? 'border-2 border-amber-400 bg-amber-950/40 shadow-md'
-                        : isDropAbove
-                        ? 'border-t-2 border-t-blue-500 border-x-transparent border-b-transparent'
-                        : isDropBelow
-                        ? 'border-b-2 border-b-blue-500 border-x-transparent border-t-transparent'
                         : isActive
                         ? 'bg-[#383838] border-[#555555] text-white shadow-sm'
                         : 'bg-[#242425] hover:bg-[#2b2b2c] border-transparent text-[#cccccc]'
+                    } ${
+                      isBeingDragged ? 'opacity-40 cursor-grabbing' : 'cursor-grab'
                     }`}
                   >
+                    {/* Visual Drop Insertion Line (Above / Below) */}
+                    {isDropAbove && (
+                      <div className="absolute -top-1 left-0 right-0 h-[2.5px] bg-blue-500 rounded-full z-30 pointer-events-none shadow-[0_0_8px_rgba(59,130,246,1)]" />
+                    )}
+                    {isDropBelow && (
+                      <div className="absolute -bottom-1 left-0 right-0 h-[2.5px] bg-blue-500 rounded-full z-30 pointer-events-none shadow-[0_0_8px_rgba(59,130,246,1)]" />
+                    )}
+
+                    {/* Drag Grip Handle */}
+                    <div
+                      className="w-3 h-3.5 flex items-center justify-center shrink-0 text-[#555555] group-hover:text-[#aaaaaa] transition-colors"
+                      title="Drag to reorder"
+                    >
+                      <GripVertical className="w-3 h-3" />
+                    </div>
                     {/* Visibility Eye Toggle */}
                     <button
                       onClick={(e) => {
@@ -1147,6 +1364,24 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                         <EyeOff className="w-3.5 h-3.5" />
                       )}
                     </button>
+
+                    {/* Clip to Layer Below Toggle Button (with standard indent arrow icon) */}
+                    {layer.id !== 'layer-bg' && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleClipping?.(layer.id);
+                        }}
+                        title={layer.clipped ? 'Release Clipping Mask' : 'Clip to Layer Below (Clipping Mask)'}
+                        className={`p-0.5 rounded-[2px] transition-colors shrink-0 ${
+                          layer.clipped
+                            ? 'text-blue-400 bg-blue-950/60 ring-1 ring-blue-500/50 shadow-xs'
+                            : 'text-[#555555] hover:text-white hover:bg-[#333333]'
+                        }`}
+                      >
+                        <ClipToLayerIcon className="w-3.5 h-3.5" />
+                      </button>
+                    )}
 
                     {/* Folder Collapse / Expand Chevron */}
                     {isFolder && (
@@ -1207,6 +1442,14 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                             style={{
                               backgroundColor: layer.id === 'layer-bg' ? '#ffffff' : 'transparent',
                             }}
+                          />
+                        )}
+
+                        {/* Clipping Mask Left Indicator Stripe (CSP style) */}
+                        {layer.clipped && (
+                          <div
+                            className="absolute left-0 top-0 bottom-0 w-1 bg-blue-500 rounded-l-[1px] z-10 shadow-xs"
+                            title="Clipped to layer below"
                           />
                         )}
                       </div>
@@ -1299,6 +1542,21 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                         </span>
                       )}
                     </div>
+
+                    {/* Alpha Lock Indicator Tag */}
+                    {layer.alphaLocked && (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onToggleAlphaLock?.(layer.id);
+                        }}
+                        className="p-0.5 text-amber-400 hover:text-amber-300 shrink-0"
+                        title="Transparent Pixels Locked (Alpha Lock: ON - click to toggle)"
+                      >
+                        <AlphaLockIcon className="w-3.5 h-3.5" />
+                      </button>
+                    )}
 
                     {/* Lock Indicator */}
                     {layer.locked && (

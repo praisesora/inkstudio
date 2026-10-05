@@ -9,6 +9,8 @@ interface LeftSidebarProps {
   primaryColor: string;
   secondaryColor: string;
   onSwapColors: () => void;
+  isTransparentColor?: boolean;
+  onToggleTransparentColor?: () => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -17,6 +19,8 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   primaryColor,
   secondaryColor,
   onSwapColors,
+  isTransparentColor = false,
+  onToggleTransparentColor,
 }) => {
   // Keyboard shortcuts: B for Brush, E for Eraser, I for Pipette, J for Liquify, X for swap colors
   useEffect(() => {
@@ -38,12 +42,14 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         onSelectTool('liquify');
       } else if (key === 'x') {
         onSwapColors();
+      } else if (key === 'c') {
+        onToggleTransparentColor?.();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [onSelectTool, onSwapColors]);
+  }, [onSelectTool, onSwapColors, onToggleTransparentColor]);
 
   return (
     <aside className="w-14 bg-[#252526] border-r border-[#333333] flex flex-col items-center py-3 select-none z-10 shrink-0">
@@ -129,12 +135,40 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
 
           {/* Primary Color Swatch (top-left) */}
           <div
-            onClick={onSwapColors}
-            title={`Primary Active Color: ${primaryColor}`}
-            className="absolute top-0 left-0 w-6 h-6 rounded-[2px] border border-white cursor-pointer shadow-md z-10"
+            onClick={() => {
+              if (isTransparentColor) {
+                onToggleTransparentColor?.();
+              } else {
+                onSwapColors();
+              }
+            }}
+            title={`Primary Active Color: ${primaryColor} (Click to select/swap)`}
+            className={`absolute top-0 left-0 w-6 h-6 rounded-[2px] cursor-pointer transition-all z-10 ${
+              !isTransparentColor
+                ? 'border border-white shadow-md ring-1 ring-white/40'
+                : 'border border-[#555555] hover:border-white opacity-80'
+            }`}
             style={{ backgroundColor: primaryColor }}
           />
         </div>
+
+        {/* Transparent Color Swatch (Clip Studio Paint 'C' key toggle) */}
+        <div
+          onClick={onToggleTransparentColor}
+          title="Transparent Ink / Color (C) - Brush as textured eraser"
+          className={`w-7 h-3.5 rounded-[2px] border cursor-pointer relative overflow-hidden transition-all ${
+            isTransparentColor
+              ? 'border-[#38bdf8] ring-2 ring-[#38bdf8] shadow-md scale-105'
+              : 'border-[#555555] hover:border-white opacity-80 hover:opacity-100'
+          }`}
+          style={{
+            backgroundImage:
+              'linear-gradient(45deg, #777 25%, transparent 25%), linear-gradient(-45deg, #777 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #777 75%), linear-gradient(-45deg, transparent 75%, #777 75%)',
+            backgroundSize: '4px 4px',
+            backgroundPosition: '0 0, 0 2px, 2px -2px, -2px 0px',
+            backgroundColor: '#bbb',
+          }}
+        />
 
         {/* Swap button */}
         <button
@@ -145,8 +179,8 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           <ArrowLeftRight className="w-3.5 h-3.5" />
         </button>
 
-        <span className="text-[10px] text-[#777777] font-mono">
-          X
+        <span className="text-[9px] text-[#777777] font-mono">
+          X / C
         </span>
       </div>
     </aside>

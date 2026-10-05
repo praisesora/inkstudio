@@ -116,7 +116,13 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
       </div>
 
       {/* Floating Tool Panel */}
-      <div className="w-80 bg-[#1e1f22] border border-[#383a40] rounded-md shadow-2xl overflow-hidden flex flex-col">
+      <div
+        className="w-80 bg-[#1e1f22] border border-[#383a40] rounded-md shadow-2xl overflow-hidden flex flex-col"
+        style={{
+          transform: `scale(${zoom > 0 ? 1 / zoom : 1})`,
+          transformOrigin: 'top left',
+        }}
+      >
         {/* Header Draggable Bar */}
         <div
           onPointerDown={handleDragDown}

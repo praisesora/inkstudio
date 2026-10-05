@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import {
   ToolType,
   BrushSettings,
@@ -55,6 +55,9 @@ import { multiplayerService } from './services/multiplayerService';
 import { HostModal } from './components/HostModal';
 import { ClipboardInviteToast } from './components/ClipboardInviteToast';
 import { WebLandingModal } from './components/WebLandingModal';
+import { WelcomeScreen } from './components/WelcomeScreen';
+import { FirstTimeNameModal } from './components/FirstTimeNameModal';
+import { saveRecentDocument, RecentDocument } from './utils/recentDocumentsManager';
 import {
   renderCompleteStroke,
   drawDot,
@@ -65,6 +68,7 @@ import {
   screenToCanvas,
   sampleCompositedColor,
 } from './utils/canvasUtils';
+import { globalTileGrid } from './utils/tileEngine';
 import { getNextCollabLayerName } from './hooks/useLayerManager';
 import { drawPencilDot, drawPencilBezierSegment, PencilGrade } from './utils/pencilEngine';
 import { Point } from './types/editor';
@@ -74,8 +78,16 @@ import {
   StrokeFinishMessage,
   MultiplayerMessage,
 } from './types/multiplayer';
+import { renderVectorStroke } from './utils/vectorEngine';
 
-import { AppSettings, loadAppSettings, saveAppSettings, ResizeCanvasOptions } from './types/settings';
+import {
+  AppSettings,
+  loadAppSettings,
+  saveAppSettings,
+  ResizeCanvasOptions,
+  resolveModernAccentColor,
+  hexToRgb,
+} from './types/settings';
 import {
   FilePlus,
   FolderOpen,
@@ -89,7 +101,7 @@ import {
   RotateCcw,
   Plus,
   Loader2,
-  Sparkles,
+  Info as InfoIcon,
   CheckCircle2,
   Copy,
   ClipboardPaste,
@@ -279,7 +291,30 @@ export function App() {
   useEffect(() => {
     const theme = appSettings.themePreset || 'vintage-manga';
     document.documentElement.setAttribute('data-theme', theme);
-  }, [appSettings.themePreset]);
+
+    if (theme === 'modern') {
+      const accent = appSettings.modernAccent || 'blue';
+      const hex = resolveModernAccentColor(accent, appSettings.modernCustomColor);
+      const rgb = hexToRgb(hex) || { r: 59, g: 130, b: 246 };
+      document.documentElement.setAttribute('data-accent', accent);
+      document.documentElement.setAttribute('data-tone', appSettings.uiTone || 'slate');
+      document.documentElement.style.setProperty('--modern-accent', hex);
+      document.documentElement.style.setProperty('--modern-accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
+      document.documentElement.style.setProperty('--modern-accent-glow', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.3)`);
+      document.documentElement.style.setProperty('--modern-accent-subtle', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.12)`);
+      document.documentElement.style.setProperty('--modern-accent-border', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4)`);
+      document.documentElement.style.setProperty('--modern-accent-hover', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.2)`);
+    } else {
+      document.documentElement.removeAttribute('data-accent');
+      document.documentElement.removeAttribute('data-tone');
+      document.documentElement.style.removeProperty('--modern-accent');
+      document.documentElement.style.removeProperty('--modern-accent-rgb');
+      document.documentElement.style.removeProperty('--modern-accent-glow');
+      document.documentElement.style.removeProperty('--modern-accent-subtle');
+      document.documentElement.style.removeProperty('--modern-accent-border');
+      document.documentElement.style.removeProperty('--modern-accent-hover');
+    }
+  }, [appSettings.themePreset, appSettings.modernAccent, appSettings.modernCustomColor, appSettings.uiTone]);
 
   const [isNewCanvasModalOpen, setIsNewCanvasModalOpen] = useState<boolean>(false);
   const [isResizeCanvasModalOpen, setIsResizeCanvasModalOpen] = useState<boolean>(false);
@@ -423,6 +458,8 @@ export function App() {
     setLayerMonoExpressMode,
     applyExpressionColorOfPreview,
     applyLayerColorPermanently,
+    toggleClipping,
+    toggleAlphaLock,
     convertLayer,
     fillScreentoneSelection,
   } = useLayerManager({ dimensions });
@@ -655,44 +692,103 @@ export function App() {
     }
 
     if (targetCanvas && strokeState.points.length > 0) {
-      const ctx = get2DContext(targetCanvas);
-      if (ctx) {
-        const isEraser = strokeState.tool === 'eraser';
-        const isBgEraser = isEraser && (targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg'));
-        const bs = strokeState.brushSettings;
-        const isTranslucentBrush = !isEraser && (bs.opacity ?? 1.0) < 0.999;
+      const targetLayer = layersRef.current.find((l) => l.id === targetLayerId);
+      const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
+      const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
 
-        if (isTranslucentBrush) {
-          const bakeCanvas = getReusableBakeCanvas(targetCanvas.width, targetCanvas.height);
-          const bCtx = get2DContext(bakeCanvas);
-          if (bCtx) {
-            bCtx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+      if (msg.vectorStroke && targetLayer?.type === 'vector') {
+        targetLayer.vectorStrokes = [...(targetLayer.vectorStrokes || []), msg.vectorStroke];
+        const ctx = get2DContext(targetCanvas);
+        if (ctx) {
+          renderVectorStroke(ctx, msg.vectorStroke);
+          const fullData = ctx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+          globalTileGrid.writeImageData(targetLayerId, fullData, 0, 0, targetFormat);
+        }
+        globalTileGrid.notifyChange(true);
+        updateLayerThumbnail(targetLayerId, true);
+      } else {
+        const ctx = get2DContext(targetCanvas);
+        if (ctx) {
+          const isEraser = strokeState.tool === 'eraser';
+          const isBgEraser = isEraser && (targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg'));
+          const bs = strokeState.brushSettings;
+          const isTranslucentBrush = !isEraser && (bs.opacity ?? 1.0) < 0.999;
+          const isAlphaLocked = Boolean(targetLayer?.alphaLocked);
+          const isTransparentInk = Boolean(bs.isTransparentInk);
+
+          if (isTranslucentBrush || isTransparentInk || isAlphaLocked) {
+            const bakeCanvas = getReusableBakeCanvas(targetCanvas.width, targetCanvas.height);
+            const bCtx = get2DContext(bakeCanvas);
+            if (bCtx) {
+              bCtx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+              renderCompleteStroke(
+                bCtx,
+                strokeState.points,
+                bs,
+                strokeState.tool,
+                colorMode,
+                isBgEraser,
+                targetCanvas,
+                isAlphaLocked
+              );
+              ctx.save();
+              ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
+              if (isTransparentInk) {
+                ctx.globalCompositeOperation = 'destination-out';
+              } else if (isAlphaLocked) {
+                ctx.globalCompositeOperation = 'source-atop';
+              } else {
+                ctx.globalCompositeOperation = 'source-over';
+              }
+              ctx.drawImage(bakeCanvas, 0, 0);
+              ctx.restore();
+            }
+          } else {
             renderCompleteStroke(
-              bCtx,
+              ctx,
               strokeState.points,
               bs,
               strokeState.tool,
               colorMode,
-              isBgEraser
+              isBgEraser,
+              targetCanvas,
+              isAlphaLocked
             );
-            ctx.save();
-            ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
-            ctx.globalCompositeOperation = 'source-over';
-            ctx.drawImage(bakeCanvas, 0, 0);
-            ctx.restore();
           }
-        } else {
-          renderCompleteStroke(
-            ctx,
-            strokeState.points,
-            bs,
-            strokeState.tool,
-            colorMode,
-            isBgEraser
-          );
-        }
 
-        updateLayerThumbnail(targetLayerId, true);
+          const pad = Math.ceil(Math.max(32, (bs.size || 10) * 1.5));
+          let dirtyX = 0;
+          let dirtyY = 0;
+          let dirtyW = targetCanvas.width;
+          let dirtyH = targetCanvas.height;
+
+          if (msg.dirtyRect) {
+            dirtyX = Math.max(0, Math.floor(msg.dirtyRect.x));
+            dirtyY = Math.max(0, Math.floor(msg.dirtyRect.y));
+            dirtyW = Math.min(targetCanvas.width - dirtyX, Math.ceil(msg.dirtyRect.width));
+            dirtyH = Math.min(targetCanvas.height - dirtyY, Math.ceil(msg.dirtyRect.height));
+          } else if (strokeState.points.length > 0) {
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            for (const pt of strokeState.points) {
+              if (pt.x < minX) minX = pt.x;
+              if (pt.y < minY) minY = pt.y;
+              if (pt.x > maxX) maxX = pt.x;
+              if (pt.y > maxY) maxY = pt.y;
+            }
+            dirtyX = Math.max(0, Math.floor(minX - pad));
+            dirtyY = Math.max(0, Math.floor(minY - pad));
+            dirtyW = Math.min(targetCanvas.width - dirtyX, Math.ceil(maxX + pad) - dirtyX);
+            dirtyH = Math.min(targetCanvas.height - dirtyY, Math.ceil(maxY + pad) - dirtyY);
+          }
+
+          if (dirtyW > 0 && dirtyH > 0) {
+            const afterData = ctx.getImageData(dirtyX, dirtyY, dirtyW, dirtyH);
+            globalTileGrid.writeImageData(targetLayerId, afterData, dirtyX, dirtyY, targetFormat);
+          }
+
+          globalTileGrid.notifyChange(true);
+          updateLayerThumbnail(targetLayerId, true);
+        }
       }
     }
 
@@ -801,6 +897,8 @@ export function App() {
     }
   }, [addRemoteLayer, deleteRemoteLayer, layerCanvasesRef, updateLayerThumbnail, renameLayer, toggleVisibility, setOpacity]);
 
+  const selectiveUndoRef = useRef<(peerId?: string | number) => void>(() => {});
+
   const {
     isConnected: isCollabConnected,
     isHost: isCollabHost,
@@ -832,6 +930,9 @@ export function App() {
     onRemoteJoinRequest: handleRemoteJoinRequest,
     onRemoteAssignedLayer: handleRemoteAssignedLayer,
     onRemoteLayerAction: handleRemoteLayerAction,
+    onRemoteSelectiveUndo: (_strokeId, peerId) => {
+      selectiveUndoRef.current(peerId);
+    },
     showToast,
   });
 
@@ -944,6 +1045,7 @@ export function App() {
     jumpToHistoryIndex,
     clearCanvas,
     resetHistory,
+    selectiveUndo,
     cursorPos,
     currentPressure,
     isHovering,
@@ -976,9 +1078,9 @@ export function App() {
         multiplayerService.sendStrokeChunk(strokeId, pts);
       }
     },
-    onCollabStrokeFinish: (strokeId, layerId, endPt, dirty) => {
+    onCollabStrokeFinish: (strokeId, layerId, endPt, dirty, vectorStroke) => {
       if (multiplayerService.isConnected()) {
-        multiplayerService.sendStrokeFinish(strokeId, layerId, endPt, dirty);
+        multiplayerService.sendStrokeFinish(strokeId, layerId, endPt, dirty, vectorStroke);
       }
     },
     onCollabCursorMove: (x, y, isDrawing, t) => {
@@ -989,6 +1091,17 @@ export function App() {
     perspectiveRuler: hasOpenDocument ? perspectiveRuler : null,
     onActiveConstraintAxisChange: setActiveLockedAxis,
   });
+
+  selectiveUndoRef.current = selectiveUndo;
+
+  const handleUndo = useCallback(() => {
+    if (isCollabConnected && collabMyPeer.id) {
+      selectiveUndo(collabMyPeer.id);
+      multiplayerService.sendSelectiveUndo(collabMyPeer.id.toString());
+    } else {
+      undo();
+    }
+  }, [isCollabConnected, collabMyPeer.id, selectiveUndo, undo]);
 
 
   const handleSelectTool = useCallback((newTool: ToolType) => {
@@ -1044,11 +1157,23 @@ export function App() {
     });
   }, []);
 
+  const [isTransparentColor, setIsTransparentColor] = useState<boolean>(false);
+
+  const toggleTransparentColor = useCallback(() => {
+    setIsTransparentColor((prev) => {
+      const next = !prev;
+      updateBrushSettings({ isTransparentInk: next });
+      showToast(next ? 'Transparent ink mode active' : 'Color ink mode active');
+      return next;
+    });
+  }, [updateBrushSettings, showToast]);
+
   const handlePrimaryColorChange = useCallback(
     (color: string, commit = true) => {
       const effective = enforceColorMode(color, colorMode);
       setPrimaryColor(effective);
-      updateBrushSettings({ color: effective });
+      setIsTransparentColor(false);
+      updateBrushSettings({ color: effective, isTransparentInk: false });
       if (commit) {
         addRecentColor(effective);
       }
@@ -1071,10 +1196,11 @@ export function App() {
   );
 
   const handleSwapColors = useCallback(() => {
+    setIsTransparentColor(false);
     setPrimaryColor((prevPrim) => {
       setSecondaryColor(prevPrim);
       const effective = enforceColorMode(secondaryColor, colorMode);
-      updateBrushSettings({ color: effective });
+      updateBrushSettings({ color: effective, isTransparentInk: false });
       addRecentColor(effective);
       return effective;
     });
@@ -2684,6 +2810,18 @@ export function App() {
       setPerspectiveRuler(null);
       setDocuments((prev) => [...prev, newDoc]);
       setActiveDocumentId(newDocId);
+
+      // Track in recent documents
+      saveRecentDocument({
+        id: newDocId,
+        title: name.replace(/\*+$/, ''),
+        path: `InkStudio\\${name.replace(/\*+$/, '')}.sora`,
+        size: 524288,
+        coverUrl: initialLayers[0]?.thumbnailUrl,
+        isStarred: false,
+        fileType: '.sora',
+      }).catch(console.warn);
+
       showToast(`Created ${name}`);
     },
     [primaryColor, resetHistory, resetToNewCanvas, resetZoomAndCenter, showToast, updateBrushSettings]
@@ -2857,6 +2995,18 @@ export function App() {
         setPerspectiveRuler(null);
         setDocuments((prev) => [...prev, newDoc]);
         setActiveDocumentId(newDocId);
+
+        // Track in recent documents
+        saveRecentDocument({
+          id: newDocId,
+          title: file.name,
+          path: (file as any).path || `C:\\Users\\Artist\\Documents\\InkStudio\\${file.name}`,
+          size: file.size || 1048576,
+          coverUrl: doc.layers[0]?.thumbnailUrl,
+          isStarred: false,
+          fileType: file.name.slice(file.name.lastIndexOf('.')),
+        }).catch(console.warn);
+
         showToast(`Opened ${file.name}`);
       } catch (err: unknown) {
         console.error('Failed to open file:', err);
@@ -3027,6 +3177,15 @@ export function App() {
         setDocuments((prev) =>
           prev.map((d) => (d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info } : d))
         );
+        saveRecentDocument({
+          id: activeDocumentId || `doc-${Date.now()}`,
+          title: info.name,
+          path: `InkStudio\\${info.name}`,
+          size: 1572864,
+          coverUrl: layers[0]?.thumbnailUrl,
+          isStarred: false,
+          fileType: info.extension,
+        }).catch(console.warn);
         showToast(`Saved to ${info.name}`);
       } catch (err: any) {
         if (err.message !== 'Save canceled') {
@@ -3041,6 +3200,15 @@ export function App() {
         setDocuments((prev) =>
           prev.map((d) => (d.id === activeDocumentId ? { ...d, name: savedFileInfo.name } : d))
         );
+        saveRecentDocument({
+          id: activeDocumentId || `doc-${Date.now()}`,
+          title: savedFileInfo.name,
+          path: `InkStudio\\${savedFileInfo.name}`,
+          size: 1572864,
+          coverUrl: layers[0]?.thumbnailUrl,
+          isStarred: false,
+          fileType: savedFileInfo.extension,
+        }).catch(console.warn);
         showToast(`Saved to ${savedFileInfo.name}`);
       } catch (err: any) {
         console.warn('Direct handle save failed, prompting with Save As:', err);
@@ -3051,6 +3219,15 @@ export function App() {
           setDocuments((prev) =>
             prev.map((d) => (d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info } : d))
           );
+          saveRecentDocument({
+            id: activeDocumentId || `doc-${Date.now()}`,
+            title: info.name,
+            path: `InkStudio\\${info.name}`,
+            size: 1572864,
+            coverUrl: layers[0]?.thumbnailUrl,
+            isStarred: false,
+            fileType: info.extension,
+          }).catch(console.warn);
           showToast(`Saved to ${info.name}`);
         } catch (e: any) {
           if (e.message !== 'Save canceled') {
@@ -3093,6 +3270,15 @@ export function App() {
       setDocuments((prev) =>
         prev.map((d) => (d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info } : d))
       );
+      saveRecentDocument({
+        id: activeDocumentId || `doc-${Date.now()}`,
+        title: info.name,
+        path: `InkStudio\\${info.name}`,
+        size: 1572864,
+        coverUrl: layers[0]?.thumbnailUrl,
+        isStarred: false,
+        fileType: info.extension,
+      }).catch(console.warn);
       showToast(`Saved as ${info.name}`);
     } catch (err: any) {
       if (err.message !== 'Save canceled') {
@@ -3159,7 +3345,7 @@ export function App() {
         if (!e.shiftKey && (key === 'z' || e.code === 'KeyZ')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
-          undo();
+          handleUndo();
           return;
         }
         // Redo: Ctrl+Shift+Z or Ctrl+Y
@@ -3304,6 +3490,8 @@ export function App() {
           handleSelectTool('liquify');
         } else if (key === 'x') {
           handleSwapColors();
+        } else if (key === 'c') {
+          toggleTransparentColor();
         } else if (key === '[') {
           setIsLeftPanelHidden((prev) => !prev);
         } else if (key === 'delete') {
@@ -3344,11 +3532,12 @@ export function App() {
     handleSave,
     handleSaveAs,
     handleSwapColors,
+    toggleTransparentColor,
     handleTriggerOpenFile,
     hasOpenDocument,
     activeLayer,
     redo,
-    undo,
+    handleUndo,
     handleStartTransform,
     handleDeselect,
     handleInvertSelection,
@@ -3596,7 +3785,7 @@ export function App() {
           shortcut: 'Ctrl+Z',
           icon: <Undo2 className="w-3.5 h-3.5" />,
           disabled: !hasOpenDocument || !canUndo,
-          onClick: undo,
+          onClick: handleUndo,
         },
         {
           id: 'edit-redo',
@@ -4142,7 +4331,7 @@ export function App() {
         {
           id: 'help-about',
           label: 'About Ink Studio',
-          icon: <Sparkles className="w-3.5 h-3.5 text-amber-400" />,
+          icon: <InfoIcon className="w-3.5 h-3.5 text-[#93c5fd]" />,
           onClick: () => {
             alert(
               'Ink Studio — Professional Digital Painting & Manga Studio\n\n' +
@@ -4160,10 +4349,85 @@ export function App() {
     },
   ];
 
+  const handleSaveFirstTimeName = useCallback(
+    (name: string) => {
+      const updated: AppSettings = {
+        ...appSettings,
+        userName: name,
+        hasPromptedName: true,
+      };
+      setAppSettings(updated);
+      saveAppSettings(updated);
+      try {
+        localStorage.setItem('sora_paint_nickname', name);
+      } catch {
+        // ignore
+      }
+      showToast(`Welcome, ${name}!`);
+    },
+    [appSettings, showToast]
+  );
+
+  const handleSelectWelcomeDocument = useCallback(
+    async (doc: RecentDocument) => {
+      // 1. If running in Tauri, attempt to read directly from PC disk
+      if (typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__) {
+        try {
+          const { invoke } = await import('@tauri-apps/api/core');
+          const bytes = await invoke<number[]>('read_file_from_disk', { path: doc.path });
+          if (bytes && bytes.length > 0) {
+            const uint8 = new Uint8Array(bytes);
+            const file = new File([uint8], doc.title, { type: 'application/octet-stream' });
+            await handleProcessFile(file);
+            return;
+          }
+        } catch (err) {
+          console.warn('Direct disk read via Tauri failed, fallback:', err);
+        }
+      }
+
+      // 2. Fallback: Initialize new canvas with the document title and standard dimensions
+      handleCreateNewCanvas({
+        width: 1920,
+        height: 1080,
+        dpi: 300,
+        colorMode: 'color',
+        name: doc.title,
+        backgroundColor: '#ffffff',
+        aspectRatioPreset: '16:9',
+        aspectRatioX: 16,
+        aspectRatioY: 9,
+        lockAspectRatio: true,
+      });
+      showToast(`Loaded workspace for "${doc.title}"`);
+    },
+    [handleCreateNewCanvas, handleProcessFile, showToast]
+  );
+
+  const isModernTheme = appSettings.themePreset === 'modern';
+  const modernAccent = appSettings.modernAccent || 'blue';
+  const modernAccentHex = resolveModernAccentColor(modernAccent, appSettings.modernCustomColor);
+  const modernAccentRgb = hexToRgb(modernAccentHex) || { r: 59, g: 130, b: 246 };
+
+  const modernStyleVars = useMemo(() => {
+    if (!isModernTheme) return undefined;
+    return {
+      '--modern-accent': modernAccentHex,
+      '--modern-accent-rgb': `${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}`,
+      '--modern-accent-glow': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.28)`,
+      '--modern-accent-subtle': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.12)`,
+      '--modern-accent-border': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.42)`,
+      '--modern-accent-hover': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.2)`,
+    } as React.CSSProperties;
+  }, [isModernTheme, modernAccentHex, modernAccentRgb.r, modernAccentRgb.g, modernAccentRgb.b]);
+
   return (
     <div
       className="flex flex-col w-screen h-screen overflow-hidden bg-[#1e1e1e] text-[#cccccc] font-sans app-root-container"
       data-theme={appSettings.themePreset || 'vintage-manga'}
+      data-accent={isModernTheme ? modernAccent : undefined}
+      data-tone={isModernTheme ? (appSettings.uiTone || 'slate') : undefined}
+      style={modernStyleVars}
     >
       {/* Hidden File Input for Native File Picker */}
       <input
@@ -4201,7 +4465,7 @@ export function App() {
         onBrushSizeChange={handleBrushSizeChange}
         canUndo={hasOpenDocument && canUndo}
         canRedo={hasOpenDocument && canRedo}
-        onUndo={undo}
+        onUndo={handleUndo}
         onRedo={redo}
         zoom={zoom}
         onZoomIn={zoomIn}
@@ -4221,15 +4485,28 @@ export function App() {
       />
 
 
-      {/* Main Workspace: Left Panel + Center Canvas Column + Right Sidebar */}
+      {/* Main Workspace */}
       <div className="flex flex-1 overflow-hidden relative">
-        <LeftPanel
+        {!hasOpenDocument ? (
+          <WelcomeScreen
+            userName={appSettings.userName}
+            onNewDocument={() => setIsNewCanvasModalOpen(true)}
+            onOpenFile={handleTriggerOpenFile}
+            onSelectRecentDocument={handleSelectWelcomeDocument}
+            showToast={showToast}
+            themePreset={appSettings.themePreset}
+          />
+        ) : (
+          <>
+            <LeftPanel
           currentTool={tool}
           onSelectTool={handleSelectTool}
           brushSettings={brushSettings}
           onUpdateBrushSettings={updateBrushSettings}
           primaryColor={primaryColor}
           secondaryColor={secondaryColor}
+          isTransparentColor={isTransparentColor}
+          onToggleTransparentColor={toggleTransparentColor}
           onPrimaryColorChange={handlePrimaryColorChange}
           onSecondaryColorChange={handleSecondaryColorChange}
           onSwapColors={handleSwapColors}
@@ -4287,6 +4564,7 @@ export function App() {
             onPointerEnter={handlePointerEnter}
             onPointerLeave={handlePointerLeave}
             layers={layers}
+            layerCanvasesRef={layerCanvasesRef}
             registerLayerCanvas={registerLayerCanvas}
             getEffectiveOpacity={getEffectiveOpacity}
             isLayerEffectivelyVisible={isLayerEffectivelyVisible}
@@ -4353,7 +4631,7 @@ export function App() {
           onJumpToHistory={jumpToHistoryIndex}
           canUndo={hasOpenDocument && canUndo}
           canRedo={hasOpenDocument && canRedo}
-          onUndo={undo}
+          onUndo={handleUndo}
           onRedo={redo}
           layers={hasOpenDocument ? layers : []}
           activeLayerId={hasOpenDocument ? activeLayerId : ''}
@@ -4366,6 +4644,8 @@ export function App() {
           onSetOpacity={handleSetOpacity}
           onSetBlendMode={setBlendMode}
           onToggleLock={toggleLock}
+          onToggleAlphaLock={toggleAlphaLock}
+          onToggleClipping={toggleClipping}
           onToggleCollapse={toggleCollapse}
           onRenameLayer={handleRenameLayer}
           onMoveLayer={moveLayer}
@@ -4388,6 +4668,8 @@ export function App() {
           width={rightSidebarWidth}
           onWidthChange={handleRightSidebarWidthChange}
         />
+        </>
+        )}
       </div>
 
       {/* Bottom Status Bar */}
@@ -4506,6 +4788,12 @@ export function App() {
           <span className="font-medium">{toastMessage}</span>
         </div>
       )}
+
+      {/* First Time Setup Name Modal */}
+      <FirstTimeNameModal
+        isOpen={!appSettings.hasPromptedName && !appSettings.userName}
+        onSaveName={handleSaveFirstTimeName}
+      />
     </div>
   );
 }

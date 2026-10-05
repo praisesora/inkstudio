@@ -8,9 +8,12 @@ import {
   StrokeFinishMessage,
   CursorMoveMessage,
   JoinAcceptedMessage,
+  TileStreamMessage,
+  SelectiveUndoMessage,
 } from '../types/multiplayer';
 import { multiplayerService } from '../services/multiplayerService';
 import { LayerItem, CanvasDimensions, CanvasColorMode } from '../types/editor';
+import { globalTileGrid, TILE_SIZE, TileBuffer } from '../utils/tileEngine';
 
 const PEER_COLORS = [
   '#f43f5e', // Rose
@@ -44,6 +47,7 @@ export interface UseMultiplayerProps {
   onRemoteDocSync?: (dimensions: CanvasDimensions, colorMode: CanvasColorMode, layers: LayerItem[], dataUrls: Record<string, string>) => void;
   onRemoteJoinRequest?: (peer: CollabPeer) => { assignedLayerId: string; updatedLayers: LayerItem[] } | void;
   onRemoteAssignedLayer?: (layerId: string) => void;
+  onRemoteSelectiveUndo?: (strokeId: string, peerId: string | number) => void;
   showToast: (msg: string) => void;
 }
 
@@ -59,6 +63,7 @@ export function useMultiplayer({
   onRemoteDocSync,
   onRemoteJoinRequest,
   onRemoteAssignedLayer,
+  onRemoteSelectiveUndo,
   showToast,
 }: UseMultiplayerProps) {
   const [isConnected, setIsConnected] = useState(false);
@@ -120,6 +125,7 @@ export function useMultiplayer({
   const onRemoteDocSyncRef = useRef(onRemoteDocSync);
   const onRemoteJoinRequestRef = useRef(onRemoteJoinRequest);
   const onRemoteAssignedLayerRef = useRef(onRemoteAssignedLayer);
+  const onRemoteSelectiveUndoRef = useRef(onRemoteSelectiveUndo);
   const showToastRef = useRef(showToast);
 
   onRemoteStrokeStartRef.current = onRemoteStrokeStart;
@@ -129,6 +135,7 @@ export function useMultiplayer({
   onRemoteDocSyncRef.current = onRemoteDocSync;
   onRemoteJoinRequestRef.current = onRemoteJoinRequest;
   onRemoteAssignedLayerRef.current = onRemoteAssignedLayer;
+  onRemoteSelectiveUndoRef.current = onRemoteSelectiveUndo;
   showToastRef.current = showToast;
 
   // Handle incoming messages
@@ -167,16 +174,6 @@ export function useMultiplayer({
                 }
               }
 
-              // Snapshot all canvases for initial synchronization
-              const layerDataUrls: Record<string, string> = {};
-              layerCanvasesRef.current.forEach((canvas, id) => {
-                try {
-                  layerDataUrls[id] = canvas.toDataURL('image/png');
-                } catch (e) {
-                  console.warn('Failed to snapshot canvas for layer', id, e);
-                }
-              });
-
               // Send JOIN_ACCEPTED to the joining guest
               const joinAcceptedMsg: JoinAcceptedMessage = {
                 type: 'JOIN_ACCEPTED',
@@ -197,8 +194,16 @@ export function useMultiplayer({
                 dimensions: dimensionsRef.current,
                 colorMode: colorModeRef.current,
                 layers: effectiveLayers,
-                layerDataUrls,
+                layerDataUrls: {},
               });
+
+              // Progressive Tile Streaming: stream active layer tiles progressively from sparse tile grid
+              for (const layer of effectiveLayers) {
+                const tiles = globalTileGrid.getLayerTiles(layer.id);
+                for (const tile of tiles) {
+                  multiplayerService.sendTileDelta(layer.id, tile);
+                }
+              }
 
               // Broadcast PEER_JOINED to other already connected peers
               multiplayerService.sendMessage({
@@ -356,6 +361,36 @@ export function useMultiplayer({
           setTimeout(() => {
             setActivePings((prev) => prev.filter((p) => p.id !== pingId));
           }, 2400);
+          break;
+        }
+
+        case 'BINARY_TILE': {
+          const tMsg = msg as TileStreamMessage;
+          const tile: TileBuffer = {
+            layerId: tMsg.layerId,
+            tileX: tMsg.tileX,
+            tileY: tMsg.tileY,
+            format: tMsg.format,
+            version: tMsg.version,
+            data: tMsg.data,
+            dirty: true,
+          };
+          globalTileGrid.setTile(tMsg.layerId, tMsg.tileX, tMsg.tileY, tile);
+          const canvas = layerCanvasesRef.current.get(tMsg.layerId);
+          if (canvas) {
+            globalTileGrid.renderLayerToCanvas(tMsg.layerId, canvas, {
+              x: tMsg.tileX * TILE_SIZE,
+              y: tMsg.tileY * TILE_SIZE,
+              width: TILE_SIZE,
+              height: TILE_SIZE,
+            });
+          }
+          break;
+        }
+
+        case 'SELECTIVE_UNDO': {
+          const uMsg = msg as SelectiveUndoMessage;
+          onRemoteSelectiveUndoRef.current?.(uMsg.strokeId, uMsg.peerId);
           break;
         }
       }

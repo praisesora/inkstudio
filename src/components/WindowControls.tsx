@@ -93,6 +93,53 @@ export const WindowControls: React.FC<WindowControlsProps> = ({ themePreset: _th
     }
   }, [isTauri]);
 
+  if (_themePreset === 'modern') {
+    return (
+      <div
+        className="flex items-center ml-2 shrink-0 select-none"
+        data-tauri-drag-region="false"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
+        <div className="flex items-center space-x-1.5 px-2 py-1 rounded-full bg-white/[0.04] border border-white/[0.08]">
+          {/* Minimize button */}
+          <button
+            type="button"
+            onClick={handleMinimize}
+            tabIndex={-1}
+            title="Minimize"
+            className="w-3 h-3 rounded-full bg-white/20 hover:bg-amber-400 hover:text-black flex items-center justify-center text-white/50 transition-all cursor-pointer"
+          >
+            <span className="w-1.5 h-[1px] bg-currentColor rounded-full" />
+          </button>
+
+          {/* Maximize button */}
+          <button
+            type="button"
+            onClick={handleToggleMaximize}
+            tabIndex={-1}
+            title={isMaximized ? 'Restore' : 'Maximize'}
+            className="w-3 h-3 rounded-full bg-white/20 hover:bg-emerald-400 hover:text-black flex items-center justify-center text-white/50 transition-all cursor-pointer"
+          >
+            <span className="w-1.5 h-1.5 border border-currentColor rounded-[0.5px]" />
+          </button>
+
+          {/* Close button */}
+          <button
+            type="button"
+            onClick={handleClose}
+            tabIndex={-1}
+            title="Close"
+            className="w-3 h-3 rounded-full bg-white/20 hover:bg-rose-500 hover:text-white flex items-center justify-center text-white/50 transition-all cursor-pointer"
+          >
+            <svg width="6" height="6" viewBox="0 0 8 8" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <path d="M1 1L7 7M7 1L1 7" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   // Japanese Manga Studio / ComicStudio rounded capsule control pod (Old Studio)
   return (
     <div

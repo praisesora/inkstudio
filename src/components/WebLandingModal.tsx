@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Sparkles, Globe, Monitor, ArrowRight, X } from 'lucide-react';
+import { Users, Globe, Monitor, ArrowRight, X } from 'lucide-react';
 import { isTauriEnvironment } from '../hooks/useMultiplayer';
 
 interface WebLandingModalProps {
@@ -41,76 +41,76 @@ export const WebLandingModal: React.FC<WebLandingModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-sm p-4">
-      <div className="relative w-full max-w-md rounded-xl border border-[#444444] bg-[#1e1e1e] p-6 shadow-2xl text-white">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none">
+      <div className="relative w-full max-w-md rounded-[2px] border border-[#242426] bg-[#444447] p-5 shadow-[0_8px_24px_rgba(0,0,0,0.8)] text-[#d6d6da]">
         <button
           onClick={onDismiss}
-          className="absolute top-4 right-4 rounded p-1 text-[#888888] hover:bg-[#333333] hover:text-white transition-colors cursor-pointer"
+          className="absolute top-3 right-3 rounded-[2px] p-1 text-[#99999e] hover:bg-[#525255] hover:text-white transition-colors cursor-pointer"
         >
           <X className="w-4 h-4" />
         </button>
 
         {/* Header Icon */}
-        <div className="flex items-center space-x-3 mb-5">
-          <div className="flex items-center justify-center w-10 h-10 rounded-xl bg-[#2a2a2a] border border-[#3e3e3e] shadow-md">
-            <Sparkles className="w-5 h-5 text-[#cccccc]" />
+        <div className="flex items-center space-x-2.5 mb-4">
+          <div className="flex items-center justify-center w-8 h-8 rounded-[2px] bg-[#363639] border border-[#242426] shadow-xs">
+            <Users className="w-4 h-4 text-[#93c5fd]" />
           </div>
           <div>
-            <h2 className="text-base font-bold text-white">Ink Studio Collab</h2>
-            <p className="text-xs text-[#999999]">Real-time collaborative drawing</p>
+            <h2 className="text-sm font-semibold text-[#f0f0f4]">Ink Studio Collab</h2>
+            <p className="text-[11px] text-[#8c8c92]">Real-time canvas session</p>
           </div>
         </div>
 
         {/* Room Info Card */}
-        <div className="rounded-lg border border-[#333333] bg-[#282828] p-3.5 mb-5 space-y-1">
-          <div className="text-[11px] font-medium text-[#aaaaaa]">Connecting to canvas:</div>
-          <div className="text-sm font-semibold text-white">"{invite.roomName}"</div>
-          <div className="text-[11px] text-[#777777] font-mono">
+        <div className="rounded-[2px] border border-[#242426] bg-[#2b2b2e] p-3 mb-4 space-y-1 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.5)]">
+          <div className="text-[11px] font-medium text-[#99999e]">Connecting to canvas:</div>
+          <div className="text-xs font-semibold text-[#f0f0f4]">"{invite.roomName}"</div>
+          <div className="text-[10px] text-[#808085] font-mono">
             Host: {invite.host}{invite.port && invite.port !== 443 && invite.port !== 80 ? `:${invite.port}` : ''}
           </div>
         </div>
 
         {/* Name input */}
-        <div className="mb-5">
-          <label className="block text-xs font-medium text-[#cccccc] mb-1.5">
-            Your nickname on canvas:
+        <div className="mb-4 space-y-1">
+          <label className="block text-xs font-medium text-[#cccccc]">
+            Artist Nickname:
           </label>
           <input
             type="text"
             value={userName}
             onChange={(e) => setUserName(e.target.value)}
-            placeholder="Enter nickname..."
-            className="w-full rounded-md border border-[#3e3e3e] bg-[#141414] px-3.5 py-2 text-sm text-white focus:border-[#007acc] focus:outline-hidden"
+            placeholder="Artist..."
+            className="w-full rounded-[2px] border border-[#1e1e20] bg-[#2b2b2e] px-2.5 py-1.5 text-xs text-[#f0f0f4] placeholder-[#707075] outline-none focus:border-[#4a8fc7] shadow-[inset_1px_1px_2px_rgba(0,0,0,0.5)]"
           />
         </div>
 
         {/* Action Buttons */}
-        <div className="space-y-2.5">
+        <div className="space-y-2">
           <button
             onClick={handleJoinBrowser}
-            className="w-full flex items-center justify-between rounded-lg border border-[#3e3e3e] bg-[#2a2a2a] hover:bg-[#333333] hover:border-[#4e4e4e] px-4 py-3 text-sm font-semibold text-white transition-colors shadow-sm cursor-pointer"
+            className="w-full flex items-center justify-between rounded-[2px] border border-[#242426] bg-gradient-to-b from-[#56565a] to-[#424245] hover:from-[#626266] hover:to-[#4b4b4e] px-3.5 py-2 text-xs font-medium text-[#f0f0f4] transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.18),0_1px_1px_rgba(0,0,0,0.3)] cursor-pointer"
           >
-            <div className="flex items-center space-x-2.5">
-              <Globe className="w-4 h-4" />
-              <span>Continue directly in browser</span>
+            <div className="flex items-center space-x-2">
+              <Globe className="w-3.5 h-3.5 text-[#93c5fd]" />
+              <span>Connect in Web Browser</span>
             </div>
-            <ArrowRight className="w-4 h-4" />
+            <ArrowRight className="w-3.5 h-3.5" />
           </button>
 
           <button
             onClick={handleOpenInApp}
-            className="w-full flex items-center justify-between rounded-lg border border-[#3e3e3e] bg-[#2a2a2a] hover:bg-[#333333] px-4 py-2.5 text-xs font-medium text-[#e0e0e0] transition-colors cursor-pointer"
+            className="w-full flex items-center justify-between rounded-[2px] border border-[#242426] bg-gradient-to-b from-[#48484c] to-[#38383b] hover:from-[#525256] hover:to-[#404043] px-3.5 py-2 text-xs font-medium text-[#d0d0d5] transition-colors shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] cursor-pointer"
           >
-            <div className="flex items-center space-x-2.5">
-              <Monitor className="w-4 h-4 text-emerald-400" />
-              <span>Open in Ink Studio App (.exe)</span>
+            <div className="flex items-center space-x-2">
+              <Monitor className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Launch Desktop Client (.exe)</span>
             </div>
           </button>
         </div>
 
-        <div className="mt-4 text-center">
-          <span className="text-[11px] text-[#777777]">
-            Drawing in browser requires no installation and supports graphic tablets and styluses!
+        <div className="mt-3.5 text-center">
+          <span className="text-[10px] text-[#808085]">
+            Supports graphic tablets, stylus pressure, and real-time synchronization.
           </span>
         </div>
       </div>
