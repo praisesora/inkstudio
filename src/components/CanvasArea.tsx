@@ -9,6 +9,7 @@ import {
   ToolType,
   LiquifySettings,
   SpeechBalloon,
+  SoftProofSettings,
 } from '../types/editor';
 import { ROTATE_CURSOR_CSS } from '../hooks/useCanvasNavigation';
 import { SelectionOverlay } from './SelectionOverlay';
@@ -108,6 +109,7 @@ interface CanvasAreaProps {
   onAddAnimationCel?: (frameIndex: number) => void;
   onDeleteAnimationCel?: (frameIndex: number) => void;
   onSelectCelLayer?: (layerId: string) => void;
+  softProofSettings?: SoftProofSettings;
 }
 
 function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
@@ -213,6 +215,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onAddAnimationCel,
   onDeleteAnimationCel,
   onSelectCelLayer,
+  softProofSettings,
 }) => {
 
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
@@ -418,7 +421,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           { pan, zoom, rotation },
           dimensions,
           globalTileGrid,
-          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames }
+          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames, softProof: softProofSettings }
         );
       }
 
@@ -432,7 +435,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     updateCanvasSizes();
     window.addEventListener('resize', updateCanvasSizes);
     return () => window.removeEventListener('resize', updateCanvasSizes);
-  }, [viewportRef, effectiveDraftCanvasRef, effectiveLayers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames]);
+  }, [viewportRef, effectiveDraftCanvasRef, effectiveLayers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames, softProofSettings]);
 
   // Render scene using Unified GPU Viewport Compositor
   useEffect(() => {
@@ -466,9 +469,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       { pan, zoom, rotation },
       dimensions,
       globalTileGrid,
-      { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames }
+      { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames, softProof: softProofSettings }
     );
-  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas, onionSkinFrames]);
+  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas, onionSkinFrames, softProofSettings]);
 
   // Event-Driven Compositor Invalidation via SparseTileGrid subscription
   useEffect(() => {
@@ -481,7 +484,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           { pan, zoom, rotation },
           dimensions,
           globalTileGrid,
-          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames }
+          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames, softProof: softProofSettings }
         );
       }
     };
@@ -507,7 +510,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       unsubscribe();
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames]);
+  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames, softProofSettings]);
 
   useEffect(() => {
     return () => {

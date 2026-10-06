@@ -22,6 +22,9 @@ import {
   VectorEditSettings,
   SpeechBalloon,
   AnimationTimeline,
+  CmykStandard,
+  SoftProofSettings,
+  DEFAULT_SOFT_PROOF_SETTINGS,
 } from './types/editor';
 import {
   createDefaultAnimationTimeline,
@@ -175,6 +178,7 @@ import {
   Sparkles,
   MessageSquare,
   Spline,
+  Check,
 } from 'lucide-react';
 import { parseSutFile } from './utils/sutParser';
 import {
@@ -358,6 +362,30 @@ export function App() {
   const [colorMode, setColorMode] = useState<CanvasColorMode>('color');
   const [documentName, setDocumentName] = useState<string>('');
 
+  // CMYK Soft Proofing & Gamut Warning
+  const [softProofSettings, setSoftProofSettings] = useState<SoftProofSettings>(DEFAULT_SOFT_PROOF_SETTINGS);
+
+  const toggleSoftProof = useCallback(() => {
+    setSoftProofSettings((prev) => ({
+      ...prev,
+      enabled: !prev.enabled,
+    }));
+  }, []);
+
+  const toggleGamutWarning = useCallback(() => {
+    setSoftProofSettings((prev) => ({
+      ...prev,
+      gamutWarning: !prev.gamutWarning,
+    }));
+  }, []);
+
+  const setProofStandard = useCallback((standard: CmykStandard) => {
+    setSoftProofSettings((prev) => ({
+      ...prev,
+      standard,
+    }));
+  }, []);
+
   // Multi-document tab management (starts empty by default)
   const [documents, setDocuments] = useState<DocumentTab[]>([]);
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
@@ -519,6 +547,10 @@ export function App() {
     setLayers,
     activeLayerId,
     setActiveLayerId,
+    selectedLayerIds,
+    toggleLayerSelection,
+    deleteSelectedLayers,
+    groupSelectedLayers,
     activeLayer,
     layerCanvasesRef,
     registerLayerCanvas,
@@ -1257,6 +1289,20 @@ export function App() {
     },
     [deleteLayer, isCollabConnected]
   );
+
+  const handleDeleteSelectedLayers = useCallback(() => {
+    if (selectedLayerIds && selectedLayerIds.length > 1) {
+      deleteSelectedLayers();
+      showToast(`Deleted ${selectedLayerIds.length} layers`);
+    } else {
+      handleDeleteLayer(activeLayerId);
+    }
+  }, [selectedLayerIds, deleteSelectedLayers, handleDeleteLayer, activeLayerId, showToast]);
+
+  const handleGroupSelectedLayers = useCallback(() => {
+    groupSelectedLayers();
+    showToast('Grouped layers into folder');
+  }, [groupSelectedLayers, showToast]);
 
   const handleToggleVisibility = useCallback(
     (id: string) => {
@@ -2227,6 +2273,129 @@ export function App() {
       });
       setSelection(null);
     } else {
+      const isMultiLayer = !selection && selectedLayerIds && selectedLayerIds.length > 1;
+      const multiTargetLayers = isMultiLayer
+        ? layers.filter((l) => selectedLayerIds.includes(l.id) && l.type === 'raster')
+        : [];
+
+      if (isMultiLayer && multiTargetLayers.length > 1) {
+        // Multi-Layer Batch Transform
+        const layerBeforeImages = new Map<string, ImageData>();
+        const layerSourceCanvases = new Map<string, HTMLCanvasElement>();
+
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+
+        for (const lyr of multiTargetLayers) {
+          const c = layerCanvasesRef.current.get(lyr.id);
+          if (!c) continue;
+          const cCtx = get2DContext(c);
+          if (!cCtx) continue;
+          const bData = cCtx.getImageData(0, 0, c.width, c.height);
+          layerBeforeImages.set(lyr.id, bData);
+
+          const cb = getCanvasContentBounds(c, lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg'));
+          if (cb) {
+            minX = Math.min(minX, cb.x);
+            minY = Math.min(minY, cb.y);
+            maxX = Math.max(maxX, cb.x + cb.width);
+            maxY = Math.max(maxY, cb.y + cb.height);
+          }
+        }
+
+        if (!isFinite(minX) || !isFinite(minY) || maxX <= minX || maxY <= minY) {
+          showToast('Selected layers are empty');
+          return;
+        }
+
+        const b = {
+          x: Math.max(0, minX),
+          y: Math.max(0, minY),
+          width: Math.max(1, maxX - minX),
+          height: Math.max(1, maxY - minY),
+        };
+
+        const compositeCanvas = document.createElement('canvas');
+        compositeCanvas.width = b.width;
+        compositeCanvas.height = b.height;
+        const compCtx = get2DContext(compositeCanvas);
+
+        const orderedLayers = multiTargetLayers.slice().reverse();
+        for (const lyr of orderedLayers) {
+          const c = layerCanvasesRef.current.get(lyr.id);
+          if (!c) continue;
+          const cCtx = get2DContext(c);
+          if (!cCtx) continue;
+
+          const sCanvas = document.createElement('canvas');
+          sCanvas.width = b.width;
+          sCanvas.height = b.height;
+          const sCtx = get2DContext(sCanvas);
+          if (sCtx) {
+            sCtx.drawImage(c, -b.x, -b.y);
+            layerSourceCanvases.set(lyr.id, sCanvas);
+          }
+
+          if (compCtx) {
+            compCtx.save();
+            compCtx.globalAlpha = lyr.opacity;
+            compCtx.drawImage(sCanvas, 0, 0);
+            compCtx.restore();
+          }
+
+          const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
+          if (isLayerBg) {
+            cCtx.fillStyle = '#ffffff';
+            cCtx.fillRect(b.x, b.y, b.width, b.height);
+          } else {
+            cCtx.clearRect(b.x, b.y, b.width, b.height);
+          }
+
+          const existingSrc = layerSourceCanvasesRef.current?.get(lyr.id);
+          if (existingSrc) {
+            const escCtx = get2DContext(existingSrc);
+            if (escCtx) {
+              if (isLayerBg) {
+                escCtx.fillStyle = '#ffffff';
+                escCtx.fillRect(b.x, b.y, b.width, b.height);
+              } else {
+                escCtx.clearRect(b.x, b.y, b.width, b.height);
+              }
+            }
+          }
+          updateLayerThumbnail(lyr.id, true);
+        }
+
+        const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
+        setTransformSession({
+          active: true,
+          layerId: activeLayerId,
+          layerIds: multiTargetLayers.map((l) => l.id),
+          layerSourceCanvases,
+          layerBeforeImages,
+          sourceCanvas: compositeCanvas,
+          beforeImageData: layerBeforeImages.get(activeLayerId) || Array.from(layerBeforeImages.values())[0],
+          bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
+          x: b.x,
+          y: b.y,
+          width: b.width,
+          height: b.height,
+          rotation: 0,
+          flipH: false,
+          flipV: false,
+          isSelection: false,
+          mode: 'affine',
+          perspectiveQuad: quad,
+          meshCols: 4,
+          meshRows: 4,
+          meshPoints: createDefaultMeshPoints(quad, 4, 4),
+        });
+        setTool('transform');
+        return;
+      }
+
       const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const contentBounds = getCanvasContentBounds(canvas, isBg);
       let b = contentBounds;
@@ -2293,10 +2462,85 @@ export function App() {
       });
     }
     setTool('transform');
-  }, [transformSession, getActiveCanvas, selection, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, showToast]);
+  }, [transformSession, getActiveCanvas, selection, activeLayerId, selectedLayerIds, layers, layerSourceCanvasesRef, updateLayerThumbnail, showToast]);
 
   const handleApplyTransform = useCallback(() => {
     if (!transformSession) return;
+
+    if (transformSession.layerIds && transformSession.layerIds.length > 1 && transformSession.layerSourceCanvases) {
+      for (const lId of transformSession.layerIds) {
+        const c = layerCanvasesRef.current.get(lId);
+        const sCanvas = transformSession.layerSourceCanvases.get(lId);
+        if (!c || !sCanvas) continue;
+        const cCtx = get2DContext(c);
+        if (!cCtx) continue;
+
+        const drawLayerTransformed = (targetCtx: CanvasRenderingContext2D) => {
+          targetCtx.save();
+          if (transformSession.mode === 'perspective' && transformSession.perspectiveQuad) {
+            renderPerspectiveQuad(targetCtx, sCanvas, transformSession.perspectiveQuad, 24);
+          } else if (transformSession.mode === 'mesh' && transformSession.meshPoints) {
+            renderMeshWarp(targetCtx, sCanvas, transformSession.meshPoints, 6);
+          } else {
+            const cx = transformSession.x + transformSession.width / 2;
+            const cy = transformSession.y + transformSession.height / 2;
+            targetCtx.translate(cx, cy);
+            targetCtx.rotate((transformSession.rotation * Math.PI) / 180);
+            targetCtx.scale(transformSession.flipH ? -1 : 1, transformSession.flipV ? -1 : 1);
+            targetCtx.drawImage(
+              sCanvas,
+              -transformSession.width / 2,
+              -transformSession.height / 2,
+              transformSession.width,
+              transformSession.height
+            );
+          }
+          targetCtx.restore();
+        };
+
+        drawLayerTransformed(cCtx);
+
+        const existingSrc = layerSourceCanvasesRef.current?.get(lId);
+        if (existingSrc) {
+          const sCtx = get2DContext(existingSrc);
+          if (sCtx) drawLayerTransformed(sCtx);
+        }
+
+        const lyr = layers.find((l) => l.id === lId);
+        if (lyr?.toneEnabled && existingSrc) {
+          applyScreentone(existingSrc, c, {
+            frequency: lyr.toneFrequency ?? 60,
+            angle: lyr.toneAngle ?? 45,
+            dotShape: lyr.toneDotShape ?? 'circle',
+            dpi: dimensions.dpi ?? 600,
+          });
+        }
+
+        updateLayerThumbnail(lId, true);
+      }
+
+      if (transformSession.beforeImageData) {
+        const primaryCanvas = layerCanvasesRef.current.get(transformSession.layerId);
+        if (primaryCanvas) {
+          const primaryCtx = get2DContext(primaryCanvas);
+          if (primaryCtx) {
+            const afterImageData = primaryCtx.getImageData(0, 0, primaryCanvas.width, primaryCanvas.height);
+            pushHistoryStep(
+              'transform',
+              'Batch Free Transform',
+              transformSession.beforeImageData,
+              afterImageData,
+              transformSession.layerId
+            );
+          }
+        }
+      }
+
+      setTransformSession(null);
+      setTool('brush');
+      return;
+    }
+
     const canvas = layerCanvasesRef.current.get(transformSession.layerId) || getActiveCanvas();
     if (!canvas) return;
     const ctx = get2DContext(canvas);
@@ -2372,6 +2616,37 @@ export function App() {
 
   const handleCancelTransform = useCallback(() => {
     if (!transformSession) return;
+
+    if (transformSession.layerBeforeImages && transformSession.layerBeforeImages.size > 0) {
+      for (const [lId, beforeData] of transformSession.layerBeforeImages.entries()) {
+        const c = layerCanvasesRef.current.get(lId);
+        if (c && beforeData) {
+          const ctx = get2DContext(c);
+          ctx?.putImageData(beforeData, 0, 0);
+
+          const sourceCanvas = layerSourceCanvasesRef.current?.get(lId);
+          if (sourceCanvas) {
+            const sCtx = get2DContext(sourceCanvas);
+            sCtx?.putImageData(beforeData, 0, 0);
+
+            const lyr = layers.find((l) => l.id === lId);
+            if (lyr?.toneEnabled) {
+              applyScreentone(sourceCanvas, c, {
+                frequency: lyr.toneFrequency ?? 60,
+                angle: lyr.toneAngle ?? 45,
+                dotShape: lyr.toneDotShape ?? 'circle',
+                dpi: dimensions.dpi ?? 600,
+              });
+            }
+          }
+          updateLayerThumbnail(lId, true);
+        }
+      }
+      setTransformSession(null);
+      setTool('brush');
+      return;
+    }
+
     const canvas = layerCanvasesRef.current.get(transformSession.layerId) || getActiveCanvas();
     if (canvas && transformSession.beforeImageData) {
       const ctx = get2DContext(canvas);
@@ -4153,14 +4428,22 @@ export function App() {
           handleUndo();
           return;
         }
-        // Redo: Ctrl+Shift+Z or Ctrl+Y
-        if (
-          (e.shiftKey && (key === 'z' || e.code === 'KeyZ')) ||
-          (!e.shiftKey && (key === 'y' || e.code === 'KeyY'))
-        ) {
+        // Redo: Ctrl+Shift+Z
+        if (e.shiftKey && (key === 'z' || e.code === 'KeyZ')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           redo();
+          return;
+        }
+        // Proof Colors (Ctrl+Y) & Gamut Warning (Ctrl+Shift+Y)
+        if (key === 'y' || e.code === 'KeyY') {
+          if (!hasOpenDocument) return;
+          e.preventDefault();
+          if (e.shiftKey) {
+            toggleGamutWarning();
+          } else {
+            toggleSoftProof();
+          }
           return;
         }
         if (!e.shiftKey && key === 'n') {
@@ -4202,6 +4485,13 @@ export function App() {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handlePasteSelectedLayer();
+          return;
+        }
+        // Group Layers: Ctrl+G
+        if (!e.shiftKey && (key === 'g' || e.code === 'KeyG')) {
+          if (!hasOpenDocument) return;
+          e.preventDefault();
+          handleGroupSelectedLayers();
           return;
         }
         // Transform: Ctrl+T
@@ -4308,7 +4598,7 @@ export function App() {
           toggleTransparentColor();
         } else if (key === '[') {
           setIsLeftPanelHidden((prev) => !prev);
-        } else if (key === 'delete') {
+        } else if (key === 'delete' || key === 'backspace') {
           if (!hasOpenDocument) return;
           e.preventDefault();
           if (selection) {
@@ -4341,6 +4631,7 @@ export function App() {
   }, [
     handleCopySelectedLayer,
     handleDeleteSelectedLayer,
+    handleGroupSelectedLayers,
     handleExportImage,
     handlePasteSelectedLayer,
     handleSave,
@@ -4366,6 +4657,8 @@ export function App() {
     transformSession,
     textSession,
     handleSelectTool,
+    toggleSoftProof,
+    toggleGamutWarning,
   ]);
 
   // Pipette tool: hold Alt to activate, release Alt to switch back to previous tool
@@ -5348,6 +5641,57 @@ export function App() {
           disabled: !hasOpenDocument,
           onClick: () => setIsWebtoonMode((prev) => !prev),
         },
+        {
+          id: 'view-div-soft-proof',
+          label: '',
+          divider: true,
+        },
+        {
+          id: 'view-proof-setup',
+          label: 'Proof Setup',
+          disabled: !hasOpenDocument,
+          submenu: [
+            {
+              id: 'proof-setup-us-web',
+              label: 'Working CMYK - U.S. Web Coated (SWOP) v2',
+              checked: softProofSettings.standard === 'us-web-coated-swop',
+              icon: softProofSettings.standard === 'us-web-coated-swop' ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
+              onClick: () => setProofStandard('us-web-coated-swop'),
+            },
+            {
+              id: 'proof-setup-japan',
+              label: 'Japan Color 2001 Coated',
+              checked: softProofSettings.standard === 'japan-color-2001',
+              icon: softProofSettings.standard === 'japan-color-2001' ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
+              onClick: () => setProofStandard('japan-color-2001'),
+            },
+            {
+              id: 'proof-setup-iso',
+              label: 'ISO Coated v2 (ECI)',
+              checked: softProofSettings.standard === 'iso-coated-v2',
+              icon: softProofSettings.standard === 'iso-coated-v2' ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
+              onClick: () => setProofStandard('iso-coated-v2'),
+            },
+          ],
+        },
+        {
+          id: 'view-proof-colors',
+          label: 'Proof Colors',
+          shortcut: 'Ctrl+Y',
+          checked: softProofSettings.enabled,
+          icon: softProofSettings.enabled ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
+          disabled: !hasOpenDocument,
+          onClick: toggleSoftProof,
+        },
+        {
+          id: 'view-gamut-warning',
+          label: 'Gamut Warning',
+          shortcut: 'Ctrl+Shift+Y',
+          checked: softProofSettings.gamutWarning,
+          icon: softProofSettings.gamutWarning ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
+          disabled: !hasOpenDocument,
+          onClick: toggleGamutWarning,
+        },
       ],
     },
     {
@@ -5606,6 +5950,7 @@ export function App() {
         onOpenCollabModal={() => setIsHostModalOpen(true)}
         themePreset={appSettings.themePreset}
         activeDocumentTitle={documents.find((d) => d.id === activeDocumentId)?.name}
+        softProofSettings={softProofSettings}
       />
 
 
@@ -5760,6 +6105,7 @@ export function App() {
             onAddAnimationCel={handleAddAnimationCel}
             onDeleteAnimationCel={handleDeleteAnimationCel}
             onSelectCelLayer={setActiveLayerId}
+            softProofSettings={softProofSettings}
           />
         </div>
 
@@ -5785,7 +6131,11 @@ export function App() {
           onRedo={redo}
           layers={hasOpenDocument ? layers : []}
           activeLayerId={hasOpenDocument ? activeLayerId : ''}
+          selectedLayerIds={hasOpenDocument ? selectedLayerIds : []}
           onSelectLayer={setActiveLayerId}
+          onToggleLayerSelection={toggleLayerSelection}
+          onGroupSelectedLayers={handleGroupSelectedLayers}
+          onDeleteSelectedLayers={handleDeleteSelectedLayers}
           onAddLayer={handleAddLayer}
           onOpen3DLayer={hasOpenDocument ? () => setIs3DLayerOpen(true) : undefined}
           onDuplicateLayer={duplicateLayer}
@@ -5845,6 +6195,7 @@ export function App() {
         showPressureInStatusBar={appSettings.showPressureInStatusBar}
         hasOpenDocument={hasOpenDocument}
         themePreset={appSettings.themePreset}
+        softProofSettings={softProofSettings}
       />
 
       {/* New Canvas Modal Dialog */}

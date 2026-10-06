@@ -8,7 +8,7 @@ import {
   RotateCw,
   Users,
 } from 'lucide-react';
-import { ToolType, CanvasDimensions, MenuSection, CanvasColorMode, BrushPresetId } from '../types/editor';
+import { ToolType, CanvasDimensions, MenuSection, CanvasColorMode, BrushPresetId, SoftProofSettings } from '../types/editor';
 import { ThemePreset } from '../types/settings';
 import { formatZoomPercent } from '../hooks/useCanvasNavigation';
 import { formatRotationDegrees } from '../utils/canvasUtils';
@@ -42,6 +42,7 @@ interface HeaderProps {
   onOpenCollabModal?: () => void;
   themePreset?: ThemePreset;
   activeDocumentTitle?: string;
+  softProofSettings?: SoftProofSettings;
 }
 
 export const Header: React.FC<HeaderProps> = React.memo(({
@@ -69,6 +70,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   onOpenCollabModal,
   themePreset = 'vintage-manga',
   activeDocumentTitle,
+  softProofSettings,
 }) => {
   if (themePreset === 'modern') {
     return (
@@ -121,6 +123,24 @@ export const Header: React.FC<HeaderProps> = React.memo(({
                 >
                   {colorMode === 'monochrome' ? 'Manga' : colorMode}
                 </span>
+
+                {softProofSettings?.enabled && (
+                  <span
+                    className="text-[9px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider bg-cyan-500/15 text-cyan-300 border border-cyan-500/30"
+                    title={`CMYK Soft Proofing Active (${softProofSettings.standard})`}
+                  >
+                    CMYK Proof
+                  </span>
+                )}
+
+                {softProofSettings?.gamutWarning && (
+                  <span
+                    className="text-[9px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30"
+                    title="Gamut Warning Overlay Active"
+                  >
+                    Gamut Warning
+                  </span>
+                )}
               </div>
             </>
           )}
@@ -293,6 +313,24 @@ export const Header: React.FC<HeaderProps> = React.memo(({
               >
                 {colorMode === 'monochrome' ? 'Manga B&W' : colorMode}
               </span>
+
+              {softProofSettings?.enabled && (
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase tracking-wider bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+                  title={`CMYK Soft Proofing Active (${softProofSettings.standard})`}
+                >
+                  CMYK Proof
+                </span>
+              )}
+
+              {softProofSettings?.gamutWarning && (
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase tracking-wider bg-amber-500/20 text-amber-300 border border-amber-500/30"
+                  title="Gamut Warning Overlay Active"
+                >
+                  Gamut Warning
+                </span>
+              )}
             </div>
           </>
         )}

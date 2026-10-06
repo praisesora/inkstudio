@@ -173,5 +173,106 @@ describe('Unified GPU Viewport Compositor', () => {
       expect(LAYER_STYLES_FRAGMENT_SHADER).toContain('POISSON_KERNEL');
     });
   });
+
+  describe('Folder Tree and Pass-Through Compositing Engine', () => {
+    it('accurately builds hierarchy trees from flat layer collections', async () => {
+      const { buildLayerTree } = await import('../compositor');
+
+      const layers: LayerItem[] = [
+        { id: 'folder-1', name: 'Folder 1', type: 'folder', visible: true, opacity: 1, blendMode: 'pass-through', locked: false, parentId: null },
+        { id: 'layer-child-1', name: 'Child 1', type: 'raster', visible: true, opacity: 1, blendMode: 'normal', locked: false, parentId: 'folder-1' },
+        { id: 'layer-child-2', name: 'Child 2', type: 'raster', visible: true, opacity: 1, blendMode: 'normal', locked: false, parentId: 'folder-1' },
+        { id: 'root-layer-2', name: 'Root Layer 2', type: 'raster', visible: true, opacity: 1, blendMode: 'normal', locked: false, parentId: null },
+      ];
+
+      const tree = buildLayerTree(layers);
+      expect(tree).toHaveLength(2);
+      expect(tree[0].layer.id).toBe('folder-1');
+      expect(tree[0].children).toHaveLength(2);
+      expect(tree[0].children[0].layer.id).toBe('layer-child-1');
+      expect(tree[0].children[1].layer.id).toBe('layer-child-2');
+      expect(tree[1].layer.id).toBe('root-layer-2');
+      expect(tree[1].children).toHaveLength(0);
+    });
+
+    it('groups sibling tree nodes respecting clipping masks', async () => {
+      const { buildLayerTree, groupTreeNodesForCompositing } = await import('../compositor');
+
+      const layers: LayerItem[] = [
+        { id: 'base-1', name: 'Base 1', type: 'raster', visible: true, opacity: 1, blendMode: 'normal', locked: false, parentId: null },
+        { id: 'clip-1', name: 'Clip 1', type: 'raster', visible: true, opacity: 1, blendMode: 'normal', locked: false, parentId: null, clipped: true },
+        { id: 'base-2', name: 'Base 2', type: 'raster', visible: true, opacity: 1, blendMode: 'normal', locked: false, parentId: null },
+      ];
+
+      const tree = buildLayerTree(layers);
+      const groups = groupTreeNodesForCompositing(tree);
+
+      expect(groups).toHaveLength(2);
+      expect(groups[0].baseNode.layer.id).toBe('base-1');
+      expect(groups[0].clippedNodes).toHaveLength(1);
+      expect(groups[0].clippedNodes[0].layer.id).toBe('clip-1');
+      expect(groups[1].baseNode.layer.id).toBe('base-2');
+      expect(groups[1].clippedNodes).toHaveLength(0);
+    });
+
+    it('contains folder blit shaders with texture uniforms and pass-through blend support', async () => {
+      const { FOLDER_BLIT_VERTEX_SHADER, FOLDER_BLIT_FRAGMENT_SHADER, BLEND_MODE_MAP } = await import('../compositor');
+
+      expect(FOLDER_BLIT_VERTEX_SHADER).toContain('a_quadPos');
+      expect(FOLDER_BLIT_FRAGMENT_SHADER).toContain('u_blitTexture');
+      expect(FOLDER_BLIT_FRAGMENT_SHADER).toContain('u_blitOpacity');
+      expect(BLEND_MODE_MAP['pass-through']).toBe(12);
+    });
+  });
+
+  describe('CMYK Soft Proofing and Out-of-Gamut Warning Shader', () => {
+    it('exports SOFT_PROOF_VERTEX_SHADER and SOFT_PROOF_FRAGMENT_SHADER', async () => {
+      const { SOFT_PROOF_VERTEX_SHADER, SOFT_PROOF_FRAGMENT_SHADER } = await import('../compositor');
+
+      expect(SOFT_PROOF_VERTEX_SHADER).toBeDefined();
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toBeDefined();
+      expect(SOFT_PROOF_VERTEX_SHADER).toContain('a_quadPos');
+      expect(SOFT_PROOF_VERTEX_SHADER).toContain('v_uv = a_quadPos;');
+    });
+
+    it('contains sRGB to CIE XYZ to Lab color conversion routines in fragment shader', async () => {
+      const { SOFT_PROOF_FRAGMENT_SHADER } = await import('../compositor');
+
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('srgbToLinear');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('linearToSrgb');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('linearToXyz');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('xyzToLab');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('srgbToLab');
+      // D65 reference white constants
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('0.95047');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('1.08883');
+    });
+
+    it('evaluates CMYK ink densities and pigment compression for all standards', async () => {
+      const { SOFT_PROOF_FRAGMENT_SHADER } = await import('../compositor');
+
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('simulateCmyk');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('u_standard');
+      // Japan Color 2001, US Web Coated SWOP, and ISO Coated v2 profiles
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('densC');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('densM');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('densY');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('densK');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('tacLimit');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('tvi');
+    });
+
+    it('detects out-of-gamut pixels using delta-E > 0.05 and replaces them with warning color', async () => {
+      const { SOFT_PROOF_FRAGMENT_SHADER } = await import('../compositor');
+
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('dLab = labOrig - labProof;');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('deltaE = length(dLab) / 100.0;');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('bool isOutOfGamut = (deltaE > 0.05);');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('u_gamutWarningColor');
+      expect(SOFT_PROOF_FRAGMENT_SHADER).toContain('outRgb = u_gamutWarningColor;');
+    });
+  });
 });
+
+
 

@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { ChevronRight } from 'lucide-react';
+import { ChevronRight, Check } from 'lucide-react';
 import { MenuSection, MenuItem } from '../types/editor';
 
 export const DEFAULT_MENU_SECTIONS: MenuSection[] = [
@@ -155,7 +155,11 @@ export const MenuBar: React.FC<MenuBarProps> = ({ sections = DEFAULT_MENU_SECTIO
                           }`}
                         >
                           <span className="flex items-center space-x-2">
-                            {item.icon && <span className="w-3.5 h-3.5">{item.icon}</span>}
+                            {item.icon ? (
+                              <span className="w-3.5 h-3.5 flex items-center justify-center">{item.icon}</span>
+                            ) : item.checked ? (
+                              <span className="w-3.5 h-3.5 flex items-center justify-center"><Check className="w-3.5 h-3.5 text-cyan-400" /></span>
+                            ) : null}
                             <span>{item.label}</span>
                           </span>
                           {hasSubmenu ? (
@@ -199,9 +203,11 @@ export const MenuBar: React.FC<MenuBarProps> = ({ sections = DEFAULT_MENU_SECTIO
                                   }`}
                                 >
                                   <span className="flex items-center space-x-2">
-                                    {subItem.icon && (
-                                      <span className="w-3.5 h-3.5">{subItem.icon}</span>
-                                    )}
+                                    {subItem.icon ? (
+                                      <span className="w-3.5 h-3.5 flex items-center justify-center">{subItem.icon}</span>
+                                    ) : subItem.checked ? (
+                                      <span className="w-3.5 h-3.5 flex items-center justify-center"><Check className="w-3.5 h-3.5 text-cyan-400" /></span>
+                                    ) : null}
                                     <span>{subItem.label}</span>
                                   </span>
                                   {subItem.shortcut && (

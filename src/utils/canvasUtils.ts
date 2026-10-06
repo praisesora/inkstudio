@@ -205,6 +205,7 @@ export function drawDot(
 let _sharedThumbCanvas: HTMLCanvasElement | null = null;
 
 export const BLEND_MODES: { value: BlendMode; label: string }[] = [
+  { value: 'pass-through', label: 'Pass Through' },
   { value: 'normal', label: 'Normal' },
   { value: 'multiply', label: 'Multiply' },
   { value: 'screen', label: 'Screen' },
@@ -221,6 +222,7 @@ export const BLEND_MODES: { value: BlendMode; label: string }[] = [
 
 export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalCompositeOperation {
   switch (blendMode) {
+    case 'pass-through':
     case 'normal':
       return 'source-over';
     case 'multiply':

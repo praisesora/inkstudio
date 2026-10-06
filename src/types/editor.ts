@@ -423,6 +423,9 @@ export interface TransformSession {
   meshCols?: number;
   meshRows?: number;
   meshPoints?: Point2D[][];
+  layerIds?: string[];
+  layerSourceCanvases?: Map<string, HTMLCanvasElement>;
+  layerBeforeImages?: Map<string, ImageData>;
 }
 
 export type BlendMode =
@@ -437,7 +440,8 @@ export type BlendMode =
   | 'hard-light'
   | 'soft-light'
   | 'difference'
-  | 'exclusion';
+  | 'exclusion'
+  | 'pass-through';
 
 export interface HistoryItemMeta {
   id: string;
@@ -670,6 +674,7 @@ export interface MenuItem {
   disabled?: boolean;
   danger?: boolean;
   divider?: boolean;
+  checked?: boolean;
   onClick?: () => void;
   submenu?: MenuItem[];
 }
@@ -703,6 +708,23 @@ export interface LoadedDocument {
   layers: LayerItem[];
   layerCanvases?: Map<string, HTMLCanvasElement>;
 }
+
+export type CmykStandard = 'japan-color-2001' | 'us-web-coated-swop' | 'iso-coated-v2';
+
+export interface SoftProofSettings {
+  enabled: boolean;
+  standard: CmykStandard;
+  gamutWarning: boolean;
+  gamutWarningColor: string; // e.g. '#7f7f7f' or neon green
+}
+
+export const DEFAULT_SOFT_PROOF_SETTINGS: SoftProofSettings = {
+  enabled: false,
+  standard: 'us-web-coated-swop',
+  gamutWarning: false,
+  gamutWarningColor: '#7f7f7f',
+};
+
 
 
 

@@ -2737,7 +2737,6 @@ export function useCanvasDrawing({
 
       const key = e.key.toLowerCase();
       const isZ = key === 'z' || e.code === 'KeyZ';
-      const isY = key === 'y' || e.code === 'KeyY';
 
       if ((e.ctrlKey || e.metaKey) && isZ) {
         e.preventDefault();
@@ -2747,10 +2746,6 @@ export function useCanvasDrawing({
         } else {
           undo();
         }
-      } else if ((e.ctrlKey || e.metaKey) && isY) {
-        e.preventDefault();
-        e.stopPropagation();
-        redo();
       }
     };
 

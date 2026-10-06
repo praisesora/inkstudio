@@ -51,7 +51,11 @@ interface RightSidebarProps {
   // Multi-layer management props
   layers: LayerItem[];
   activeLayerId: string;
+  selectedLayerIds?: string[];
   onSelectLayer: (id: string) => void;
+  onToggleLayerSelection?: (id: string, isShift: boolean, isCtrl: boolean) => void;
+  onGroupSelectedLayers?: () => void;
+  onDeleteSelectedLayers?: () => void;
   onAddLayer: (type?: 'raster' | 'folder') => void;
   onOpen3DLayer?: () => void;
   onDuplicateLayer: (id: string) => void;
@@ -195,7 +199,11 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onRedo,
   layers,
   activeLayerId,
+  selectedLayerIds,
   onSelectLayer,
+  onToggleLayerSelection,
+  onGroupSelectedLayers,
+  onDeleteSelectedLayers,
   onAddLayer,
   onOpen3DLayer,
   onDuplicateLayer,
@@ -466,8 +474,12 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
         return;
       }
 
+      const draggedIds = selectedLayerIds && selectedLayerIds.includes(layerId)
+        ? selectedLayerIds
+        : [layerId];
+
       const targetId = row.dataset.layerId;
-      if (!targetId || targetId === layerId) {
+      if (!targetId || draggedIds.includes(targetId)) {
         if (dropIndicatorRef.current) {
           dropIndicatorRef.current = null;
           setDropIndicator(null);
@@ -485,24 +497,27 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
       }
 
       // Prevent dragging a folder into its own subtree
-      const draggedItem = layers.find((l) => l.id === layerId);
-      if (draggedItem?.type === 'folder') {
-        let isDescendant = false;
-        let curr: LayerItem | undefined = targetLayer;
-        while (curr) {
-          if (curr.id === layerId) {
-            isDescendant = true;
-            break;
+      let isDescendant = false;
+      for (const dId of draggedIds) {
+        const draggedItem = layers.find((l) => l.id === dId);
+        if (draggedItem?.type === 'folder') {
+          let curr: LayerItem | undefined = targetLayer;
+          while (curr) {
+            if (curr.id === dId) {
+              isDescendant = true;
+              break;
+            }
+            curr = layers.find((l) => l.id === curr?.parentId);
           }
-          curr = layers.find((l) => l.id === curr?.parentId);
         }
-        if (isDescendant) {
-          if (dropIndicatorRef.current) {
-            dropIndicatorRef.current = null;
-            setDropIndicator(null);
-          }
-          return;
+        if (isDescendant) break;
+      }
+      if (isDescendant) {
+        if (dropIndicatorRef.current) {
+          dropIndicatorRef.current = null;
+          setDropIndicator(null);
         }
+        return;
       }
 
       const rect = row.getBoundingClientRect();
@@ -546,7 +561,10 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
         }, 100);
 
         const currentIndicator = dropIndicatorRef.current;
-        if (currentIndicator && currentIndicator.id !== layerId && onReorderLayers) {
+        const draggedIds = selectedLayerIds && selectedLayerIds.includes(layerId)
+          ? selectedLayerIds
+          : [layerId];
+        if (currentIndicator && !draggedIds.includes(currentIndicator.id) && onReorderLayers) {
           onReorderLayers(layerId, currentIndicator.id, currentIndicator.position);
         }
       }
@@ -1236,14 +1254,20 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                   <span className="text-[10px]">Layer</span>
                 </button>
 
-                {/* Add Folder */}
+                {/* Add Folder / Group Selected Layers */}
                 <button
-                  onClick={() => onAddLayer('folder')}
-                  title="New Folder"
+                  onClick={() => {
+                    if (onGroupSelectedLayers && selectedLayerIds && selectedLayerIds.length > 1) {
+                      onGroupSelectedLayers();
+                    } else {
+                      onAddLayer('folder');
+                    }
+                  }}
+                  title={selectedLayerIds && selectedLayerIds.length > 1 ? `Group ${selectedLayerIds.length} Selected Layers (Ctrl+G)` : 'New Folder'}
                   className="flex items-center space-x-1 px-1.5 py-0.5 hover:text-white hover:bg-[#333333] rounded-[2px] transition-colors"
                 >
                   <FolderPlus className="w-3.5 h-3.5 text-amber-400" />
-                  <span className="text-[10px]">Folder</span>
+                  <span className="text-[10px]">{selectedLayerIds && selectedLayerIds.length > 1 ? 'Group' : 'Folder'}</span>
                 </button>
 
                 {/* Local-Only 3D Viewport Ghost Layer */}
@@ -1356,10 +1380,16 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                   </button>
                 )}
 
-                {/* Delete Active Layer */}
+                {/* Delete Active or Selected Layer(s) */}
                 <button
-                  onClick={() => onDeleteLayer(activeLayerId)}
-                  title="Delete Layer"
+                  onClick={() => {
+                    if (onDeleteSelectedLayers && selectedLayerIds && selectedLayerIds.length > 1) {
+                      onDeleteSelectedLayers();
+                    } else {
+                      onDeleteLayer(activeLayerId);
+                    }
+                  }}
+                  title={selectedLayerIds && selectedLayerIds.length > 1 ? `Delete ${selectedLayerIds.length} Selected Layers` : 'Delete Layer'}
                   className="p-1 text-[#888888] hover:text-rose-400 hover:bg-[#333333] rounded-[2px] transition-colors"
                 >
                   <Trash2 className="w-3.5 h-3.5" />
@@ -1379,22 +1409,27 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                 }
 
                 const isActive = layer.id === activeLayerId;
+                const isSelected = selectedLayerIds ? selectedLayerIds.includes(layer.id) : isActive;
                 const isFolder = layer.type === 'folder';
                 const isInsideFolder = !!layer.parentId;
                 const isTarget = dropIndicator?.id === layer.id;
                 const isDropInside = isTarget && dropIndicator.position === 'inside';
                 const isDropAbove = isTarget && dropIndicator.position === 'above';
                 const isDropBelow = isTarget && dropIndicator.position === 'below';
-                const isBeingDragged = draggedLayerId === layer.id;
+                const isBeingDragged = draggedLayerId === layer.id || (draggedLayerId !== null && !!selectedLayerIds?.includes(draggedLayerId) && !!selectedLayerIds?.includes(layer.id));
 
                 return (
                   <div
                     key={layer.id}
                     data-layer-id={layer.id}
                     onPointerDown={(e) => handleLayerPointerDown(e, layer.id)}
-                    onClick={() => {
+                    onClick={(e) => {
                       if (justDraggedRef.current) return;
-                      onSelectLayer(layer.id);
+                      if (onToggleLayerSelection) {
+                        onToggleLayerSelection(layer.id, e.shiftKey, e.ctrlKey || e.metaKey);
+                      } else {
+                        onSelectLayer(layer.id);
+                      }
                       if (activeEditTarget === 'mask' && !layer.maskCanvas && layer.maskEnabled === undefined) {
                         onSelectEditTarget?.('layer');
                       }
@@ -1409,7 +1444,13 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     onContextMenu={(e) => {
                       e.preventDefault();
                       e.stopPropagation();
-                      onSelectLayer(layer.id);
+                      if (selectedLayerIds && !selectedLayerIds.includes(layer.id)) {
+                        if (onToggleLayerSelection) {
+                          onToggleLayerSelection(layer.id, false, false);
+                        } else {
+                          onSelectLayer(layer.id);
+                        }
+                      }
                       setContextMenu({
                         layerId: layer.id,
                         x: e.clientX,
@@ -1423,8 +1464,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     } ${
                       isDropInside
                         ? 'border-2 border-amber-400 bg-amber-950/40 shadow-md'
-                        : isActive
-                        ? 'bg-[#383838] border-[#555555] text-white shadow-sm'
+                        : isSelected
+                        ? (isActive ? 'bg-[#383838] border-blue-500 text-white shadow-sm ring-1 ring-blue-500/50' : 'bg-[#2b2b2e] border-blue-500/60 text-white shadow-sm')
                         : 'bg-[#242425] hover:bg-[#2b2b2c] border-transparent text-[#cccccc]'
                     } ${
                       isBeingDragged ? 'opacity-40 cursor-grabbing' : 'cursor-grab'
@@ -2168,6 +2209,18 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
             )}
 
             {/* --- GENERAL ACTIONS --- */}
+            {onGroupSelectedLayers && (
+              <button
+                onClick={() => {
+                  onGroupSelectedLayers();
+                  setContextMenu(null);
+                }}
+                className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-[#333333] hover:text-white transition-colors text-amber-300"
+              >
+                <FolderPlus className="w-3.5 h-3.5 text-amber-400" />
+                <span>Group into Folder (Ctrl+G)</span>
+              </button>
+            )}
             <button
               onClick={() => {
                 onDuplicateLayer(targetLayer.id);
@@ -2190,13 +2243,17 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
             {targetLayer.id !== 'layer-bg' && (
               <button
                 onClick={() => {
-                  onDeleteLayer(targetLayer.id);
+                  if (onDeleteSelectedLayers && selectedLayerIds && selectedLayerIds.length > 1) {
+                    onDeleteSelectedLayers();
+                  } else {
+                    onDeleteLayer(targetLayer.id);
+                  }
                   setContextMenu(null);
                 }}
                 className="w-full text-left px-3 py-1.5 flex items-center space-x-2 hover:bg-rose-950/40 text-rose-400 hover:text-rose-300 transition-colors"
               >
                 <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-                <span>Delete</span>
+                <span>{selectedLayerIds && selectedLayerIds.length > 1 ? `Delete Selected Layers (${selectedLayerIds.length})` : 'Delete'}</span>
               </button>
             )}
           </div>

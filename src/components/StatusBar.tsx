@@ -1,8 +1,14 @@
 import React, { useEffect, useRef } from 'react';
-import { ToolType, BrushSettings, CanvasColorMode } from '../types/editor';
+import { ToolType, BrushSettings, CanvasColorMode, SoftProofSettings, CmykStandard } from '../types/editor';
 import { ThemePreset } from '../types/settings';
 import { formatZoomPercent } from '../hooks/useCanvasNavigation';
 import { formatRotationDegrees } from '../utils/canvasUtils';
+
+const CMYK_STANDARD_LABELS: Record<CmykStandard, string> = {
+  'japan-color-2001': 'Japan Color 2001',
+  'us-web-coated-swop': 'US Web Coated',
+  'iso-coated-v2': 'ISO Coated v2',
+};
 
 interface StatusBarProps {
   cursorPos?: { x: number; y: number } | null;
@@ -17,6 +23,7 @@ interface StatusBarProps {
   showPressureInStatusBar?: boolean;
   hasOpenDocument?: boolean;
   themePreset?: ThemePreset;
+  softProofSettings?: SoftProofSettings;
 }
 
 export const StatusBar: React.FC<StatusBarProps> = React.memo(({
@@ -30,6 +37,7 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(({
   showPressureInStatusBar = true,
   hasOpenDocument = true,
   themePreset: _themePreset = 'vintage-manga',
+  softProofSettings,
 }) => {
   const posTextRef = useRef<HTMLSpanElement>(null);
   const pressureBarRef = useRef<HTMLDivElement>(null);
@@ -75,18 +83,31 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(({
             <span className="text-white capitalize font-medium text-[11px]">{tool}</span>
             <span className="text-white/20">|</span>
             {hasOpenDocument ? (
-              <span
-                className={`font-mono text-[10px] font-medium ${
-                  colorMode === 'monochrome'
-                    ? 'text-amber-400'
-                    : colorMode === 'grayscale'
-                    ? 'text-slate-300'
-                    : 'text-[var(--modern-accent)]'
-                }`}
-                title={`Active Document Color Mode: ${colorMode}`}
-              >
-                {colorMode === 'monochrome' ? '1-bit Manga' : colorMode === 'grayscale' ? 'Grayscale' : 'Color RGB'}
-              </span>
+              <>
+                <span
+                  className={`font-mono text-[10px] font-medium ${
+                    colorMode === 'monochrome'
+                      ? 'text-amber-400'
+                      : colorMode === 'grayscale'
+                      ? 'text-slate-300'
+                      : 'text-[var(--modern-accent)]'
+                  }`}
+                  title={`Active Document Color Mode: ${colorMode}`}
+                >
+                  {colorMode === 'monochrome' ? '1-bit Manga' : colorMode === 'grayscale' ? 'Grayscale' : 'Color RGB'}
+                </span>
+                {softProofSettings?.enabled && (
+                  <>
+                    <span className="text-white/20">|</span>
+                    <span
+                      className="text-cyan-400 font-mono text-[10px] font-medium"
+                      title={`CMYK Soft Proofing: ${softProofSettings.standard}${softProofSettings.gamutWarning ? ' (Gamut Warning ON)' : ''}`}
+                    >
+                      [CMYK Proof: {CMYK_STANDARD_LABELS[softProofSettings.standard] || 'US Web Coated'}]
+                    </span>
+                  </>
+                )}
+              </>
             ) : (
               <span className="text-white/30 italic text-[10px]">No active document</span>
             )}
@@ -162,18 +183,31 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(({
           <span className="text-[#f0f0f4] capitalize font-medium">{tool}</span>
           <span className="text-[#4a4a4e]">|</span>
           {hasOpenDocument ? (
-            <span
-              className={`font-mono text-[10px] font-medium ${
-                colorMode === 'monochrome'
-                  ? 'text-amber-400'
-                  : colorMode === 'grayscale'
-                  ? 'text-slate-300'
-                  : 'text-emerald-400'
-              }`}
-              title={`Active Document Color Mode: ${colorMode}`}
-            >
-              {colorMode === 'monochrome' ? 'Manga (1-bit)' : colorMode === 'grayscale' ? 'Grayscale' : 'Color (RGB)'}
-            </span>
+            <>
+              <span
+                className={`font-mono text-[10px] font-medium ${
+                  colorMode === 'monochrome'
+                    ? 'text-amber-400'
+                    : colorMode === 'grayscale'
+                    ? 'text-slate-300'
+                    : 'text-emerald-400'
+                }`}
+                title={`Active Document Color Mode: ${colorMode}`}
+              >
+                {colorMode === 'monochrome' ? 'Manga (1-bit)' : colorMode === 'grayscale' ? 'Grayscale' : 'Color (RGB)'}
+              </span>
+              {softProofSettings?.enabled && (
+                <>
+                  <span className="text-[#4a4a4e]">|</span>
+                  <span
+                    className="text-cyan-400 font-mono text-[10px] font-medium"
+                    title={`CMYK Soft Proofing: ${softProofSettings.standard}${softProofSettings.gamutWarning ? ' (Gamut Warning ON)' : ''}`}
+                  >
+                    [CMYK Proof: {CMYK_STANDARD_LABELS[softProofSettings.standard] || 'US Web Coated'}]
+                  </span>
+                </>
+              )}
+            </>
           ) : (
             <span className="text-[#77777d] italic text-[10px]">No active document</span>
           )}
