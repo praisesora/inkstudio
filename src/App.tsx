@@ -3871,7 +3871,7 @@ export function App() {
         options.colorMode,
         defaultFreq
       );
-      resetZoomAndCenter();
+      resetZoomAndCenter(newDims);
       resetHistory();
 
       // Add to document tabs (empty perspective ruler by default)
@@ -3890,17 +3890,6 @@ export function App() {
       setPerspectiveRuler(null);
       setDocuments((prev) => [...prev, newDoc]);
       setActiveDocumentId(newDocId);
-
-      // Track in recent documents
-      saveRecentDocument({
-        id: newDocId,
-        title: name.replace(/\*+$/, ''),
-        path: `InkStudio\\${name.replace(/\*+$/, '')}.sora`,
-        size: 524288,
-        coverUrl: initialLayers[0]?.thumbnailUrl,
-        isStarred: false,
-        fileType: '.sora',
-      }).catch(console.warn);
 
       showToast(`Created ${name}`);
     },
@@ -3995,7 +3984,7 @@ export function App() {
 
       resizeCanvas(newDims, options);
       setDimensions(newDims);
-      resetZoomAndCenter();
+      resetZoomAndCenter(newDims);
       resetHistory();
       showToast(`Canvas resized to ${newDims.width} × ${newDims.height} px`);
     },
@@ -4057,7 +4046,7 @@ export function App() {
         setSavedFileInfo(null); // Reset handle on new import
 
         loadDocument(doc);
-        resetZoomAndCenter();
+        resetZoomAndCenter(doc.dimensions);
         resetHistory();
 
         // Create document tab
@@ -4085,6 +4074,7 @@ export function App() {
           coverUrl: doc.layers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: file.name.slice(file.name.lastIndexOf('.')),
+          isSaved: true,
         }).catch(console.warn);
 
         showToast(`Opened ${file.name}`);
@@ -4156,7 +4146,7 @@ export function App() {
         });
       }
       setPerspectiveRuler(doc.perspectiveRuler ?? null);
-      resetZoomAndCenter();
+      resetZoomAndCenter(doc.dimensions);
     },
     [documents, loadDocument, resetZoomAndCenter]
   );
@@ -4190,6 +4180,7 @@ export function App() {
                 layers: nextActive.layers,
                 layerCanvases: nextActive.layerCanvasesMap,
               });
+              resetZoomAndCenter(nextActive.dimensions);
             } else {
               clearDocument();
             }
@@ -4250,9 +4241,9 @@ export function App() {
     // If haven't saved the file yet, prompt to select a path and file extension
     if (!savedFileInfo?.handle) {
       try {
-        const info = await promptSaveAs(docData, savedFileInfo?.extension || '.png');
+        const info = await promptSaveAs(docData, savedFileInfo?.extension || '.sora');
         setSavedFileInfo(info);
-        // info.name includes the extension (e.g. art.png or Untitled.png)
+        // info.name includes the extension (e.g. art.sora or Untitled.sora)
         setDocumentName(info.name);
         setDocuments((prev) =>
           prev.map((d) => (d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info } : d))
@@ -4265,6 +4256,7 @@ export function App() {
           coverUrl: layers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: info.extension,
+          isSaved: true,
         }).catch(console.warn);
         showToast(`Saved to ${info.name}`);
       } catch (err: any) {
@@ -4288,12 +4280,13 @@ export function App() {
           coverUrl: layers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: savedFileInfo.extension,
+          isSaved: true,
         }).catch(console.warn);
         showToast(`Saved to ${savedFileInfo.name}`);
       } catch (err: any) {
         console.warn('Direct handle save failed, prompting with Save As:', err);
         try {
-          const info = await promptSaveAs(docData, savedFileInfo.extension || '.png');
+          const info = await promptSaveAs(docData, savedFileInfo.extension || '.sora');
           setSavedFileInfo(info);
           setDocumentName(info.name);
           setDocuments((prev) =>
@@ -4307,6 +4300,7 @@ export function App() {
             coverUrl: layers[0]?.thumbnailUrl,
             isStarred: false,
             fileType: info.extension,
+            isSaved: true,
           }).catch(console.warn);
           showToast(`Saved to ${info.name}`);
         } catch (e: any) {
@@ -4343,7 +4337,7 @@ export function App() {
     };
 
     try {
-      const defaultExt = savedFileInfo?.extension || '.png';
+      const defaultExt = savedFileInfo?.extension || '.sora';
       const info = await promptSaveAs(docData, defaultExt);
       setSavedFileInfo(info);
       setDocumentName(info.name);
@@ -4358,6 +4352,7 @@ export function App() {
         coverUrl: layers[0]?.thumbnailUrl,
         isStarred: false,
         fileType: info.extension,
+        isSaved: true,
       }).catch(console.warn);
       showToast(`Saved as ${info.name}`);
     } catch (err: any) {

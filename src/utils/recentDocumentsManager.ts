@@ -9,12 +9,29 @@ export interface RecentDocument {
   lastOpened: number; // unix timestamp ms
   isStarred: boolean;
   fileType?: string;
+  isSaved?: boolean;
 }
 
 const DB_NAME = 'InkStudioRecentDocsDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'recent_documents';
 const LS_BACKUP_KEY = 'inkstudio_recent_docs_backup';
+
+export function isActualSavedDocument(doc: RecentDocument): boolean {
+  if (!doc) return false;
+  if (doc.isSaved === false) return false;
+  // Purge legacy sample documents
+  if (doc.id.startsWith('sample-doc-')) return false;
+  // Purge unsaved dummy canvases generated on canvas creation
+  if (doc.size === 524288) return false;
+  // Purge unsaved documents with asterisk indicator
+  if (doc.title?.endsWith('*')) return false;
+  // If explicitly flagged as saved to PC
+  if (doc.isSaved === true) return true;
+  // Purge legacy records that used dummy relative paths without being explicitly saved
+  if (doc.path?.startsWith('InkStudio\\') && doc.size <= 524288) return false;
+  return true;
+}
 
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -37,13 +54,13 @@ function openDB(): Promise<IDBDatabase> {
 }
 
 export async function loadRecentDocuments(): Promise<RecentDocument[]> {
-  // Purge any legacy sample docs from localStorage
+  // Purge unsaved and legacy sample docs from localStorage
   try {
     const raw = localStorage.getItem(LS_BACKUP_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        const cleaned = parsed.filter((d: RecentDocument) => !d.id.startsWith('sample-doc-'));
+        const cleaned = parsed.filter(isActualSavedDocument);
         localStorage.setItem(LS_BACKUP_KEY, JSON.stringify(cleaned));
       }
     }
@@ -59,13 +76,13 @@ export async function loadRecentDocuments(): Promise<RecentDocument[]> {
       const req = store.getAll();
       req.onsuccess = () => {
         let docs = (req.result as RecentDocument[]) || [];
-        // Clean out any legacy sample documents from IDB
-        const sampleDocs = docs.filter((d) => d.id.startsWith('sample-doc-'));
-        if (sampleDocs.length > 0) {
-          for (const s of sampleDocs) {
+        // Clean out any unsaved or legacy dummy documents from IDB
+        const invalidDocs = docs.filter((d) => !isActualSavedDocument(d));
+        if (invalidDocs.length > 0) {
+          for (const s of invalidDocs) {
             store.delete(s.id);
           }
-          docs = docs.filter((d) => !d.id.startsWith('sample-doc-'));
+          docs = docs.filter((d) => isActualSavedDocument(d));
         }
         docs.sort((a, b) => b.lastOpened - a.lastOpened);
         resolve(docs);
@@ -85,7 +102,7 @@ function getFallbackDocs(): RecentDocument[] {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        return parsed.filter((d: RecentDocument) => !d.id.startsWith('sample-doc-'));
+        return parsed.filter(isActualSavedDocument);
       }
     }
   } catch {
@@ -97,8 +114,14 @@ function getFallbackDocs(): RecentDocument[] {
 export async function saveRecentDocument(
   doc: Omit<RecentDocument, 'lastOpened'> & { lastOpened?: number }
 ): Promise<void> {
+  // Only persist documents that were actually saved to the PC
+  if (doc.isSaved === false || doc.size === 524288 || doc.title?.endsWith('*')) {
+    return;
+  }
+
   const fullDoc: RecentDocument = {
     ...doc,
+    isSaved: doc.isSaved ?? true,
     lastOpened: doc.lastOpened ?? Date.now(),
   };
 

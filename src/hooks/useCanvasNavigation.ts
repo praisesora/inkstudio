@@ -1,11 +1,17 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { CanvasDimensions } from '../types/editor';
 
-export const MIN_ZOOM = 0.1; // 10%
+export const MIN_ZOOM = 0.01; // 1% (supports large manga/print canvas vertical adaptation)
 export const MAX_ZOOM = 32.0; // 3200%
 
 // Discrete zoom steps used in professional software (Photoshop / Clip Studio Paint)
 export const ZOOM_PRESETS = [
+  0.01,   // 1%
+  0.02,   // 2%
+  0.03,   // 3%
+  0.05,   // 5%
+  0.0625, // 6.25%
+  0.0833, // 8.33%
   0.1,    // 10%
   0.125,  // 12.5%
   0.1667, // 16.7%
@@ -41,18 +47,56 @@ export function formatZoomPercent(zoom: number): string {
   return `${rounded % 1 === 0 ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
 }
 
+export const VIEWPORT_FIT_PADDING = 48; // 24px margin on each side for clean artboard visibility
+
+/**
+ * Calculates adaptive zoom based on layer/canvas dimensions and viewport size.
+ * 100% (1.0) is the default zoom level when canvas fits.
+ * If canvas exceeds viewport (e.g. manga canvas), adapts vertically to fit cleanly.
+ * 100% is the default zoom level rather than the maximum zoom level (MAX_ZOOM = 32.0).
+ */
+export function calculateAdaptiveZoom(
+  dimensions: CanvasDimensions | undefined,
+  viewport: HTMLDivElement | null
+): number {
+  if (!viewport || !dimensions || dimensions.height <= 0 || dimensions.width <= 0) {
+    return 1.0;
+  }
+
+  const vw = viewport.clientWidth;
+  const vh = viewport.clientHeight;
+  if (vw <= 0 || vh <= 0) {
+    return 1.0;
+  }
+
+  const availH = Math.max(20, vh - VIEWPORT_FIT_PADDING);
+  const availW = Math.max(20, vw - VIEWPORT_FIT_PADDING);
+
+  const scaleY = availH / dimensions.height;
+  const scaleX = availW / dimensions.width;
+  const fitZoom = Math.min(scaleY, scaleX);
+
+  const targetZoom = fitZoom < 1.0 ? fitZoom : 1.0;
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, targetZoom));
+}
+
 interface UseCanvasNavigationProps {
   dimensions?: CanvasDimensions;
   isWebtoonMode?: boolean;
 }
 
-export function useCanvasNavigation({ dimensions: _dimensions, isWebtoonMode = false }: UseCanvasNavigationProps = {}) {
+export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCanvasNavigationProps = {}) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
 
   const [zoom, setZoomState] = useState<number>(1.0);
   // Pan represents the canvas center in viewport coordinates
   const [pan, setPanState] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [rotation, setRotationState] = useState<number>(0.0);
+
+  const dimensionsRef = useRef<CanvasDimensions | undefined>(dimensions);
+  useEffect(() => {
+    dimensionsRef.current = dimensions;
+  }, [dimensions]);
 
   const [isSpaceDown, setIsSpaceDown] = useState<boolean>(false);
   const [isShiftDown, setIsShiftDown] = useState<boolean>(false);
@@ -136,19 +180,25 @@ export function useCanvasNavigation({ dimensions: _dimensions, isWebtoonMode = f
       y: Math.round(vh / 2),
     };
 
+    const clampedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, targetZoom));
     panRef.current = newCenter;
     setPanState(newCenter);
-    zoomRef.current = targetZoom;
+    zoomRef.current = clampedZoom;
+    setZoomState(clampedZoom);
   }, []);
 
-  // Reset zoom to 100%, rotation to 0°, and re-center the canvas (Ctrl + 0)
-  const resetZoomAndCenter = useCallback(() => {
-    zoomRef.current = 1.0;
-    setZoomState(1.0);
-    rotationRef.current = 0.0;
-    setRotationState(0.0);
-    centerCanvas(1.0);
-  }, [centerCanvas]);
+  // Reset zoom based on layer/canvas dimensions (adapts vertically for oversized formats like manga,
+  // defaults to 100% when fitting, centered, rotation to 0°)
+  const resetZoomAndCenter = useCallback(
+    (customDims?: CanvasDimensions) => {
+      const activeDims = customDims || dimensionsRef.current;
+      const targetZoom = calculateAdaptiveZoom(activeDims, viewportRef.current);
+      rotationRef.current = 0.0;
+      setRotationState(0.0);
+      centerCanvas(targetZoom);
+    },
+    [centerCanvas]
+  );
 
   // Reset only rotation to 0° around the viewport center (Ctrl + Alt + 0)
   const resetRotation = useCallback(() => {
@@ -284,7 +334,8 @@ export function useCanvasNavigation({ dimensions: _dimensions, isWebtoonMode = f
     let prevHeight = viewport.clientHeight;
 
     if (!hasInitializedCenterRef.current && prevWidth > 0 && prevHeight > 0) {
-      centerCanvas(1.0);
+      const initialZoom = calculateAdaptiveZoom(dimensionsRef.current, viewport);
+      centerCanvas(initialZoom);
       hasInitializedCenterRef.current = true;
     }
 
@@ -294,7 +345,8 @@ export function useCanvasNavigation({ dimensions: _dimensions, isWebtoonMode = f
         if (width <= 0 || height <= 0) continue;
 
         if (!hasInitializedCenterRef.current) {
-          centerCanvas(1.0);
+          const initialZoom = calculateAdaptiveZoom(dimensionsRef.current, viewport);
+          centerCanvas(initialZoom);
           hasInitializedCenterRef.current = true;
         } else {
           // Adjust canvas center by half the size difference to keep canvas centered

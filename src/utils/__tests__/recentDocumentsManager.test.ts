@@ -103,4 +103,49 @@ describe('recentDocumentsManager', () => {
     const docs = await loadRecentDocuments();
     expect(docs.find((d) => d.id === testDoc.id)).toBeUndefined();
   });
+
+  it('filters out unsaved files and dummy canvas creation entries', async () => {
+    // Unsaved dummy created canvas from handleCreateNewCanvas
+    const unsavedDummy: RecentDocument = {
+      id: 'doc-unsaved-1',
+      title: 'Untitled*',
+      path: 'InkStudio\\Untitled.sora',
+      size: 524288,
+      isStarred: false,
+      lastOpened: Date.now(),
+      isSaved: false,
+    };
+    await saveRecentDocument(unsavedDummy);
+
+    // Document explicitly flagged as not saved
+    const notSavedDoc: RecentDocument = {
+      id: 'doc-unsaved-2',
+      title: 'Manga Draft',
+      path: 'C:\\Draft.sora',
+      size: 1024,
+      isStarred: false,
+      lastOpened: Date.now(),
+      isSaved: false,
+    };
+    await saveRecentDocument(notSavedDoc);
+
+    // Valid actually saved document
+    const savedDoc: RecentDocument = {
+      id: 'doc-saved-1',
+      title: 'Finished_Page.sora',
+      path: 'C:\\Users\\Artist\\Documents\\Finished_Page.sora',
+      size: 1572864,
+      isStarred: false,
+      lastOpened: Date.now(),
+      isSaved: true,
+      fileType: '.sora',
+    };
+    await saveRecentDocument(savedDoc);
+
+    const docs = await loadRecentDocuments();
+    expect(docs.find((d) => d.id === 'doc-unsaved-1')).toBeUndefined();
+    expect(docs.find((d) => d.id === 'doc-unsaved-2')).toBeUndefined();
+    expect(docs.find((d) => d.id === 'doc-saved-1')).toBeDefined();
+    expect(docs.length).toBe(1);
+  });
 });

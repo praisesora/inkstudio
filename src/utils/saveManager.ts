@@ -282,7 +282,7 @@ export function downloadFile(
  */
 export async function promptSaveAs(
   data: SaveDocumentData,
-  defaultExtension: string = '.png',
+  defaultExtension: string = '.sora',
   fallbackToDownload: boolean = true
 ): Promise<SavedFileInfo> {
   const safeName = data.name.trim().replace(/[^a-zA-Z0-9_\- ]/g, '_') || 'Untitled';
@@ -290,16 +290,16 @@ export async function promptSaveAs(
 
   const types = [
     {
-      description: 'PNG Image (*.png)',
-      accept: { 'image/png': ['.png'] },
+      description: 'Ink Studio Layered Project (*.sora, *.ink)',
+      accept: { 'application/json': ['.sora', '.ink'] },
     },
     {
       description: 'Photoshop Document with Layers (*.psd)',
       accept: { 'image/vnd.adobe.photoshop': ['.psd'] },
     },
     {
-      description: 'Ink Studio Layered Project (*.ink, *.sora)',
-      accept: { 'application/json': ['.ink', '.sora'] },
+      description: 'PNG Image (*.png)',
+      accept: { 'image/png': ['.png'] },
     },
     {
       description: 'JPEG Image (*.jpg, *.jpeg)',
