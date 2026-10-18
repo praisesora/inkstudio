@@ -785,6 +785,23 @@ export const ColorWheel: React.FC<ColorWheelProps> = ({
             </button>
           </div>
 
+          {/* Harmony Button matching Reference 2 */}
+          <button
+            onClick={() => {
+              const compHue = (hsv.h + 180) % 360;
+              const compHex = hsvToHex(compHue, hsv.s, hsv.v);
+              if (activeTarget === 'primary') {
+                onSecondaryColorChange(compHex);
+              } else {
+                onPrimaryColorChange(compHex);
+              }
+            }}
+            title="Set complementary harmony color to secondary swatch"
+            className="px-2 py-1 rounded-md bg-white/[0.05] hover:bg-white/[0.09] border border-white/[0.08] text-white/80 hover:text-white text-[11px] font-medium transition-colors cursor-pointer"
+          >
+            Harmony
+          </button>
+
           {/* Toggle RGB Sliders */}
           <button
             onClick={() => setShowAdvanced((v) => !v)}

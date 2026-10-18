@@ -59,14 +59,21 @@ export function calculateAdaptiveZoom(
   dimensions: CanvasDimensions | undefined,
   viewport: HTMLDivElement | null
 ): number {
-  if (!viewport || !dimensions || dimensions.height <= 0 || dimensions.width <= 0) {
+  if (!dimensions || dimensions.height <= 0 || dimensions.width <= 0) {
     return 1.0;
   }
 
-  const vw = viewport.clientWidth;
-  const vh = viewport.clientHeight;
+  let vw = viewport?.clientWidth ?? 0;
+  let vh = viewport?.clientHeight ?? 0;
+
+  // Fallback to window dimensions if viewport is not yet attached to DOM or measured
   if (vw <= 0 || vh <= 0) {
-    return 1.0;
+    if (typeof window !== 'undefined') {
+      vw = Math.max(300, window.innerWidth - 300);
+      vh = Math.max(300, window.innerHeight - 80);
+    } else {
+      return 1.0;
+    }
   }
 
   const availH = Math.max(20, vh - VIEWPORT_FIT_PADDING);
@@ -83,9 +90,14 @@ export function calculateAdaptiveZoom(
 interface UseCanvasNavigationProps {
   dimensions?: CanvasDimensions;
   isWebtoonMode?: boolean;
+  activeDocumentId?: string | null;
 }
 
-export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCanvasNavigationProps = {}) {
+export function useCanvasNavigation({
+  dimensions,
+  isWebtoonMode = false,
+  activeDocumentId = null,
+}: UseCanvasNavigationProps = {}) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
 
   const [zoom, setZoomState] = useState<number>(1.0);
@@ -94,9 +106,7 @@ export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCa
   const [rotation, setRotationState] = useState<number>(0.0);
 
   const dimensionsRef = useRef<CanvasDimensions | undefined>(dimensions);
-  useEffect(() => {
-    dimensionsRef.current = dimensions;
-  }, [dimensions]);
+  dimensionsRef.current = dimensions;
 
   const [isSpaceDown, setIsSpaceDown] = useState<boolean>(false);
   const [isShiftDown, setIsShiftDown] = useState<boolean>(false);
@@ -169,11 +179,18 @@ export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCa
   // Center canvas in viewport given target zoom
   const centerCanvas = useCallback((targetZoom: number = zoomRef.current) => {
     const viewport = viewportRef.current;
-    if (!viewport) return;
+    let vw = viewport?.clientWidth ?? 0;
+    let vh = viewport?.clientHeight ?? 0;
 
-    const vw = viewport.clientWidth;
-    const vh = viewport.clientHeight;
-    if (vw <= 0 || vh <= 0) return;
+    // Fallback to window bounds if viewport not yet mounted
+    if (vw <= 0 || vh <= 0) {
+      if (typeof window !== 'undefined') {
+        vw = Math.max(300, window.innerWidth - 300);
+        vh = Math.max(300, window.innerHeight - 80);
+      } else {
+        return;
+      }
+    }
 
     const newCenter = {
       x: Math.round(vw / 2),
@@ -195,6 +212,7 @@ export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCa
       const targetZoom = calculateAdaptiveZoom(activeDims, viewportRef.current);
       rotationRef.current = 0.0;
       setRotationState(0.0);
+      hasInitializedCenterRef.current = true;
       centerCanvas(targetZoom);
     },
     [centerCanvas]
@@ -325,7 +343,12 @@ export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCa
     setIsRotating(true);
   }, []);
 
-  // Center on initial mount and handle window / viewport resize gracefully
+  // Reset centering flag when active document changes
+  useEffect(() => {
+    hasInitializedCenterRef.current = false;
+  }, [activeDocumentId]);
+
+  // Center on mount, document change, and handle window / viewport resize gracefully
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -364,7 +387,7 @@ export function useCanvasNavigation({ dimensions, isWebtoonMode = false }: UseCa
 
     ro.observe(viewport);
     return () => ro.disconnect();
-  }, [centerCanvas, setPan]);
+  }, [centerCanvas, setPan, activeDocumentId]);
 
   // Mouse wheel zoom centered on cursor position (accounts for rotation angle)
   useEffect(() => {

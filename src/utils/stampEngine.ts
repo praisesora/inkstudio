@@ -7,6 +7,7 @@ import {
   rgbToHex,
 } from './colorMixingEngine';
 import { evaluateCspSpline } from './sutParser';
+import { WebGlBrushEngine, GpuDab } from './webglBrushEngine';
 
 export interface TexturedBrushOptions {
   size: number;
@@ -31,6 +32,7 @@ export interface TexturedBrushOptions {
   spray?: CspSpraySettings;
   taper?: CspTaperSettings;
   colorMixing?: boolean;
+  perceptualMixing?: boolean;
   amountOfPaint?: number;
   densityOfPaint?: number;
   colorStretch?: number;
@@ -44,6 +46,9 @@ export interface TexturedBrushOptions {
   paperTextureImage?: HTMLImageElement;
   paperTextureScale?: number;
   paperTextureRotate?: number;
+  dualBrush?: boolean;
+  dualTipImage?: HTMLImageElement;
+  dualBrushCompositeMode?: string;
   useGpu?: boolean;
   underlyingCanvas?: HTMLCanvasElement;
   sampler?: LayerPixelSampler;
@@ -787,6 +792,16 @@ export function drawTexturedCubicBezierSegment(
   const thickness = options.thickness ?? 1.0;
   const rotationRandomScale = options.rotationRandomScale ?? 0;
 
+  const gpuEngine = WebGlBrushEngine.getInstance();
+  const canUseGpu =
+    Boolean(options.useGpu) &&
+    gpuEngine.isAvailable() &&
+    !options.alphaLocked &&
+    !options.isTransparentInk &&
+    (!options.subTipImages || options.subTipImages.length <= 1) &&
+    Boolean(ctx.canvas && ctx.canvas.width > 0 && ctx.canvas.height > 0);
+  const gpuDabs: GpuDab[] | null = canUseGpu ? [] : null;
+
   let smoothCos = Math.cos(baseAngleRad);
   let smoothSin = Math.sin(baseAngleRad);
 
@@ -801,9 +816,10 @@ export function drawTexturedCubicBezierSegment(
       ? options.size * (minFactor + (1.0 - minFactor) * effPressure)
       : options.size;
 
+    const strokeDist = (options.currentStrokeDist ?? 0) + currentDist;
+
     // Stroke taper modulation (Clip Studio Paint style)
     if (options.taper) {
-      const strokeDist = (options.currentStrokeDist ?? 0) + currentDist;
       const inLen = options.taper.inLength || (options.taper.inRatio ? options.taper.inRatio * 2.5 : 0);
       if (options.taper.useIn && inLen > 0 && strokeDist < inLen) {
         const inFactor = Math.max(0.01, Math.min(1.0, strokeDist / inLen));
@@ -880,7 +896,7 @@ export function drawTexturedCubicBezierSegment(
     }
 
     // Wet Edge rim boost
-    if (options.wetEdge && options.wetEdge > 0) {
+    if (options.wetEdge && options.wetEdge > 0 && !gpuDabs) {
       dabAlpha = Math.min(1.0, dabAlpha * (1.0 + options.wetEdge * 0.25));
     }
 
@@ -893,7 +909,7 @@ export function drawTexturedCubicBezierSegment(
       stampAngle
     );
     const isColorTip = Boolean(options.subTips && options.subTips[0]?.isColor);
-    const master = getTintedTipMaster(activeTip, dabColor, isColorTip);
+    const master = gpuDabs ? null : getTintedTipMaster(activeTip, dabColor, isColorTip);
 
     const tiltX = pt.tiltX ?? 0;
     const tiltY = pt.tiltY ?? 0;
@@ -934,7 +950,7 @@ export function drawTexturedCubicBezierSegment(
     const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
     const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
     const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
-    const primRgb = colorJitterEnabled ? parseColorToRgb(dabColor) : null;
+    const primRgb = (colorJitterEnabled || gpuDabs) ? parseColorToRgb(dabColor) : null;
     const secRgb = colorJitterEnabled ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
 
     for (let k = 0; k < dabCount; k++) {
@@ -975,13 +991,22 @@ export function drawTexturedCubicBezierSegment(
       }
 
       let curMaster = master;
+      let dabR = primRgb ? primRgb.r / 255 : 0;
+      let dabG = primRgb ? primRgb.g / 255 : 0;
+      let dabB = primRgb ? primRgb.b / 255 : 0;
+
       if (colorJitterEnabled && primRgb && secRgb && dynamics) {
         const cd = applyColorDynamics(
           { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
           { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
           dynamics
         );
-        curMaster = getTintedTipMaster(activeTip, cd.hex, isColorTip);
+        dabR = cd.r;
+        dabG = cd.g;
+        dabB = cd.b;
+        if (!gpuDabs) {
+          curMaster = getTintedTipMaster(activeTip, cd.hex, isColorTip);
+        }
       }
 
       let finalW = curDabW;
@@ -1000,22 +1025,55 @@ export function drawTexturedCubicBezierSegment(
           const u2 = Math.random();
           const r = radius * Math.sqrt(u1) * (1 - (options.spray.bias || 0) * (1 - u2));
           const th = Math.PI * 2 * Math.random();
-          drawSingleStamp(
-            ctx,
-            curMaster,
-            curDabX + r * Math.cos(th),
-            curDabY + r * Math.sin(th),
-            pSize,
-            pSize * aspect * curDabThickness,
-            curDabAngle,
-            curDabAlpha,
-            isEraser,
-            isBgEraser,
-            options.alphaLocked,
-            options.isTransparentInk
-          );
+          const spX = curDabX + r * Math.cos(th);
+          const spY = curDabY + r * Math.sin(th);
+          const spH = pSize * aspect * curDabThickness;
+          if (gpuDabs) {
+            gpuDabs.push({
+              x: spX,
+              y: spY,
+              width: pSize,
+              height: spH,
+              angle: curDabAngle,
+              r: dabR,
+              g: dabG,
+              b: dabB,
+              alpha: curDabAlpha,
+              pressure: effPressure,
+              strokeDist,
+            });
+          } else if (curMaster) {
+            drawSingleStamp(
+              ctx,
+              curMaster,
+              spX,
+              spY,
+              pSize,
+              spH,
+              curDabAngle,
+              curDabAlpha,
+              isEraser,
+              isBgEraser,
+              options.alphaLocked,
+              options.isTransparentInk
+            );
+          }
         }
-      } else {
+      } else if (gpuDabs) {
+        gpuDabs.push({
+          x: curDabX,
+          y: curDabY,
+          width: finalW,
+          height: finalH,
+          angle: curDabAngle,
+          r: dabR,
+          g: dabG,
+          b: dabB,
+          alpha: curDabAlpha,
+          pressure: effPressure,
+          strokeDist,
+        });
+      } else if (curMaster) {
         drawSingleStamp(
           ctx,
           curMaster,
@@ -1035,6 +1093,32 @@ export function drawTexturedCubicBezierSegment(
 
     const requiredStep = Math.max(0.2, curWidth * spacingRatio);
     currentDist += requiredStep;
+  }
+
+  if (gpuDabs && gpuDabs.length > 0) {
+    gpuEngine.renderDabsToContext(
+      ctx,
+      gpuDabs,
+      {
+        size: options.size,
+        opacity: options.opacity ?? 1.0,
+        flow: baseFlow,
+        hardness: options.hardness ?? 1.0,
+        wetEdge: options.wetEdge ?? 0,
+        grain: options.grain,
+        textureDensity: options.textureDensity,
+        paperTextureScale: options.paperTextureScale,
+        customTipImage: tipImage,
+        dualBrush: options.dualBrush,
+        dualTipImage: options.dualTipImage,
+        dualBrushCompositeMode: options.dualBrushCompositeMode,
+        colorMixing: false, // Reservoir already mixed per dab with LayerPixelSampler
+        perceptualMixing: options.perceptualMixing,
+      } as any,
+      isEraser ? 'eraser' : 'brush',
+      ctx.canvas.width,
+      ctx.canvas.height
+    );
   }
 
   const nextRemainder = currentDist - totalCurveLength;
@@ -1255,6 +1339,7 @@ export function centripetalCatmullRomToBezier(
 
 export interface RadialMixingOptions {
   colorMixing?: boolean;
+  perceptualMixing?: boolean;
   amountOfPaint?: number;
   densityOfPaint?: number;
   colorStretch?: number;
@@ -1266,6 +1351,10 @@ export interface RadialMixingOptions {
   isTransparentInk?: boolean;
   dynamics?: BrushDynamics;
   secondaryColor?: string;
+  useGpu?: boolean;
+  dualBrush?: boolean;
+  dualTipImage?: HTMLImageElement;
+  dualBrushCompositeMode?: string;
 }
 
 /**
@@ -1438,7 +1527,7 @@ export function drawRadialCubicBezierSegment(
   color: string,
   hardness: number = 1.0,
   flow: number = 1.0,
-  spacing: number = 0.06,
+  spacing: number = 0.08,
   isEraser: boolean = false,
   isBgEraser: boolean = false,
   remainderDist: number = 0,
@@ -1453,16 +1542,26 @@ export function drawRadialCubicBezierSegment(
   }
 
   const isColorMixing = Boolean(mixingOptions?.colorMixing) && !isEraser && !isBgEraser;
+  const dynamics = mixingOptions?.dynamics;
+
+  const gpuEngine = WebGlBrushEngine.getInstance();
+  const canUseGpu =
+    Boolean(mixingOptions?.useGpu) &&
+    gpuEngine.isAvailable() &&
+    !mixingOptions?.alphaLocked &&
+    !mixingOptions?.isTransparentInk &&
+    Boolean(ctx.canvas && ctx.canvas.width > 0 && ctx.canvas.height > 0);
+  const gpuDabs: GpuDab[] | null = canUseGpu ? [] : null;
+
   if (isColorMixing && mixingOptions && !mixingOptions.reservoir) {
     mixingOptions.reservoir = new PaintReservoir(color);
   }
   const reservoir = mixingOptions?.reservoir;
   const sampler = mixingOptions?.sampler;
-  const staticMaster = isColorMixing ? null : getRadialDabMaster(hardness, color, isEraser && !isBgEraser);
+  const staticMaster = (isColorMixing || gpuDabs) ? null : getRadialDabMaster(hardness, color, isEraser && !isBgEraser);
   const spacingRatio = Math.max(0.015, Math.min(1.0, spacing));
   let currentDist = remainderDist > 0 ? remainderDist : 0;
 
-  const dynamics = mixingOptions?.dynamics;
   const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
   const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
   const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
@@ -1471,7 +1570,7 @@ export function drawRadialCubicBezierSegment(
   const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
   const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
   const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
-  const primRgb = colorJitterEnabled ? parseColorToRgb(color) : null;
+  const baseRgb = (colorJitterEnabled || gpuDabs) ? parseColorToRgb(isBgEraser ? '#ffffff' : color) : null;
   const secRgb = colorJitterEnabled ? parseColorToRgb(mixingOptions?.secondaryColor || '#ffffff') : null;
 
   while (currentDist <= totalCurveLength) {
@@ -1498,6 +1597,7 @@ export function drawRadialCubicBezierSegment(
 
     let dabMaster = staticMaster;
     let dabFlow = flow;
+    let dabRgb = baseRgb;
 
     if (isColorMixing && reservoir) {
       let sampled = { r: 255, g: 255, b: 255, a: 0 };
@@ -1522,7 +1622,11 @@ export function drawRadialCubicBezierSegment(
         requiredStep
       );
 
-      dabMaster = getRadialDabMaster(hardness, mixed.colorHex, false);
+      if (!gpuDabs) {
+        dabMaster = getRadialDabMaster(hardness, mixed.colorHex, false);
+      } else {
+        dabRgb = { r: mixed.r, g: mixed.g, b: mixed.b };
+      }
       dabFlow = mixed.alpha;
 
       if (sampler) {
@@ -1593,13 +1697,22 @@ export function drawRadialCubicBezierSegment(
       }
 
       let curMaster = dabMaster;
-      if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+      let rNorm = dabRgb ? dabRgb.r / 255 : 0;
+      let gNorm = dabRgb ? dabRgb.g / 255 : 0;
+      let bNorm = dabRgb ? dabRgb.b / 255 : 0;
+
+      if (colorJitterEnabled && dabRgb && secRgb && dynamics) {
         const cd = applyColorDynamics(
-          { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
+          { r: dabRgb.r / 255, g: dabRgb.g / 255, b: dabRgb.b / 255 },
           { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
           dynamics
         );
-        curMaster = getRadialDabMaster(hardness, cd.hex, isEraser && !isBgEraser);
+        rNorm = cd.r;
+        gNorm = cd.g;
+        bNorm = cd.b;
+        if (!gpuDabs) {
+          curMaster = getRadialDabMaster(hardness, cd.hex, isEraser && !isBgEraser);
+        }
       }
 
       let finalW = curDabW;
@@ -1609,7 +1722,21 @@ export function drawRadialCubicBezierSegment(
         finalH = (curDabW * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
       }
 
-      if (curMaster) {
+      if (gpuDabs) {
+        gpuDabs.push({
+          x: curDabX,
+          y: curDabY,
+          width: finalW,
+          height: finalH,
+          angle: curDabRot,
+          r: rNorm,
+          g: gNorm,
+          b: bNorm,
+          alpha: curDabFlow,
+          pressure: pt.pressure ?? 1.0,
+          strokeDist: currentDist,
+        });
+      } else if (curMaster) {
         drawSingleStamp(
           ctx,
           curMaster,
@@ -1630,6 +1757,28 @@ export function drawRadialCubicBezierSegment(
     currentDist += requiredStep;
   }
 
+  if (gpuDabs && gpuDabs.length > 0) {
+    gpuEngine.renderDabsToContext(
+      ctx,
+      gpuDabs,
+      {
+        size: p0.width || 10,
+        opacity: 1.0,
+        flow,
+        hardness,
+        wetEdge: 0,
+        dualBrush: mixingOptions?.dualBrush,
+        dualTipImage: mixingOptions?.dualTipImage,
+        dualBrushCompositeMode: mixingOptions?.dualBrushCompositeMode,
+        colorMixing: false,
+        perceptualMixing: mixingOptions?.perceptualMixing,
+      } as any,
+      isEraser ? 'eraser' : 'brush',
+      ctx.canvas.width,
+      ctx.canvas.height
+    );
+  }
+
   const nextRemainder = currentDist - totalCurveLength;
   return Math.max(0, nextRemainder);
 }
@@ -1643,7 +1792,7 @@ export function renderCompleteRadialStroke(
   color: string,
   hardness: number = 1.0,
   flow: number = 1.0,
-  spacing: number = 0.06,
+  spacing: number = 0.08,
   isEraser: boolean = false,
   isBgEraser: boolean = false,
   thickness: number = 1.0,

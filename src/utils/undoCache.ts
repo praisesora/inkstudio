@@ -7,6 +7,7 @@
  * older tile-delta states to high-speed temporary disk storage via Tauri v2 Rust IPC.
  */
 
+import { zlibSync, unzlibSync } from 'fflate';
 import { TileDelta, HistoryItem } from '../types/editor';
 import { serializeTileDeltas, deserializeTileDeltas } from './tileEngine';
 
@@ -21,10 +22,34 @@ export function isTauriEnvironment(): boolean {
   );
 }
 
+/**
+ * Compresses serialized tile deltas using fast level-1 zlib compression.
+ */
+export function compressTileDeltasPayload(deltas: TileDelta[]): Uint8Array {
+  const serialized = serializeTileDeltas(deltas);
+  return zlibSync(serialized, { level: 1 });
+}
+
+/**
+ * Decompresses and deserializes tile deltas (supports both zlib-compressed and raw payloads).
+ */
+export function decompressTileDeltasPayload(payload: Uint8Array): TileDelta[] {
+  if (payload.length >= 2 && payload[0] === 0x78) {
+    try {
+      const raw = unzlibSync(payload);
+      return deserializeTileDeltas(raw);
+    } catch {
+      // Fallback if byte 0 happened to be 0x78 in an uncompressed stream
+    }
+  }
+  return deserializeTileDeltas(payload);
+}
+
 export class UndoCacheManager {
   private sessionId: string;
   private ramItems: Set<string> = new Set();
   private diskCachedIds: Set<string> = new Set();
+  private compressedRamCache: Map<string, Uint8Array> = new Map();
 
   constructor(sessionId?: string) {
     this.sessionId = sessionId || `session-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
@@ -42,9 +67,8 @@ export class UndoCacheManager {
 
     this.ramItems.add(item.id);
 
-    // If RAM budget is exceeded, offload the oldest in-memory steps to disk
+    // If RAM budget is exceeded, offload the oldest in-memory steps to disk or compressed archive
     if (this.ramItems.size > MAX_RAM_UNDO_STEPS) {
-      // Find oldest items in allHistory that are still in ramItems
       for (const oldItem of allHistory) {
         if (oldItem.id !== item.id && this.ramItems.has(oldItem.id) && oldItem.tileDeltas) {
           await this.offloadToDisk(oldItem);
@@ -56,51 +80,72 @@ export class UndoCacheManager {
   }
 
   /**
-   * Offload a single history item's tile deltas to disk via Tauri IPC.
+   * Offload a single history item's tile deltas to disk via Tauri IPC (with fast zlib compression),
+   * or to a compact zlib-compressed RAM buffer when running in a browser environment.
    */
   public async offloadToDisk(item: HistoryItem): Promise<void> {
     if (!item.tileDeltas || item.tileDeltas.length === 0) return;
 
+    const compressed = compressTileDeltasPayload(item.tileDeltas);
+
     if (isTauriEnvironment()) {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        const serialized = serializeTileDeltas(item.tileDeltas);
         await invoke('save_undo_tile_cache', {
           sessionId: this.sessionId,
           stateId: item.id,
-          data: Array.from(serialized),
+          data: compressed,
         });
         this.diskCachedIds.add(item.id);
-        // Free memory in RAM
         item.tileDeltas = undefined;
+        return;
       } catch (err) {
-        console.warn('[UndoCache] Failed to offload tile deltas to disk:', err);
+        console.warn('[UndoCache] Failed to offload tile deltas to disk, using compressed RAM fallback:', err);
       }
     }
+
+    // Browser / fallback path: store zlib-compressed binary payload (85-95% smaller than raw RGBA)
+    this.compressedRamCache.set(item.id, compressed);
+    item.tileDeltas = undefined;
   }
 
   /**
-   * Retrieve tile deltas for a history item, restoring from disk if necessary.
+   * Retrieve tile deltas for a history item, restoring from compressed RAM or disk if necessary.
    */
   public async resolveDeltas(item: HistoryItem): Promise<TileDelta[] | null> {
     if (item.tileDeltas && item.tileDeltas.length > 0) {
       return item.tileDeltas;
     }
 
+    const compressedInRam = this.compressedRamCache.get(item.id);
+    if (compressedInRam) {
+      const deltas = decompressTileDeltasPayload(compressedInRam);
+      this.compressedRamCache.delete(item.id);
+      item.tileDeltas = deltas;
+      this.ramItems.add(item.id);
+      return deltas;
+    }
+
     if (this.diskCachedIds.has(item.id) && isTauriEnvironment()) {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        const rawData = await invoke<number[]>('load_undo_tile_cache', {
+        const rawData = await invoke<number[] | Uint8Array | ArrayBuffer>('load_undo_tile_cache', {
           sessionId: this.sessionId,
           stateId: item.id,
         });
-        if (rawData && rawData.length > 0) {
-          const u8 = new Uint8Array(rawData);
-          const deltas = deserializeTileDeltas(u8);
-          // Re-populate item
-          item.tileDeltas = deltas;
-          this.ramItems.add(item.id);
-          return deltas;
+        if (rawData) {
+          const u8 =
+            rawData instanceof Uint8Array
+              ? rawData
+              : rawData instanceof ArrayBuffer
+              ? new Uint8Array(rawData)
+              : new Uint8Array(rawData);
+          if (u8.length > 0) {
+            const deltas = decompressTileDeltasPayload(u8);
+            item.tileDeltas = deltas;
+            this.ramItems.add(item.id);
+            return deltas;
+          }
         }
       } catch (err) {
         console.warn('[UndoCache] Failed to restore tile deltas from disk:', err);
@@ -111,11 +156,12 @@ export class UndoCacheManager {
   }
 
   /**
-   * Clear all disk cached states for this session.
+   * Clear all disk and compressed cached states for this session.
    */
   public async clearCache(): Promise<void> {
     this.ramItems.clear();
     this.diskCachedIds.clear();
+    this.compressedRamCache.clear();
     if (isTauriEnvironment()) {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
@@ -129,3 +175,4 @@ export class UndoCacheManager {
 
 // Global default undo cache manager instance
 export const globalUndoCache = new UndoCacheManager();
+

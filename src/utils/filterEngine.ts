@@ -435,6 +435,199 @@ export function applyFilmGrain(
   return output;
 }
 
+export const FILTER_VERTEX_SHADER = `
+  attribute vec2 a_position;
+  varying vec2 v_uv;
+  void main() {
+    v_uv = a_position * 0.5 + 0.5;
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+`;
+
+export const GAUSSIAN_BLUR_FRAGMENT_SHADER = `
+  precision highp float;
+  varying vec2 v_uv;
+  uniform sampler2D u_tex;
+  uniform vec2 u_dir; // (1.0/width, 0.0) or (0.0, 1.0/height)
+  uniform float u_radius;
+
+  void main() {
+    float sigma = max(0.5, u_radius * 0.5);
+    float twoSigmaSq = 2.0 * sigma * sigma;
+    vec4 acc = vec4(0.0);
+    float weightSum = 0.0;
+
+    for (int i = -24; i <= 24; i++) {
+      float fi = float(i);
+      if (abs(fi) > u_radius) continue;
+      float w = exp(-(fi * fi) / twoSigmaSq);
+      acc += texture2D(u_tex, clamp(v_uv + u_dir * fi, 0.0, 1.0)) * w;
+      weightSum += w;
+    }
+
+    gl_FragColor = acc / max(0.0001, weightSum);
+  }
+`;
+
+export const MOTION_BLUR_FRAGMENT_SHADER = `
+  precision highp float;
+  varying vec2 v_uv;
+  uniform sampler2D u_tex;
+  uniform vec2 u_stepVec;
+  uniform int u_halfSteps;
+
+  void main() {
+    vec4 acc = vec4(0.0);
+    float count = 0.0;
+    for (int i = -32; i <= 32; i++) {
+      if (i < -u_halfSteps || i > u_halfSteps) continue;
+      vec2 sampleUv = clamp(v_uv + u_stepVec * float(i), 0.0, 1.0);
+      acc += texture2D(u_tex, sampleUv);
+      count += 1.0;
+    }
+    gl_FragColor = acc / max(1.0, count);
+  }
+`;
+
+export class WebGlFilterEngine {
+  private static instance: WebGlFilterEngine | null = null;
+  private canvas: HTMLCanvasElement | null = null;
+  private gl: WebGLRenderingContext | null = null;
+  private gaussProgram: WebGLProgram | null = null;
+  private motionProgram: WebGLProgram | null = null;
+  private quadBuffer: WebGLBuffer | null = null;
+  private texA: WebGLTexture | null = null;
+  private texB: WebGLTexture | null = null;
+  private fboA: WebGLFramebuffer | null = null;
+  private gpuReady = false;
+
+  public static getInstance(): WebGlFilterEngine {
+    if (!WebGlFilterEngine.instance) {
+      WebGlFilterEngine.instance = new WebGlFilterEngine();
+    }
+    return WebGlFilterEngine.instance;
+  }
+
+  private constructor() {
+    if (typeof document === 'undefined') return;
+    try {
+      this.canvas = document.createElement('canvas');
+      const gl = (this.canvas.getContext('webgl2', { premultipliedAlpha: false, alpha: true }) ||
+        this.canvas.getContext('webgl', { premultipliedAlpha: false, alpha: true })) as WebGLRenderingContext | null;
+      if (!gl) return;
+      this.gl = gl;
+
+      this.gaussProgram = this.compileProgram(gl, FILTER_VERTEX_SHADER, GAUSSIAN_BLUR_FRAGMENT_SHADER);
+      this.motionProgram = this.compileProgram(gl, FILTER_VERTEX_SHADER, MOTION_BLUR_FRAGMENT_SHADER);
+      if (!this.gaussProgram || !this.motionProgram) return;
+
+      this.quadBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
+        gl.STATIC_DRAW
+      );
+
+      this.texA = gl.createTexture();
+      this.texB = gl.createTexture();
+      this.fboA = gl.createFramebuffer();
+      this.gpuReady = true;
+    } catch {
+      this.gpuReady = false;
+    }
+  }
+
+  private compileProgram(gl: WebGLRenderingContext, vsSrc: string, fsSrc: string): WebGLProgram | null {
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    if (!vs || !fs) return null;
+    gl.shaderSource(vs, vsSrc);
+    gl.compileShader(vs);
+    gl.shaderSource(fs, fsSrc);
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS) || !gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+      return null;
+    }
+    const prog = gl.createProgram();
+    if (!prog) return null;
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return null;
+    return prog;
+  }
+
+  public isAvailable(): boolean {
+    return this.gpuReady && this.gl !== null;
+  }
+
+  public renderGaussianBlurToCanvas(targetCanvas: HTMLCanvasElement, radius: number): boolean {
+    if (!this.isAvailable() || !this.gl || !this.canvas || !this.gaussProgram || !this.texA || !this.texB || !this.fboA) {
+      return false;
+    }
+    const w = targetCanvas.width;
+    const h = targetCanvas.height;
+    if (w <= 0 || h <= 0 || radius > 24) return false;
+
+    const gl = this.gl;
+    if (this.canvas.width !== w || this.canvas.height !== h) {
+      this.canvas.width = w;
+      this.canvas.height = h;
+    }
+
+    // Upload source canvas to texA
+    gl.bindTexture(gl.TEXTURE_2D, this.texA);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, targetCanvas);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    // Allocate texB for horizontal pass FBO
+    gl.bindTexture(gl.TEXTURE_2D, this.texB);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fboA);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.texB, 0);
+
+    gl.viewport(0, 0, w, h);
+    gl.useProgram(this.gaussProgram);
+
+    const posLoc = gl.getAttribLocation(this.gaussProgram, 'a_position');
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+    // Pass 1: Horizontal into texB
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.texA);
+    gl.uniform1i(gl.getUniformLocation(this.gaussProgram, 'u_tex'), 0);
+    gl.uniform2f(gl.getUniformLocation(this.gaussProgram, 'u_dir'), 1.0 / w, 0.0);
+    gl.uniform1f(gl.getUniformLocation(this.gaussProgram, 'u_radius'), radius);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Pass 2: Vertical to default framebuffer
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, this.texB);
+    gl.uniform2f(gl.getUniformLocation(this.gaussProgram, 'u_dir'), 0.0, 1.0 / h);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    const ctx = targetCanvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.save();
+    ctx.globalCompositeOperation = 'copy';
+    ctx.drawImage(this.canvas, 0, 0);
+    ctx.restore();
+    return true;
+  }
+}
+
 /**
  * Universal dispatcher for convolution filters.
  */
@@ -470,3 +663,27 @@ export function applyFilter(
       return imageData;
   }
 }
+
+/**
+ * Applies a filter directly to an HTMLCanvasElement, using WebGL2 GPU acceleration when supported.
+ */
+export function applyFilterToCanvas(
+  canvas: HTMLCanvasElement,
+  type: FilterType,
+  params: any
+): boolean {
+  if (type === 'gaussian-blur') {
+    const p = params as GaussianBlurParams;
+    const gpuFilter = WebGlFilterEngine.getInstance();
+    if (gpuFilter.isAvailable() && gpuFilter.renderGaussianBlurToCanvas(canvas, p.radius || 5)) {
+      return true;
+    }
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return false;
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const filtered = applyFilter(imgData, type, params);
+  ctx.putImageData(filtered, 0, 0);
+  return true;
+}
+

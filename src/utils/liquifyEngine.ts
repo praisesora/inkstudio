@@ -36,6 +36,249 @@ export interface LiquifyStepParams {
   pressure?: number;
   initialImageData?: ImageData | null;
   selectionMask?: Uint8Array | null;
+  useGpu?: boolean;
+}
+
+export const LIQUIFY_VERTEX_SHADER = `
+  attribute vec2 a_position;
+  varying vec2 v_uv;
+  void main() {
+    v_uv = a_position * 0.5 + 0.5;
+    gl_Position = vec4(a_position, 0.0, 1.0);
+  }
+`;
+
+export const LIQUIFY_FRAGMENT_SHADER = `
+  precision highp float;
+  varying vec2 v_uv;
+  uniform sampler2D u_sourceTex;
+  uniform vec2 u_roiOrigin;
+  uniform vec2 u_roiSize;
+  uniform vec2 u_center;
+  uniform vec2 u_pushDir;
+  uniform float u_vLen;
+  uniform float u_radius;
+  uniform float u_hardness;
+  uniform float u_strength;
+  uniform int u_mode; // 0: push, 1: push-left, 2: push-right, 3: expand, 4: pinch, 5: twirl-cw, 6: twirl-ccw
+
+  void main() {
+    // Convert v_uv (with WebGL Y-flip accounted for) to canvas pixel coordinates
+    vec2 localPos = vec2(v_uv.x * u_roiSize.x, (1.0 - v_uv.y) * u_roiSize.y);
+    vec2 canvasPos = u_roiOrigin + localPos;
+    vec2 delta = canvasPos - u_center;
+    float distSq = dot(delta, delta);
+    float radiusSq = u_radius * u_radius;
+
+    if (distSq >= radiusSq) {
+      gl_FragColor = texture2D(u_sourceTex, vec2(v_uv.x, 1.0 - v_uv.y));
+      return;
+    }
+
+    float dist = sqrt(distSq);
+    float u = dist / u_radius;
+    float t = 1.0 - u * u;
+    float weight = (1.0 - u_hardness) * (t * t) + u_hardness * t;
+
+    vec2 srcCanvas = canvasPos;
+    if (u_mode == 0) {
+      float pushAmount = u_vLen * u_strength * weight;
+      srcCanvas = canvasPos - u_pushDir * pushAmount;
+    } else if (u_mode == 1) {
+      float pushAmount = max(1.5, u_vLen) * u_strength * weight;
+      srcCanvas = canvasPos + vec2(u_pushDir.y, -u_pushDir.x) * pushAmount;
+    } else if (u_mode == 2) {
+      float pushAmount = max(1.5, u_vLen) * u_strength * weight;
+      srcCanvas = canvasPos + vec2(-u_pushDir.y, u_pushDir.x) * pushAmount;
+    } else if (u_mode == 3) {
+      float factor = u_strength * weight * 0.3;
+      srcCanvas = u_center + delta * (1.0 - factor);
+    } else if (u_mode == 4) {
+      float factor = u_strength * weight * 0.3;
+      srcCanvas = u_center + delta * (1.0 + factor);
+    } else if (u_mode == 5 || u_mode == 6) {
+      float signDir = (u_mode == 5) ? 1.0 : -1.0;
+      float theta = signDir * (u_strength * 0.45) * weight;
+      float cosT = cos(theta);
+      float sinT = sin(theta);
+      srcCanvas = u_center + vec2(delta.x * cosT + delta.y * sinT, -delta.x * sinT + delta.y * cosT);
+    }
+
+    vec2 sampleLocal = clamp(srcCanvas - u_roiOrigin, vec2(0.0), u_roiSize - vec2(1.0));
+    vec2 sampleUv = sampleLocal / u_roiSize;
+    gl_FragColor = texture2D(u_sourceTex, sampleUv);
+  }
+`;
+
+export class WebGlLiquifyEngine {
+  private static instance: WebGlLiquifyEngine | null = null;
+  private canvas: HTMLCanvasElement | null = null;
+  private roiStagingCanvas: HTMLCanvasElement | null = null;
+  private gl: WebGLRenderingContext | null = null;
+  private program: WebGLProgram | null = null;
+  private quadBuffer: WebGLBuffer | null = null;
+  private sourceTex: WebGLTexture | null = null;
+  private gpuReady = false;
+
+  public static getInstance(): WebGlLiquifyEngine {
+    if (!WebGlLiquifyEngine.instance) {
+      WebGlLiquifyEngine.instance = new WebGlLiquifyEngine();
+    }
+    return WebGlLiquifyEngine.instance;
+  }
+
+  private constructor() {
+    if (typeof document === 'undefined') return;
+    try {
+      this.canvas = document.createElement('canvas');
+      this.roiStagingCanvas = document.createElement('canvas');
+      const gl = (this.canvas.getContext('webgl2', { premultipliedAlpha: false, alpha: true }) ||
+        this.canvas.getContext('webgl', { premultipliedAlpha: false, alpha: true })) as WebGLRenderingContext | null;
+      if (!gl) return;
+      this.gl = gl;
+
+      const vs = gl.createShader(gl.VERTEX_SHADER);
+      const fs = gl.createShader(gl.FRAGMENT_SHADER);
+      if (!vs || !fs) return;
+      gl.shaderSource(vs, LIQUIFY_VERTEX_SHADER);
+      gl.compileShader(vs);
+      gl.shaderSource(fs, LIQUIFY_FRAGMENT_SHADER);
+      gl.compileShader(fs);
+      if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS) || !gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        return;
+      }
+
+      const prog = gl.createProgram();
+      if (!prog) return;
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) return;
+      this.program = prog;
+
+      this.quadBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
+        gl.STATIC_DRAW
+      );
+
+      this.sourceTex = gl.createTexture();
+      this.gpuReady = true;
+    } catch {
+      this.gpuReady = false;
+    }
+  }
+
+  public isAvailable(): boolean {
+    return this.gpuReady && this.gl !== null && this.program !== null;
+  }
+
+  public executeStep(
+    targetCanvas: HTMLCanvasElement,
+    targetCtx: CanvasRenderingContext2D,
+    sourceCanvas: HTMLCanvasElement | null | undefined,
+    minX: number,
+    minY: number,
+    roiW: number,
+    roiH: number,
+    cx: number,
+    cy: number,
+    ux: number,
+    uy: number,
+    vLen: number,
+    radius: number,
+    hardnessFactor: number,
+    strengthFactor: number,
+    mode: LiquifyMode
+  ): boolean {
+    if (!this.isAvailable() || !this.gl || !this.program || !this.canvas || !this.roiStagingCanvas || !this.sourceTex) {
+      return false;
+    }
+
+    const modeMap: Record<string, number> = {
+      push: 0,
+      'push-left': 1,
+      'push-right': 2,
+      expand: 3,
+      pinch: 4,
+      'twirl-cw': 5,
+      'twirl-ccw': 6,
+    };
+    const modeInt = modeMap[mode];
+    if (modeInt === undefined) return false;
+
+    if (this.roiStagingCanvas.width !== roiW || this.roiStagingCanvas.height !== roiH) {
+      this.roiStagingCanvas.width = roiW;
+      this.roiStagingCanvas.height = roiH;
+    }
+    const stagingCtx = this.roiStagingCanvas.getContext('2d');
+    if (!stagingCtx) return false;
+    stagingCtx.clearRect(0, 0, roiW, roiH);
+    stagingCtx.drawImage(targetCanvas, minX, minY, roiW, roiH, 0, 0, roiW, roiH);
+
+    if (this.canvas.width !== roiW || this.canvas.height !== roiH) {
+      this.canvas.width = roiW;
+      this.canvas.height = roiH;
+    }
+
+    const gl = this.gl;
+    gl.viewport(0, 0, roiW, roiH);
+    gl.useProgram(this.program);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.sourceTex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.roiStagingCanvas);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    gl.uniform1i(gl.getUniformLocation(this.program, 'u_sourceTex'), 0);
+    gl.uniform2f(gl.getUniformLocation(this.program, 'u_roiOrigin'), minX, minY);
+    gl.uniform2f(gl.getUniformLocation(this.program, 'u_roiSize'), roiW, roiH);
+    gl.uniform2f(gl.getUniformLocation(this.program, 'u_center'), cx, cy);
+    gl.uniform2f(gl.getUniformLocation(this.program, 'u_pushDir'), ux, uy);
+    gl.uniform1f(gl.getUniformLocation(this.program, 'u_vLen'), vLen);
+    gl.uniform1f(gl.getUniformLocation(this.program, 'u_radius'), radius);
+    gl.uniform1f(gl.getUniformLocation(this.program, 'u_hardness'), hardnessFactor);
+    gl.uniform1f(gl.getUniformLocation(this.program, 'u_strength'), strengthFactor);
+    gl.uniform1i(gl.getUniformLocation(this.program, 'u_mode'), modeInt);
+
+    const posLoc = gl.getAttribLocation(this.program, 'a_position');
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+    gl.enableVertexAttribArray(posLoc);
+    gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    targetCtx.save();
+    targetCtx.globalCompositeOperation = 'copy';
+    targetCtx.beginPath();
+    targetCtx.rect(minX, minY, roiW, roiH);
+    targetCtx.clip();
+    targetCtx.drawImage(this.canvas, 0, 0, roiW, roiH, minX, minY, roiW, roiH);
+    targetCtx.restore();
+
+    if (sourceCanvas && sourceCanvas !== targetCanvas) {
+      const sCtx = sourceCanvas.getContext('2d');
+      if (sCtx) {
+        sCtx.save();
+        sCtx.globalCompositeOperation = 'copy';
+        sCtx.beginPath();
+        sCtx.rect(minX, minY, roiW, roiH);
+        sCtx.clip();
+        sCtx.drawImage(this.canvas, 0, 0, roiW, roiH, minX, minY, roiW, roiH);
+        sCtx.restore();
+      }
+    }
+
+    return true;
+  }
 }
 
 /**
@@ -52,7 +295,7 @@ function computeFalloffWeight(dist: number, radius: number, hardnessFactor: numb
 
 /**
  * Executes a single localized, bilinear-interpolated liquify deformation step on the target canvas.
- * Highly optimized: only processes the local region of interest (ROI) bounding box.
+ * Uses hardware WebGL shader displacement on large brushes when available, with automatic CPU fallback.
  */
 export function applyLiquifyStep(params: LiquifyStepParams): DirtyRect | null {
   const {
@@ -66,6 +309,7 @@ export function applyLiquifyStep(params: LiquifyStepParams): DirtyRect | null {
     pressure = 1.0,
     initialImageData,
     selectionMask,
+    useGpu = true,
   } = params;
 
   const width = canvas.width;
@@ -86,14 +330,6 @@ export function applyLiquifyStep(params: LiquifyStepParams): DirtyRect | null {
 
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
   if (!ctx) return null;
-
-  const srcImageData = ctx.getImageData(minX, minY, roiW, roiH);
-  const src = srcImageData.data;
-
-  // Clone source buffer for destination write
-  const dstImageData = ctx.createImageData(roiW, roiH);
-  const dst = dstImageData.data;
-  dst.set(src);
 
   const hardnessFactor = Math.max(0, Math.min(1, settings.hardness / 100));
   const effectivePressure = settings.usePressure ? Math.max(0.1, pressure) : 1.0;
@@ -117,11 +353,47 @@ export function applyLiquifyStep(params: LiquifyStepParams): DirtyRect | null {
     return null;
   }
 
+  // Hardware WebGL fast path for large Liquify brushes
+  if (useGpu && !selectionMask && mode !== 'reconstruct' && roiW * roiH >= 64 * 64) {
+    const gpuLiquify = WebGlLiquifyEngine.getInstance();
+    if (
+      gpuLiquify.executeStep(
+        canvas,
+        ctx,
+        sourceCanvas,
+        minX,
+        minY,
+        roiW,
+        roiH,
+        cx,
+        cy,
+        ux,
+        uy,
+        vLen,
+        radius,
+        hardnessFactor,
+        strengthFactor,
+        mode
+      )
+    ) {
+      return { x: minX, y: minY, width: roiW, height: roiH };
+    }
+  }
+
+  const srcImageData = ctx.getImageData(minX, minY, roiW, roiH);
+  const src = srcImageData.data;
+
+  // Clone source buffer for destination write
+  const dstImageData = ctx.createImageData(roiW, roiH);
+  const dst = dstImageData.data;
+  dst.set(src);
+
   // Pre-calculate twirl angles if in twirl mode
   const twirlBaseAngle = (mode === 'twirl-cw' ? 1 : -1) * (strengthFactor * 0.45);
 
   const initData = initialImageData?.data;
   const initW = initialImageData?.width ?? width;
+
 
   for (let ry = 0; ry < roiH; ry++) {
     const py = minY + ry;

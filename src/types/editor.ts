@@ -26,6 +26,7 @@ export interface Point {
   tiltY?: number;
   twist?: number;
   timestamp?: number;
+  isCorner?: boolean;
 }
 
 export type BrushPresetId =
@@ -135,6 +136,7 @@ export interface CspBrush {
   velocityCurve?: [number, number][];
   // Advanced CSP Mathematics Parameters
   colorMixing?: boolean; // Enable CSP pigment mixing
+  perceptualMixing?: boolean; // OKLab / Kubelka-Munk perceptual pigment mixing (default true)
   amountOfPaint?: number; // 0.0 to 1.0 (CSP: Amount of Paint)
   densityOfPaint?: number; // 0.0 to 1.0 (CSP: Density of Paint)
   colorStretch?: number; // 0.0 to 1.0 (CSP: Color Stretch along stroke length)
@@ -194,6 +196,7 @@ export interface BrushSettings {
   isRibbon?: boolean;
   // Advanced CSP Mathematics Settings
   colorMixing?: boolean; // True to activate real-time canvas color mixing
+  perceptualMixing?: boolean; // True for OKLab / Kubelka-Munk perceptual pigment mixing
   amountOfPaint?: number; // 0.0 to 1.0 (default 0.7)
   densityOfPaint?: number; // 0.0 to 1.0 (default 0.8)
   colorStretch?: number; // 0.0 to 1.0 (default 0.6)
@@ -208,6 +211,7 @@ export interface BrushSettings {
   paperTextureScale?: number;
   paperTextureRotate?: number;
   dualBrush?: boolean;
+  dualBrushCompositeMode?: 'multiply' | 'subtract' | 'darken' | 'overlay' | 'screen' | string;
   dualTipDataUrl?: string;
   dualTipImage?: HTMLImageElement;
   pressureCurveGamma?: number; // 0.4 (soft) to 2.5 (hard) response curve
@@ -294,11 +298,14 @@ export interface LiquifySettings {
   usePressure: boolean;
 }
 
-export type FillMethod = 'refer-all' | 'refer-active' | 'lasso';
+export type FillMethod = 'refer-all' | 'refer-active' | 'refer-reference' | 'lasso';
 
 export interface FillSettings {
   method: FillMethod;
   tolerance: number; // 0 - 100
+  closeGap?: number; // 0 - 20 px (CSP Close Gap)
+  areaScale?: number; // -20 to +20 px (CSP Area Scaling)
+  antiAlias?: boolean; // Anti-aliasing edge smoothing & spill guard
 }
 
 export interface TextSettings {
@@ -441,7 +448,11 @@ export type BlendMode =
   | 'soft-light'
   | 'difference'
   | 'exclusion'
-  | 'pass-through';
+  | 'pass-through'
+  | 'linear-burn'
+  | 'add-glow'
+  | 'color-dodge-glow'
+  | 'divide';
 
 export interface HistoryItemMeta {
   id: string;
@@ -629,6 +640,7 @@ export interface LayerItem {
   monoExpressWhite?: boolean; // Express white in monochrome (default: true)
   // Non-destructive Layer Mask
   maskCanvas?: HTMLCanvasElement;
+  maskVersion?: number;
   maskEnabled?: boolean;
   maskLinked?: boolean;
   maskThumbnailUrl?: string;

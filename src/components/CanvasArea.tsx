@@ -10,6 +10,7 @@ import {
   LiquifySettings,
   SpeechBalloon,
   SoftProofSettings,
+  CanvasColorMode,
 } from '../types/editor';
 import { ROTATE_CURSOR_CSS } from '../hooks/useCanvasNavigation';
 import { SelectionOverlay } from './SelectionOverlay';
@@ -110,6 +111,9 @@ interface CanvasAreaProps {
   onDeleteAnimationCel?: (frameIndex: number) => void;
   onSelectCelLayer?: (layerId: string) => void;
   softProofSettings?: SoftProofSettings;
+  onViewportReady?: (viewport: HTMLDivElement) => void;
+  activeLayerId?: string;
+  colorMode?: CanvasColorMode;
 }
 
 function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
@@ -118,7 +122,7 @@ function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEven
     try {
       const coalesced = native.getCoalescedEvents();
       if (coalesced && coalesced.length > 0) {
-        return Array.from(coalesced);
+        return coalesced as unknown as PointerEvent[];
       }
     } catch {}
   }
@@ -131,7 +135,7 @@ function extractPredictedEvents(e: React.PointerEvent<HTMLElement>): PointerEven
     try {
       const predicted = native.getPredictedEvents();
       if (predicted && predicted.length > 0) {
-        return Array.from(predicted);
+        return predicted as unknown as PointerEvent[];
       }
     } catch {}
   }
@@ -140,6 +144,7 @@ function extractPredictedEvents(e: React.PointerEvent<HTMLElement>): PointerEven
 
 export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   viewportRef,
+  onViewportReady,
   dimensions,
   brushSettings,
   onUpdateBrushSettings,
@@ -216,11 +221,16 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onDeleteAnimationCel,
   onSelectCelLayer,
   softProofSettings,
+  activeLayerId,
+  colorMode = 'color',
 }) => {
 
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
   const localPredictedCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const effectivePredictedCanvasRef = predictedCanvasRef || localPredictedCanvasRef;
+
+  const activeLayer = layers.find((l) => l.id === activeLayerId);
+  const isMonochromeActive = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome' || brushSettings.antiAlias === 0;
 
   // Resolve tip image and extract vector outline silhouette
   const activeTipImage = resolveBrushTipImage(brushSettings);
@@ -430,12 +440,30 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         draftCanvas.width = w;
         draftCanvas.height = h;
       }
+
+      const predCanvas = effectivePredictedCanvasRef?.current;
+      if (predCanvas && (predCanvas.width !== w || predCanvas.height !== h)) {
+        predCanvas.width = w;
+        predCanvas.height = h;
+      }
     };
 
     updateCanvasSizes();
     window.addEventListener('resize', updateCanvasSizes);
     return () => window.removeEventListener('resize', updateCanvasSizes);
-  }, [viewportRef, effectiveDraftCanvasRef, effectiveLayers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames, softProofSettings]);
+  }, [viewportRef, effectiveDraftCanvasRef, effectivePredictedCanvasRef, effectiveLayers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames, softProofSettings]);
+
+  useEffect(() => {
+    if (viewportRef.current) {
+      onViewportReady?.(viewportRef.current);
+      const raf = requestAnimationFrame(() => {
+        if (viewportRef.current) {
+          onViewportReady?.(viewportRef.current);
+        }
+      });
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [onViewportReady, viewportRef]);
 
   // Render scene using Unified GPU Viewport Compositor
   useEffect(() => {
@@ -671,6 +699,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     onPointerMove(e, coalesced, predicted);
   };
 
+
   // Determine cursor based on active mode
   const getCursorStyle = (isOverCanvas: boolean): React.CSSProperties => {
     if (isResizingBrush || isCtrlAltDown) {
@@ -904,7 +933,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         )}
 
         {/* Top Transparent Interaction Surface capturing Stylus / Mouse Pointer Events */}
-
         <div
           ref={interactionRef}
           onPointerDown={handleCanvasPointerDown}
@@ -928,6 +956,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           height: '100%',
           opacity: brushSettings.opacity ?? 1.0,
           display: 'block',
+          filter: isMonochromeActive ? 'url(#ink-monochrome-threshold)' : undefined,
         }}
       />
 
@@ -940,8 +969,20 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           height: '100%',
           opacity: brushSettings.opacity ?? 1.0,
           display: 'block',
+          filter: isMonochromeActive ? 'url(#ink-monochrome-threshold)' : undefined,
         }}
       />
+
+      {/* SVG 1-bit Discrete Binary Threshold Filter for Manga WYSIWYG */}
+      <svg className="absolute w-0 h-0 pointer-events-none overflow-hidden" aria-hidden="true">
+        <defs>
+          <filter id="ink-monochrome-threshold" colorInterpolationFilters="sRGB">
+            <feComponentTransfer>
+              <feFuncA type="discrete" tableValues="0 1" />
+            </feComponentTransfer>
+          </filter>
+        </defs>
+      </svg>
 
       {/* Interactive Perspective Ruler Overlay Layer (Clip Studio Paint style) */}
       {perspectiveRuler && onUpdatePerspectiveRuler && (

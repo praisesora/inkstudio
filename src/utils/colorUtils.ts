@@ -109,25 +109,15 @@ export function applyColorModeToImageData(imageData: ImageData, mode: CanvasColo
 }
 
 /**
- * Ultra-fast 32-bit in-place binary thresholding on a canvas context rect.
- * Converts anti-aliased stroke edges to 1-bit crisp binary output in real time (<0.05ms).
+ * Ultra-fast 32-bit in-place binary thresholding directly on ImageData buffer.
  */
-export function binarizeCanvasRect(
-  ctx: CanvasRenderingContext2D,
-  rect: { x: number; y: number; width: number; height: number },
+export function binarizeImageDataBuffer(
+  imgData: ImageData | { data: Uint8ClampedArray | Uint8Array; width: number; height: number },
   threshold: number = 128,
   expressBlack: boolean = true,
   expressWhite: boolean = true
 ) {
-  const sx = Math.max(0, Math.floor(rect.x));
-  const sy = Math.max(0, Math.floor(rect.y));
-  const sw = Math.min(ctx.canvas.width - sx, Math.ceil(rect.width));
-  const sh = Math.min(ctx.canvas.height - sy, Math.ceil(rect.height));
-
-  if (sw <= 0 || sh <= 0) return;
-
-  const imgData = ctx.getImageData(sx, sy, sw, sh);
-  const u32 = new Uint32Array(imgData.data.buffer);
+  const u32 = new Uint32Array(imgData.data.buffer, imgData.data.byteOffset, (imgData.width * imgData.height));
   const len = u32.length;
   const thresh = Math.max(1, Math.min(255, threshold));
 
@@ -148,7 +138,28 @@ export function binarizeCanvasRect(
       u32[i] = expressWhite ? 0xFFFFFFFF : 0;
     }
   }
+}
 
+/**
+ * Ultra-fast 32-bit in-place binary thresholding on a canvas context rect.
+ * Converts anti-aliased stroke edges to 1-bit crisp binary output in real time (<0.05ms).
+ */
+export function binarizeCanvasRect(
+  ctx: CanvasRenderingContext2D,
+  rect: { x: number; y: number; width: number; height: number },
+  threshold: number = 128,
+  expressBlack: boolean = true,
+  expressWhite: boolean = true
+) {
+  const sx = Math.max(0, Math.floor(rect.x));
+  const sy = Math.max(0, Math.floor(rect.y));
+  const sw = Math.min(ctx.canvas.width - sx, Math.ceil(rect.width));
+  const sh = Math.min(ctx.canvas.height - sy, Math.ceil(rect.height));
+
+  if (sw <= 0 || sh <= 0) return;
+
+  const imgData = ctx.getImageData(sx, sy, sw, sh);
+  binarizeImageDataBuffer(imgData, threshold, expressBlack, expressWhite);
   ctx.putImageData(imgData, sx, sy);
 }
 

@@ -341,21 +341,21 @@ input[type="range"]:active::-moz-range-thumb {
   --modern-accent-hover: rgba(59, 130, 246, 0.2);
   --modern-accent-border: rgba(59, 130, 246, 0.42);
 
-  /* Modern Theme Tone - Default Slate */
-  --modern-bg-base: #0c0d12;
-  --modern-bg-surface: #13141b;
-  --modern-bg-elevated: #1a1b24;
-  --modern-bg-input: #111217;
+  /* Modern Theme Tone - Neutral Charcoal / Graphite Palette */
+  --modern-bg-base: #18191d;
+  --modern-bg-surface: #1e1f24;
+  --modern-bg-elevated: #25262c;
+  --modern-bg-input: #151619;
   --modern-border: rgba(255, 255, 255, 0.08);
   --modern-border-subtle: rgba(255, 255, 255, 0.04);
 }
 
 [data-theme="modern"] {
   /* Surface tokens (accent variables cascade dynamically from :root or inline element styles) */
-  --modern-bg-base: #0c0d12;
-  --modern-bg-surface: #13141b;
-  --modern-bg-elevated: #1a1b24;
-  --modern-bg-input: #111217;
+  --modern-bg-base: #18191d;
+  --modern-bg-surface: #1e1f24;
+  --modern-bg-elevated: #25262c;
+  --modern-bg-input: #151619;
   --modern-border: rgba(255, 255, 255, 0.08);
   --modern-border-subtle: rgba(255, 255, 255, 0.04);
 }
@@ -372,12 +372,12 @@ input[type="range"]:active::-moz-range-thumb {
 
 [data-tone="charcoal"],
 [data-theme="modern"][data-tone="charcoal"] {
-  --modern-bg-base: #111215;
-  --modern-bg-surface: #18191d;
-  --modern-bg-elevated: #212228;
-  --modern-bg-input: #141518;
-  --modern-border: rgba(255, 255, 255, 0.07);
-  --modern-border-subtle: rgba(255, 255, 255, 0.035);
+  --modern-bg-base: #18191d;
+  --modern-bg-surface: #1f2025;
+  --modern-bg-elevated: #26272e;
+  --modern-bg-input: #15161a;
+  --modern-border: rgba(255, 255, 255, 0.08);
+  --modern-border-subtle: rgba(255, 255, 255, 0.04);
 }
 
 [data-accent="blue"],

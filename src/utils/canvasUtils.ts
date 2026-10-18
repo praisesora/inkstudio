@@ -208,16 +208,20 @@ export const BLEND_MODES: { value: BlendMode; label: string }[] = [
   { value: 'pass-through', label: 'Pass Through' },
   { value: 'normal', label: 'Normal' },
   { value: 'multiply', label: 'Multiply' },
-  { value: 'screen', label: 'Screen' },
-  { value: 'overlay', label: 'Overlay' },
-  { value: 'darken', label: 'Darken' },
-  { value: 'lighten', label: 'Lighten' },
-  { value: 'color-dodge', label: 'Color Dodge' },
+  { value: 'linear-burn', label: 'Linear Burn' },
   { value: 'color-burn', label: 'Color Burn' },
-  { value: 'hard-light', label: 'Hard Light' },
+  { value: 'darken', label: 'Darken' },
+  { value: 'screen', label: 'Screen' },
+  { value: 'color-dodge', label: 'Color Dodge' },
+  { value: 'color-dodge-glow', label: 'Glow Dodge' },
+  { value: 'add-glow', label: 'Add (Glow)' },
+  { value: 'lighten', label: 'Lighten' },
+  { value: 'overlay', label: 'Overlay' },
   { value: 'soft-light', label: 'Soft Light' },
+  { value: 'hard-light', label: 'Hard Light' },
   { value: 'difference', label: 'Difference' },
   { value: 'exclusion', label: 'Exclusion' },
+  { value: 'divide', label: 'Divide' },
 ];
 
 export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalCompositeOperation {
@@ -236,14 +240,19 @@ export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalComposi
     case 'lighten':
       return 'lighten';
     case 'color-dodge':
+    case 'color-dodge-glow':
       return 'color-dodge';
     case 'color-burn':
+    case 'linear-burn':
       return 'color-burn';
+    case 'add-glow':
+      return 'lighter';
     case 'hard-light':
       return 'hard-light';
     case 'soft-light':
       return 'soft-light';
     case 'difference':
+    case 'divide':
       return 'difference';
     case 'exclusion':
       return 'exclusion';
@@ -569,7 +578,7 @@ export function renderCompleteStroke(
       paperTextureImage: brushSettings.paperTextureImage,
       paperTextureScale: brushSettings.paperTextureScale,
       paperTextureRotate: brushSettings.paperTextureRotate,
-      useGpu: false,
+      useGpu: Boolean(brushSettings.useGpu),
       underlyingCanvas: underlyingCanvas || ctx.canvas,
       sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
       reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
@@ -604,7 +613,7 @@ export function renderCompleteStroke(
       colorStretch: brushSettings.colorStretch,
       mixingMode: brushSettings.mixingMode,
       underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      sampler: (brushSettings.colorMixing && underlyingCanvas) ? new LayerPixelSampler(underlyingCanvas) : undefined,
       reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
       alphaLocked,
       isTransparentInk,
@@ -663,7 +672,7 @@ export function renderCompleteStroke(
       colorStretch: brushSettings.colorStretch,
       mixingMode: brushSettings.mixingMode,
       underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      sampler: (brushSettings.colorMixing && underlyingCanvas) ? new LayerPixelSampler(underlyingCanvas) : undefined,
       reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
       alphaLocked,
       isTransparentInk,

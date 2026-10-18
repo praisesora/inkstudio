@@ -85,6 +85,7 @@ import { HostModal } from './components/HostModal';
 import { ClipboardInviteToast } from './components/ClipboardInviteToast';
 import { WebLandingModal } from './components/WebLandingModal';
 import { WelcomeScreen } from './components/WelcomeScreen';
+import { ModernPropertyBar } from './components/ModernPropertyBar';
 import { FirstTimeNameModal } from './components/FirstTimeNameModal';
 import { AdjustmentModal } from './components/AdjustmentModal';
 import { LayerStylesModal } from './components/LayerStylesModal';
@@ -390,6 +391,7 @@ export function App() {
   const [documents, setDocuments] = useState<DocumentTab[]>([]);
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const hasOpenDocument = Boolean(activeDocumentId && documents.some((d) => d.id === activeDocumentId));
+  const [appView, setAppView] = useState<'home' | 'workspace'>('workspace');
 
   // Panels width & visibility (global resizability)
   const [leftPanelWidth, setLeftPanelWidth] = useState<number>(() => {
@@ -482,6 +484,24 @@ export function App() {
 
   const [perspectiveRuler, setPerspectiveRuler] = useState<PerspectiveRuler | null>(null);
   const [activeLockedAxis, setActiveLockedAxis] = useState<ConstraintAxis | null>(null);
+
+  const handleActiveConstraintAxisChange = useCallback((newAxis: ConstraintAxis | null) => {
+    setActiveLockedAxis((prev) => {
+      if (prev === newAxis) return prev;
+      if (
+        prev &&
+        newAxis &&
+        prev.type === newAxis.type &&
+        prev.origin.x === newAxis.origin.x &&
+        prev.origin.y === newAxis.origin.y &&
+        prev.dir.x === newAxis.dir.x &&
+        prev.dir.y === newAxis.dir.y
+      ) {
+        return prev;
+      }
+      return newAxis;
+    });
+  }, []);
 
   const updatePerspectiveRuler = useCallback(
     (
@@ -783,6 +803,7 @@ export function App() {
   } = useCanvasNavigation({
     dimensions,
     isWebtoonMode,
+    activeDocumentId,
   });
 
   // Remote multiplayer draft overlays and stroke states
@@ -1406,7 +1427,7 @@ export function App() {
       }
     },
     perspectiveRuler: hasOpenDocument ? perspectiveRuler : null,
-    onActiveConstraintAxisChange: setActiveLockedAxis,
+    onActiveConstraintAxisChange: handleActiveConstraintAxisChange,
   });
 
   selectiveUndoRef.current = selectiveUndo;
@@ -1466,6 +1487,7 @@ export function App() {
     },
     [updateBrushSettings]
   );
+
 
   const addRecentColor = useCallback((color: string) => {
     setRecentColors((prev) => {
@@ -3836,6 +3858,24 @@ export function App() {
     ]
   );
 
+  const needsAdaptiveFitRef = useRef<boolean>(true);
+  const pendingFitDimsRef = useRef<CanvasDimensions | null>(null);
+
+  const handleViewportReady = useCallback(
+    (_viewport: HTMLDivElement) => {
+      if (needsAdaptiveFitRef.current) {
+        if (_viewport.clientWidth <= 0 || _viewport.clientHeight <= 0) {
+          return;
+        }
+        needsAdaptiveFitRef.current = false;
+        const targetDims = pendingFitDimsRef.current || dimensions;
+        pendingFitDimsRef.current = null;
+        resetZoomAndCenter(targetDims);
+      }
+    },
+    [dimensions, resetZoomAndCenter]
+  );
+
   // Create New Canvas handler
   const handleCreateNewCanvas = useCallback(
     (options: NewCanvasOptions) => {
@@ -3871,6 +3911,8 @@ export function App() {
         options.colorMode,
         defaultFreq
       );
+      needsAdaptiveFitRef.current = true;
+      pendingFitDimsRef.current = newDims;
       resetZoomAndCenter(newDims);
       resetHistory();
 
@@ -3890,6 +3932,7 @@ export function App() {
       setPerspectiveRuler(null);
       setDocuments((prev) => [...prev, newDoc]);
       setActiveDocumentId(newDocId);
+      setAppView('workspace');
 
       showToast(`Created ${name}`);
     },
@@ -3984,6 +4027,8 @@ export function App() {
 
       resizeCanvas(newDims, options);
       setDimensions(newDims);
+      pendingFitDimsRef.current = newDims;
+      needsAdaptiveFitRef.current = true;
       resetZoomAndCenter(newDims);
       resetHistory();
       showToast(`Canvas resized to ${newDims.width} × ${newDims.height} px`);
@@ -4046,6 +4091,8 @@ export function App() {
         setSavedFileInfo(null); // Reset handle on new import
 
         loadDocument(doc);
+        needsAdaptiveFitRef.current = true;
+        pendingFitDimsRef.current = doc.dimensions;
         resetZoomAndCenter(doc.dimensions);
         resetHistory();
 
@@ -4121,6 +4168,7 @@ export function App() {
       const doc = documents.find((d) => d.id === id);
       if (!doc) return;
       setActiveDocumentId(id);
+      setAppView('workspace');
       setDimensions(doc.dimensions);
       setColorMode(doc.colorMode);
       setDocumentName(doc.name);
@@ -4146,6 +4194,8 @@ export function App() {
         });
       }
       setPerspectiveRuler(doc.perspectiveRuler ?? null);
+      needsAdaptiveFitRef.current = true;
+      pendingFitDimsRef.current = doc.dimensions;
       resetZoomAndCenter(doc.dimensions);
     },
     [documents, loadDocument, resetZoomAndCenter]
@@ -4180,6 +4230,8 @@ export function App() {
                 layers: nextActive.layers,
                 layerCanvases: nextActive.layerCanvasesMap,
               });
+              needsAdaptiveFitRef.current = true;
+              pendingFitDimsRef.current = nextActive.dimensions;
               resetZoomAndCenter(nextActive.dimensions);
             } else {
               clearDocument();
@@ -4191,6 +4243,7 @@ export function App() {
             clearDocument();
             resetHistory();
             setPerspectiveRuler(null);
+            setAppView('home');
           }
         }
         return next;
@@ -5842,6 +5895,7 @@ export function App() {
             const uint8 = new Uint8Array(bytes);
             const file = new File([uint8], doc.title, { type: 'application/octet-stream' });
             await handleProcessFile(file);
+            setAppView('workspace');
             return;
           }
         } catch (err) {
@@ -5946,12 +6000,30 @@ export function App() {
         themePreset={appSettings.themePreset}
         activeDocumentTitle={documents.find((d) => d.id === activeDocumentId)?.name}
         softProofSettings={softProofSettings}
+        appView={appView}
+        onSelectAppView={(view) => {
+          if (view === 'workspace' && !hasOpenDocument) {
+            setIsNewCanvasModalOpen(true);
+          } else {
+            setAppView(view);
+          }
+        }}
       />
 
+      {/* Modern Horizontal Property Bar below Header in Workspace matching Reference 3 */}
+      {isModernTheme && hasOpenDocument && appView === 'workspace' && (
+        <ModernPropertyBar
+          tool={tool}
+          brushSettings={brushSettings}
+          onUpdateBrushSettings={updateBrushSettings}
+          onToggleBrushEditor={() => setIsLeftPanelHidden((prev) => !prev)}
+          isBrushEditorOpen={!isLeftPanelHidden}
+        />
+      )}
 
       {/* Main Workspace */}
       <div className="flex flex-1 overflow-hidden relative">
-        {!hasOpenDocument ? (
+        {!hasOpenDocument || appView === 'home' ? (
           <WelcomeScreen
             userName={appSettings.userName}
             onNewDocument={() => setIsNewCanvasModalOpen(true)}
@@ -6018,6 +6090,7 @@ export function App() {
 
           <CanvasArea
             viewportRef={viewportRef}
+            onViewportReady={handleViewportReady}
             dimensions={dimensions}
             brushSettings={brushSettings}
             onUpdateBrushSettings={updateBrushSettings}
@@ -6039,6 +6112,8 @@ export function App() {
             onPointerEnter={handlePointerEnter}
             onPointerLeave={handlePointerLeave}
             layers={layers}
+            activeLayerId={activeLayerId}
+            colorMode={colorMode}
             layerCanvasesRef={layerCanvasesRef}
             registerLayerCanvas={registerLayerCanvas}
             getEffectiveOpacity={getEffectiveOpacity}

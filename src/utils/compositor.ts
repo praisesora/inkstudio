@@ -39,6 +39,10 @@ export const BLEND_MODE_MAP: Record<BlendMode, number> = {
   difference: 10,
   exclusion: 11,
   'pass-through': 12,
+  'linear-burn': 13,
+  'add-glow': 14,
+  'color-dodge-glow': 15,
+  divide: 16,
 };
 
 export interface LayerTreeNode {
@@ -104,15 +108,56 @@ export const FOLDER_BLIT_FRAGMENT_SHADER = `#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_blitTexture;
+uniform sampler2D u_backdropTexture;
+uniform int u_hasBackdrop;
+uniform int u_blendMode;
 uniform float u_blitOpacity;
 out vec4 fragColor;
+
+float blendChannelFolder(float b, float s, int mode) {
+  if (mode == 1) return b * s; // multiply
+  if (mode == 2) return b + s - b * s; // screen
+  if (mode == 3) return b < 0.5 ? (2.0 * b * s) : (1.0 - 2.0 * (1.0 - b) * (1.0 - s)); // overlay
+  if (mode == 4) return min(b, s); // darken
+  if (mode == 5) return max(b, s); // lighten
+  if (mode == 6) return b <= 0.0 ? 0.0 : (s >= 1.0 ? 1.0 : min(1.0, b / max(0.0001, 1.0 - s))); // color-dodge
+  if (mode == 7) return b >= 1.0 ? 1.0 : (s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / max(0.0001, s))); // color-burn
+  if (mode == 8) return s < 0.5 ? (2.0 * b * s) : (1.0 - 2.0 * (1.0 - b) * (1.0 - s)); // hard-light
+  if (mode == 9) { // soft-light
+    float d = b <= 0.25 ? (((16.0 * b - 12.0) * b + 4.0) * b) : sqrt(max(0.0, b));
+    return s <= 0.5 ? (b - (1.0 - 2.0 * s) * b * (1.0 - b)) : (b + (2.0 * s - 1.0) * (d - b));
+  }
+  if (mode == 10) return abs(b - s); // difference
+  if (mode == 11) return b + s - 2.0 * b * s; // exclusion
+  if (mode == 13) return max(0.0, b + s - 1.0); // linear-burn
+  if (mode == 14) return min(1.0, b + s); // add-glow
+  if (mode == 15) return s >= 1.0 ? 1.0 : min(1.0, b / max(0.0001, 1.0 - s)); // color-dodge-glow
+  if (mode == 16) return s <= 0.0001 ? 1.0 : clamp(b / s, 0.0, 1.0); // divide
+  return s;
+}
+
+vec3 evaluateBlendModeFolder(vec3 Cb, vec3 Cs, int mode) {
+  return vec3(
+    blendChannelFolder(Cb.r, Cs.r, mode),
+    blendChannelFolder(Cb.g, Cs.g, mode),
+    blendChannelFolder(Cb.b, Cs.b, mode)
+  );
+}
+
 void main() {
-  vec4 color = texture(u_blitTexture, v_uv);
-  color *= u_blitOpacity;
-  if (color.a < 0.002) {
+  vec4 srcPremul = texture(u_blitTexture, v_uv);
+  float srcA = srcPremul.a * u_blitOpacity;
+  if (srcA < 0.002) {
     discard;
   }
-  fragColor = color;
+  vec3 Cs = srcPremul.a > 0.001 ? clamp(srcPremul.rgb / srcPremul.a, 0.0, 1.0) : vec3(0.0);
+  if (u_hasBackdrop == 1 && u_blendMode != 0 && u_blendMode != 12) {
+    vec4 dstPremul = texture(u_backdropTexture, v_uv);
+    vec3 Cb = dstPremul.a > 0.001 ? clamp(dstPremul.rgb / dstPremul.a, 0.0, 1.0) : vec3(1.0);
+    vec3 blended = evaluateBlendModeFolder(Cb, Cs, u_blendMode);
+    Cs = mix(Cs, blended, dstPremul.a);
+  }
+  fragColor = vec4(Cs * srcA, srcA);
 }
 `;
 
@@ -200,6 +245,9 @@ in vec2 v_texCoord;
 in vec2 v_docCoord;
 
 uniform sampler2D u_tileTexture;
+uniform sampler2D u_backdropTexture;
+uniform int u_hasBackdrop;
+uniform vec2 u_viewportSize;
 uniform float u_layerOpacity;
 uniform int u_blendMode;
 
@@ -231,6 +279,36 @@ out vec4 fragColor;
 
 float fractVal(float x) {
   return x - floor(x);
+}
+
+float blendChannel(float b, float s, int mode) {
+  if (mode == 1) return b * s; // multiply
+  if (mode == 2) return b + s - b * s; // screen
+  if (mode == 3) return b < 0.5 ? (2.0 * b * s) : (1.0 - 2.0 * (1.0 - b) * (1.0 - s)); // overlay
+  if (mode == 4) return min(b, s); // darken
+  if (mode == 5) return max(b, s); // lighten
+  if (mode == 6) return b <= 0.0 ? 0.0 : (s >= 1.0 ? 1.0 : min(1.0, b / max(0.0001, 1.0 - s))); // color-dodge
+  if (mode == 7) return b >= 1.0 ? 1.0 : (s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / max(0.0001, s))); // color-burn
+  if (mode == 8) return s < 0.5 ? (2.0 * b * s) : (1.0 - 2.0 * (1.0 - b) * (1.0 - s)); // hard-light
+  if (mode == 9) { // soft-light (W3C / Photoshop)
+    float d = b <= 0.25 ? (((16.0 * b - 12.0) * b + 4.0) * b) : sqrt(max(0.0, b));
+    return s <= 0.5 ? (b - (1.0 - 2.0 * s) * b * (1.0 - b)) : (b + (2.0 * s - 1.0) * (d - b));
+  }
+  if (mode == 10) return abs(b - s); // difference
+  if (mode == 11) return b + s - 2.0 * b * s; // exclusion
+  if (mode == 13) return max(0.0, b + s - 1.0); // linear-burn (CSP / Krita)
+  if (mode == 14) return min(1.0, b + s); // add-glow (CSP / Krita)
+  if (mode == 15) return s >= 1.0 ? 1.0 : min(1.0, b / max(0.0001, 1.0 - s)); // color-dodge-glow (CSP)
+  if (mode == 16) return s <= 0.0001 ? 1.0 : clamp(b / s, 0.0, 1.0); // divide (CSP / Krita)
+  return s;
+}
+
+vec3 evaluateBlendMode(vec3 Cb, vec3 Cs, int mode) {
+  return vec3(
+    blendChannel(Cb.r, Cs.r, mode),
+    blendChannel(Cb.g, Cs.g, mode),
+    blendChannel(Cb.b, Cs.b, mode)
+  );
 }
 
 vec4 evaluateScreentone(vec4 srcColor, vec2 docCoord) {
@@ -339,6 +417,15 @@ void main() {
 
   if (finalColor.a < 0.002) {
     discard;
+  }
+
+  if (u_hasBackdrop == 1 && u_blendMode != 0 && u_blendMode != 12) {
+    vec2 screenUV = clamp(gl_FragCoord.xy / max(vec2(1.0), u_viewportSize), 0.0, 1.0);
+    vec4 dstPremul = texture(u_backdropTexture, screenUV);
+    vec3 Cb = dstPremul.a > 0.001 ? clamp(dstPremul.rgb / dstPremul.a, 0.0, 1.0) : vec3(1.0);
+    vec3 Cs = clamp(finalColor.rgb, 0.0, 1.0);
+    vec3 blended = evaluateBlendMode(Cb, Cs, u_blendMode);
+    finalColor.rgb = mix(Cs, blended, dstPremul.a);
   }
 
   fragColor = vec4(finalColor.rgb * finalColor.a, finalColor.a);
@@ -868,6 +955,11 @@ export interface CompositorOptions {
   devicePixelRatio?: number;
   onionSkinFrames?: OnionSkinCompositorFrame[];
   softProof?: SoftProofSettings;
+  // WYSIWYG In-Stack Live Stroke Compositing
+  activeDraftCanvas?: HTMLCanvasElement | null;
+  activeDraftLayerId?: string | null;
+  activeDraftDirtyRect?: { x: number; y: number; width: number; height: number } | null;
+  activeDraftVersion?: number;
 }
 
 /**
@@ -951,6 +1043,8 @@ export class ViewportCompositor {
   private uIsBackgroundLoc: WebGLUniformLocation | null = null;
   private uShowCheckerboardLoc: WebGLUniformLocation | null = null;
   private uTileTextureLoc: WebGLUniformLocation | null = null;
+  private uBackdropTextureLoc: WebGLUniformLocation | null = null;
+  private uHasBackdropLoc: WebGLUniformLocation | null = null;
   private uLayerOpacityLoc: WebGLUniformLocation | null = null;
   private uBlendModeLoc: WebGLUniformLocation | null = null;
 
@@ -968,10 +1062,21 @@ export class ViewportCompositor {
   private uLayerColorLoc: WebGLUniformLocation | null = null;
   private uLayerSubColorLoc: WebGLUniformLocation | null = null;
 
-  // Mask uniform locations
+  // Mask uniform locations & version-tracked cache
   private uMaskTextureLoc: WebGLUniformLocation | null = null;
   private uMaskEnabledLoc: WebGLUniformLocation | null = null;
-  private maskTextureCache: Map<string, { texture: WebGLTexture }> = new Map();
+  private maskTextureCache: Map<
+    string,
+    { texture: WebGLTexture; version: number; width: number; height: number }
+  > = new Map();
+
+  // Live in-stack draft stroke texture cache
+  private draftTexture: WebGLTexture | null = null;
+  private draftTexWidth: number = 0;
+  private draftTexHeight: number = 0;
+  private lastDraftVersion: number = -1;
+  private currentOptions: CompositorOptions | null = null;
+  private currentZoom: number = 1.0;
 
   // Adjustment program & uniforms
   private adjProgram: WebGLProgram | null = null;
@@ -994,6 +1099,8 @@ export class ViewportCompositor {
   private snapshotWidth: number = 0;
   private snapshotHeight: number = 0;
   private lutTexture: WebGLTexture | null = null;
+  private lastLutKey: string = '';
+  private lastLutAdjMode: number = 0;
 
   // Layer Styles program, FBO & uniforms
   private stylesProgram: WebGLProgram | null = null;
@@ -1023,6 +1130,9 @@ export class ViewportCompositor {
   // Folder compositing blit program, uniforms, & FBOs
   private blitProgram: WebGLProgram | null = null;
   private uBlitTextureLoc: WebGLUniformLocation | null = null;
+  private uBlitBackdropTextureLoc: WebGLUniformLocation | null = null;
+  private uBlitHasBackdropLoc: WebGLUniformLocation | null = null;
+  private uBlitBlendModeLoc: WebGLUniformLocation | null = null;
   private uBlitOpacityLoc: WebGLUniformLocation | null = null;
   private folderFbos: { fbo: WebGLFramebuffer; texture: WebGLTexture; width: number; height: number }[] = [];
 
@@ -1037,8 +1147,11 @@ export class ViewportCompositor {
   private proofSnapshotWidth: number = 0;
   private proofSnapshotHeight: number = 0;
 
-  // Tile texture cache: tileKey -> { texture, version }
-  private textureCache: Map<string, { texture: WebGLTexture; version: number; lastUsed: number }> = new Map();
+  // Tile texture cache: tileKey -> { texture, version, hasMipmap, filterMode }
+  private textureCache: Map<
+    string,
+    { texture: WebGLTexture; version: number; lastUsed: number; filterTier?: number }
+  > = new Map();
   private fallbackTileCanvas: HTMLCanvasElement | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
@@ -1048,6 +1161,20 @@ export class ViewportCompositor {
 
   public isReady(): boolean {
     return this.gl !== null && this.program !== null;
+  }
+
+  /**
+   * Explicitly invalidate a cached layer mask texture (or all masks if layerId omitted).
+   */
+  public invalidateMaskTexture(layerId?: string): void {
+    if (layerId) {
+      const item = this.maskTextureCache.get(layerId);
+      if (item) item.version = -1;
+    } else {
+      for (const item of this.maskTextureCache.values()) {
+        item.version = -1;
+      }
+    }
   }
 
   private initGL(): boolean {
@@ -1060,6 +1187,7 @@ export class ViewportCompositor {
         antialias: false,
         depth: false,
         stencil: true,
+        preserveDrawingBuffer: true,
       });
 
       if (!gl) return false;
@@ -1109,6 +1237,8 @@ export class ViewportCompositor {
       this.uIsBackgroundLoc = gl.getUniformLocation(prog, 'u_isBackground');
       this.uShowCheckerboardLoc = gl.getUniformLocation(prog, 'u_showCheckerboard');
       this.uTileTextureLoc = gl.getUniformLocation(prog, 'u_tileTexture');
+      this.uBackdropTextureLoc = gl.getUniformLocation(prog, 'u_backdropTexture');
+      this.uHasBackdropLoc = gl.getUniformLocation(prog, 'u_hasBackdrop');
       this.uLayerOpacityLoc = gl.getUniformLocation(prog, 'u_layerOpacity');
       this.uBlendModeLoc = gl.getUniformLocation(prog, 'u_blendMode');
 
@@ -1217,6 +1347,9 @@ export class ViewportCompositor {
             if (gl.getProgramParameter(bProg, gl.LINK_STATUS)) {
               this.blitProgram = bProg;
               this.uBlitTextureLoc = gl.getUniformLocation(bProg, 'u_blitTexture');
+              this.uBlitBackdropTextureLoc = gl.getUniformLocation(bProg, 'u_backdropTexture');
+              this.uBlitHasBackdropLoc = gl.getUniformLocation(bProg, 'u_hasBackdrop');
+              this.uBlitBlendModeLoc = gl.getUniformLocation(bProg, 'u_blendMode');
               this.uBlitOpacityLoc = gl.getUniformLocation(bProg, 'u_blitOpacity');
             }
           }
@@ -1329,7 +1462,10 @@ export class ViewportCompositor {
   }
 
   /**
-   * Get or upload a WebGLTexture for a tile.
+   * Get or upload a WebGLTexture for a tile with hardware mipmap pyramid and adaptive zoom filtering.
+   * - Zoom < 0.99: Trilinear mipmap filtering (gl.LINEAR_MIPMAP_LINEAR) eliminates line-art shimmering.
+   * - 0.99 <= Zoom < 2.0: Bilinear filtering (gl.LINEAR) for smooth rotation/sub-pixel pan.
+   * - Zoom >= 2.0: Nearest-neighbor magnification (gl.NEAREST) for crisp pixel-level inspection.
    */
   private getTileTexture(tile: TileBuffer, grid: SparseTileGrid): WebGLTexture | null {
     if (!this.gl) return null;
@@ -1340,19 +1476,18 @@ export class ViewportCompositor {
     if (!cached) {
       const tex = gl.createTexture();
       if (!tex) return null;
-      cached = { texture: tex, version: -1, lastUsed: performance.now() };
+      cached = { texture: tex, version: -1, lastUsed: performance.now(), filterTier: -1 };
       this.textureCache.set(key, cached);
     }
 
     cached.lastUsed = performance.now();
+    const desiredTier = this.currentZoom < 0.99 ? 0 : this.currentZoom < 2.0 ? 1 : 2;
 
     // Re-upload if dirty or version bumped
     if (cached.version !== tile.version || tile.dirty) {
       gl.bindTexture(gl.TEXTURE_2D, cached.texture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
       const rgbaData = grid.getTileAsRGBA(tile);
       const uploadBytes = rgbaData instanceof Uint8Array
@@ -1371,36 +1506,89 @@ export class ViewportCompositor {
         uploadBytes
       );
 
+      // Generate hardware mipmap pyramid for anti-aliased zoomed-out viewing (256x256 POT)
+      if (typeof gl.generateMipmap === 'function') {
+        gl.generateMipmap(gl.TEXTURE_2D);
+      }
+
       cached.version = tile.version;
+      cached.filterTier = -1; // Force filter parameter refresh
       tile.dirty = false;
+    }
+
+    if (cached.filterTier !== desiredTier) {
+      gl.bindTexture(gl.TEXTURE_2D, cached.texture);
+      if (desiredTier === 0) {
+        gl.texParameteri(
+          gl.TEXTURE_2D,
+          gl.TEXTURE_MIN_FILTER,
+          typeof gl.generateMipmap === 'function' ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      } else if (desiredTier === 1) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      } else {
+        gl.texParameteri(
+          gl.TEXTURE_2D,
+          gl.TEXTURE_MIN_FILTER,
+          typeof gl.generateMipmap === 'function' ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST
+        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      }
+      cached.filterTier = desiredTier;
     }
 
     return cached.texture;
   }
 
   /**
-   * Set WebGL blend mode according to standard layer blend modes.
+   * Captures the current framebuffer into `this.snapshotTexture` for programmable GLSL blend modes.
+   */
+  private ensureBackdropSnapshot(gl: WebGL2RenderingContext, viewportW: number, viewportH: number): WebGLTexture | null {
+    if (!this.snapshotTexture || this.snapshotWidth !== viewportW || this.snapshotHeight !== viewportH) {
+      if (this.snapshotTexture) gl.deleteTexture(this.snapshotTexture);
+      this.snapshotTexture = gl.createTexture();
+      this.snapshotWidth = viewportW;
+      this.snapshotHeight = viewportH;
+      gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, viewportW, viewportH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
+    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, viewportW, viewportH);
+    return this.snapshotTexture;
+  }
+
+  /**
+   * Set WebGL blend mode and snapshot backdrop when programmable blending is active.
+   * Because COMPOSITOR_FRAGMENT_SHADER outputs:
+   *   fragColor = vec4(mix(Cs, B(Cb, Cs), dstA) * srcA, srcA)
+   * standard premultiplied Porter-Duff (gl.ONE, gl.ONE_MINUS_SRC_ALPHA) produces the exact
+   * W3C / Clip Studio Paint composited result for all 16 blend modes!
    */
   private setGLBlendMode(blendMode: BlendMode): void {
     if (!this.gl) return;
     const gl = this.gl;
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-    switch (blendMode) {
-      case 'multiply':
-        // dstRGB * srcRGB
-        gl.blendFuncSeparate(gl.DST_COLOR, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        break;
-      case 'screen':
-        // 1 - (1 - dst) * (1 - src)
-        gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_COLOR, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        break;
-      case 'pass-through':
-      case 'normal':
-      default:
-        // Premultiplied alpha standard over
-        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-        break;
+    const modeCode = BLEND_MODE_MAP[blendMode] ?? 0;
+    if (modeCode !== 0 && modeCode !== 12 && this.canvas.width > 0 && this.canvas.height > 0) {
+      const backdropTex = this.ensureBackdropSnapshot(gl, this.canvas.width, this.canvas.height);
+      if (backdropTex) {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, backdropTex);
+        gl.uniform1i(this.uBackdropTextureLoc, 2);
+        gl.uniform1i(this.uHasBackdropLoc, 1);
+        gl.activeTexture(gl.TEXTURE0);
+        return;
+      }
     }
+    gl.uniform1i(this.uHasBackdropLoc, 0);
   }
 
   /**
@@ -1431,6 +1619,9 @@ export class ViewportCompositor {
     _options: CompositorOptions = { dimensions }
   ): void {
     const gl = this.gl;
+    this.currentOptions = _options;
+    this.currentZoom = transform.zoom;
+
     if (!gl || !this.program) {
       this.render2DFallback(layers, transform, dimensions, grid, _options);
       return;
@@ -1457,6 +1648,7 @@ export class ViewportCompositor {
     gl.uniform1f(this.uRotationRadLoc, rotRad);
     gl.uniform1f(this.uDprLoc, dpr);
     gl.uniform1i(this.uTileTextureLoc, 0);
+    gl.uniform1i(this.uHasBackdropLoc, 0);
 
     // Bind Quad Vertices
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
@@ -1721,40 +1913,50 @@ export class ViewportCompositor {
   }
 
   /**
-   * Get or upload a WebGLTexture for a layer's mask canvas.
+   * Get or upload a WebGLTexture for a layer's mask canvas with dirty-version caching.
    */
   private getMaskTexture(layer: LayerItem): WebGLTexture | null {
     if (!this.gl || !layer.maskCanvas) return null;
     const gl = this.gl;
     let cached = this.maskTextureCache.get(layer.id);
+    const currentVersion = layer.maskVersion ?? 0;
+    const maskW = layer.maskCanvas.width;
+    const maskH = layer.maskCanvas.height;
+
     if (!cached) {
       const tex = gl.createTexture();
       if (!tex) return null;
-      cached = { texture: tex };
+      cached = { texture: tex, version: -1, width: 0, height: 0 };
       this.maskTextureCache.set(layer.id, cached);
     }
 
-    gl.bindTexture(gl.TEXTURE_2D, cached.texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    if (cached.version !== currentVersion || cached.width !== maskW || cached.height !== maskH) {
+      gl.bindTexture(gl.TEXTURE_2D, cached.texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-    gl.texImage2D(
-      gl.TEXTURE_2D,
-      0,
-      gl.RGBA,
-      gl.RGBA,
-      gl.UNSIGNED_BYTE,
-      layer.maskCanvas
-    );
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.RGBA,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        layer.maskCanvas
+      );
+
+      cached.version = currentVersion;
+      cached.width = maskW;
+      cached.height = maskH;
+    }
 
     return cached.texture;
   }
 
   /**
-   * Evaluates non-destructive adjustment layers via GPU snapshot and real-time LUT evaluation.
+   * Evaluates non-destructive adjustment layers via GPU snapshot and version-cached LUT evaluation.
    */
   private renderAdjustmentLayer(
     gl: WebGL2RenderingContext,
@@ -1769,73 +1971,67 @@ export class ViewportCompositor {
     if (!this.adjProgram || !layer.adjustmentData) return;
 
     // 1. Snapshot lower composite
-    if (!this.snapshotTexture || this.snapshotWidth !== viewportW || this.snapshotHeight !== viewportH) {
-      if (this.snapshotTexture) gl.deleteTexture(this.snapshotTexture);
-      this.snapshotTexture = gl.createTexture();
-      this.snapshotWidth = viewportW;
-      this.snapshotHeight = viewportH;
-      gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, viewportW, viewportH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    }
+    this.ensureBackdropSnapshot(gl, viewportW, viewportH);
 
-    gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, viewportW, viewportH);
-
-    // 2. Prepare 256x1 LUT
+    // 2. Prepare 256x1 LUT (Cached by AdjustmentLayerData signature)
     if (!this.lutTexture) {
       this.lutTexture = gl.createTexture();
+      this.lastLutKey = '';
     }
     const adj = layer.adjustmentData;
-    let lutData: Uint8Array;
-    let adjMode = 0; // 0 = per-channel, 1 = gradient map
+    const lutKey = JSON.stringify(adj);
 
-    if (adj.type === 'curves') {
-      const { rLut, gLut, bLut } = buildCurvesCombinedLut(adj.curves);
-      lutData = new Uint8Array(256 * 4);
-      for (let i = 0; i < 256; i++) {
-        const off = i * 4;
-        lutData[off] = rLut[i];
-        lutData[off + 1] = gLut[i];
-        lutData[off + 2] = bLut[i];
-        lutData[off + 3] = 255;
+    if (lutKey !== this.lastLutKey) {
+      let lutData: Uint8Array;
+      let adjMode = 0; // 0 = per-channel, 1 = gradient map
+
+      if (adj.type === 'curves') {
+        const { rLut, gLut, bLut } = buildCurvesCombinedLut(adj.curves);
+        lutData = new Uint8Array(256 * 4);
+        for (let i = 0; i < 256; i++) {
+          const off = i * 4;
+          lutData[off] = rLut[i];
+          lutData[off + 1] = gLut[i];
+          lutData[off + 2] = bLut[i];
+          lutData[off + 3] = 255;
+        }
+      } else if (adj.type === 'gradient-map') {
+        adjMode = 1;
+        const gMap = buildGradientMapLut(adj.stops, adj.interpolation || 'linear');
+        lutData = new Uint8Array(gMap.buffer, gMap.byteOffset, gMap.byteLength);
+      } else if (adj.type === 'levels') {
+        const lLut = buildLevelsLut(adj.blackPoint, adj.whitePoint, adj.gamma, adj.outputMin ?? 0, adj.outputMax ?? 255);
+        lutData = new Uint8Array(256 * 4);
+        for (let i = 0; i < 256; i++) {
+          const off = i * 4;
+          lutData[off] = lLut[i];
+          lutData[off + 1] = lLut[i];
+          lutData[off + 2] = lLut[i];
+          lutData[off + 3] = 255;
+        }
+      } else { // color-balance
+        lutData = new Uint8Array(256 * 4);
+        for (let i = 0; i < 256; i++) {
+          const [r, g, b] = evaluateColorBalancePixel(i, i, i, adj);
+          const off = i * 4;
+          lutData[off] = r;
+          lutData[off + 1] = g;
+          lutData[off + 2] = b;
+          lutData[off + 3] = 255;
+        }
       }
-    } else if (adj.type === 'gradient-map') {
-      adjMode = 1;
-      const gMap = buildGradientMapLut(adj.stops, adj.interpolation || 'linear');
-      lutData = new Uint8Array(gMap.buffer, gMap.byteOffset, gMap.byteLength);
-    } else if (adj.type === 'levels') {
-      const lLut = buildLevelsLut(adj.blackPoint, adj.whitePoint, adj.gamma, adj.outputMin ?? 0, adj.outputMax ?? 255);
-      lutData = new Uint8Array(256 * 4);
-      for (let i = 0; i < 256; i++) {
-        const off = i * 4;
-        lutData[off] = lLut[i];
-        lutData[off + 1] = lLut[i];
-        lutData[off + 2] = lLut[i];
-        lutData[off + 3] = 255;
-      }
-    } else { // color-balance
-      lutData = new Uint8Array(256 * 4);
-      for (let i = 0; i < 256; i++) {
-        const [r, g, b] = evaluateColorBalancePixel(i, i, i, adj);
-        const off = i * 4;
-        lutData[off] = r;
-        lutData[off + 1] = g;
-        lutData[off + 2] = b;
-        lutData[off + 3] = 255;
-      }
+
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutData);
+
+      this.lastLutKey = lutKey;
+      this.lastLutAdjMode = adjMode;
     }
-
-    gl.activeTexture(gl.TEXTURE3);
-    gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutData);
 
     // 3. Switch to Adjustment Program
     gl.useProgram(this.adjProgram);
@@ -1860,7 +2056,7 @@ export class ViewportCompositor {
     gl.bindTexture(gl.TEXTURE_2D, this.lutTexture);
     gl.uniform1i(this.uAdjLutLoc, 3);
 
-    gl.uniform1i(this.uAdjModeLoc, adjMode);
+    gl.uniform1i(this.uAdjModeLoc, this.lastLutAdjMode);
     gl.uniform1f(this.uAdjOpacityLoc, layer.opacity * opacityMultiplier);
 
     // Mask for adjustment layer
@@ -1887,6 +2083,7 @@ export class ViewportCompositor {
 
   /**
    * Renders all visible tiles of a single layer onto WebGL2 context.
+   * Also composites any in-progress WYSIWYG draft stroke targeting this layer.
    */
   private renderSingleLayer(
     gl: WebGL2RenderingContext,
@@ -1954,6 +2151,8 @@ export class ViewportCompositor {
       frustum.maxY
     );
 
+    gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
+
     // Draw each visible tile with 1 draw call per tile
     for (const tile of visibleTiles) {
       const tex = this.getTileTexture(tile, grid);
@@ -1966,9 +2165,59 @@ export class ViewportCompositor {
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
 
+    // WYSIWYG In-Stack Live Stroke Compositing:
+    // If an active brush stroke is targeting this exact layer, composite it right here in the stack
+    // so upper layers, blend modes, clipping masks, screentones, and layer tinting apply in real time!
+    const opts = this.currentOptions;
+    if (opts?.activeDraftLayerId === layer.id && opts.activeDraftCanvas) {
+      this.renderActiveDraftForLayer(gl, opts.activeDraftCanvas, dimensions, opts.activeDraftVersion);
+      gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
+    }
+
     if (hasMask) {
       gl.uniform1i(this.uMaskEnabledLoc, 0);
     }
+    gl.uniform1i(this.uHasBackdropLoc, 0);
+  }
+
+  /**
+   * Uploads and renders the active draft canvas in-stack for the active layer.
+   */
+  private renderActiveDraftForLayer(
+    gl: WebGL2RenderingContext,
+    draftCanvas: HTMLCanvasElement,
+    dimensions: CanvasDimensions,
+    draftVersion?: number
+  ): void {
+    if (draftCanvas.width <= 0 || draftCanvas.height <= 0) return;
+    if (!this.draftTexture) {
+      this.draftTexture = gl.createTexture();
+    }
+    if (!this.draftTexture) return;
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.draftTexture);
+
+    const ver = draftVersion ?? -1;
+    if (
+      ver === -1 ||
+      ver !== this.lastDraftVersion ||
+      this.draftTexWidth !== draftCanvas.width ||
+      this.draftTexHeight !== draftCanvas.height
+    ) {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+      this.draftTexWidth = draftCanvas.width;
+      this.draftTexHeight = draftCanvas.height;
+      this.lastDraftVersion = ver;
+    }
+
+    gl.uniform2f(this.uTileOriginLoc, 0, 0);
+    gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
   }
 
   /**
@@ -2069,7 +2318,18 @@ export class ViewportCompositor {
     if (!this.blitProgram) return;
 
     gl.viewport(0, 0, viewportW, viewportH);
-    this.setGLBlendMode(blendMode);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+    const modeCode = BLEND_MODE_MAP[blendMode] ?? 0;
+    let hasBackdrop = 0;
+    if (modeCode !== 0 && modeCode !== 12 && viewportW > 0 && viewportH > 0) {
+      const backdropTex = this.ensureBackdropSnapshot(gl, viewportW, viewportH);
+      if (backdropTex) {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, backdropTex);
+        hasBackdrop = 1;
+      }
+    }
 
     gl.useProgram(this.blitProgram);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer);
@@ -2080,6 +2340,9 @@ export class ViewportCompositor {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.uniform1i(this.uBlitTextureLoc, 0);
+    gl.uniform1i(this.uBlitBackdropTextureLoc, 2);
+    gl.uniform1i(this.uBlitHasBackdropLoc, hasBackdrop);
+    gl.uniform1i(this.uBlitBlendModeLoc, modeCode);
     gl.uniform1f(this.uBlitOpacityLoc, opacity);
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -2386,6 +2649,13 @@ export class ViewportCompositor {
 
     // Draw main layer content
     drawTiles(targetCtx);
+
+    // WYSIWYG 2D fallback in-stack live draft compositing
+    const opts = this.currentOptions;
+    if (opts?.activeDraftLayerId === layer.id && opts.activeDraftCanvas) {
+      targetCtx.drawImage(opts.activeDraftCanvas, 0, 0);
+    }
+
     targetCtx.restore();
   }
 
@@ -2566,6 +2836,10 @@ export class ViewportCompositor {
         this.gl.deleteTexture(item.texture);
       }
       this.maskTextureCache.clear();
+      if (this.draftTexture) {
+        this.gl.deleteTexture(this.draftTexture);
+        this.draftTexture = null;
+      }
       if (this.snapshotTexture) {
         this.gl.deleteTexture(this.snapshotTexture);
         this.snapshotTexture = null;

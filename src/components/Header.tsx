@@ -43,6 +43,8 @@ interface HeaderProps {
   themePreset?: ThemePreset;
   activeDocumentTitle?: string;
   softProofSettings?: SoftProofSettings;
+  appView?: 'home' | 'workspace';
+  onSelectAppView?: (view: 'home' | 'workspace') => void;
 }
 
 export const Header: React.FC<HeaderProps> = React.memo(({
@@ -71,14 +73,16 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   themePreset = 'vintage-manga',
   activeDocumentTitle,
   softProofSettings,
+  appView = 'workspace',
+  onSelectAppView,
 }) => {
   if (themePreset === 'modern') {
     return (
       <header
         data-tauri-drag-region
-        className="h-10 px-3 flex items-center justify-between text-xs select-none z-30 shrink-0 cursor-default bg-[#121318] border-b border-white/[0.08] text-[#e0e0e3]"
+        className="h-10 px-3 flex items-center justify-between text-xs select-none z-30 shrink-0 cursor-default bg-[#18191d] border-b border-white/[0.08] text-white/90"
       >
-        {/* Brand, Menus & Document Info */}
+        {/* Brand, Menus, Home/Workspace Pills & Document Info */}
         <div className="flex items-center space-x-3 min-w-0">
           <div className="flex items-center space-x-2" title="Ink Studio">
             <div className="w-5 h-5 flex items-center justify-center">
@@ -95,6 +99,30 @@ export const Header: React.FC<HeaderProps> = React.memo(({
 
           {/* Menu Bar Sections: File, Edit, Layer, View, Help */}
           <MenuBar sections={menuSections} />
+
+          {/* Home / Workspace Navigation Pills matching Reference 1 & 3 */}
+          <div className="flex items-center space-x-0.5 bg-white/[0.04] p-0.5 rounded-lg border border-white/[0.08]">
+            <button
+              onClick={() => onSelectAppView?.('home')}
+              className={`px-3 py-1 rounded-md text-xs transition-colors cursor-pointer ${
+                appView === 'home'
+                  ? 'bg-white/[0.14] text-white font-medium border border-white/10 shadow-xs'
+                  : 'text-white/60 hover:text-white hover:bg-white/[0.06] border border-transparent'
+              }`}
+            >
+              Home
+            </button>
+            <button
+              onClick={() => onSelectAppView?.('workspace')}
+              className={`px-3 py-1 rounded-md text-xs transition-colors cursor-pointer ${
+                appView === 'workspace'
+                  ? 'bg-white/[0.14] text-white font-medium border border-white/10 shadow-xs'
+                  : 'text-white/60 hover:text-white hover:bg-white/[0.06] border border-transparent'
+              }`}
+            >
+              Workspace
+            </button>
+          </div>
 
           {hasOpenDocument && (
             <>

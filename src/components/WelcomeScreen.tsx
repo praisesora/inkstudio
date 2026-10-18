@@ -101,85 +101,84 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
 
   if (themePreset === 'modern') {
     return (
-      <div className="flex-1 flex flex-col h-full bg-[#0c0d12] text-white/90 overflow-y-auto select-none font-sans">
-        {/* Top Utility Header */}
-        <div className="border-b border-white/[0.08] bg-[#121318]/90 backdrop-blur-md px-8 py-3.5 shrink-0">
-          <div className="max-w-6xl mx-auto flex items-center justify-between gap-4">
-            <div className="flex items-center space-x-3">
-              <span className="w-2.5 h-2.5 rounded-full bg-[var(--modern-accent)] shadow-[0_0_8px_var(--modern-accent)]" />
-              <span className="text-sm font-semibold tracking-tight text-white">
-                Ink Studio
-              </span>
-              <span className="text-white/20">/</span>
-              <span className="text-xs text-white/50">Recent Documents</span>
+      <div className="flex-1 flex flex-col h-full bg-[#18191d] text-white/90 overflow-y-auto select-none font-sans">
+        {/* Main Content Container matching Reference 1 */}
+        <div className="max-w-4xl w-full mx-auto px-6 py-12 flex-1 flex flex-col">
+          {/* Header Row: Greeting & Action Buttons */}
+          <div className="flex items-start justify-between gap-6 mb-8">
+            <div>
+              <h1 className="text-3xl font-light tracking-tight text-white/95">
+                Welcome back{userName?.trim() ? `, ${userName.trim()}` : ', my Lord'}.
+              </h1>
+              <p className="text-xs text-white/40 mt-1 font-mono tracking-wide">
+                bdt.greeting
+              </p>
             </div>
 
-            <div className="flex items-center space-x-2.5">
+            <div className="flex items-center gap-2.5 shrink-0 pt-1">
               <button
                 type="button"
                 onClick={onNewDocument}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-lg bg-[var(--modern-accent)] hover:brightness-110 active:scale-[0.98] text-xs font-medium text-white shadow-sm transition-all cursor-pointer"
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-white/[0.08] hover:bg-white/[0.14] active:scale-[0.98] border border-white/10 text-xs font-medium text-white shadow-xs transition-all cursor-pointer"
               >
-                <FilePlus className="w-3.5 h-3.5" />
-                <span>New Canvas</span>
+                <FilePlus className="w-3.5 h-3.5 text-white/90" />
+                <span>+ New document</span>
               </button>
 
               <button
                 type="button"
                 onClick={onOpenFile}
-                className="flex items-center space-x-1.5 px-3.5 py-1.5 rounded-lg bg-white/[0.05] hover:bg-white/[0.1] active:scale-[0.98] border border-white/10 text-xs font-medium text-white/90 transition-all cursor-pointer"
+                className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] active:scale-[0.98] border border-white/10 text-xs font-medium text-white/80 hover:text-white transition-all cursor-pointer"
               >
                 <FolderOpen className="w-3.5 h-3.5 text-white/70" />
-                <span>Open File...</span>
+                <span>Open file...</span>
               </button>
             </div>
           </div>
-        </div>
 
-        {/* Main Container */}
-        <div className="max-w-6xl w-full mx-auto p-8 space-y-8 flex-1">
-          <div>
-            <h1 className="text-xl font-semibold tracking-tight text-white">
-              Welcome back, {displayName}
-            </h1>
-          </div>
-
-          {/* Search Bar */}
-          <div className="flex items-center justify-between gap-4 pb-3 border-b border-white/[0.06]">
-            <div className="relative w-80">
-              <Search className="w-3.5 h-3.5 text-white/40 absolute left-3 top-2.5 pointer-events-none" />
+          {/* Wide Search Bar */}
+          <div className="mb-2">
+            <div className="relative w-full">
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Filter files..."
-                className="w-full pl-9 pr-8 py-1.5 text-xs bg-white/[0.04] border border-white/[0.08] rounded-lg text-white placeholder-white/40 outline-none focus:border-[var(--modern-accent)] focus:ring-1 focus:ring-[var(--modern-accent)] transition-all"
+                placeholder="Search your documents"
+                className="w-full pl-4 pr-10 py-2.5 text-xs bg-[#222328] border border-white/[0.06] rounded-xl text-white placeholder-white/35 outline-none focus:border-white/20 focus:ring-1 focus:ring-white/20 transition-all shadow-inner"
               />
-              {searchQuery && (
+              {searchQuery ? (
                 <button
                   type="button"
                   onClick={() => setSearchQuery('')}
-                  className="absolute right-2.5 top-2 text-white/40 hover:text-white"
+                  className="absolute right-3 top-2.5 text-white/40 hover:text-white cursor-pointer"
                 >
-                  <X className="w-3 h-3" />
+                  <X className="w-3.5 h-3.5" />
                 </button>
+              ) : (
+                <Search className="w-3.5 h-3.5 text-white/30 absolute right-3.5 top-3 pointer-events-none" />
               )}
-            </div>
-
-            <div className="text-[11px] font-mono text-white/40">
-              {filtered.length} {filtered.length === 1 ? 'file' : 'files'}
             </div>
           </div>
 
-          {/* Starred Section */}
-          {starredDocs.length > 0 && (
-            <section className="space-y-3">
-              <div className="flex items-center space-x-2 text-xs font-semibold text-white/70 uppercase tracking-wider">
-                <Star className="w-3.5 h-3.5 text-amber-400 fill-amber-400" />
-                <span>Favorites ({starredDocs.length})</span>
-              </div>
+          <p className="text-[11px] text-white/35 mb-8">
+            Removed from Home. Saved files are kept.
+          </p>
 
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3.5">
+          {/* Starred Section */}
+          <div className="mb-8">
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-xs font-medium text-white/80">Starred</span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/[0.06] text-white/50 font-mono">
+                {starredDocs.length}
+              </span>
+            </div>
+
+            {starredDocs.length === 0 ? (
+              <p className="text-xs text-white/35">
+                Star a document below to keep it close.
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
                 {starredDocs.map((doc) => (
                   <ModernDocCard
                     key={`starred-${doc.id}`}
@@ -192,17 +191,20 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
                   />
                 ))}
               </div>
-            </section>
-          )}
+            )}
+          </div>
 
-          {/* Recent Section */}
-          <section className="space-y-3">
-            <div className="text-xs font-semibold text-white/70 uppercase tracking-wider">
-              All Documents ({regularDocs.length})
+          {/* Recent Documents Section */}
+          <div>
+            <div className="flex items-center gap-2 mb-3">
+              <span className="text-xs font-medium text-white/80">Recent documents</span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/[0.06] text-white/50 font-mono">
+                {regularDocs.length}
+              </span>
             </div>
 
             {regularDocs.length === 0 ? (
-              <div className="border border-dashed border-white/10 bg-white/[0.02] p-10 text-center rounded-xl">
+              <div className="border border-dashed border-white/10 bg-white/[0.02] p-8 text-center rounded-xl">
                 <p className="text-xs text-white/40">
                   {cleanQuery
                     ? 'No documents matched the filter.'
@@ -210,7 +212,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
                 </p>
               </div>
             ) : (
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3.5">
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
                 {regularDocs.map((doc) => (
                   <ModernDocCard
                     key={`recent-${doc.id}`}
@@ -224,7 +226,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
                 ))}
               </div>
             )}
-          </section>
+          </div>
         </div>
 
         {/* Delete Confirmation Modal */}
@@ -472,62 +474,64 @@ const ModernDocCard: React.FC<VintageDocCardProps> = ({
   return (
     <div
       onClick={onSelect}
-      className="group relative flex flex-col bg-[#14151b] hover:bg-[#1a1b24] border border-white/[0.08] hover:border-[var(--modern-accent-border)] rounded-xl p-3 cursor-pointer transition-all duration-150 shadow-xs hover:shadow-lg hover:-translate-y-0.5"
+      className="group relative flex flex-col bg-[#222328] hover:bg-[#282930] border border-white/[0.07] hover:border-white/20 rounded-xl p-3 cursor-pointer transition-all duration-150 shadow-md hover:shadow-xl"
       title={`${doc.title}\n${doc.path}`}
     >
-      {/* Thumbnail Area */}
-      <div className="relative aspect-[4/3] bg-[#0c0d12] border border-white/[0.04] overflow-hidden flex items-center justify-center rounded-lg mb-2.5">
+      {/* Thumbnail Area - Aspect Square with Checkerboard Canvas Preview */}
+      <div
+        className="relative aspect-square border border-white/[0.05] overflow-hidden flex items-center justify-center rounded-lg mb-2.5"
+        style={{
+          background:
+            'repeating-conic-gradient(#202126 0% 25%, #17181c 0% 50%) 50% / 12px 12px',
+        }}
+      >
         {doc.coverUrl ? (
           <img
             src={doc.coverUrl}
             alt={doc.title}
-            className="w-full h-full object-cover select-none pointer-events-none group-hover:scale-105 transition-transform duration-300"
+            className="w-full h-full object-cover select-none pointer-events-none group-hover:scale-102 transition-transform duration-200"
           />
         ) : (
-          <div className="flex flex-col items-center justify-center text-white/30 space-y-1">
+          <div className="w-3/4 h-3/4 bg-white/90 rounded-sm shadow-md flex flex-col items-center justify-center text-zinc-400">
             <FileText className="w-6 h-6 stroke-[1.5]" />
-            <span className="text-[9px] font-mono uppercase tracking-wider text-white/40">{doc.fileType || 'CANVAS'}</span>
           </div>
         )}
 
-        {/* Quick Actions (top corners) */}
-        <div className="absolute top-1.5 left-1.5 flex items-center space-x-1">
+        {/* Top Right Quick Actions: Close (X) and Star */}
+        <div className="absolute top-1.5 right-1.5 flex items-center space-x-1">
+          <button
+            type="button"
+            onClick={onDelete}
+            title="Remove from recents"
+            className="w-5 h-5 rounded-md bg-black/60 hover:bg-black/90 text-white/50 hover:text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all backdrop-blur-xs cursor-pointer"
+          >
+            <X className="w-3 h-3" />
+          </button>
           <button
             type="button"
             onClick={onToggleStar}
             title={doc.isStarred ? 'Remove favorite' : 'Add favorite'}
-            className={`w-6 h-6 rounded-md flex items-center justify-center transition-all cursor-pointer ${
+            className={`w-5 h-5 rounded-md flex items-center justify-center transition-all cursor-pointer ${
               doc.isStarred
-                ? 'bg-black/60 text-amber-400 backdrop-blur-xs'
-                : 'bg-black/50 text-white/40 opacity-0 group-hover:opacity-100 hover:text-amber-400 backdrop-blur-xs'
+                ? 'bg-black/70 text-amber-400 backdrop-blur-xs'
+                : 'bg-black/60 text-white/50 opacity-0 group-hover:opacity-100 hover:text-amber-400 backdrop-blur-xs'
             }`}
           >
-            <Star className={`w-3.5 h-3.5 ${doc.isStarred ? 'fill-amber-400' : ''}`} />
-          </button>
-        </div>
-
-        <div className="absolute top-1.5 right-1.5">
-          <button
-            type="button"
-            onClick={onDelete}
-            title="Delete file options"
-            className="w-6 h-6 rounded-md bg-black/50 hover:bg-rose-950/80 text-white/40 hover:text-rose-300 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all backdrop-blur-xs cursor-pointer"
-          >
-            <Trash2 className="w-3.5 h-3.5" />
+            <Star className={`w-3 h-3 ${doc.isStarred ? 'fill-amber-400' : ''}`} />
           </button>
         </div>
       </div>
 
-      {/* Meta */}
-      <div className="min-w-0 space-y-1">
-        <div className="text-xs font-medium text-white/90 truncate group-hover:text-[var(--modern-accent)] transition-colors">
+      {/* Meta matching Reference 1 */}
+      <div className="min-w-0 space-y-0.5">
+        <div className="text-xs font-semibold text-white/95 truncate">
           {doc.title}
         </div>
-        <div className="flex items-center justify-between text-[10px] text-white/40 font-mono">
-          <span>{formatFileSize(doc.size)}</span>
-          <span className="uppercase text-[9px] px-1.5 py-0.5 bg-white/[0.05] border border-white/[0.06] rounded font-mono text-white/60">
-            {doc.fileType || 'CANVAS'}
-          </span>
+        <div className="text-[10px] text-white/45 truncate">
+          Previous session · Last worked on {formatFileSize(doc.size)}
+        </div>
+        <div className="text-[9px] text-white/30 font-mono truncate">
+          {doc.path}
         </div>
       </div>
     </div>

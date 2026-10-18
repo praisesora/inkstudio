@@ -133,10 +133,12 @@ export function oklabToLinearRgb(L: number, a: number, b: number): { r: number; 
   };
 }
 
+import { SparseTileGrid, TILE_SIZE, globalTileGrid } from './tileEngine';
+
 /**
- * Subtractive Pigment Mixing (Physical Paint Simulation).
- * Simulates real-world physical absorption where Blue + Yellow = Green,
- * Red + Blue = Purple, and colors don't collapse into dull muddy grays!
+ * Subtractive Pigment Mixing (Physical Paint Simulation — CSP Perceptual / Krita Kubelka-Munk).
+ * Simulates real-world physical absorption and spectral overlap where Blue + Yellow = vibrant Green,
+ * Red + Blue = Purple/Violet, Red + Yellow = Orange, and colors don't collapse into muddy RGB grays!
  */
 export function mixSubtractivePigments(
   c1: RgbColor,
@@ -155,8 +157,7 @@ export function mixSubtractivePigments(
   const g2 = srgbToLinear(c2.g);
   const b2 = srgbToLinear(c2.b);
 
-  // 1. Subtractive absorption coefficients (Kubelka-Munk approximation)
-  // Higher absorption = darker pigment absorption in that channel
+  // 1. Subtractive absorption coefficients (Kubelka-Munk K/S approximation)
   const absR1 = 1 - Math.sqrt(r1);
   const absG1 = 1 - Math.sqrt(g1);
   const absB1 = 1 - Math.sqrt(b1);
@@ -169,18 +170,33 @@ export function mixSubtractivePigments(
   const mixAbsG = absG1 * w1 + absG2 * w2;
   const mixAbsB = absB1 * w1 + absB2 * w2;
 
-  const subR = Math.pow(Math.max(0, 1 - mixAbsR), 2);
-  const subG = Math.pow(Math.max(0, 1 - mixAbsG), 2);
-  const subB = Math.pow(Math.max(0, 1 - mixAbsB), 2);
+  let subR = Math.pow(Math.max(0, 1 - mixAbsR), 2);
+  let subG = Math.pow(Math.max(0, 1 - mixAbsG), 2);
+  let subB = Math.pow(Math.max(0, 1 - mixAbsB), 2);
 
-  // 2. Perceptual Lightness correction via OKLab
+  // 2. Spectral Yellow + Blue -> Green pigment transmittance coupling
+  // In RGB, pure blue has R=0, G=0, B=1, which falsely implies infinite green absorption.
+  // Physical blue/cyan pigments transmit 490-540nm (green) wavelengths that overlap with yellow's passband.
+  const yellow1 = Math.max(0, Math.min(r1, g1) - b1);
+  const yellow2 = Math.max(0, Math.min(r2, g2) - b2);
+  const blue1 = Math.max(0, b1 - r1);
+  const blue2 = Math.max(0, b2 - r2);
+
+  const ybCross = (yellow1 * blue2 + yellow2 * blue1) * 4.0 * w1 * w2;
+  if (ybCross > 0.001) {
+    subG = Math.min(1.0, subG + ybCross * 0.55);
+    subR = Math.max(0.0, subR * (1.0 - ybCross * 0.45));
+    subB = Math.max(0.0, subB * (1.0 - ybCross * 0.45));
+  }
+
+  // 3. Perceptual Lightness & Chroma preservation via OKLab
   const lab1 = linearRgbToOklab(r1, g1, b1);
   const lab2 = linearRgbToOklab(r2, g2, b2);
   const targetLightness = lab1.L * w1 + lab2.L * w2;
 
   const subLab = linearRgbToOklab(subR, subG, subB);
   const tunedLab = {
-    L: Math.max(0.01, targetLightness * 0.75 + subLab.L * 0.25),
+    L: Math.max(0.01, targetLightness * 0.72 + subLab.L * 0.28),
     a: subLab.a,
     b: subLab.b,
   };
@@ -195,8 +211,8 @@ export function mixSubtractivePigments(
 }
 
 // -------------------------------------------------------------
-// Ultra-Fast Zero-Lag In-Memory Pixel Sampler
-// Eliminates GPU readback stalls (getImageData) during live drawing!
+// Ultra-Fast Zero-Lag Tile-Aware In-Memory Pixel Sampler
+// Eliminates full-canvas GPU readback stalls (getImageData) during live drawing!
 // -------------------------------------------------------------
 
 export class LayerPixelSampler {
@@ -204,14 +220,38 @@ export class LayerPixelSampler {
   public height: number;
   public data: Uint8ClampedArray;
   public u32: Uint32Array;
+  private sourceCtx: CanvasRenderingContext2D | null = null;
+  private tileGrid: SparseTileGrid | null = null;
+  private layerId: string | null = null;
+  private useLazyTiles: boolean = false;
+  private lazyTiles: Map<number, Uint8ClampedArray> = new Map();
+  private tilesX: number = 1;
 
-  constructor(sourceCanvas: HTMLCanvasElement) {
+  constructor(
+    sourceCanvas: HTMLCanvasElement,
+    layerId?: string,
+    tileGrid: SparseTileGrid = globalTileGrid
+  ) {
     this.width = sourceCanvas.width;
     this.height = sourceCanvas.height;
-    const ctx = sourceCanvas.getContext('2d', { willReadFrequently: true });
-    if (ctx && this.width > 0 && this.height > 0) {
+    this.tilesX = Math.max(1, Math.ceil(this.width / TILE_SIZE));
+    this.sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+
+    // If a SparseTileGrid has tiles for this layer, or if the canvas is large (> 512x512),
+    // use zero-stall on-demand 256x256 tile caching instead of a synchronous full-document getImageData!
+    const hasGridTiles = Boolean(layerId && tileGrid && tileGrid.getLayerTiles(layerId).length > 0);
+    const isLargeCanvas = this.width * this.height > 512 * 512;
+
+    if (hasGridTiles || isLargeCanvas) {
+      this.useLazyTiles = true;
+      this.layerId = layerId ?? null;
+      this.tileGrid = hasGridTiles ? tileGrid : null;
+      // Allocate a minimal 1-pixel placeholder for legacy property access
+      this.data = new Uint8ClampedArray(4);
+      this.u32 = new Uint32Array(this.data.buffer);
+    } else if (this.sourceCtx && this.width > 0 && this.height > 0) {
       try {
-        const imgData = ctx.getImageData(0, 0, this.width, this.height);
+        const imgData = this.sourceCtx.getImageData(0, 0, this.width, this.height);
         this.data = imgData.data;
         this.u32 = new Uint32Array(this.data.buffer);
       } catch {
@@ -225,7 +265,53 @@ export class LayerPixelSampler {
   }
 
   /**
-   * Samples average color and opacity in microseconds with ZERO GPU pipeline flushes!
+   * Fetches or initializes a 256x256 RGBA tile in CPU memory on demand (zero full-canvas stall).
+   */
+  private getOrLoadTile(tx: number, ty: number): Uint8ClampedArray {
+    const key = ty * this.tilesX + tx;
+    let buf = this.lazyTiles.get(key);
+    if (buf) return buf;
+
+    if (this.tileGrid && this.layerId) {
+      const tile = this.tileGrid.getTile(this.layerId, tx, ty);
+      if (tile) {
+        const rgba = this.tileGrid.getTileAsRGBA(tile);
+        buf = new Uint8ClampedArray(rgba.length);
+        buf.set(rgba);
+        this.lazyTiles.set(key, buf);
+        return buf;
+      }
+    }
+
+    buf = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+    if (this.sourceCtx) {
+      const sx = tx * TILE_SIZE;
+      const sy = ty * TILE_SIZE;
+      const sw = Math.min(TILE_SIZE, this.width - sx);
+      const sh = Math.min(TILE_SIZE, this.height - sy);
+      if (sw > 0 && sh > 0) {
+        try {
+          const img = this.sourceCtx.getImageData(sx, sy, sw, sh);
+          if (sw === TILE_SIZE && sh === TILE_SIZE) {
+            buf.set(img.data);
+          } else {
+            for (let row = 0; row < sh; row++) {
+              const srcOff = row * sw * 4;
+              const dstOff = row * TILE_SIZE * 4;
+              buf.set(img.data.subarray(srcOff, srcOff + sw * 4), dstOff);
+            }
+          }
+        } catch {
+          // Ignore security/context errors
+        }
+      }
+    }
+    this.lazyTiles.set(key, buf);
+    return buf;
+  }
+
+  /**
+   * Samples average color and opacity in microseconds with ZERO full-canvas GPU pipeline flushes!
    */
   public sampleColor(cx: number, cy: number, radius: number): RgbaColor {
     const r = Math.max(1, Math.min(64, Math.round(radius)));
@@ -235,6 +321,67 @@ export class LayerPixelSampler {
     const h = this.height;
 
     if (ix < -r || ix >= w + r || iy < -r || iy >= h + r) {
+      return { r: 255, g: 255, b: 255, a: 0 };
+    }
+
+    if (this.useLazyTiles) {
+      if (r <= 2) {
+        const clampedX = Math.max(0, Math.min(w - 1, ix));
+        const clampedY = Math.max(0, Math.min(h - 1, iy));
+        const tile = this.getOrLoadTile(clampedX >> 8, clampedY >> 8);
+        const idx = (((clampedY & 255) << 8) + (clampedX & 255)) << 2;
+        const alpha = tile[idx + 3];
+        return {
+          r: tile[idx],
+          g: tile[idx + 1],
+          b: tile[idx + 2],
+          a: alpha / 255,
+        };
+      }
+
+      const x0 = Math.max(0, ix - r);
+      const x1 = Math.min(w - 1, ix + r);
+      const y0 = Math.max(0, iy - r);
+      const y1 = Math.min(h - 1, iy + r);
+
+      const step = Math.max(1, Math.floor(r / 3.5));
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let weightSum = 0;
+      const rSq = r * r;
+
+      for (let y = y0; y <= y1; y += step) {
+        const dy = y - iy;
+        const dySq = dy * dy;
+        const ty = y >> 8;
+        const lyOffset = (y & 255) << 8;
+        for (let x = x0; x <= x1; x += step) {
+          const dx = x - ix;
+          const distSq = dx * dx + dySq;
+          if (distSq <= rSq) {
+            const tile = this.getOrLoadTile(x >> 8, ty);
+            const idx = (lyOffset + (x & 255)) << 2;
+            const alpha = tile[idx + 3];
+            if (alpha > 4) {
+              const radialWeight = (1 - distSq / rSq) * (alpha / 255);
+              sumR += tile[idx] * radialWeight;
+              sumG += tile[idx + 1] * radialWeight;
+              sumB += tile[idx + 2] * radialWeight;
+              weightSum += radialWeight;
+            }
+          }
+        }
+      }
+
+      if (weightSum > 0.001) {
+        return {
+          r: sumR / weightSum,
+          g: sumG / weightSum,
+          b: sumB / weightSum,
+          a: Math.min(1.0, weightSum),
+        };
+      }
       return { r: 255, g: 255, b: 255, a: 0 };
     }
 
@@ -261,7 +408,6 @@ export class LayerPixelSampler {
     let sumR = 0;
     let sumG = 0;
     let sumB = 0;
-    let sumA = 0;
     let weightSum = 0;
     const rSq = r * r;
 
@@ -281,7 +427,6 @@ export class LayerPixelSampler {
             sumR += this.data[idx] * radialWeight;
             sumG += this.data[idx + 1] * radialWeight;
             sumB += this.data[idx + 2] * radialWeight;
-            sumA += alpha;
             weightSum += radialWeight;
           }
         }
@@ -327,6 +472,38 @@ export class LayerPixelSampler {
     const radSq = rad * rad;
     const invRadSq = 1 / radSq;
     const step = Math.max(1, Math.floor(rad / 4.5));
+
+    if (this.useLazyTiles) {
+      for (let y = y0; y <= y1; y += step) {
+        const dy = y - iy;
+        const dySq = dy * dy;
+        const ty = y >> 8;
+        const lyOffset = (y & 255) << 8;
+        for (let x = x0; x <= x1; x += step) {
+          const dx = x - ix;
+          const dSq = dx * dx + dySq;
+          if (dSq <= radSq) {
+            const falloff = 1 - dSq * invRadSq;
+            const effAlpha = Math.min(1.0, a * falloff);
+            const tile = this.getOrLoadTile(x >> 8, ty);
+            const idx = (lyOffset + (x & 255)) << 2;
+            const dstA = tile[idx + 3] / 255;
+            const outA = effAlpha + dstA * (1 - effAlpha);
+            if (outA > 0.001) {
+              const outR = (r * effAlpha + tile[idx] * dstA * (1 - effAlpha)) / outA;
+              const outG = (g * effAlpha + tile[idx + 1] * dstA * (1 - effAlpha)) / outA;
+              const outB = (b * effAlpha + tile[idx + 2] * dstA * (1 - effAlpha)) / outA;
+
+              tile[idx] = Math.round(outR);
+              tile[idx + 1] = Math.round(outG);
+              tile[idx + 2] = Math.round(outB);
+              tile[idx + 3] = Math.round(Math.min(255, outA * 255));
+            }
+          }
+        }
+      }
+      return;
+    }
 
     for (let y = y0; y <= y1; y += step) {
       const dy = y - iy;
