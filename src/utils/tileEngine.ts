@@ -383,6 +383,20 @@ const _downsampleRgbaView = new Uint8Array(_downsampleRgbaScratch.buffer);
 const _downsample8BitScratch = new Uint8Array(BYTES_8BIT);
 const _downsample1BitScratch = new Uint8Array(BYTES_1BIT);
 
+// Precomputed 256-entry LUT mapping an 8-bit 1-bit-row byte to a 4-bit downsampled nibble (2x1 horizontal OR)
+const _lut1BitByteToNibble = (() => {
+  const lut = new Uint8Array(256);
+  for (let b = 0; b < 256; b++) {
+    let nib = 0;
+    if (b & 0xc0) nib |= 0x08;
+    if (b & 0x30) nib |= 0x04;
+    if (b & 0x0c) nib |= 0x02;
+    if (b & 0x03) nib |= 0x01;
+    lut[b] = nib;
+  }
+  return lut;
+})();
+
 /**
  * Downsample 4 child tiles (2x2 cluster) at LOD k-1 into a single destination tile at LOD k.
  * Reuses pre-allocated scratch buffers for zero 256KB heap allocations during zoom-out LOD builds.
@@ -450,6 +464,11 @@ export function downsample2x2ToParentTile(
             dst[outIdx + 1] = 0;
             dst[outIdx + 2] = 0;
             dst[outIdx + 3] = 0;
+          } else if (sumA === 1020) {
+            dst[outIdx] = (childData[p00] + childData[p10] + childData[p01] + childData[p11] + 2) >> 2;
+            dst[outIdx + 1] = (childData[p00 + 1] + childData[p10 + 1] + childData[p01 + 1] + childData[p11 + 1] + 2) >> 2;
+            dst[outIdx + 2] = (childData[p00 + 2] + childData[p10 + 2] + childData[p01 + 2] + childData[p11 + 2] + 2) >> 2;
+            dst[outIdx + 3] = 255;
           } else {
             dst[outIdx + 3] = sumA >> 2;
             dst[outIdx] = Math.round(
@@ -503,22 +522,18 @@ export function downsample2x2ToParentTile(
         packRGBATo1Bit(_downsampleRgbaScratch, _downsample1BitScratch);
         childData = _downsample1BitScratch;
       }
+      const dstByteBaseX = xBase >> 3;
       for (let ly = 0; ly < 128; ly++) {
         const sy0 = ly << 1;
-        const sy1 = sy0 + 1;
-        const dy = yBase + ly;
+        const srcRow0 = sy0 << 5;
+        const srcRow1 = (sy0 + 1) << 5;
+        const dstRow = ((yBase + ly) << 5) + dstByteBaseX;
 
-        for (let lx = 0; lx < 128; lx++) {
-          const sx0 = lx << 1;
-          const sx1 = sx0 + 1;
-          const dx = xBase + lx;
-
-          const b0 = getPixel1Bit(childData, sx0, sy0);
-          const b1 = getPixel1Bit(childData, sx1, sy0);
-          const b2 = getPixel1Bit(childData, sx0, sy1);
-          const b3 = getPixel1Bit(childData, sx1, sy1);
-
-          setPixel1Bit(dst, dx, dy, (b0 | b1 | b2 | b3) !== 0);
+        for (let bx = 0; bx < 16; bx++) {
+          const sBx = bx << 1;
+          const comb0 = childData[srcRow0 + sBx] | childData[srcRow1 + sBx];
+          const comb1 = childData[srcRow0 + sBx + 1] | childData[srcRow1 + sBx + 1];
+          dst[dstRow + bx] = (_lut1BitByteToNibble[comb0] << 4) | _lut1BitByteToNibble[comb1];
         }
       }
     }
@@ -955,9 +970,10 @@ export class SparseTileGrid {
   private ingestedLayers: Set<string> = new Set();
   private dirtyLodTiles: Set<string> = new Set();
   private scratchRGBA: Uint8ClampedArray = new Uint8ClampedArray(BYTES_32BIT);
+  private writeScratchRGBA: Uint8ClampedArray = new Uint8ClampedArray(BYTES_32BIT);
+  private thumbCanvas: HTMLCanvasElement | null = null;
   private listeners: Set<(immediate?: boolean) => void> = new Set();
   private memoryManager: TileMemoryManager | null = null;
-  private idleCallbackScheduled: boolean = false;
 
   constructor(memoryManagerOptions?: TileMemoryManagerOptions) {
     this.memoryManager = new TileMemoryManager(this, memoryManagerOptions);
@@ -1175,7 +1191,7 @@ export class SparseTileGrid {
     const maxTileX = pixelToTileCoord(destX + w - 1, 0);
     const maxTileY = pixelToTileCoord(destY + h - 1, 0);
 
-    const tileScratch = new Uint8ClampedArray(BYTES_32BIT);
+    const tileScratch = this.writeScratchRGBA;
     const srcData = imgData.data;
 
     for (let ty = minTileY; ty <= maxTileY; ty++) {
@@ -1349,37 +1365,32 @@ export class SparseTileGrid {
       maxY = Math.min(targetCanvas.height, Math.ceil(dirtyRect.y + dirtyRect.height));
     }
 
-    ctx.clearRect(minX, minY, maxX - minX, maxY - minY);
+    if (maxX <= minX || maxY <= minY) return;
 
     const minTileX = pixelToTileCoord(minX, 0);
     const minTileY = pixelToTileCoord(minY, 0);
     const maxTileX = pixelToTileCoord(maxX - 1, 0);
     const maxTileY = pixelToTileCoord(maxY - 1, 0);
 
-    let helperCanvas: HTMLCanvasElement | null = null;
-    let helperCtx: CanvasRenderingContext2D | null = null;
-
     for (let ty = minTileY; ty <= maxTileY; ty++) {
       const tileDocY = ty * TILE_SIZE;
+      const validH = Math.min(TILE_SIZE, targetCanvas.height - tileDocY);
+      if (validH <= 0) continue;
       for (let tx = minTileX; tx <= maxTileX; tx++) {
-        const tile = this.getTile(layerId, tx, ty, 0);
-        if (!tile) continue;
-
         const tileDocX = tx * TILE_SIZE;
-        const rgba = this.getTileAsRGBA(tile);
-
-        if (!helperCanvas && typeof document !== 'undefined') {
-          helperCanvas = document.createElement('canvas');
-          helperCanvas.width = TILE_SIZE;
-          helperCanvas.height = TILE_SIZE;
-          helperCtx = helperCanvas.getContext('2d');
+        const validW = Math.min(TILE_SIZE, targetCanvas.width - tileDocX);
+        if (validW <= 0) continue;
+        const tile = this.getTile(layerId, tx, ty, 0);
+        if (!tile) {
+          ctx.clearRect(tileDocX, tileDocY, validW, validH);
+          continue;
         }
 
-        if (helperCtx && helperCanvas) {
+        const rgba = this.getTileAsRGBA(tile);
+        if (typeof ImageData !== 'undefined') {
           const clamped = new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, BYTES_32BIT);
           const imgData = new ImageData(clamped, TILE_SIZE, TILE_SIZE);
-          helperCtx.putImageData(imgData, 0, 0);
-          ctx.drawImage(helperCanvas, tileDocX, tileDocY);
+          ctx.putImageData(imgData, tileDocX, tileDocY, 0, 0, validW, validH);
         }
       }
     }
@@ -1396,9 +1407,12 @@ export class SparseTileGrid {
     docDimensions: { width: number; height: number }
   ): string {
     if (typeof document === 'undefined') return '';
-    const canvas = document.createElement('canvas');
-    canvas.width = thumbWidth;
-    canvas.height = thumbHeight;
+    if (!this.thumbCanvas) {
+      this.thumbCanvas = document.createElement('canvas');
+    }
+    const canvas = this.thumbCanvas;
+    if (canvas.width !== thumbWidth) canvas.width = thumbWidth;
+    if (canvas.height !== thumbHeight) canvas.height = thumbHeight;
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
@@ -1407,15 +1421,12 @@ export class SparseTileGrid {
     const docW = Math.max(1, docDimensions.width);
     const docH = Math.max(1, docDimensions.height);
 
-    // Prefer LOD 3 (1/8 scale) or LOD 2 if available, else LOD 0
-    if (this.dirtyLodTiles.size > 0) {
-      this.flushMipmaps(layerId);
-    }
-    let renderLod = 3;
-    let tiles = this.getLayerTiles(layerId, 3);
+    // Sample directly from LOD 0 tiles without flushing full mipmap pyramids
+    let renderLod = 0;
+    let tiles = this.getLayerTiles(layerId, 0);
     if (tiles.length === 0) {
-      renderLod = 0;
-      tiles = this.getLayerTiles(layerId, 0);
+      renderLod = 3;
+      tiles = this.getLayerTiles(layerId, 3);
     }
 
     if (tiles.length === 0) {
@@ -1496,29 +1507,6 @@ export class SparseTileGrid {
       if (existing) {
         existing.dirty = true;
       }
-    }
-    this.scheduleIdleDownsampling();
-  }
-
-  private scheduleIdleDownsampling(): void {
-    if (this.idleCallbackScheduled || this.dirtyLodTiles.size === 0) return;
-    this.idleCallbackScheduled = true;
-
-    const run = () => {
-      this.idleCallbackScheduled = false;
-      const updated = this.updateDirtyMipmaps(16);
-      if (updated > 0) {
-        this.notifyChange();
-      }
-      if (this.dirtyLodTiles.size > 0) {
-        this.scheduleIdleDownsampling();
-      }
-    };
-
-    if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-      (window as any).requestIdleCallback(run, { timeout: 100 });
-    } else {
-      setTimeout(run, 16);
     }
   }
 
@@ -1869,7 +1857,7 @@ export class SparseTileGrid {
     const deltas: TileDelta[] = [];
     const keysToCheck = new Set<string>(beforeSnapshot.keys());
 
-    if (bounds && bounds.width > 0 && bounds.height > 0) {
+    if (beforeSnapshot.size === 0 && bounds && bounds.width > 0 && bounds.height > 0) {
       const minTileX = pixelToTileCoord(bounds.x, 0);
       const minTileY = pixelToTileCoord(bounds.y, 0);
       const maxTileX = pixelToTileCoord(bounds.x + bounds.width - 1, 0);
@@ -1882,6 +1870,7 @@ export class SparseTileGrid {
     }
 
     for (const key of keysToCheck) {
+      if (beforeSnapshot.size > 0 && !beforeSnapshot.has(key)) continue;
       const before = beforeSnapshot.get(key);
       const { tileX, tileY } = parseTileKey(key);
       const currentTile = this.getTile(layerId, tileX, tileY, 0);

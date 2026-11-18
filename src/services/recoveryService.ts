@@ -294,16 +294,9 @@ class RecoveryService {
       }
     }
 
-    // Increment checkpoint stroke counter
+    // Increment checkpoint stroke counter and defer full grid snapshot to idle timer so active drawing never freezes
     this.strokesSinceCheckpoint++;
-
-    // Check Checkpoint Policy: 25-30 completed strokes
-    if (this.strokesSinceCheckpoint >= CHECKPOINT_STROKE_THRESHOLD) {
-      void this.triggerCheckpoint(activeId);
-    } else {
-      // Schedule 30-second idle timer
-      this.resetIdleCheckpointTimer(activeId);
-    }
+    this.resetIdleCheckpointTimer(activeId);
   }
 
   /**

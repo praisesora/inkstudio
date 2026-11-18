@@ -230,6 +230,7 @@ export function useCanvasDrawing({
   const latestPredictedRef = useRef<{ predEvents: PointerEvent[]; vRect: DOMRect } | null>(null);
 
   const clearPredictedCanvas = useCallback(() => {
+    if (!isPredictedCanvasDirtyRef.current) return;
     const pCanvas = getPredictedCanvas();
     if (pCanvas) {
       const pCtx = get2DContext(pCanvas);
@@ -360,6 +361,8 @@ export function useCanvasDrawing({
   const liveOrigCanvasTilesRef = useRef<Map<number, ImageData>>(new Map());
   const liveBeforeTileSnapshotRef = useRef<Map<string, { format: TileFormat; data: Uint8Array | null }>>(new Map());
   const liveNeedsNotifyRef = useRef<boolean>(false);
+  const isBatchFlushingRef = useRef<boolean>(false);
+  const pendingBatchSyncRectRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const lastStrokeEndRef = useRef<{ x: number; y: number; pressure: number; width: number; layerId: string } | null>(null);
   const isShiftLineStrokeRef = useRef<boolean>(false);
   const historyQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -612,10 +615,15 @@ export function useCanvasDrawing({
 
       if (canvas) {
         const isLarge = canvas.width * canvas.height > 1024 * 1024 && globalTileGrid.isLayerIngested(targetLayerId);
-        const targetH = Math.max(38, Math.round((canvas.height / Math.max(1, canvas.width)) * 60));
-        item.thumbnailUrl = isLarge
-          ? globalTileGrid.generateThumbnail(targetLayerId, 60, targetH, { width: canvas.width, height: canvas.height })
-          : createCanvasThumbnail(canvas, !isBackgroundLayerId(targetLayerId));
+        if (isLarge && hasDeltas) {
+          const existingLayerThumb = layersRef.current?.find((l) => l.id === targetLayerId)?.thumbnailUrl || '';
+          item.thumbnailUrl = existingLayerThumb;
+        } else {
+          const targetH = Math.max(38, Math.round((canvas.height / Math.max(1, canvas.width)) * 60));
+          item.thumbnailUrl = isLarge
+            ? globalTileGrid.generateThumbnail(targetLayerId, 60, targetH, { width: canvas.width, height: canvas.height })
+            : createCanvasThumbnail(canvas, !isBackgroundLayerId(targetLayerId));
+        }
       }
       syncHistoryState();
 
@@ -663,9 +671,9 @@ export function useCanvasDrawing({
     if (idleCallbackIdRef.current === null) {
       const scheduleRun = () => {
         if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-          idleCallbackIdRef.current = (window as any).requestIdleCallback(runTasks, { timeout: 250 });
+          idleCallbackIdRef.current = (window as any).requestIdleCallback(runTasks, { timeout: 1200 });
         } else {
-          idleCallbackIdRef.current = setTimeout(runTasks, 32);
+          idleCallbackIdRef.current = setTimeout(runTasks, 64);
         }
       };
       const runTasks = () => {
@@ -766,7 +774,18 @@ export function useCanvasDrawing({
             const tw = Math.min(TILE_SIZE, canvas.width - ox);
             const th = Math.min(TILE_SIZE, canvas.height - oy);
             if (tw <= 0 || th <= 0) continue;
-            const origImg = canvasCtx.getImageData(ox, oy, tw, th);
+            if (liveStrokeIsolationRef.current && liveAccumCanvasRef.current) {
+              const accCtx = get2DContext(liveAccumCanvasRef.current);
+              accCtx?.clearRect(ox, oy, tw, th);
+            }
+            let origImg: ImageData;
+            if (globalTileGrid.isLayerIngested(layerId) && typeof ImageData !== 'undefined') {
+              const rawTile = globalTileGrid.readImageData(layerId, ox, oy, tw, th);
+              origImg = new ImageData(new Uint8ClampedArray(rawTile.data), tw, th);
+              canvasCtx.putImageData(origImg, ox, oy);
+            } else {
+              origImg = canvasCtx.getImageData(ox, oy, tw, th);
+            }
             liveOrigCanvasTilesRef.current.set(numKey, origImg);
             if (!globalTileGrid.isLayerIngested(layerId) && !globalTileGrid.getTile(layerId, tx, ty, 0)) {
               const activeLayer = layersRef.current?.find((l) => l.id === layerId);
@@ -1748,20 +1767,36 @@ export function useCanvasDrawing({
           stampRemainderDistRef.current = renderSegmentToContext(canvasCtx, segStart, c1, c2, segEnd, false);
           canvasCtx.restore();
         }
-        syncLiveRegionToTiles(
-          canvas,
-          canvasCtx,
-          currentLayerId,
-          segMinX,
-          segMinY,
-          segMaxX,
-          segMaxY,
-          isMonochrome,
-          activeLayer,
-          bs,
-          isEraser,
-          isBgEraser
-        );
+        if (isBatchFlushingRef.current) {
+          if (!pendingBatchSyncRectRef.current) {
+            pendingBatchSyncRectRef.current = {
+              minX: segMinX,
+              minY: segMinY,
+              maxX: segMaxX,
+              maxY: segMaxY,
+            };
+          } else {
+            pendingBatchSyncRectRef.current.minX = Math.min(pendingBatchSyncRectRef.current.minX, segMinX);
+            pendingBatchSyncRectRef.current.minY = Math.min(pendingBatchSyncRectRef.current.minY, segMinY);
+            pendingBatchSyncRectRef.current.maxX = Math.max(pendingBatchSyncRectRef.current.maxX, segMaxX);
+            pendingBatchSyncRectRef.current.maxY = Math.max(pendingBatchSyncRectRef.current.maxY, segMaxY);
+          }
+        } else {
+          syncLiveRegionToTiles(
+            canvas,
+            canvasCtx,
+            currentLayerId,
+            segMinX,
+            segMinY,
+            segMaxX,
+            segMaxY,
+            isMonochrome,
+            activeLayer,
+            bs,
+            isEraser,
+            isBgEraser
+          );
+        }
         return;
       }
     }
@@ -2078,6 +2113,7 @@ export function useCanvasDrawing({
       }
 
       pCtx.restore();
+      isPredictedCanvasDirtyRef.current = true;
     },
     [clearPredictedCanvas, getPredictedCanvas]
   );
@@ -2093,9 +2129,8 @@ export function useCanvasDrawing({
       const predData = latestPredictedRef.current;
       latestPredictedRef.current = null;
       const vRect = getViewportRect();
-      if (vRect && allStrokePointsRef.current.length > 0) {
+      if (vRect && allStrokePointsRef.current.length > 0 && !drewDirectlyOnLayerCanvasRef.current) {
         renderPredictedStroke(predData ? predData.predEvents : [], vRect);
-        isPredictedCanvasDirtyRef.current = true;
       } else if (isPredictedCanvasDirtyRef.current) {
         clearPredictedCanvas();
       }
@@ -2114,6 +2149,9 @@ export function useCanvasDrawing({
     let batchMaxX = -Infinity;
     let batchMaxY = -Infinity;
     let maxStrokeWidth = 0;
+
+    isBatchFlushingRef.current = true;
+    pendingBatchSyncRectRef.current = null;
 
     for (let i = 0; i < queueLen; i++) {
       const item = queue[i];
@@ -2139,7 +2177,35 @@ export function useCanvasDrawing({
       }
     }
     queue.length = 0;
+    isBatchFlushingRef.current = false;
 
+    const pendingSync = pendingBatchSyncRectRef.current as { minX: number; minY: number; maxX: number; maxY: number } | null;
+    pendingBatchSyncRectRef.current = null;
+    if (pendingSync && drewDirectlyOnLayerCanvasRef.current) {
+      const canvas = getActiveCanvas();
+      const canvasCtx = canvas ? get2DContext(canvas) : null;
+      if (canvas && canvasCtx) {
+        const currentLayerId = activeLayerIdRef.current;
+        const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+        const isMonochrome = colorModeRef.current === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+        const isEraser = toolRef.current === 'eraser';
+        const isBgEraser = isEraser && isBackgroundLayerId(currentLayerId);
+        syncLiveRegionToTiles(
+          canvas,
+          canvasCtx,
+          currentLayerId,
+          pendingSync.minX,
+          pendingSync.minY,
+          pendingSync.maxX,
+          pendingSync.maxY,
+          isMonochrome,
+          activeLayer,
+          brushSettingsRef.current,
+          isEraser,
+          isBgEraser
+        );
+      }
+    }
 
     if (batchMinX <= batchMaxX) {
       const dims = dimensionsRef.current;
@@ -2170,9 +2236,8 @@ export function useCanvasDrawing({
     const predData = latestPredictedRef.current;
     latestPredictedRef.current = null;
     const vRect = getViewportRect();
-    if (vRect && allStrokePointsRef.current.length > 0) {
+    if (vRect && allStrokePointsRef.current.length > 0 && !drewDirectlyOnLayerCanvasRef.current) {
       renderPredictedStroke(predData ? predData.predEvents : [], vRect);
-      isPredictedCanvasDirtyRef.current = true;
     } else if (isPredictedCanvasDirtyRef.current) {
       clearPredictedCanvas();
     }
@@ -2183,6 +2248,7 @@ export function useCanvasDrawing({
     getActiveCanvas,
     getViewportRect,
     renderPredictedStroke,
+    syncLiveRegionToTiles,
   ]);
 
 
@@ -2472,9 +2538,6 @@ export function useCanvasDrawing({
           liveAccumCanvasRef.current = document.createElement('canvas');
           liveAccumCanvasRef.current.width = canvas.width;
           liveAccumCanvasRef.current.height = canvas.height;
-        } else {
-          const accCtx = get2DContext(liveAccumCanvasRef.current);
-          accCtx?.clearRect(0, 0, canvas.width, canvas.height);
         }
       }
 
@@ -3202,7 +3265,7 @@ export function useCanvasDrawing({
               const beforeSnapshot = new Map<string, { format: TileFormat; data: Uint8Array | null }>(
                 liveBeforeTileSnapshotRef.current
               );
-              const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId, dirtyRect);
+              const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId);
               enqueueHistoryTask(() => {
                 pushHistoryStep(toolForHistory, label, null, null, currentLayerId, dirtyRect, tileDeltas);
               });

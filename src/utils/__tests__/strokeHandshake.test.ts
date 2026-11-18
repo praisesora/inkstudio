@@ -316,4 +316,55 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
     expect(sampled.g).toBe(200);
     expect(sampled.a).toBeCloseTo(1.0, 2);
   });
+
+  it('Ctrl+Z undo never deletes untouched pre-existing tiles inside a stroke bounding box dirtyRect', () => {
+    const layerId = 'layer-carbon';
+    const existingInk = new Uint8ClampedArray(20 * 20 * 4);
+    for (let i = 0; i < 20 * 20; i++) {
+      existingInk[i * 4 + 3] = 255;
+    }
+
+    // 1. Pre-existing strokes ('CARBON') in all 4 tiles: (0,0), (1,0), (0,1), (1,1)
+    grid.writeImageData(layerId, { data: existingInk, width: 20, height: 20 }, 10, 10, 'color-32bit');
+    grid.writeImageData(layerId, { data: existingInk, width: 20, height: 20 }, 300, 10, 'color-32bit');
+    grid.writeImageData(layerId, { data: existingInk, width: 20, height: 20 }, 10, 300, 'color-32bit');
+    grid.writeImageData(layerId, { data: existingInk, width: 20, height: 20 }, 300, 300, 'color-32bit');
+
+    // 2. New diagonal stroke only touches tiles (0,0) and (1,1), so ensureLiveTileSnapshots only snapshots (0,0) and (1,1)
+    const liveBeforeSnapshot = new Map();
+    for (const [k, v] of grid.snapshotTilesInRect(layerId, { x: 0, y: 0, width: 100, height: 100 })) {
+      liveBeforeSnapshot.set(k, v);
+    }
+    for (const [k, v] of grid.snapshotTilesInRect(layerId, { x: 260, y: 260, width: 100, height: 100 })) {
+      liveBeforeSnapshot.set(k, v);
+    }
+
+    // Mutate tiles (0,0) and (1,1) with new red stroke
+    const newStroke = new Uint8ClampedArray(20 * 20 * 4);
+    for (let i = 0; i < 20 * 20; i++) {
+      newStroke[i * 4] = 255;
+      newStroke[i * 4 + 3] = 255;
+    }
+    grid.writeImageData(layerId, { data: newStroke, width: 20, height: 20 }, 50, 50, 'color-32bit');
+    grid.writeImageData(layerId, { data: newStroke, width: 20, height: 20 }, 340, 340, 'color-32bit');
+
+    // 3. Compute deltas even if full 512x512 bounding box dirtyRect is passed
+    const deltas = grid.computeDeltasFromSnapshot(liveBeforeSnapshot, layerId, {
+      x: 0,
+      y: 0,
+      width: 512,
+      height: 512,
+    });
+    expect(deltas.length).toBe(2);
+
+    // 4. Press Ctrl+Z (undo): untouched tiles (1,0) and (0,1) MUST still exist and retain their original pixels!
+    grid.applyTileDeltas(deltas, 'undo');
+    expect(grid.getTile(layerId, 1, 0)).not.toBeNull();
+    expect(grid.getTile(layerId, 0, 1)).not.toBeNull();
+    expect(grid.readImageData(layerId, 300, 10, 1, 1).data[3]).toBe(255);
+    expect(grid.readImageData(layerId, 10, 300, 1, 1).data[3]).toBe(255);
+    // And touched tiles (0,0) and (1,1) must be restored to their pre-stroke CARBON pixels without the red stroke
+    expect(grid.readImageData(layerId, 10, 10, 1, 1).data[3]).toBe(255);
+    expect(grid.readImageData(layerId, 50, 50, 1, 1).data[3]).toBe(0);
+  });
 });

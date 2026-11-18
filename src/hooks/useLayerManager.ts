@@ -371,8 +371,9 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId }: Us
   const layersRef = useRef(layers);
   layersRef.current = layers;
 
-  // Track layer mutations and log to recovery service WAL
+  // Track structural layer mutations and log to recovery service WAL (ignore pure thumbnailUrl refreshes)
   const isInitialLayerMount = useRef(true);
+  const lastLoggedLayersSigRef = useRef<string>('');
   useEffect(() => {
     if (isInitialLayerMount.current) {
       isInitialLayerMount.current = false;
@@ -380,6 +381,11 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId }: Us
     }
     const sId = activeSessionId || recoveryService.getCurrentSessionId();
     if (sId && layers.length > 0) {
+      const sig = `${activeLayerId}|` + layers
+        .map((l) => `${l.id}:${l.name}:${l.visible ? 1 : 0}:${l.opacity}:${l.blendMode}:${l.locked ? 1 : 0}:${l.clipped ? 1 : 0}:${l.alphaLocked ? 1 : 0}:${l.parentId || ''}:${l.expressionColor || ''}:${l.toneEnabled ? 1 : 0}`)
+        .join(';');
+      if (sig === lastLoggedLayersSigRef.current) return;
+      lastLoggedLayersSigRef.current = sig;
       recoveryService.logLayerMutation(sId, 'update', layers, activeLayerId);
     }
   }, [layers, activeSessionId, activeLayerId]);
@@ -558,10 +564,12 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId }: Us
       thumbDebounceTimersRef.current.delete(id);
       run();
     } else {
+      const isLargeDoc = _dimensions.width * _dimensions.height > 1024 * 1024;
+      const delayMs = isLargeDoc ? 900 : 350;
       const timer = setTimeout(() => {
         thumbDebounceTimersRef.current.delete(id);
         run();
-      }, 350);
+      }, delayMs);
       thumbDebounceTimersRef.current.set(id, timer);
     }
   }, [_dimensions]);

@@ -690,19 +690,25 @@ export function App() {
       async () => {
         const cur = recoveryStateRef.current;
         const doc = cur.documents.find((d) => d.id === activeDocumentId);
-        const firstCanvas =
-          layerCanvasesRef.current.get(doc?.activeLayerId || cur.activeLayerId) ||
-          layerCanvasesRef.current.values().next().value;
-        if (!firstCanvas) return null;
-        return new Promise((resolve) => {
-          firstCanvas.toBlob((blob: Blob | null) => {
-            if (!blob) return resolve(null);
-            blob
-              .arrayBuffer()
-              .then((buf: ArrayBuffer) => resolve(new Uint8Array(buf)))
-              .catch(() => resolve(null));
-          }, 'image/png');
-        });
+        const targetLayerId = doc?.activeLayerId || cur.activeLayerId;
+        const dims = doc?.dimensions || cur.dimensions;
+        if (!targetLayerId || dims.width <= 0 || dims.height <= 0) return null;
+        try {
+          const thumbW = 120;
+          const thumbH = Math.max(68, Math.round((dims.height / Math.max(1, dims.width)) * thumbW));
+          const dataUrl = globalTileGrid.generateThumbnail(targetLayerId, thumbW, thumbH, dims);
+          const commaIdx = dataUrl.indexOf(',');
+          if (commaIdx < 0) return null;
+          const b64 = dataUrl.slice(commaIdx + 1);
+          const binStr = atob(b64);
+          const bytes = new Uint8Array(binStr.length);
+          for (let i = 0; i < binStr.length; i++) {
+            bytes[i] = binStr.charCodeAt(i);
+          }
+          return bytes;
+        } catch {
+          return null;
+        }
       }
     );
   }, [activeDocumentId, layerCanvasesRef]);

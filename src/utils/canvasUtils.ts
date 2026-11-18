@@ -19,7 +19,7 @@ import {
 export const CANVAS_2D_CONTEXT_OPTIONS: CanvasRenderingContext2DSettings = {
   alpha: true,
   desynchronized: false,
-  willReadFrequently: false,
+  willReadFrequently: true,
 };
 
 /**
