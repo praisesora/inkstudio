@@ -3,9 +3,54 @@ import { CspBrush, BrushSettings } from '../types/editor';
 const DB_NAME = 'SoraPaintBrushesDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'csp_brushes';
+const LS_KEY = 'sora_paint_custom_brushes';
+
+export const CUSTOM_BRUSHES_CHANGED_EVENT = 'ink-custom-brushes-changed';
 
 // In-memory cache of decoded HTMLImageElements for zero-latency painting
 const tipImageCache = new Map<string, HTMLImageElement>();
+
+// In-memory registry of loaded custom brushes so tool switches (E -> B) never lose .sut presets
+let _cachedCustomBrushes: CspBrush[] = [];
+let _hasLoadedCustomBrushes = false;
+const _debouncedBrushSaves = new Map<string, ReturnType<typeof setTimeout>>();
+
+function emitCustomBrushesChanged(): void {
+  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+    window.dispatchEvent(new CustomEvent(CUSTOM_BRUSHES_CHANGED_EVENT));
+  }
+}
+
+function preloadAllBrushAssets(brush: CspBrush): void {
+  if (brush.tipDataUrl) {
+    preloadTipImage(brush.tipDataUrl).catch(() => {});
+  }
+  if (brush.secondaryTipDataUrl) {
+    preloadTipImage(brush.secondaryTipDataUrl).catch(() => {});
+  }
+  if (brush.subTips) {
+    for (const st of brush.subTips) {
+      if (st.dataUrl) preloadTipImage(st.dataUrl).catch(() => {});
+    }
+  }
+  if (brush.paperTexture) {
+    preloadTipImage(brush.paperTexture).catch(() => {});
+  }
+}
+
+/**
+ * Synchronous accessor for cached custom brushes.
+ */
+export function getCachedCustomBrushes(): CspBrush[] {
+  if (!_hasLoadedCustomBrushes) {
+    const fallback = loadFromLocalStorageFallback();
+    if (fallback.length > 0) {
+      _cachedCustomBrushes = fallback;
+      _hasLoadedCustomBrushes = true;
+    }
+  }
+  return _cachedCustomBrushes;
+}
 
 /**
  * Preloads an image element from a data URL and caches it.
@@ -14,6 +59,9 @@ export function preloadTipImage(dataUrl: string): Promise<HTMLImageElement> {
   const cached = tipImageCache.get(dataUrl);
   if (cached && cached.complete) {
     return Promise.resolve(cached);
+  }
+  if (typeof Image === 'undefined') {
+    return Promise.reject(new Error('Image constructor unavailable'));
   }
 
   return new Promise((resolve, reject) => {
@@ -73,29 +121,26 @@ export async function loadCustomBrushes(): Promise<CspBrush[]> {
 
       request.onsuccess = () => {
         const brushes: CspBrush[] = request.result || [];
-        // Preload all tip images and paper textures in parallel
+        _cachedCustomBrushes = brushes;
+        _hasLoadedCustomBrushes = true;
         for (const b of brushes) {
-          if (b.tipDataUrl) {
-            preloadTipImage(b.tipDataUrl).catch(() => {});
-          }
-          if (b.subTips) {
-            for (const st of b.subTips) {
-              if (st.dataUrl) preloadTipImage(st.dataUrl).catch(() => {});
-            }
-          }
-          if (b.paperTexture) {
-            preloadTipImage(b.paperTexture).catch(() => {});
-          }
+          preloadAllBrushAssets(b);
         }
         resolve(brushes);
       };
 
       request.onerror = () => {
-        resolve(loadFromLocalStorageFallback());
+        const fallback = loadFromLocalStorageFallback();
+        _cachedCustomBrushes = fallback;
+        _hasLoadedCustomBrushes = true;
+        resolve(fallback);
       };
     });
   } catch {
-    return loadFromLocalStorageFallback();
+    const fallback = loadFromLocalStorageFallback();
+    _cachedCustomBrushes = fallback;
+    _hasLoadedCustomBrushes = true;
+    return fallback;
   }
 }
 
@@ -103,22 +148,22 @@ export async function loadCustomBrushes(): Promise<CspBrush[]> {
  * Saves or updates a Clip Studio Paint brush in persistent IndexedDB storage.
  */
 export async function saveCustomBrush(brush: CspBrush): Promise<void> {
-  // Preload image elements into memory immediately
-  if (brush.tipDataUrl) {
-    preloadTipImage(brush.tipDataUrl).catch(() => {});
+  preloadAllBrushAssets(brush);
+  const existingIdx = _cachedCustomBrushes.findIndex((b) => b.id === brush.id);
+  if (existingIdx >= 0) {
+    _cachedCustomBrushes = [
+      ..._cachedCustomBrushes.slice(0, existingIdx),
+      brush,
+      ..._cachedCustomBrushes.slice(existingIdx + 1),
+    ];
+  } else {
+    _cachedCustomBrushes = [..._cachedCustomBrushes, brush];
   }
-  if (brush.subTips) {
-    for (const st of brush.subTips) {
-      if (st.dataUrl) preloadTipImage(st.dataUrl).catch(() => {});
-    }
-  }
-  if (brush.paperTexture) {
-    preloadTipImage(brush.paperTexture).catch(() => {});
-  }
+  _hasLoadedCustomBrushes = true;
 
   try {
     const db = await openDB();
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction([STORE_NAME], 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
       const request = store.put(brush);
@@ -132,15 +177,45 @@ export async function saveCustomBrush(brush: CspBrush): Promise<void> {
   } catch {
     syncToLocalStorageFallback(brush);
   }
+  emitCustomBrushesChanged();
+}
+
+/**
+ * Debounced variant of saveCustomBrush so live slider drags do not serialize Base64 blobs at 240Hz.
+ */
+export function saveCustomBrushDebounced(brush: CspBrush, delayMs: number = 350): void {
+  const existingIdx = _cachedCustomBrushes.findIndex((b) => b.id === brush.id);
+  if (existingIdx >= 0) {
+    _cachedCustomBrushes[existingIdx] = brush;
+  } else {
+    _cachedCustomBrushes.push(brush);
+  }
+  _hasLoadedCustomBrushes = true;
+
+  const prevTimer = _debouncedBrushSaves.get(brush.id);
+  if (prevTimer) clearTimeout(prevTimer);
+
+  const timer = setTimeout(() => {
+    _debouncedBrushSaves.delete(brush.id);
+    saveCustomBrush(brush).catch(() => {});
+  }, delayMs);
+  _debouncedBrushSaves.set(brush.id, timer);
 }
 
 /**
  * Deletes a Clip Studio Paint brush from persistent storage.
  */
 export async function deleteCustomBrush(brushId: string): Promise<void> {
+  const pending = _debouncedBrushSaves.get(brushId);
+  if (pending) {
+    clearTimeout(pending);
+    _debouncedBrushSaves.delete(brushId);
+  }
+  _cachedCustomBrushes = _cachedCustomBrushes.filter((b) => b.id !== brushId);
+
   try {
     const db = await openDB();
-    return new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction([STORE_NAME], 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
       const request = store.delete(brushId);
@@ -154,13 +229,12 @@ export async function deleteCustomBrush(brushId: string): Promise<void> {
   } catch {
     removeFromLocalStorageFallback(brushId);
   }
+  emitCustomBrushesChanged();
 }
-
-// LocalStorage Fallbacks for resilient redundancy
-const LS_KEY = 'sora_paint_custom_brushes';
 
 function loadFromLocalStorageFallback(): CspBrush[] {
   try {
+    if (typeof localStorage === 'undefined') return [];
     const data = localStorage.getItem(LS_KEY);
     return data ? JSON.parse(data) : [];
   } catch {
@@ -170,16 +244,18 @@ function loadFromLocalStorageFallback(): CspBrush[] {
 
 function syncToLocalStorageFallback(brush: CspBrush) {
   try {
+    if (typeof localStorage === 'undefined') return;
     const current = loadFromLocalStorageFallback().filter((b) => b.id !== brush.id);
     current.push(brush);
     localStorage.setItem(LS_KEY, JSON.stringify(current));
   } catch {
-    // LocalStorage quota may be exceeded with large base64 tips
+    // LocalStorage quota may be exceeded with large base64 tips; IndexedDB remains authoritative
   }
 }
 
 function removeFromLocalStorageFallback(brushId: string) {
   try {
+    if (typeof localStorage === 'undefined') return;
     const current = loadFromLocalStorageFallback().filter((b) => b.id !== brushId);
     localStorage.setItem(LS_KEY, JSON.stringify(current));
   } catch {
@@ -189,7 +265,7 @@ function removeFromLocalStorageFallback(brushId: string) {
 
 /**
  * Assembles fully resolved BrushSettings for a Clip Studio Paint brush,
- * ensuring all tips, sub-tips, curves, paper grain textures, and watercolor wet-edges are preloaded.
+ * ensuring all tips, dual-tips, sub-tips, curves, paper grain textures, and watercolor wet-edges are preloaded.
  */
 export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Partial<BrushSettings>> {
   let tipImg: HTMLImageElement | undefined = undefined;
@@ -197,6 +273,13 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     tipImg =
       getPreloadedTipImage(brush.tipDataUrl) ||
       (await preloadTipImage(brush.tipDataUrl).catch(() => undefined));
+  }
+
+  let dualTipImg: HTMLImageElement | undefined = undefined;
+  if (brush.secondaryTipDataUrl) {
+    dualTipImg =
+      getPreloadedTipImage(brush.secondaryTipDataUrl) ||
+      (await preloadTipImage(brush.secondaryTipDataUrl).catch(() => undefined));
   }
 
   let subTipImages: HTMLImageElement[] | undefined = undefined;
@@ -223,6 +306,10 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     size: brush.size,
     minSizeFactor: brush.minSizeFactor,
     flow: brush.flow,
+    brushDensity: brush.brushDensity,
+    adjustDensityByGap: brush.adjustDensityByGap,
+    blendTipsMode: brush.blendTipsMode,
+    brushCombineMode: brush.brushCombineMode,
     opacity: brush.opacity,
     spacing: brush.spacing,
     hardness: brush.hardness,
@@ -230,8 +317,14 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     thicknessVertical: brush.thicknessVertical,
     antiAlias: brush.antiAlias,
     stabilization: brush.stabilization,
+    postCorrection: brush.postCorrection,
+    sharpCorners: brush.sharpCorners ?? true,
+    smoothing: brush.smoothing ?? true,
     customTipDataUrl: brush.tipDataUrl,
     customTipImage: tipImg,
+    isColorTip: brush.isColorTip,
+    flipH: brush.flipH,
+    flipV: brush.flipV,
     customTipAngle: brush.angle,
     customTipAngleDynamics: brush.angleDynamics,
     customTipRotationRandomScale: brush.rotationRandomScale,
@@ -242,10 +335,16 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     velocityCurve: brush.velocityCurve,
     usePressure: brush.usePressure,
     useVelocity: brush.useVelocity,
+    useTilt: brush.useTilt ?? false,
+    tiltScale: brush.tiltScale,
+    sizeSensor: brush.sizeSensor,
+    opacitySensor: brush.opacitySensor,
+    densitySensor: brush.densitySensor,
     spray: brush.spray,
     taper: brush.taper,
     isRibbon: brush.isRibbon,
     colorMixing: brush.colorMixing,
+    perceptualMixing: true,
     amountOfPaint: brush.amountOfPaint ?? 0.7,
     densityOfPaint: brush.densityOfPaint ?? 0.8,
     colorStretch: brush.colorStretch ?? 0.6,
@@ -255,11 +354,21 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     wetEdgeAlphaPower: brush.wetEdgeAlphaPower,
     wetEdgeValuePower: brush.wetEdgeValuePower,
     grain: brush.textureDensity ?? 0,
+    textureDensity: brush.textureDensity,
     paperTexture: brush.paperTexture,
     paperTextureImage,
     paperTextureScale: brush.paperTextureScale,
     paperTextureRotate: brush.paperTextureRotate,
+    paperTextureMode: brush.paperTextureMode,
+    paperTextureBrightness: brush.paperTextureBrightness,
+    paperTextureContrast: brush.paperTextureContrast,
+    paperTextureApplyEachPlot: brush.paperTextureApplyEachPlot,
+    paperTextureInverted: brush.paperTextureInverted,
+    dualBrush: brush.dualBrush,
+    dualTipImage: dualTipImg,
+    dualBrushCompositeMode: (brush.dualBrushCompositeMode as BrushSettings['dualBrushCompositeMode']) || 'multiply',
+    dualSize: brush.dualSize,
+    dualSpacing: brush.dualSpacing,
     useGpu: true,
   };
 }
-

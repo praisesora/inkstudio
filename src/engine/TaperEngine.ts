@@ -86,24 +86,33 @@ export class TaperEngine {
     const u = Math.max(0, Math.min(1, pNorm));
     const pMin = this.pConfig.minPressure;
 
-    // Piecewise cubic Hermite transfer curve with matched slopes
+    // C1-continuous piecewise cubic Hermite transfer curve with matched derivatives at knots
+    const evalHermite = (t: number, h: number, y0: number, y1: number, m0: number, m1: number): number => {
+      const t2 = t * t;
+      const t3 = t2 * t;
+      const h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+      const h10 = t3 - 2.0 * t2 + t;
+      const h01 = -2.0 * t3 + 3.0 * t2;
+      const h11 = t3 - t2;
+      return h00 * y0 + h10 * (h * m0) + h01 * y1 + h11 * (h * m1);
+    };
+
+    const y1 = 0.145;
+    const y2 = 0.685;
+    const m0 = 0.15;
+    const m1 = 0.98;
+    const m2 = 1.05;
+    const m3 = 0.55;
+
     if (u <= 0.15) {
-      // Zone 1: Hairline zone [0.0, 0.15] -> [pMin, 0.18]
-      // Quadratic-cubic ease-in
-      const t = u / 0.15;
-      const curve = t * t * (1.5 - 0.5 * t);
-      return pMin + (0.18 - pMin) * curve;
+      // Zone 1: Hairline zone [0.0, 0.15] -> [pMin, 0.145]
+      return evalHermite(u / 0.15, 0.15, pMin, y1, m0, m1);
     } else if (u <= 0.70) {
-      // Zone 2: Stable controllable body [0.15, 0.70] -> [0.18, 0.72]
-      const t = (u - 0.15) / 0.55;
-      // Gentle linear-smooth slope
-      return 0.18 + (0.72 - 0.18) * t;
+      // Zone 2: Stable controllable body [0.15, 0.70] -> [0.145, 0.685]
+      return evalHermite((u - 0.15) / 0.55, 0.55, y1, y2, m1, m2);
     } else {
-      // Zone 3: Saturated expansion [0.70, 1.00] -> [0.72, 1.00]
-      const t = Math.max(0, Math.min(1.0, (u - 0.70) / 0.30));
-      // Cubic ease-out acceleration to maximum saturated weight
-      const easeOut = 1.0 - Math.pow(Math.max(0, 1.0 - t), 2.5);
-      return 0.72 + (1.00 - 0.72) * easeOut;
+      // Zone 3: Saturated expansion [0.70, 1.00] -> [0.685, 1.00]
+      return evalHermite(Math.min(1.0, (u - 0.70) / 0.30), 0.30, y2, 1.0, m2, m3);
     }
   }
 
@@ -112,17 +121,20 @@ export class TaperEngine {
    * to eliminate bumpy / sausage-like stroke artifacts.
    */
   public smoothPressure(currentMappedPressure: number): number {
-    const idx = this.pressureHistoryCount % this.pressureHistory.length;
+    const len = this.pressureHistory.length;
+    const idx = this.pressureHistoryCount % len;
     this.pressureHistory[idx] = currentMappedPressure;
     this.pressureHistoryCount++;
 
-    const sampleCount = Math.min(this.pressureHistoryCount, this.pressureHistory.length);
+    const sampleCount = Math.min(this.pressureHistoryCount, len);
+    const startIdx = this.pressureHistoryCount - sampleCount;
     let sum = 0;
     let weightSum = 0;
 
     for (let i = 0; i < sampleCount; i++) {
+      const ringIdx = (startIdx + i) % len;
       const w = 1.0 + i * 0.4;
-      sum += this.pressureHistory[i] * w;
+      sum += this.pressureHistory[ringIdx] * w;
       weightSum += w;
     }
 
@@ -142,7 +154,8 @@ export class TaperEngine {
     lastPressure: number,
     exitVx: number, // px / ms
     exitVy: number, // px / ms
-    lastTimestampMs: number
+    lastTimestampMs: number,
+    angularVelRadPerMs: number = 0
   ): { points: ExtrapolatedPoint[]; count: number } {
     const exitSpeed = Math.hypot(exitVx, exitVy); // px / ms
 
@@ -150,8 +163,8 @@ export class TaperEngine {
       return { points: this.flickPointPool, count: 0 };
     }
 
-    const dirX = exitVx / exitSpeed;
-    const dirY = exitVy / exitSpeed;
+    let curAngle = Math.atan2(exitVy, exitVx);
+    const clampedOmega = Math.max(-0.012, Math.min(0.012, angularVelRadPerMs));
 
     const count = Math.min(this.fConfig.flickPoints, this.flickPointPool.length);
     let curX = lastX;
@@ -163,13 +176,14 @@ export class TaperEngine {
     const lambda = this.fConfig.decayRate;
 
     for (let i = 0; i < count; i++) {
-      // Inertial damping on velocity: v(t) = v0 * exp(-drag * t)
+      // Inertial damping on velocity & gentle curvature continuation (prevents linear kinks on curved flicks)
       const dragFactor = Math.exp(-this.fConfig.dragCoefficient * (dt * 0.05));
       curSpeed *= dragFactor;
+      curAngle += clampedOmega * dt * Math.exp(-0.22 * i);
       const stepDist = curSpeed * dt;
 
-      curX += dirX * stepDist;
-      curY += dirY * stepDist;
+      curX += Math.cos(curAngle) * stepDist;
+      curY += Math.sin(curAngle) * stepDist;
       curTime += dt;
 
       // Exponential attenuation of radius: w(k) = w0 * exp(-lambda * (k + 1))

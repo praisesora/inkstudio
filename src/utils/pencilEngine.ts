@@ -1,5 +1,5 @@
 import { Point } from '../types/editor';
-import { getTintedMasterCanvas, drawSingleStamp } from './stampEngine';
+import { getTintedMasterCanvas, drawSingleStamp, buildCubicArcLengthTable, getCubicPointAtArcLength } from './stampEngine';
 
 /**
  * Real Pencil Physics & Paper Grain Simulation Engine
@@ -103,9 +103,9 @@ export const PENCIL_CONFIGS: Record<PencilGrade, PencilGradeConfig> = {
  * Precalculated at startup into a 1D Uint8Array for instant O(1) single-cycle lookups.
  * Models cold-press cotton sketchbook paper with micro-mineral tooth and intertwined cellulose fibers.
  */
-const GRAIN_SIZE = 512;
+export const GRAIN_SIZE = 512;
 const GRAIN_MASK = GRAIN_SIZE - 1;
-const paperGrainTable = new Uint8Array(GRAIN_SIZE * GRAIN_SIZE);
+export const paperGrainTable = new Uint8Array(GRAIN_SIZE * GRAIN_SIZE);
 
 // Deterministic fast PRNG for seamless texture synthesis
 function sfc32(a: number, b: number, c: number, d: number) {
@@ -161,12 +161,28 @@ function sfc32(a: number, b: number, c: number, d: number) {
 
 /**
  * World-anchored paper grain elevation query at canvas coordinate (x, y).
- * Returns integer 0 to 255 representing paper tooth height.
+ * Uses smooth sub-pixel bilinear interpolation across the 512x512 seamless paper grain table.
+ * Returns number 0 to 255 representing paper tooth height.
  */
 export function getPaperGrain(x: number, y: number): number {
-  const ix = (Math.floor(x) & GRAIN_MASK) >>> 0;
-  const iy = (Math.floor(y) & GRAIN_MASK) >>> 0;
-  return paperGrainTable[iy * GRAIN_SIZE + ix];
+  const fx = Math.floor(x);
+  const fy = Math.floor(y);
+  const tx = x - fx;
+  const ty = y - fy;
+
+  const x0 = (fx & GRAIN_MASK) >>> 0;
+  const y0 = (fy & GRAIN_MASK) >>> 0;
+  const x1 = ((fx + 1) & GRAIN_MASK) >>> 0;
+  const y1 = ((fy + 1) & GRAIN_MASK) >>> 0;
+
+  const v00 = paperGrainTable[y0 * GRAIN_SIZE + x0];
+  const v10 = paperGrainTable[y0 * GRAIN_SIZE + x1];
+  const v01 = paperGrainTable[y1 * GRAIN_SIZE + x0];
+  const v11 = paperGrainTable[y1 * GRAIN_SIZE + x1];
+
+  const top = v00 + (v10 - v00) * tx;
+  const bottom = v01 + (v11 - v01) * tx;
+  return Math.round(top + (bottom - top) * ty);
 }
 
 /**
@@ -331,35 +347,34 @@ export function drawPencilCubicBezierSegment(
   _userHardness?: number,
   remainderDist: number = 0,
   alphaLocked: boolean = false,
-  isTransparentInk: boolean = false
+  isTransparentInk: boolean = false,
+  useTilt: boolean = true
 ): number {
   const config = PENCIL_CONFIGS[grade] || PENCIL_CONFIGS['pencil-2b'];
-  const dx = p3.x - p0.x;
-  const dy = p3.y - p0.y;
-  const dist = Math.hypot(dx, dy);
-  if (dist < 0.15) return remainderDist;
+  const arcTable = buildCubicArcLengthTable(p0, c1, c2, p3);
+  const dist = arcTable.totalLength;
+  if (dist < 0.1) return Math.max(0, remainderDist - dist);
 
   const graphiteMaster = getGraphiteTipMaster(grade, color);
-  const avgWidth = Math.max(1, (p0.width + p3.width) / 2);
-  const stepDist = Math.max(0.4, Math.min(1.6, avgWidth * (config.spacing || 0.07)));
-  const numSteps = Math.max(2, Math.ceil(dist / stepDist));
-
+  const isMonoCrisp = _userHardness !== undefined && _userHardness >= 0.99;
   const baseThreshold = config.thresholdBase;
   const sens = config.thresholdPressureSensitivity;
-  const flow = userFlow * config.flow;
-  const stepT = 1.0 / numSteps;
+  const flow = isMonoCrisp ? 1.0 : userFlow * config.flow;
+  const spacingRatio = config.spacing || 0.07;
 
-  for (let i = 0; i <= numSteps; i++) {
-    const t = i * stepT;
-    const pt = getCubicBezierPoint(p0, c1, c2, p3, t);
+  let currentDist = Math.max(0, remainderDist);
+  while (currentDist <= dist) {
+    const pt = getCubicPointAtArcLength(p0, c1, c2, p3, currentDist, arcTable);
     const pressure = Math.min(Math.max(pt.pressure || 0.5, 0.05), 1.0);
 
-    const tiltX = pt.tiltX ?? 0;
-    const tiltY = pt.tiltY ?? 0;
+    const tiltX = useTilt ? (pt.tiltX ?? 0) : 0;
+    const tiltY = useTilt ? (pt.tiltY ?? 0) : 0;
     const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
     const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
 
-    const curWidth = Math.max(0.6, pt.width * (1.0 + tiltMagnitude * 2.2));
+    const minStampW = isMonoCrisp ? 1.35 : 0.6;
+    const curWidth = Math.max(minStampW, pt.width * (1.0 + tiltMagnitude * 2.2));
+    const stepDist = Math.max(0.25, Math.min(1.8, Math.max(0.6, pt.width) * spacingRatio));
 
     const effThreshold = Math.max(
       15,
@@ -381,14 +396,29 @@ export function drawPencilCubicBezierSegment(
       stampAngle += (pt.twist * Math.PI) / 180;
     }
 
-    const paperHeight = getPaperGrain(pt.x, pt.y);
+    // Multi-sample Quincunx grain integration for wider graphite leads (> 4px) to prevent whole-stamp blinking
+    let paperHeight: number;
+    if (curWidth > 4.0) {
+      const off = curWidth * 0.25;
+      paperHeight = (
+        getPaperGrain(pt.x, pt.y) * 2 +
+        getPaperGrain(pt.x - off, pt.y - off) +
+        getPaperGrain(pt.x + off, pt.y - off) +
+        getPaperGrain(pt.x - off, pt.y + off) +
+        getPaperGrain(pt.x + off, pt.y + off)
+      ) / 6;
+    } else {
+      paperHeight = getPaperGrain(pt.x, pt.y);
+    }
 
-    if (paperHeight >= effThreshold) {
-      const heightFactor = Math.min(1.0, (paperHeight - effThreshold + 25) / 55);
-      const dabAlpha = Math.min(
-        1.0,
-        Math.max(0.04, flow * (0.35 + 0.65 * pressure) * heightFactor)
-      );
+    if (isMonoCrisp || paperHeight >= effThreshold) {
+      const heightFactor = isMonoCrisp ? 1.0 : Math.min(1.0, (paperHeight - effThreshold + 25) / 55);
+      const dabAlpha = isMonoCrisp
+        ? 1.0
+        : Math.min(
+            1.0,
+            Math.max(0.04, flow * (0.35 + 0.65 * pressure) * heightFactor)
+          );
 
       drawSingleStamp(
         ctx,
@@ -422,9 +452,11 @@ export function drawPencilCubicBezierSegment(
         isTransparentInk
       );
     }
+
+    currentDist += stepDist;
   }
 
-  return 0;
+  return Math.max(0, currentDist - dist);
 }
 
 /**
@@ -480,6 +512,7 @@ export function drawPencilDot(
 ) {
   const config = PENCIL_CONFIGS[grade] || PENCIL_CONFIGS['pencil-2b'];
   const graphiteMaster = getGraphiteTipMaster(grade, color);
+  const isMonoCrisp = _userHardness !== undefined && _userHardness >= 0.99;
   const pressure = Math.min(Math.max(point.pressure || 0.5, 0.05), 1.0);
 
   const tiltX = point.tiltX ?? 0;
@@ -487,7 +520,7 @@ export function drawPencilDot(
   const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
   const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
 
-  const curWidth = Math.max(0.6, point.width * (1.0 + tiltMagnitude * 2.2));
+  const curWidth = Math.max(isMonoCrisp ? 1.35 : 0.6, point.width * (1.0 + tiltMagnitude * 2.2));
 
   const effThreshold = Math.max(
     15,
@@ -510,12 +543,14 @@ export function drawPencilDot(
   }
 
   const paperHeight = getPaperGrain(point.x, point.y);
-  const heightFactor = paperHeight >= effThreshold
+  const heightFactor = isMonoCrisp
+    ? 1.0
+    : paperHeight >= effThreshold
     ? Math.min(1.0, (paperHeight - effThreshold + 25) / 55)
     : 0.15;
 
-  const flow = userFlow * config.flow;
-  const dabAlpha = Math.min(1.0, Math.max(0.05, flow * pressure * heightFactor));
+  const flow = isMonoCrisp ? 1.0 : userFlow * config.flow;
+  const dabAlpha = isMonoCrisp ? 1.0 : Math.min(1.0, Math.max(0.05, flow * pressure * heightFactor));
 
   drawSingleStamp(
     ctx,

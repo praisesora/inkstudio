@@ -1,5 +1,6 @@
 import { LoadedDocument, LayerItem, CanvasColorMode } from '../types/editor';
 import { createCanvasThumbnail } from './canvasUtils';
+import { renderVectorLayer } from './vectorEngine';
 
 /**
  * Loads standard raster/vector image formats (.png, .jpg, .jpeg, .webp, .bmp, .gif, .svg).
@@ -108,43 +109,82 @@ export async function openFile(file: File): Promise<LoadedDocument> {
       if (project.layers && Array.isArray(project.layers)) {
         const width = project.dimensions?.width || 1440;
         const height = project.dimensions?.height || 900;
+        const dpi = project.dimensions?.dpi || 300;
         const colorMode: CanvasColorMode = project.colorMode || 'color';
-        const layers: LayerItem[] = project.layers;
+        const layers: LayerItem[] = project.layers.map((l: any) => {
+          // Ensure stale/serialized plain-object maskCanvas does not break CanvasRenderingContext2D calls
+          if (l.maskCanvas && typeof l.maskCanvas.getContext !== 'function') {
+            return { ...l, maskCanvas: undefined };
+          }
+          return l;
+        });
         const layerCanvases = new Map<string, HTMLCanvasElement>();
 
         const loadPromises = layers.map((layer) => {
-          if (layer.type === 'folder') return Promise.resolve();
-          return new Promise<void>((resolve) => {
-            const dataUrl = project.canvases?.[layer.id];
-            const canvas = document.createElement('canvas');
-            canvas.width = width;
-            canvas.height = height;
+          const tasks: Promise<void>[] = [];
 
-            if (dataUrl) {
-              const img = new Image();
-              img.onload = () => {
-                const ctx = canvas.getContext('2d');
-                ctx?.drawImage(img, 0, 0);
-                layerCanvases.set(layer.id, canvas);
-                resolve();
-              };
-              img.onerror = () => {
-                layerCanvases.set(layer.id, canvas);
-                resolve();
-              };
-              img.src = dataUrl;
-            } else {
-              layerCanvases.set(layer.id, canvas);
-              resolve();
-            }
-          });
+          // Reconstruct maskCanvas if saved in project.masks
+          const maskDataUrl = project.masks?.[layer.id];
+          if (maskDataUrl) {
+            tasks.push(
+              new Promise<void>((resolve) => {
+                const mCanvas = document.createElement('canvas');
+                mCanvas.width = width;
+                mCanvas.height = height;
+                const mImg = new Image();
+                mImg.onload = () => {
+                  mCanvas.getContext('2d')?.drawImage(mImg, 0, 0);
+                  layer.maskCanvas = mCanvas;
+                  layer.maskVersion = (layer.maskVersion || 0) + 1;
+                  resolve();
+                };
+                mImg.onerror = () => resolve();
+                mImg.src = maskDataUrl;
+              })
+            );
+          }
+
+          if (layer.type !== 'folder' && layer.type !== 'adjustment') {
+            tasks.push(
+              new Promise<void>((resolve) => {
+                const dataUrl = project.canvases?.[layer.id];
+                const canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+
+                if (dataUrl) {
+                  const img = new Image();
+                  img.onload = () => {
+                    const ctx = canvas.getContext('2d');
+                    ctx?.drawImage(img, 0, 0);
+                    layerCanvases.set(layer.id, canvas);
+                    resolve();
+                  };
+                  img.onerror = () => {
+                    layerCanvases.set(layer.id, canvas);
+                    resolve();
+                  };
+                  img.src = dataUrl;
+                } else {
+                  if (layer.type === 'vector' && layer.vectorStrokes && layer.vectorStrokes.length > 0) {
+                    const ctx = canvas.getContext('2d');
+                    if (ctx) renderVectorLayer(ctx, layer.vectorStrokes);
+                  }
+                  layerCanvases.set(layer.id, canvas);
+                  resolve();
+                }
+              })
+            );
+          }
+
+          return Promise.all(tasks).then(() => {});
         });
 
         await Promise.all(loadPromises);
 
         return {
           name: project.name || file.name.replace(/\.[^/.]+$/, ''),
-          dimensions: { width, height },
+          dimensions: { width, height, dpi },
           colorMode,
           layers,
           layerCanvases,

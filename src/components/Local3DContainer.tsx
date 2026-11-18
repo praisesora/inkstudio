@@ -101,6 +101,12 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   const [showPoseDrawer, setShowPoseDrawer] = useState<boolean>(false);
   const [showLTModal, setShowLTModal] = useState<boolean>(false);
   const [syncCameraPerspective, setSyncCameraPerspective] = useState<boolean>(true);
+  const syncCameraPerspectiveRef = useRef<boolean>(syncCameraPerspective);
+  syncCameraPerspectiveRef.current = syncCameraPerspective;
+  const onUpdatePerspectiveRulerRef = useRef(onUpdatePerspectiveRuler);
+  onUpdatePerspectiveRulerRef.current = onUpdatePerspectiveRuler;
+  const perspectiveRulerRef = useRef(perspectiveRuler);
+  perspectiveRulerRef.current = perspectiveRuler;
   const [activeIKHandle, setActiveIKHandle] = useState<string | null>(null);
   const [ltLineThreshold, setLtLineThreshold] = useState<number>(0.28);
   const [ltToneBands, setLtToneBands] = useState<2 | 3>(2);
@@ -335,14 +341,14 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     controls.dampingFactor = 0.08;
     controls.target.set(0, 0.3, 0);
     controls.addEventListener('change', () => {
-      if (onUpdatePerspectiveRuler && cameraRef.current) {
+      if (syncCameraPerspectiveRef.current && onUpdatePerspectiveRulerRef.current && cameraRef.current) {
         const ruler = calculatePerspectiveFromCamera(
           cameraRef.current,
           dimensions.width,
           dimensions.height,
-          perspectiveRuler
+          perspectiveRulerRef.current
         );
-        onUpdatePerspectiveRuler(ruler);
+        onUpdatePerspectiveRulerRef.current(ruler);
       }
     });
     controlsRef.current = controls;
@@ -807,6 +813,12 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
         updateGizmoTarget();
 
         // Detect humanoid skinned mesh hierarchy
+        if (ikHandlesContainerRef.current && sceneRef.current) {
+          disposeThreeResources(ikHandlesContainerRef.current, null);
+          sceneRef.current.remove(ikHandlesContainerRef.current);
+          ikHandlesContainerRef.current = null;
+          ikHandlesRef.current = null;
+        }
         const detectedBones = findHumanoidBones(model);
         if (detectedBones.hips || detectedBones.leftHand || detectedBones.rightHand || detectedBones.head) {
           mannequinBonesRef.current = detectedBones;
@@ -905,8 +917,10 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       modelRootRef.current = null;
     }
     if (ikHandlesContainerRef.current) {
+      disposeThreeResources(ikHandlesContainerRef.current, null);
       sceneRef.current.remove(ikHandlesContainerRef.current);
       ikHandlesContainerRef.current = null;
+      ikHandlesRef.current = null;
     }
 
     const { group, bones } = createProceduralMannequin();
@@ -1024,9 +1038,10 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     setIsBaking(true);
 
     try {
-      // Temporarily hide helper gizmo and ground grid
+      // Temporarily hide helper gizmo, ground grid, and IK handles
       if (transformHelperRef.current) transformHelperRef.current.visible = false;
       if (gridHelperRef.current) gridHelperRef.current.visible = false;
+      if (ikHandlesContainerRef.current) ikHandlesContainerRef.current.visible = false;
 
       const result = await bake3DToRasterLayer({
         scene: sceneRef.current,
@@ -1048,6 +1063,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       setIsBaking(false);
       if (gridHelperRef.current) gridHelperRef.current.visible = showGrid;
       if (transformHelperRef.current && gizmoMode !== 'none') transformHelperRef.current.visible = true;
+      if (ikHandlesContainerRef.current) ikHandlesContainerRef.current.visible = true;
     }
   };
 

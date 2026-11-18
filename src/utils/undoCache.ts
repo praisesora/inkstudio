@@ -2,9 +2,8 @@
  * LRU Tile-Delta Undo/Redo Disk Caching Engine
  *
  * Designed for 600 DPI professional manga documents (4961 x 7016 px, 70MP double spreads).
- * Instead of keeping dozens of multi-megabyte ImageData frames in V8 heap memory,
- * this engine keeps only the most recent steps in RAM, seamlessly offloading
- * older tile-delta states to high-speed temporary disk storage via Tauri v2 Rust IPC.
+ * Keeps only the most recent steps in RAM, seamlessly offloading older tile-delta states
+ * to temporary disk storage via Tauri v2 Rust IPC or zlib-compressed RAM buffers.
  */
 
 import { zlibSync, unzlibSync } from 'fflate';
@@ -12,6 +11,7 @@ import { TileDelta, HistoryItem } from '../types/editor';
 import { serializeTileDeltas, deserializeTileDeltas } from './tileEngine';
 
 export const MAX_RAM_UNDO_STEPS = 15;
+const MAX_DECOMPRESSED_UNDO_BYTES = 128 * 1024 * 1024;
 
 export function isTauriEnvironment(): boolean {
   if (typeof window === 'undefined') return false;
@@ -37,7 +37,9 @@ export function decompressTileDeltasPayload(payload: Uint8Array): TileDelta[] {
   if (payload.length >= 2 && payload[0] === 0x78) {
     try {
       const raw = unzlibSync(payload);
-      return deserializeTileDeltas(raw);
+      if (raw.byteLength <= MAX_DECOMPRESSED_UNDO_BYTES) {
+        return deserializeTileDeltas(raw);
+      }
     } catch {
       // Fallback if byte 0 happened to be 0x78 in an uncompressed stream
     }
@@ -60,14 +62,33 @@ export class UndoCacheManager {
   }
 
   /**
+   * Prunes orphaned history IDs evicted by redo branching or the 50-step cap.
+   */
+  private pruneOrphanedIds(allHistory: HistoryItem[]): void {
+    const validIds = new Set<string>();
+    for (let i = 0; i < allHistory.length; i++) {
+      validIds.add(allHistory[i].id);
+    }
+    for (const id of Array.from(this.ramItems)) {
+      if (!validIds.has(id)) this.ramItems.delete(id);
+    }
+    for (const id of Array.from(this.compressedRamCache.keys())) {
+      if (!validIds.has(id)) this.compressedRamCache.delete(id);
+    }
+    for (const id of Array.from(this.diskCachedIds)) {
+      if (!validIds.has(id)) this.diskCachedIds.delete(id);
+    }
+  }
+
+  /**
    * Register a history item and enforce the in-memory LRU budget.
    */
   public async registerStep(item: HistoryItem, allHistory: HistoryItem[]): Promise<void> {
+    this.pruneOrphanedIds(allHistory);
     if (!item.tileDeltas || item.tileDeltas.length === 0) return;
 
     this.ramItems.add(item.id);
 
-    // If RAM budget is exceeded, offload the oldest in-memory steps to disk or compressed archive
     if (this.ramItems.size > MAX_RAM_UNDO_STEPS) {
       for (const oldItem of allHistory) {
         if (oldItem.id !== item.id && this.ramItems.has(oldItem.id) && oldItem.tileDeltas) {
@@ -104,7 +125,6 @@ export class UndoCacheManager {
       }
     }
 
-    // Browser / fallback path: store zlib-compressed binary payload (85-95% smaller than raw RGBA)
     this.compressedRamCache.set(item.id, compressed);
     item.tileDeltas = undefined;
   }
@@ -173,6 +193,4 @@ export class UndoCacheManager {
   }
 }
 
-// Global default undo cache manager instance
 export const globalUndoCache = new UndoCacheManager();
-

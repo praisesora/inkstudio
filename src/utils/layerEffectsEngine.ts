@@ -7,7 +7,7 @@ export type ExpressionColor = 'color' | 'gray' | 'monochrome';
 export interface LayerEffectOptions {
   frequency?: number;
   angle?: number;
-  dotShape?: 'circle' | 'euclidean';
+  dotShape?: 'circle' | 'euclidean' | 'line' | 'diamond';
   dpi?: number;
 }
 
@@ -81,23 +81,40 @@ export function applyExpressionColorToImageData(
       data[i + 2] = lum;
     }
   } else if (mode === 'monochrome') {
-    const u32 = new Uint32Array(imgData.data.buffer);
-    const u32Len = u32.length;
-    for (let i = 0; i < u32Len; i++) {
-      const pix = u32[i];
-      const a = (pix >>> 24) & 0xFF;
+    for (let i = 0; i < len; i += 4) {
+      const a = data[i + 3];
       if (a < 64) {
-        u32[i] = 0;
+        data[i] = 0;
+        data[i + 1] = 0;
+        data[i + 2] = 0;
+        data[i + 3] = 0;
         continue;
       }
-      const r = pix & 0xFF;
-      const g = (pix >>> 8) & 0xFF;
-      const b = (pix >>> 16) & 0xFF;
-      const lum = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+      const lum = (19595 * data[i] + 38470 * data[i + 1] + 7471 * data[i + 2] + 32768) >> 16;
       if (lum < threshold) {
-        u32[i] = expressBlack ? 0xFF000000 : 0;
+        if (expressBlack) {
+          data[i] = 0;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = 255;
+        } else {
+          data[i] = 0;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = 0;
+        }
       } else {
-        u32[i] = expressWhite ? 0xFFFFFFFF : 0;
+        if (expressWhite) {
+          data[i] = 255;
+          data[i + 1] = 255;
+          data[i + 2] = 255;
+          data[i + 3] = 255;
+        } else {
+          data[i] = 0;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = 0;
+        }
       }
     }
   }

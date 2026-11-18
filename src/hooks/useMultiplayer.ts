@@ -147,8 +147,8 @@ export function useMultiplayer({
         }
 
         case 'JOIN_REQUEST': {
-          // A guest wants to join
-          if (msg.peer) {
+          // Only the host processes join requests; other guests will receive PEER_JOINED
+          if (msg.peer && isHostRef.current) {
             const guestPeer = msg.peer;
 
             setPeers((prev) => {
@@ -158,59 +158,56 @@ export function useMultiplayer({
               return next;
             });
 
-            showToastRef.current(`🎨 ${guestPeer.name} joined the canvas`);
+            showToastRef.current(`${guestPeer.name} joined the canvas`);
 
-            // If we are host, set up a dedicated layer for the guest and reply with accept + current doc
-            if (isHostRef.current) {
-              let assignedLayerId: string | undefined;
-              let effectiveLayers = layersRef.current;
+            let assignedLayerId: string | undefined;
+            let effectiveLayers = layersRef.current;
 
-              // Delegate layer creation to the host application
-              if (onRemoteJoinRequestRef.current) {
-                const res = onRemoteJoinRequestRef.current(guestPeer);
-                if (res) {
-                  assignedLayerId = res.assignedLayerId;
-                  effectiveLayers = res.updatedLayers;
-                }
+            // Delegate layer creation to the host application
+            if (onRemoteJoinRequestRef.current) {
+              const res = onRemoteJoinRequestRef.current(guestPeer);
+              if (res) {
+                assignedLayerId = res.assignedLayerId;
+                effectiveLayers = res.updatedLayers;
               }
-
-              // Send JOIN_ACCEPTED to the joining guest
-              const joinAcceptedMsg: JoinAcceptedMessage = {
-                type: 'JOIN_ACCEPTED',
-                targetPeerId: guestPeer.id,
-                roomName: hostInfoRef.current?.roomName || 'Studio',
-                peers: [...peersRef.current.filter((p) => p.id !== guestPeer.id), myPeerRef.current],
-                hostId: myPeerRef.current.id,
-                docDimensions: dimensionsRef.current,
-                colorMode: colorModeRef.current,
-                assignedLayerId,
-              };
-              multiplayerService.sendMessage(joinAcceptedMsg);
-
-              // Send document synchronization
-              multiplayerService.sendMessage({
-                type: 'DOC_SYNC_RESPONSE',
-                targetPeerId: guestPeer.id,
-                dimensions: dimensionsRef.current,
-                colorMode: colorModeRef.current,
-                layers: effectiveLayers,
-                layerDataUrls: {},
-              });
-
-              // Progressive Tile Streaming: stream active layer tiles progressively from sparse tile grid
-              for (const layer of effectiveLayers) {
-                const tiles = globalTileGrid.getLayerTiles(layer.id);
-                for (const tile of tiles) {
-                  multiplayerService.sendTileDelta(layer.id, tile);
-                }
-              }
-
-              // Broadcast PEER_JOINED to other already connected peers
-              multiplayerService.sendMessage({
-                type: 'PEER_JOINED',
-                peer: guestPeer,
-              });
             }
+
+            // Send JOIN_ACCEPTED to the joining guest
+            const joinAcceptedMsg: JoinAcceptedMessage = {
+              type: 'JOIN_ACCEPTED',
+              targetPeerId: guestPeer.id,
+              roomName: hostInfoRef.current?.roomName || 'Studio',
+              peers: [...peersRef.current.filter((p) => p.id !== guestPeer.id), myPeerRef.current],
+              hostId: myPeerRef.current.id,
+              docDimensions: dimensionsRef.current,
+              colorMode: colorModeRef.current,
+              assignedLayerId,
+            };
+            multiplayerService.sendMessage(joinAcceptedMsg);
+
+            // Send document synchronization
+            multiplayerService.sendMessage({
+              type: 'DOC_SYNC_RESPONSE',
+              targetPeerId: guestPeer.id,
+              dimensions: dimensionsRef.current,
+              colorMode: colorModeRef.current,
+              layers: effectiveLayers,
+              layerDataUrls: {},
+            });
+
+            // Progressive Tile Streaming: stream active layer tiles progressively from sparse tile grid
+            for (const layer of effectiveLayers) {
+              const tiles = globalTileGrid.getLayerTiles(layer.id);
+              for (const tile of tiles) {
+                multiplayerService.sendTileDelta(layer.id, tile);
+              }
+            }
+
+            // Broadcast PEER_JOINED to other already connected peers
+            multiplayerService.sendMessage({
+              type: 'PEER_JOINED',
+              peer: guestPeer,
+            });
           }
           break;
         }
@@ -374,6 +371,9 @@ export function useMultiplayer({
             version: tMsg.version,
             data: tMsg.data,
             dirty: true,
+            isPagedToDisk: false,
+            lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+            lod: 0,
           };
           globalTileGrid.setTile(tMsg.layerId, tMsg.tileX, tMsg.tileY, tile);
           const canvas = layerCanvasesRef.current.get(tMsg.layerId);
@@ -385,6 +385,7 @@ export function useMultiplayer({
               height: TILE_SIZE,
             });
           }
+          globalTileGrid.notifyChange(true);
           break;
         }
 

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Paintbrush,
   Pencil,
@@ -8,16 +8,10 @@ import {
   ArrowLeftRight,
   ChevronDown,
   ChevronRight,
-  Activity,
-  Sparkles,
-  X,
-  LayoutList,
   Plus,
   Trash2,
   Loader2,
   FolderDown,
-  Zap,
-  Droplets,
   Palette,
   Square,
   BoxSelect,
@@ -27,20 +21,15 @@ import {
   Frame,
   Scaling,
   Pipette,
-  Move,
   Maximize2,
   Minimize2,
-  RotateCw,
   RotateCcw,
-  Undo2,
-  CornerUpLeft,
-  CornerUpRight,
   Wand2,
   PenTool,
   Feather,
   MessageSquare,
   Spline,
-  Shuffle,
+  Sparkles,
 } from 'lucide-react';
 import {
   ToolType,
@@ -57,25 +46,27 @@ import {
   WandSettings,
   BalloonSettings,
   VectorEditSettings,
+  CspAngleDynamicsMode,
+  CspBlendTipsMode,
+  CspPaperTextureMode,
+  CspTipFlipMode,
+  CspTaperSettings,
+  CspSpraySettings,
 } from '../types/editor';
 import { LiquifyIcon } from './LiquifyIcon';
-import { PENCIL_CONFIGS, PencilGrade } from '../utils/pencilEngine';
-import { BrushPreview } from './BrushPreview';
 import { parseSutFile } from '../utils/sutParser';
-import { WebGlBrushEngine } from '../utils/webglBrushEngine';
 import {
   loadCustomBrushes,
+  getCachedCustomBrushes,
   saveCustomBrush,
+  saveCustomBrushDebounced,
   deleteCustomBrush,
-  getPreloadedTipImage,
   preloadTipImage,
   prepareBrushSettingsForCsp,
+  CUSTOM_BRUSHES_CHANGED_EVENT,
 } from '../utils/brushStorage';
-import {
-  BUILTIN_BRUSHES,
-  BrushCategory,
-} from '../utils/presetBrushes';
-import { BrushSizePalette } from './BrushSizePalette';
+import { resolveBrushTipImage } from '../utils/brushOutline';
+import { BUILTIN_BRUSHES, BrushCategory } from '../utils/presetBrushes';
 import {
   getEffectiveBrushSettings,
   getSavedBrushSettings,
@@ -83,6 +74,8 @@ import {
   saveActivePresetId,
   ERASER_PRESET_ID,
 } from '../utils/brushPresetManager';
+import { renderBrushStrokePreview } from '../utils/brushPreview';
+import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/CspBrushEngine';
 
 interface LeftPanelProps {
   currentTool: ToolType;
@@ -126,6 +119,74 @@ interface LeftPanelProps {
   onInvertSelection?: () => void;
 }
 
+interface CompactSliderProps {
+  label: string;
+  valueLabel: string;
+  min: number;
+  max: number;
+  step?: number;
+  value: number;
+  onChange: (val: number) => void;
+}
+
+const CompactSlider: React.FC<CompactSliderProps> = ({
+  label,
+  valueLabel,
+  min,
+  max,
+  step = 1,
+  value,
+  onChange,
+}) => (
+  <div className="space-y-1">
+    <div className="flex items-center justify-between text-[11px]">
+      <span className="text-[#8a8a8a] truncate">{label}</span>
+      <span className="font-mono text-[10px] text-[#e5e5e5] ml-1 shrink-0">{valueLabel}</span>
+    </div>
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      onChange={(e) => onChange(Number(e.target.value))}
+      className="w-full"
+    />
+  </div>
+);
+
+const LIQUIFY_MODES: Array<{ id: LiquifyMode; label: string }> = [
+  { id: 'push', label: 'Push' },
+  { id: 'expand', label: 'Expand' },
+  { id: 'pinch', label: 'Pinch' },
+  { id: 'push-left', label: 'Push Left' },
+  { id: 'push-right', label: 'Push Right' },
+  { id: 'twirl-cw', label: 'Twirl CW' },
+  { id: 'twirl-ccw', label: 'Twirl CCW' },
+  { id: 'reconstruct', label: 'Reconstruct' },
+];
+
+type InspectorAccordionId = 'ink' | 'tip' | 'stroke' | 'mixing' | 'texture' | 'dynamics';
+
+const DEFAULT_TAPER: CspTaperSettings = {
+  useIn: false,
+  inLength: 24,
+  inRatio: 0.9,
+  useOut: false,
+  outLength: 32,
+  outRatio: 0.9,
+  startingSharpness: 0.85,
+  endingSharpness: 0.85,
+  affectSize: true,
+};
+
+const DEFAULT_SPRAY: CspSpraySettings = {
+  enabled: false,
+  size: 4,
+  density: 12,
+  bias: 0.5,
+};
+
 export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   currentTool,
   onSelectTool,
@@ -146,10 +207,8 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   onUpdateTextSettings,
   frameSettings,
   onUpdateFrameSettings,
-  hasSelection: _hasSelection,
   onDeselect,
   onTransformSelection,
-  onFillScreentone: _onFillScreentone,
   liquifySettings,
   onUpdateLiquifySettings,
   balloonSettings,
@@ -164,38 +223,24 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
   onFeatherSelection,
   onInvertSelection,
 }) => {
-  const [showAdvanced, setShowAdvanced] = useState(false);
-  const [showDynamics, setShowDynamics] = useState(false);
-
-  const [customBrushes, setCustomBrushes] = useState<CspBrush[]>([]);
+  const [openAccordion, setOpenAccordion] = useState<InspectorAccordionId | null>(null);
+  const [customBrushes, setCustomBrushes] = useState<CspBrush[]>(() => getCachedCustomBrushes());
   const [isImportingSut, setIsImportingSut] = useState(false);
-  const [importStatus, setImportStatus] = useState<string | null>(null);
   const [isDraggingFileOver, setIsDraggingFileOver] = useState(false);
-  const sutInputRef = useRef<HTMLInputElement>(null);
-  const gpuInfo = useRef(WebGlBrushEngine.getInstance().getGpuInfo()).current;
-
   const [selectedCategory, setSelectedCategory] = useState<'all' | BrushCategory | 'csp'>('all');
-  const [bottomTab, setBottomTab] = useState<'settings' | 'size'>(() => {
-    try {
-      const saved = localStorage.getItem('sora_paint_left_bottom_tab');
-      return saved === 'size' ? 'size' : 'settings';
-    } catch {
-      return 'settings';
-    }
-  });
+  const sutInputRef = useRef<HTMLInputElement>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
-  const handleSelectBottomTab = (tab: 'settings' | 'size') => {
-    setBottomTab(tab);
-    try {
-      localStorage.setItem('sora_paint_left_bottom_tab', tab);
-    } catch {}
-  };
+  const [isDraggingWidth, setIsDraggingWidth] = useState(false);
+  const dragStartXRef = useRef(0);
+  const dragStartWidthRef = useRef(width);
 
-  useEffect(() => {
+  const syncCustomBrushes = useCallback(() => {
     loadCustomBrushes().then((brushes) => {
       setCustomBrushes(brushes);
       for (const b of brushes) {
         if (b.tipDataUrl) preloadTipImage(b.tipDataUrl).catch(() => {});
+        if (b.secondaryTipDataUrl) preloadTipImage(b.secondaryTipDataUrl).catch(() => {});
         if (b.subTips) {
           for (const st of b.subTips) {
             if (st.dataUrl) preloadTipImage(st.dataUrl).catch(() => {});
@@ -206,11 +251,84 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
     });
   }, []);
 
-  const activePreset: BrushPresetId = brushSettings.preset || 'pencil-2b';
-  const isPencilActive = currentTool === 'brush' && activePreset.startsWith('pencil');
-  const activePencilConfig = isPencilActive ? PENCIL_CONFIGS[activePreset as PencilGrade] : null;
-  const activeBuiltinBrush = BUILTIN_BRUSHES.find((b) => b.id === activePreset);
+  useEffect(() => {
+    syncCustomBrushes();
+    const handleChanged = () => {
+      setCustomBrushes([...getCachedCustomBrushes()]);
+    };
+    window.addEventListener(CUSTOM_BRUSHES_CHANGED_EVENT, handleChanged);
+    return () => window.removeEventListener(CUSTOM_BRUSHES_CHANGED_EVENT, handleChanged);
+  }, [syncCustomBrushes]);
 
+  useEffect(() => {
+    if (!isDraggingWidth) return;
+    const handlePointerMove = (e: PointerEvent) => {
+      const delta = e.clientX - dragStartXRef.current;
+      const newWidth = Math.max(128, Math.min(300, Math.round(dragStartWidthRef.current + delta)));
+      onWidthChange(newWidth);
+    };
+    const handlePointerUp = () => setIsDraggingWidth(false);
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, [isDraggingWidth, onWidthChange]);
+
+  const isBrushOrEraser = currentTool === 'brush' || currentTool === 'eraser';
+
+  // Coalesce live S-curve stroke preview redraws to a single animation frame
+  useEffect(() => {
+    if (isHidden || !isBrushOrEraser) return;
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const cssWidth = Math.max(96, width - 16);
+    const cssHeight = 32;
+    const rafId = requestAnimationFrame(() => {
+      const resolvedTip = resolveBrushTipImage(brushSettings);
+      renderBrushStrokePreview(
+        canvas,
+        cssWidth,
+        cssHeight,
+        {
+          preset: brushSettings.preset,
+          size: brushSettings.size,
+          flow: brushSettings.flow,
+          opacity: brushSettings.opacity,
+          grain: brushSettings.grain,
+          hardness: brushSettings.hardness,
+          spacing: brushSettings.spacing,
+          minSizeFactor: brushSettings.minSizeFactor,
+          usePressure: brushSettings.usePressure,
+          color: currentTool === 'eraser' ? '#e5e5e5' : '#ececec',
+          backgroundColor: '#161616',
+          tool: currentTool === 'eraser' ? 'eraser' : 'brush',
+          customTipImage: resolvedTip,
+          customTipAngle: brushSettings.customTipAngle,
+          thickness: brushSettings.thickness,
+          thicknessVertical: brushSettings.thicknessVertical,
+          flipH: brushSettings.flipH,
+          flipV: brushSettings.flipV,
+          blendTipsMode: brushSettings.blendTipsMode,
+          adjustDensityByGap: brushSettings.adjustDensityByGap,
+          antiAlias: brushSettings.antiAlias,
+          pressureCurve: brushSettings.pressureCurve,
+          spray: brushSettings.spray,
+          colorMixing: brushSettings.colorMixing,
+          amountOfPaint: brushSettings.amountOfPaint,
+          densityOfPaint: brushSettings.densityOfPaint,
+          colorStretch: brushSettings.colorStretch,
+          wetEdge: brushSettings.wetEdge,
+        },
+        true
+      );
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [isHidden, isBrushOrEraser, width, currentTool, brushSettings]);
+
+  const activePreset: BrushPresetId = brushSettings.preset || 'pencil-2b';
+  const activeBuiltinBrush = BUILTIN_BRUSHES.find((b) => b.id === activePreset);
   const isCustomBrushActive =
     currentTool === 'brush' &&
     (activePreset.startsWith('csp-') || (Boolean(brushSettings.customTipDataUrl) && !activeBuiltinBrush));
@@ -218,60 +336,68 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
     ? customBrushes.find((b) => b.id === activePreset)
     : null;
 
-  const activeToolLabel = (() => {
-    if (currentTool === 'eraser') return 'Eraser';
-    if (currentTool === 'pipette') return 'Eyedropper';
-    if (currentTool === 'select-rect') return 'Marquee';
-    if (currentTool === 'select-lasso') return 'Lasso';
-    if (currentTool === 'select-wand') return 'Magic Wand';
-    if (currentTool === 'select-pen') return 'Selection Pen';
-    if (currentTool === 'select-eraser') return 'Selection Eraser';
-    if (currentTool === 'fill') return 'Fill';
-    if (currentTool === 'text') return 'Text';
-    if (currentTool === 'frame') return 'Frame Border';
-    if (currentTool === 'transform') return 'Transform';
-    if (currentTool === 'liquify') return 'Liquify';
-    return isPencilActive ? 'Pencil' : brushSettings.brushName || activeCustomBrush?.name || activeBuiltinBrush?.name || 'Drawing';
-  })();
-
   const handleUpdateBrushSettings = (newSettings: Partial<BrushSettings>) => {
     onUpdateBrushSettings(newSettings);
     if (isCustomBrushActive && activeCustomBrush) {
       const updatedBrush: CspBrush = {
         ...activeCustomBrush,
-        size: newSettings.size !== undefined ? newSettings.size : activeCustomBrush.size,
-        opacity: newSettings.opacity !== undefined ? newSettings.opacity : activeCustomBrush.opacity,
-        flow: newSettings.flow !== undefined ? newSettings.flow : activeCustomBrush.flow,
-        spacing: newSettings.spacing !== undefined ? newSettings.spacing : activeCustomBrush.spacing,
-        hardness: newSettings.hardness !== undefined ? newSettings.hardness : activeCustomBrush.hardness,
-        stabilization: newSettings.stabilization !== undefined ? newSettings.stabilization : activeCustomBrush.stabilization,
-        dynamics: newSettings.dynamics !== undefined ? newSettings.dynamics : activeCustomBrush.dynamics,
+        size: newSettings.size ?? activeCustomBrush.size,
+        opacity: newSettings.opacity ?? activeCustomBrush.opacity,
+        flow: newSettings.flow ?? activeCustomBrush.flow,
+        brushDensity: newSettings.brushDensity ?? newSettings.flow ?? activeCustomBrush.brushDensity,
+        adjustDensityByGap: newSettings.adjustDensityByGap ?? activeCustomBrush.adjustDensityByGap,
+        blendTipsMode: newSettings.blendTipsMode ?? activeCustomBrush.blendTipsMode,
+        spacing: newSettings.spacing ?? activeCustomBrush.spacing,
+        hardness: newSettings.hardness ?? activeCustomBrush.hardness,
+        thickness: newSettings.thickness ?? activeCustomBrush.thickness,
+        thicknessVertical: newSettings.thicknessVertical ?? activeCustomBrush.thicknessVertical,
+        antiAlias: newSettings.antiAlias ?? activeCustomBrush.antiAlias,
+        stabilization: newSettings.stabilization ?? activeCustomBrush.stabilization,
+        postCorrection: newSettings.postCorrection ?? activeCustomBrush.postCorrection,
+        sharpCorners: newSettings.sharpCorners ?? activeCustomBrush.sharpCorners,
+        angle: newSettings.customTipAngle ?? activeCustomBrush.angle,
+        angleDynamics: newSettings.customTipAngleDynamics ?? activeCustomBrush.angleDynamics,
+        flipH: newSettings.flipH ?? activeCustomBrush.flipH,
+        flipV: newSettings.flipV ?? activeCustomBrush.flipV,
+        isRibbon: newSettings.isRibbon ?? activeCustomBrush.isRibbon,
+        usePressure: newSettings.usePressure ?? activeCustomBrush.usePressure,
+        useTilt: newSettings.useTilt ?? activeCustomBrush.useTilt,
+        useVelocity: newSettings.useVelocity ?? activeCustomBrush.useVelocity,
+        pressureCurve: newSettings.pressureCurve ?? activeCustomBrush.pressureCurve,
+        taper: newSettings.taper ?? activeCustomBrush.taper,
+        spray: newSettings.spray ?? activeCustomBrush.spray,
+        colorMixing: newSettings.colorMixing ?? activeCustomBrush.colorMixing,
+        mixingMode: newSettings.mixingMode ?? activeCustomBrush.mixingMode,
+        amountOfPaint: newSettings.amountOfPaint ?? activeCustomBrush.amountOfPaint,
+        densityOfPaint: newSettings.densityOfPaint ?? activeCustomBrush.densityOfPaint,
+        colorStretch: newSettings.colorStretch ?? activeCustomBrush.colorStretch,
+        wetEdge: newSettings.wetEdge ?? activeCustomBrush.wetEdge,
+        wetEdgeRadius: newSettings.wetEdgeRadius ?? activeCustomBrush.wetEdgeRadius,
+        textureDensity: newSettings.grain ?? activeCustomBrush.textureDensity,
+        paperTextureMode: newSettings.paperTextureMode ?? activeCustomBrush.paperTextureMode,
+        paperTextureScale: newSettings.paperTextureScale ?? activeCustomBrush.paperTextureScale,
+        paperTextureInverted: newSettings.paperTextureInverted ?? activeCustomBrush.paperTextureInverted,
+        dynamics: newSettings.dynamics ?? activeCustomBrush.dynamics,
       };
       setCustomBrushes((prev) => prev.map((b) => (b.id === updatedBrush.id ? updatedBrush : b)));
-      saveCustomBrush(updatedBrush).catch(() => {});
+      saveCustomBrushDebounced(updatedBrush);
     }
   };
 
   const handleUpdateDynamics = (patch: Partial<BrushDynamics>) => {
     const cur = brushSettings.dynamics || DEFAULT_BRUSH_DYNAMICS;
-    handleUpdateBrushSettings({
-      dynamics: {
-        ...cur,
-        ...patch,
-      },
-    });
+    handleUpdateBrushSettings({ dynamics: { ...cur, ...patch } });
   };
 
-  const isDynamicsActive = Boolean(
-    brushSettings.dynamics &&
-      (brushSettings.dynamics.sizeJitter > 0 ||
-        brushSettings.dynamics.angleJitter > 0 ||
-        brushSettings.dynamics.roundnessJitter > 0 ||
-        brushSettings.dynamics.scatter > 0 ||
-        (brushSettings.dynamics.count ?? 1) > 1 ||
-        brushSettings.dynamics.flowJitter > 0 ||
-        brushSettings.dynamics.colorJitterEnabled)
-  );
+  const handleUpdateTaper = (patch: Partial<CspTaperSettings>) => {
+    const cur = brushSettings.taper || DEFAULT_TAPER;
+    handleUpdateBrushSettings({ taper: { ...cur, ...patch } });
+  };
+
+  const handleUpdateSpray = (patch: Partial<CspSpraySettings>) => {
+    const cur = brushSettings.spray || DEFAULT_SPRAY;
+    handleUpdateBrushSettings({ spray: { ...cur, ...patch } });
+  };
 
   const handleSelectBrushPreset = (presetId: BrushPresetId) => {
     onSelectTool('brush');
@@ -282,9 +408,14 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
       customTipImage: undefined,
       customTipAngle: 0,
       customTipAngleDynamics: 'none',
+      flipH: 'none',
+      flipV: 'none',
+      isRibbon: false,
       colorMixing: false,
       wetEdge: 0,
       grain: 0,
+      spray: undefined,
+      taper: undefined,
       ...effective,
       preset: presetId,
     });
@@ -304,32 +435,25 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
 
   const handleImportSut = async (file: File) => {
     setIsImportingSut(true);
-    setImportStatus(`Importing ${file.name}...`);
     try {
       const buffer = await file.arrayBuffer();
       const parsedBrush = await parseSutFile(buffer, file.name);
-
-      // Clean out any previously imported brush with matching name or ID to avoid stale cache
       const existing = customBrushes.filter(
         (b) => b.name.toLowerCase() === parsedBrush.name.toLowerCase() || b.id === parsedBrush.id
       );
       for (const old of existing) {
         await deleteCustomBrush(old.id).catch(() => {});
       }
-
       await saveCustomBrush(parsedBrush);
-      setCustomBrushes((prev) => {
-        const filtered = prev.filter(
+      setCustomBrushes((prev) => [
+        parsedBrush,
+        ...prev.filter(
           (b) => b.name.toLowerCase() !== parsedBrush.name.toLowerCase() && b.id !== parsedBrush.id
-        );
-        return [parsedBrush, ...filtered];
-      });
+        ),
+      ]);
       await handleSelectCustomBrush(parsedBrush);
-      setImportStatus(null);
     } catch (err: any) {
-      console.error('CSP brush import error:', err);
       alert(err.message || 'Failed to import Clip Studio Paint brush file.');
-      setImportStatus(null);
     } finally {
       setIsImportingSut(false);
     }
@@ -346,470 +470,332 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
     }
   };
 
-  // View mode for brushes list: 'preview' (shows authentic CSP S-curve stroke) or 'compact'
-  const [brushViewMode, setBrushViewMode] = useState<'preview' | 'compact'>(() => {
-    return (localStorage.getItem('sora_paint_brush_view_mode') as 'preview' | 'compact') || 'preview';
-  });
-
-  const toggleBrushViewMode = () => {
-    setBrushViewMode((prev) => {
-      const next = prev === 'preview' ? 'compact' : 'preview';
-      localStorage.setItem('sora_paint_brush_view_mode', next);
-      return next;
-    });
+  const toggleAccordion = (id: InspectorAccordionId) => {
+    setOpenAccordion((prev) => (prev === id ? null : id));
   };
 
-  // Live preview stroke color in Tool Settings: false = neutral white (CSP standard), true = primary color
-  const [usePrimaryColorPreview, setUsePrimaryColorPreview] = useState(false);
+  const toolItems: Array<{
+    id: ToolType;
+    label: string;
+    icon: React.ReactNode;
+    dividerAfter?: boolean;
+    onClick?: () => void;
+  }> = [
+    {
+      id: 'brush',
+      label: 'Brush (B)',
+      icon: <Paintbrush className="w-3.5 h-3.5" />,
+      onClick: () => {
+        onSelectTool('brush');
+        if (isHidden) onToggleHidden();
+      },
+    },
+    { id: 'eraser', label: 'Eraser (E)', icon: <Eraser className="w-3.5 h-3.5" /> },
+    { id: 'pipette', label: 'Eyedropper (I)', icon: <Pipette className="w-3.5 h-3.5" /> },
+    {
+      id: 'liquify',
+      label: 'Liquify (J)',
+      icon: <LiquifyIcon className="w-3.5 h-3.5" />,
+      dividerAfter: true,
+    },
+    {
+      id: 'transform',
+      label: 'Transform (Ctrl+T)',
+      icon: <Scaling className="w-3.5 h-3.5" />,
+      onClick: () => {
+        onSelectTool('transform');
+        onTransformSelection?.();
+      },
+    },
+    { id: 'select-rect', label: 'Marquee (M)', icon: <BoxSelect className="w-3.5 h-3.5" /> },
+    { id: 'select-lasso', label: 'Lasso (L)', icon: <Lasso className="w-3.5 h-3.5" /> },
+    { id: 'select-wand', label: 'Magic Wand (W)', icon: <Wand2 className="w-3.5 h-3.5" /> },
+    {
+      id: 'select-pen',
+      label: 'Selection Pen',
+      icon: <PenTool className="w-3.5 h-3.5" />,
+      dividerAfter: true,
+    },
+    { id: 'fill', label: 'Fill (G)', icon: <PaintBucket className="w-3.5 h-3.5" /> },
+    { id: 'text', label: 'Text (T)', icon: <Type className="w-3.5 h-3.5" /> },
+    { id: 'frame', label: 'Frame Border (F)', icon: <Frame className="w-3.5 h-3.5" /> },
+    { id: 'balloon', label: 'Speech Balloon', icon: <MessageSquare className="w-3.5 h-3.5" /> },
+    { id: 'vector-edit', label: 'Correct Line', icon: <Spline className="w-3.5 h-3.5" /> },
+  ];
 
-  // Vertical split between Top (Brushes) and Bottom (Tool Settings)
-  const [topHeight, setTopHeight] = useState<number>(() => {
-    const saved = localStorage.getItem('sora_paint_left_top_height');
-    return saved ? Number(saved) : 255;
-  });
-
-  // Dragging states for resizers
-  const [isDraggingWidth, setIsDraggingWidth] = useState(false);
-  const [isDraggingHeight, setIsDraggingHeight] = useState(false);
-  const dragStartXRef = useRef(0);
-  const dragStartWidthRef = useRef(width);
-  const dragStartYRef = useRef(0);
-  const dragStartHeightRef = useRef(topHeight);
-
-  // Resize Width Handler (Right edge of LeftPanel)
-  const handleWidthResizeMouseDown = (e: React.MouseEvent) => {
-    e.preventDefault();
-    setIsDraggingWidth(true);
-    dragStartXRef.current = e.clientX;
-    dragStartWidthRef.current = width;
-  };
-
-  useEffect(() => {
-    if (!isDraggingWidth) return;
-
-    const handlePointerMove = (e: PointerEvent) => {
-      const delta = e.clientX - dragStartXRef.current;
-      const newWidth = Math.max(180, Math.min(500, Math.round(dragStartWidthRef.current + delta)));
-      onWidthChange(newWidth);
-    };
-
-    const handlePointerUp = () => {
-      setIsDraggingWidth(false);
-    };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
-    return () => {
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
-    };
-  }, [isDraggingWidth, onWidthChange]);
-
-  // Resize Height Handler (Divider between Top Brushes and Bottom Tool Settings)
-  const handleHeightResizeMouseDown = (e: React.MouseEvent) => {
-    e.preventDefault();
-    setIsDraggingHeight(true);
-    dragStartYRef.current = e.clientY;
-    dragStartHeightRef.current = topHeight;
-  };
-
-  useEffect(() => {
-    if (!isDraggingHeight) return;
-
-    const handlePointerMove = (e: PointerEvent) => {
-      const delta = e.clientY - dragStartYRef.current;
-      const newHeight = Math.max(80, Math.min(450, Math.round(dragStartHeightRef.current + delta)));
-      setTopHeight(newHeight);
-      localStorage.setItem('sora_paint_left_top_height', String(newHeight));
-    };
-
-    const handlePointerUp = () => {
-      setIsDraggingHeight(false);
-    };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
-    return () => {
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
-    };
-  }, [isDraggingHeight]);
-
-  const isBrushOrEraser = currentTool === 'brush' || currentTool === 'eraser';
-
-  const renderToolSettings = () => {
+  const renderContextualToolPanel = () => {
     if (currentTool === 'fill') {
+      const method = fillSettings?.method ?? 'refer-all';
       return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              <PaintBucket className="w-4 h-4 text-amber-400" />
-              <span className="text-xs font-semibold text-white">Fill Tool (G)</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
+        <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
+          <div className="text-[11px] font-medium text-[#e5e5e5]">Fill</div>
+          <div className="space-y-1">
+            {(
+              [
+                { id: 'refer-all', label: 'All Visible' },
+                { id: 'refer-active', label: 'Active Layer' },
+                { id: 'refer-reference', label: 'Reference Layer' },
+                { id: 'lasso', label: 'Lasso Fill' },
+              ] as const
+            ).map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => onUpdateFillSettings?.({ method: m.id })}
+                className={`w-full px-2 py-1 rounded text-left text-[11px] transition-colors cursor-pointer ${
+                  method === m.id
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                }`}
+              >
+                {m.label}
+              </button>
+            ))}
           </div>
-
-          <div className="p-3 space-y-4">
-            <div>
-              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1.5">Fill Method:</label>
-              <div className="space-y-1">
-                <button
-                  onClick={() => onUpdateFillSettings?.({ method: 'refer-all' })}
-                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
-                    fillSettings?.method === 'refer-all'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <span>Refer to Other Layers</span>
-                  <span className="text-[10px] text-[#777777]">All Visible</span>
-                </button>
-
-                <button
-                  onClick={() => onUpdateFillSettings?.({ method: 'refer-active' })}
-                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
-                    fillSettings?.method === 'refer-active'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <span>Refer Only to Editing Layer</span>
-                  <span className="text-[10px] text-[#777777]">Editing Layer</span>
-                </button>
-
-                <button
-                  onClick={() => onUpdateFillSettings?.({ method: 'lasso' })}
-                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
-                    fillSettings?.method === 'lasso'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <span>Lasso Fill</span>
-                  <span className="text-[10px] text-[#777777]">Enclose & Fill</span>
-                </button>
-              </div>
-            </div>
-
-            {fillSettings?.method !== 'lasso' && (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] font-medium text-[#aaaaaa]">Color Tolerance:</label>
-                  <span className="text-xs font-mono text-cyan-400">{fillSettings?.tolerance ?? 32}</span>
-                </div>
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  value={fillSettings?.tolerance ?? 32}
-                  onChange={(e) => onUpdateFillSettings?.({ tolerance: Number(e.target.value) })}
-                  className="w-full accent-cyan-400"
-                />
-              </div>
-            )}
-
-            <div className="pt-2 border-t border-[#26282c] flex items-center space-x-2">
-              <div className="w-5 h-5 rounded border border-[#44464c]" style={{ backgroundColor: primaryColor }} />
-              <span className="text-[11px] text-[#aaaaaa]">Fill Color: {primaryColor}</span>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (currentTool === 'frame') {
-      return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              <Frame className="w-4 h-4 text-cyan-400" />
-              <span className="text-xs font-semibold text-white">Frame Border Tool (F)</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="p-3 space-y-4">
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Frame Thickness (1 - 100):</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={frameSettings?.thickness ?? 4}
-                  onChange={(e) =>
-                    onUpdateFrameSettings?.({
-                      thickness: Math.max(1, Math.min(100, Number(e.target.value) || 1)),
-                    })
-                  }
-                  className="w-14 bg-[#141517] text-white text-right px-1.5 py-0.5 rounded border border-[#383a40] text-xs font-mono"
-                />
-              </div>
-              <input
-                type="range"
-                min={1}
+          {method !== 'lasso' && (
+            <>
+              <CompactSlider
+                label="Tolerance"
+                valueLabel={`${fillSettings?.tolerance ?? 32}`}
+                min={0}
                 max={100}
-                value={frameSettings?.thickness ?? 4}
-                onChange={(e) => onUpdateFrameSettings?.({ thickness: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
+                value={fillSettings?.tolerance ?? 32}
+                onChange={(v) => onUpdateFillSettings?.({ tolerance: v })}
               />
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Frame Interior:</label>
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  onClick={() => onUpdateFrameSettings?.({ fillBackground: true })}
-                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer ${
-                    frameSettings?.fillBackground
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  White Fill
-                </button>
-                <button
-                  onClick={() => onUpdateFrameSettings?.({ fillBackground: false })}
-                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer ${
-                    !frameSettings?.fillBackground
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  Transparent
-                </button>
-              </div>
-            </div>
-
-
-            <div className="pt-2 border-t border-[#26282c] flex items-center space-x-2">
-              <div className="w-5 h-5 rounded border border-[#44464c]" style={{ backgroundColor: primaryColor }} />
-              <span className="text-[11px] text-[#aaaaaa]">Border Color: {primaryColor}</span>
-            </div>
-          </div>
+              <CompactSlider
+                label="Close Gap"
+                valueLabel={`${fillSettings?.closeGap ?? 0}px`}
+                min={0}
+                max={20}
+                value={fillSettings?.closeGap ?? 0}
+                onChange={(v) => onUpdateFillSettings?.({ closeGap: v })}
+              />
+              <CompactSlider
+                label="Area Scaling"
+                valueLabel={`${(fillSettings?.areaScale ?? 0) > 0 ? '+' : ''}${fillSettings?.areaScale ?? 0}px`}
+                min={-20}
+                max={20}
+                value={fillSettings?.areaScale ?? 0}
+                onChange={(v) => onUpdateFillSettings?.({ areaScale: v })}
+              />
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Anti-Alias</span>
+                <input
+                  type="checkbox"
+                  checked={fillSettings?.antiAlias ?? true}
+                  onChange={(e) => onUpdateFillSettings?.({ antiAlias: e.target.checked })}
+                />
+              </label>
+            </>
+          )}
         </div>
       );
     }
 
-    if (currentTool === 'balloon') {
+    if (currentTool === 'liquify') {
+      const activeMode = liquifySettings?.mode ?? 'push';
       return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              <MessageSquare className="w-4 h-4 text-cyan-400" />
-              <span className="text-xs font-semibold text-white">Speech Balloon Tool</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
+        <div className="p-2 space-y-3 overflow-y-auto flex-1">
+          <div className="px-0.5 text-[11px] font-medium text-[#e5e5e5]">Liquify</div>
+          <div className="space-y-0.5">
+            {LIQUIFY_MODES.map((sub) => (
+              <button
+                key={sub.id}
+                type="button"
+                onClick={() => onUpdateLiquifySettings?.({ mode: sub.id })}
+                className={`w-full px-2 py-1 rounded text-left text-[11px] transition-colors cursor-pointer ${
+                  activeMode === sub.id
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                }`}
+              >
+                {sub.label}
+              </button>
+            ))}
+          </div>
+          <CompactSlider
+            label="Size"
+            valueLabel={`${liquifySettings?.size ?? 80}px`}
+            min={4}
+            max={500}
+            value={liquifySettings?.size ?? 80}
+            onChange={(v) => onUpdateLiquifySettings?.({ size: v })}
+          />
+          <CompactSlider
+            label="Strength"
+            valueLabel={`${liquifySettings?.strength ?? 50}%`}
+            min={1}
+            max={100}
+            value={liquifySettings?.strength ?? 50}
+            onChange={(v) => onUpdateLiquifySettings?.({ strength: v })}
+          />
+          <CompactSlider
+            label="Hardness"
+            valueLabel={`${liquifySettings?.hardness ?? 50}%`}
+            min={0}
+            max={100}
+            value={liquifySettings?.hardness ?? 50}
+            onChange={(v) => onUpdateLiquifySettings?.({ hardness: v })}
+          />
+          <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+            <span>Pressure</span>
+            <input
+              type="checkbox"
+              checked={liquifySettings?.usePressure ?? true}
+              onChange={(e) => onUpdateLiquifySettings?.({ usePressure: e.target.checked })}
+            />
+          </label>
+        </div>
+      );
+    }
+
+    if (
+      currentTool === 'select-rect' ||
+      currentTool === 'select-lasso' ||
+      currentTool === 'select-wand' ||
+      currentTool === 'select-pen' ||
+      currentTool === 'select-eraser'
+    ) {
+      const activeWand = wandSettings || {
+        tolerance: 32,
+        contiguous: true,
+        antiAlias: true,
+        referMode: 'active' as const,
+      };
+      return (
+        <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
+          <div className="text-[11px] font-medium text-[#e5e5e5]">Selection</div>
+          <div className="grid grid-cols-2 gap-1">
+            {(
+              [
+                { id: 'select-rect', label: 'Rect' },
+                { id: 'select-lasso', label: 'Lasso' },
+                { id: 'select-wand', label: 'Wand' },
+                { id: 'select-pen', label: 'Pen' },
+                { id: 'select-eraser', label: 'Erase' },
+              ] as const
+            ).map((s) => (
+              <button
+                key={s.id}
+                type="button"
+                onClick={() => onSelectTool(s.id)}
+                className={`py-1 px-1.5 rounded text-[11px] transition-colors cursor-pointer ${
+                  currentTool === s.id
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
           </div>
 
-          <div className="p-3 space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Balloon Shape:</label>
-              <div className="grid grid-cols-2 gap-1.5">
-                {(['ellipse', 'rounded-rect', 'jagged-flash', 'thought'] as const).map((shape) => (
+          {(currentTool === 'select-pen' || currentTool === 'select-eraser') && (
+            <CompactSlider
+              label="Brush Size"
+              valueLabel={`${brushSettings.size}px`}
+              min={1}
+              max={250}
+              value={Math.round(brushSettings.size)}
+              onChange={(v) => onUpdateBrushSettings({ size: v })}
+            />
+          )}
+
+          {currentTool === 'select-wand' && (
+            <div className="space-y-2.5 pt-1">
+              <CompactSlider
+                label="Tolerance"
+                valueLabel={`${activeWand.tolerance}`}
+                min={0}
+                max={255}
+                value={activeWand.tolerance}
+                onChange={(v) => onUpdateWandSettings?.({ tolerance: v })}
+              />
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Contiguous</span>
+                <input
+                  type="checkbox"
+                  checked={activeWand.contiguous}
+                  onChange={(e) => onUpdateWandSettings?.({ contiguous: e.target.checked })}
+                />
+              </label>
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Anti-Alias</span>
+                <input
+                  type="checkbox"
+                  checked={activeWand.antiAlias}
+                  onChange={(e) => onUpdateWandSettings?.({ antiAlias: e.target.checked })}
+                />
+              </label>
+              <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                {(['active', 'all', 'reference'] as const).map((mode) => (
                   <button
-                    key={shape}
+                    key={mode}
                     type="button"
-                    onClick={() => onUpdateBalloonSettings?.({ shape })}
-                    className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer capitalize font-medium ${
-                      balloonSettings?.shape === shape
-                        ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                        : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
+                    onClick={() => onUpdateWandSettings?.({ referMode: mode })}
+                    className={`py-0.5 rounded text-[10px] capitalize cursor-pointer ${
+                      activeWand.referMode === mode
+                        ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                        : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                     }`}
                   >
-                    {shape.replace('-', ' ')}
+                    {mode === 'reference' ? 'Ref' : mode}
                   </button>
                 ))}
               </div>
             </div>
+          )}
 
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block">Writing Direction:</label>
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => onUpdateBalloonSettings?.({ vertical: false })}
-                  className={`py-1 px-2 rounded text-xs text-center transition-colors cursor-pointer font-medium ${
-                    !balloonSettings?.vertical
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:text-white border border-transparent'
-                  }`}
-                >
-                  Horizontal (横)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onUpdateBalloonSettings?.({ vertical: true })}
-                  className={`py-1 px-2 rounded text-xs text-center transition-colors cursor-pointer font-medium ${
-                    balloonSettings?.vertical
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:text-white border border-transparent'
-                  }`}
-                >
-                  Vertical (縦書き)
-                </button>
-              </div>
+          <div className="space-y-1 pt-1">
+            <div className="grid grid-cols-3 gap-1">
+              <button
+                type="button"
+                onClick={() => onExpandSelection?.(5)}
+                title="Expand 5px"
+                className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center justify-center cursor-pointer"
+              >
+                <Maximize2 className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() => onContractSelection?.(5)}
+                title="Contract 5px"
+                className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center justify-center cursor-pointer"
+              >
+                <Minimize2 className="w-3 h-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() => onFeatherSelection?.(5)}
+                title="Feather 5px"
+                className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center justify-center cursor-pointer"
+              >
+                <Feather className="w-3 h-3" />
+              </button>
             </div>
-
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Border Width:</label>
-                <span className="text-xs font-mono text-cyan-400">{balloonSettings?.strokeWidth ?? 3}px</span>
-              </div>
-              <input
-                type="range"
-                min={1}
-                max={15}
-                value={balloonSettings?.strokeWidth ?? 3}
-                onChange={(e) => onUpdateBalloonSettings?.({ strokeWidth: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
-              />
-            </div>
-
-            <div className="pt-2 border-t border-[#26282c] space-y-1 text-[11px] text-[#888888]">
-              <p>• Click on canvas to place parametric speech balloon.</p>
-              <p>• Drag handles to resize body or re-orient bezier tail.</p>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (currentTool === 'vector-edit') {
-      const activeMode = vectorEditSettings?.mode || 'pinch';
-
-      return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              <Spline className="w-4 h-4 text-cyan-400" />
-              <span className="text-xs font-semibold text-white">Correct Line (Vector)</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
+            <button
+              type="button"
+              onClick={onInvertSelection}
+              className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center gap-1.5 cursor-pointer"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>Invert</span>
             </button>
-          </div>
-
-          <div className="p-3 space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Operation Mode:</label>
-              <div className="space-y-1">
-                <button
-                  type="button"
-                  onClick={() => onUpdateVectorEditSettings?.({ mode: 'pinch' })}
-                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
-                    activeMode === 'pinch'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <span>Pinch / Reshape Line</span>
-                  <span className="text-[10px] text-[#777777]">Bell-curve</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => onUpdateVectorEditSettings?.({ mode: 'width' })}
-                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
-                    activeMode === 'width'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <span>Modify Line Width</span>
-                  <span className="text-[10px] text-[#777777]">Local scale</span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => onUpdateVectorEditSettings?.({ mode: 'simplify' })}
-                  className={`w-full px-2.5 py-1.5 rounded text-left text-xs transition-colors cursor-pointer flex items-center justify-between ${
-                    activeMode === 'simplify'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <span>Simplify Vector Line</span>
-                  <span className="text-[10px] text-[#777777]">Ramer-Douglas</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Influence Radius:</label>
-                <span className="text-xs font-mono text-cyan-400">{vectorEditSettings?.radius ?? 30}px</span>
-              </div>
-              <input
-                type="range"
-                min={5}
-                max={150}
-                value={vectorEditSettings?.radius ?? 30}
-                onChange={(e) => onUpdateVectorEditSettings?.({ radius: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
-              />
-            </div>
-
-            {activeMode === 'width' && (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] font-medium text-[#aaaaaa]">Width Factor:</label>
-                  <span className="text-xs font-mono text-cyan-400">
-                    {(vectorEditSettings?.widthFactor ?? 1.5).toFixed(1)}x
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={2}
-                  max={30}
-                  value={Math.round((vectorEditSettings?.widthFactor ?? 1.5) * 10)}
-                  onChange={(e) =>
-                    onUpdateVectorEditSettings?.({ widthFactor: Number(e.target.value) / 10 })
-                  }
-                  className="w-full accent-cyan-400"
-                />
-              </div>
-            )}
-
-            {activeMode === 'simplify' && (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <label className="text-[11px] font-medium text-[#aaaaaa]">Reduction Tolerance:</label>
-                  <span className="text-xs font-mono text-cyan-400">
-                    {(vectorEditSettings?.simplifyTolerance ?? 2.0).toFixed(1)}px
-                  </span>
-                </div>
-                <input
-                  type="range"
-                  min={5}
-                  max={80}
-                  value={Math.round((vectorEditSettings?.simplifyTolerance ?? 2.0) * 10)}
-                  onChange={(e) =>
-                    onUpdateVectorEditSettings?.({ simplifyTolerance: Number(e.target.value) / 10 })
-                  }
-                  className="w-full accent-cyan-400"
-                />
-              </div>
-            )}
-
-            {onOpenMangaEffects && (
-              <div className="pt-2 border-t border-[#26282c]">
-                <button
-                  type="button"
-                  onClick={onOpenMangaEffects}
-                  className="w-full py-2 px-3 rounded bg-[#18191c] hover:bg-[#25272b] border border-[#383a40] text-cyan-300 text-xs font-medium flex items-center justify-center space-x-2 transition-colors cursor-pointer"
-                >
-                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Manga Effect Lines...</span>
-                </button>
-              </div>
-            )}
+            <button
+              type="button"
+              onClick={onTransformSelection}
+              className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center gap-1.5 cursor-pointer"
+            >
+              <Scaling className="w-3 h-3" />
+              <span>Transform</span>
+            </button>
+            <button
+              type="button"
+              onClick={onDeselect}
+              className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer text-left"
+            >
+              Deselect
+            </button>
           </div>
         </div>
       );
@@ -817,2242 +803,1260 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(({
 
     if (currentTool === 'text') {
       return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              <Type className="w-4 h-4 text-cyan-400" />
-              <span className="text-xs font-semibold text-white">Text Creation Tool (T)</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="p-3 space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa]">Manga Font Family:</label>
-              <select
-                value={textSettings?.fontFamily}
-                onChange={(e) => onUpdateTextSettings?.({ fontFamily: e.target.value })}
-                className="w-full bg-[#141517] text-white text-xs border border-[#383a40] rounded px-2 py-1.5 focus:border-cyan-500 focus:outline-none"
-              >
-                <option value="'Neucha', 'Anime Ace', 'Comic Sans MS', sans-serif">Manga / Anime (RU/EN)</option>
-                <option value="'Anime Ace', 'Comic Sans MS', sans-serif">Anime Ace (Comic)</option>
-                <option value="'Comic Sans MS', cursive, sans-serif">Comic Sans MS</option>
-                <option value="Arial, sans-serif">Arial</option>
-                <option value="Impact, sans-serif">Impact</option>
-                <option value="'Times New Roman', serif">Times New Roman</option>
-                <option value="Georgia, serif">Georgia</option>
-              </select>
-            </div>
-
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa]">Writing Direction:</label>
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => onUpdateTextSettings?.({ writingMode: 'horizontal-tb' })}
-                  className={`px-2 py-1 rounded text-xs transition-colors cursor-pointer text-center font-medium ${
-                    textSettings?.writingMode !== 'vertical-rl'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                      : 'bg-[#202226] text-[#888888] hover:text-white border border-transparent'
-                  }`}
-                >
-                  Horizontal (横)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onUpdateTextSettings?.({ writingMode: 'vertical-rl' })}
-                  className={`px-2 py-1 rounded text-xs transition-colors cursor-pointer text-center font-medium ${
-                    textSettings?.writingMode === 'vertical-rl'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                      : 'bg-[#202226] text-[#888888] hover:text-white border border-transparent'
-                  }`}
-                >
-                  Vertical (縦書き)
-                </button>
-              </div>
-            </div>
-
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Default Font Size:</label>
-                <span className="text-xs font-mono text-cyan-400">{textSettings?.fontSize ?? 28}px</span>
-              </div>
-              <input
-                type="range"
-                min={12}
-                max={160}
-                value={textSettings?.fontSize ?? 28}
-                onChange={(e) => onUpdateTextSettings?.({ fontSize: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
-              />
-            </div>
-
-            <div className="pt-2 border-t border-[#26282c] flex items-center space-x-2">
-              <div className="w-5 h-5 rounded border border-[#44464c]" style={{ backgroundColor: primaryColor }} />
-              <span className="text-[11px] text-[#aaaaaa]">Text Color: {primaryColor}</span>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    const isSelectionTool =
-      currentTool === 'select-rect' ||
-      currentTool === 'select-lasso' ||
-      currentTool === 'select-wand' ||
-      currentTool === 'select-pen' ||
-      currentTool === 'select-eraser';
-
-    if (isSelectionTool) {
-      const activeWand = wandSettings || {
-        tolerance: 32,
-        contiguous: true,
-        antiAlias: true,
-        referMode: 'active' as const,
-      };
-
-      const selectionTitle =
-        currentTool === 'select-rect'
-          ? 'Rectangular Marquee (M)'
-          : currentTool === 'select-lasso'
-          ? 'Lasso Selection (L)'
-          : currentTool === 'select-wand'
-          ? 'Magic Wand (W)'
-          : currentTool === 'select-pen'
-          ? 'Selection Pen'
-          : 'Selection Eraser';
-
-      return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              {currentTool === 'select-rect' && <BoxSelect className="w-4 h-4 text-cyan-400" />}
-              {currentTool === 'select-lasso' && <Lasso className="w-4 h-4 text-cyan-400" />}
-              {currentTool === 'select-wand' && <Wand2 className="w-4 h-4 text-cyan-400" />}
-              {currentTool === 'select-pen' && <PenTool className="w-4 h-4 text-cyan-400" />}
-              {currentTool === 'select-eraser' && <Eraser className="w-4 h-4 text-cyan-400" />}
-              <span className="text-xs font-semibold text-white">{selectionTitle}</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="p-3 space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Selection Tool:</label>
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  onClick={() => onSelectTool('select-rect')}
-                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
-                    currentTool === 'select-rect'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <BoxSelect className="w-3.5 h-3.5" />
-                  <span>Marquee</span>
-                </button>
-
-                <button
-                  onClick={() => onSelectTool('select-lasso')}
-                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
-                    currentTool === 'select-lasso'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <Lasso className="w-3.5 h-3.5" />
-                  <span>Lasso</span>
-                </button>
-
-                <button
-                  onClick={() => onSelectTool('select-wand')}
-                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
-                    currentTool === 'select-wand'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <Wand2 className="w-3.5 h-3.5" />
-                  <span>Wand</span>
-                </button>
-
-                <button
-                  onClick={() => onSelectTool('select-pen')}
-                  className={`py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
-                    currentTool === 'select-pen'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <PenTool className="w-3.5 h-3.5" />
-                  <span>Sel Pen</span>
-                </button>
-
-                <button
-                  onClick={() => onSelectTool('select-eraser')}
-                  className={`col-span-2 py-1.5 px-2 rounded text-xs text-center transition-colors cursor-pointer flex items-center justify-center space-x-1 ${
-                    currentTool === 'select-eraser'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <Eraser className="w-3.5 h-3.5" />
-                  <span>Selection Eraser</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Magic Wand Specific Settings */}
-            {currentTool === 'select-wand' && (
-              <div className="space-y-3 pt-2 border-t border-[#26282c]">
-                <div>
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="text-[#aaaaaa]">Tolerance:</span>
-                    <span className="text-white font-mono">{activeWand.tolerance}</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="255"
-                    value={activeWand.tolerance}
-                    onChange={(e) => onUpdateWandSettings?.({ tolerance: Number(e.target.value) })}
-                    className="w-full accent-cyan-400"
-                  />
-                </div>
-
-                <div className="flex items-center justify-between text-xs py-1">
-                  <span className="text-[#cccccc]">Contiguous</span>
-                  <input
-                    type="checkbox"
-                    checked={activeWand.contiguous}
-                    onChange={(e) => onUpdateWandSettings?.({ contiguous: e.target.checked })}
-                    className="accent-cyan-400 rounded cursor-pointer"
-                  />
-                </div>
-
-                <div className="flex items-center justify-between text-xs py-1">
-                  <span className="text-[#cccccc]">Anti-Aliasing</span>
-                  <input
-                    type="checkbox"
-                    checked={activeWand.antiAlias}
-                    onChange={(e) => onUpdateWandSettings?.({ antiAlias: e.target.checked })}
-                    className="accent-cyan-400 rounded cursor-pointer"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <span className="text-[11px] text-[#aaaaaa] block">Reference Source:</span>
-                  <div className="grid grid-cols-3 gap-1">
-                    {(['active', 'all', 'reference'] as const).map((mode) => (
-                      <button
-                        key={mode}
-                        onClick={() => onUpdateWandSettings?.({ referMode: mode })}
-                        className={`py-1 px-1.5 rounded text-[11px] text-center capitalize cursor-pointer transition-colors ${
-                          activeWand.referMode === mode
-                            ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium'
-                            : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white'
-                        }`}
-                      >
-                        {mode === 'active' ? 'Active' : mode === 'all' ? 'All' : 'Ref Layer'}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Selection Pen / Eraser Size */}
-            {(currentTool === 'select-pen' || currentTool === 'select-eraser') && (
-              <div className="space-y-3 pt-2 border-t border-[#26282c]">
-                <div>
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="text-[#aaaaaa]">Pen Size:</span>
-                    <span className="text-white font-mono">{Math.round(brushSettings.size)} px</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="1"
-                    max="300"
-                    value={brushSettings.size}
-                    onChange={(e) => onUpdateBrushSettings({ size: Number(e.target.value) })}
-                    className="w-full accent-cyan-400"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between text-xs mb-1">
-                    <span className="text-[#aaaaaa]">Stabilization:</span>
-                    <span className="text-white font-mono">{brushSettings.stabilization ?? 10}</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="50"
-                    value={brushSettings.stabilization ?? 10}
-                    onChange={(e) => onUpdateBrushSettings({ stabilization: Number(e.target.value) })}
-                    className="w-full accent-cyan-400"
-                  />
-                </div>
-              </div>
-            )}
-
-            {/* Selection Boundary Modifiers & Actions */}
-            <div className="space-y-1.5 pt-2 border-t border-[#26282c]">
-              <label className="text-[11px] font-medium text-[#aaaaaa] block mb-1">Boundary Modifiers:</label>
-              <div className="grid grid-cols-3 gap-1">
-                <button
-                  onClick={() => onExpandSelection?.(5)}
-                  title="Expand Selection by 5px"
-                  className="py-1.5 px-1 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-[11px] transition-colors flex items-center justify-center space-x-1 cursor-pointer border border-[#2f323a]"
-                >
-                  <Maximize2 className="w-3 h-3 text-cyan-400" />
-                  <span>Expand</span>
-                </button>
-
-                <button
-                  onClick={() => onContractSelection?.(5)}
-                  title="Contract Selection by 5px"
-                  className="py-1.5 px-1 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-[11px] transition-colors flex items-center justify-center space-x-1 cursor-pointer border border-[#2f323a]"
-                >
-                  <Minimize2 className="w-3 h-3 text-cyan-400" />
-                  <span>Contract</span>
-                </button>
-
-                <button
-                  onClick={() => onFeatherSelection?.(5)}
-                  title="Feather Selection (5px)"
-                  className="py-1.5 px-1 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-[11px] transition-colors flex items-center justify-center space-x-1 cursor-pointer border border-[#2f323a]"
-                >
-                  <Feather className="w-3 h-3 text-cyan-400" />
-                  <span>Feather</span>
-                </button>
-              </div>
-
-              <button
-                onClick={onInvertSelection}
-                className="w-full py-1.5 px-2 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-xs transition-colors flex items-center justify-center space-x-1.5 cursor-pointer border border-[#2f323a]"
-              >
-                <RotateCcw className="w-3.5 h-3.5 text-amber-400" />
-                <span>Invert Selection (Ctrl+Shift+I)</span>
-              </button>
-
-              <button
-                onClick={onTransformSelection}
-                className="w-full py-1.5 px-2 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-xs transition-colors flex items-center justify-center space-x-1.5 cursor-pointer border border-[#2f323a]"
-              >
-                <Scaling className="w-3.5 h-3.5 text-emerald-400" />
-                <span>Transform Selection (Ctrl+T)</span>
-              </button>
-
-              <button
-                onClick={onDeselect}
-                className="w-full py-1.5 px-2 bg-[#202226] hover:bg-[#282a2e] text-[#cccccc] hover:text-white rounded text-xs transition-colors flex items-center justify-center space-x-1.5 cursor-pointer border border-[#2f323a]"
-              >
-                <X className="w-3.5 h-3.5 text-red-400" />
-                <span>Deselect (Ctrl+D)</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (currentTool === 'transform') {
-      return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          <div className="h-9 px-3 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-2">
-              <Scaling className="w-4 h-4 text-cyan-400" />
-              <span className="text-xs font-semibold text-white">Free Transform (Ctrl+T)</span>
-            </div>
-            <button onClick={onToggleHidden} className="p-1 text-[#828690] hover:text-rose-400 rounded cursor-pointer">
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          <div className="p-3 space-y-4">
-            <div className="space-y-1.5">
-              <span className="text-[11px] text-[#777777] block">Keyboard Shortcuts:</span>
-              <div className="text-[11px] text-[#aaaaaa] space-y-0.5 font-mono">
-                <div>• Enter: Apply transform</div>
-                <div>• Esc: Cancel transform</div>
-                <div>• Shift + Drag: Lock aspect ratio</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (currentTool === 'liquify') {
-      const activeMode = liquifySettings?.mode ?? 'push';
-      const size = liquifySettings?.size ?? 80;
-      const strength = liquifySettings?.strength ?? 50;
-      const hardness = liquifySettings?.hardness ?? 50;
-      const usePressure = liquifySettings?.usePressure ?? true;
-
-      const LIQUIFY_SUB_TOOLS: Array<{
-        id: LiquifyMode;
-        name: string;
-        desc: string;
-        badge: string;
-        icon: React.ReactNode;
-      }> = [
-        { id: 'push', name: 'Push', desc: 'Distort along stroke direction', badge: 'Move', icon: <Move className="w-3.5 h-3.5" /> },
-        { id: 'expand', name: 'Expand', desc: 'Inflate outwards radially', badge: 'Bloat', icon: <Maximize2 className="w-3.5 h-3.5" /> },
-        { id: 'pinch', name: 'Pinch', desc: 'Deflate inwards radially', badge: 'Shrink', icon: <Minimize2 className="w-3.5 h-3.5" /> },
-        { id: 'push-left', name: 'Push Left', desc: 'Displace left of stroke', badge: 'Left', icon: <CornerUpLeft className="w-3.5 h-3.5" /> },
-        { id: 'push-right', name: 'Push Right', desc: 'Displace right of stroke', badge: 'Right', icon: <CornerUpRight className="w-3.5 h-3.5" /> },
-        { id: 'twirl-cw', name: 'Twirl Clockwise', desc: 'Rotate pixels clockwise', badge: 'CW', icon: <RotateCw className="w-3.5 h-3.5" /> },
-        { id: 'twirl-ccw', name: 'Twirl Counterclockwise', desc: 'Rotate pixels counter-clockwise', badge: 'CCW', icon: <RotateCcw className="w-3.5 h-3.5" /> },
-        { id: 'reconstruct', name: 'Reconstruct', desc: 'Restore towards original image', badge: 'Restore', icon: <Undo2 className="w-3.5 h-3.5" /> },
-      ];
-
-      return (
-        <div className="flex-1 flex flex-col overflow-y-auto">
-          {/* Header */}
-          <div className="h-8 px-2.5 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-            <div className="flex items-center space-x-1.5">
-              <LiquifyIcon className="w-4 h-4 text-cyan-400" />
-              <span className="text-xs font-semibold tracking-tight text-white">Sub Tool [Liquify]</span>
-            </div>
+        <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
+          <div className="text-[11px] font-medium text-[#e5e5e5]">Text</div>
+          <select
+            value={textSettings?.fontFamily}
+            onChange={(e) => onUpdateTextSettings?.({ fontFamily: e.target.value })}
+            className="w-full px-2 py-1 text-[11px]"
+          >
+            <option value="'Neucha', 'Anime Ace', 'Comic Sans MS', sans-serif">Manga / Anime</option>
+            <option value="'Anime Ace', 'Comic Sans MS', sans-serif">Anime Ace</option>
+            <option value="Arial, sans-serif">Arial</option>
+            <option value="Impact, sans-serif">Impact</option>
+            <option value="Georgia, serif">Georgia</option>
+          </select>
+          <div className="grid grid-cols-2 gap-1 bg-[#161616] p-0.5 rounded">
             <button
-              onClick={onToggleHidden}
-              title="Hide Panel ( [ )"
-              className="p-1 text-[#828690] hover:text-rose-400 hover:bg-[#282a2e] rounded transition-colors cursor-pointer"
+              type="button"
+              onClick={() => onUpdateTextSettings?.({ writingMode: 'horizontal-tb' })}
+              className={`py-1 rounded text-[10px] cursor-pointer ${
+                textSettings?.writingMode !== 'vertical-rl'
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+              }`}
             >
-              <X className="w-3.5 h-3.5" />
+              Horiz
+            </button>
+            <button
+              type="button"
+              onClick={() => onUpdateTextSettings?.({ writingMode: 'vertical-rl' })}
+              className={`py-1 rounded text-[10px] cursor-pointer ${
+                textSettings?.writingMode === 'vertical-rl'
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+              }`}
+            >
+              Vert
             </button>
           </div>
+          <CompactSlider
+            label="Font Size"
+            valueLabel={`${textSettings?.fontSize ?? 28}px`}
+            min={12}
+            max={160}
+            value={textSettings?.fontSize ?? 28}
+            onChange={(v) => onUpdateTextSettings?.({ fontSize: v })}
+          />
+        </div>
+      );
+    }
 
-          {/* Sub Tools List (Authentic CSP Style matching screenshot) */}
-          <div className="p-2 space-y-1 border-b border-[#2b2d31]">
-            <div className="text-[10px] uppercase font-semibold tracking-wider text-[#777777] px-1 mb-1">
-              Liquify Sub Tools
-            </div>
-            {LIQUIFY_SUB_TOOLS.map((sub) => {
-              const isSelected = activeMode === sub.id;
-              return (
-                <button
-                  key={sub.id}
-                  onClick={() => onUpdateLiquifySettings?.({ mode: sub.id })}
-                  title={sub.desc}
-                  className={`w-full px-2 py-1.5 rounded flex items-center justify-between transition-colors cursor-pointer ${
-                    isSelected
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] font-medium shadow-xs'
-                      : 'bg-[#202226] text-[#aaaaaa] hover:bg-[#282a2e] hover:text-white border border-transparent'
-                  }`}
-                >
-                  <div className="flex items-center space-x-2 truncate">
-                    <LiquifyIcon className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-[#5ce1e6]' : 'text-[#888888]'}`} />
-                    <span className="text-xs truncate">{sub.name}</span>
-                  </div>
-                  <div className="flex items-center space-x-1.5 shrink-0">
-                    <span className="text-[9px] uppercase px-1 py-0.5 rounded bg-[#161719] text-[#777777] border border-[#2b2d31]">
-                      {sub.badge}
-                    </span>
-                    <span className={isSelected ? 'text-[#5ce1e6]' : 'text-[#666666]'}>
-                      {sub.icon}
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          {/* Tool Property Section */}
-          <div className="p-3 space-y-4">
-            <div className="text-[10px] uppercase font-semibold tracking-wider text-[#777777]">
-              Tool Property [Liquify]
-            </div>
-
-            {/* Size Slider */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Brush Size:</label>
-                <div className="flex items-center space-x-1">
-                  <input
-                    type="number"
-                    min={5}
-                    max={500}
-                    value={size}
-                    onChange={(e) =>
-                      onUpdateLiquifySettings?.({
-                        size: Math.max(5, Math.min(500, Number(e.target.value) || 5)),
-                      })
-                    }
-                    className="w-14 bg-[#141517] text-white text-right px-1.5 py-0.5 rounded border border-[#383a40] text-xs font-mono"
-                  />
-                  <span className="text-[10px] text-[#777777]">px</span>
-                </div>
-              </div>
-              <input
-                type="range"
-                min={5}
-                max={500}
-                value={size}
-                onChange={(e) => onUpdateLiquifySettings?.({ size: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
-              />
-              {/* Quick size chips */}
-              <div className="flex items-center gap-1 pt-0.5 overflow-x-auto no-scrollbar">
-                {[20, 50, 80, 120, 200, 350].map((sz) => (
-                  <button
-                    key={sz}
-                    onClick={() => onUpdateLiquifySettings?.({ size: sz })}
-                    className={`px-1.5 py-0.5 text-[10px] rounded font-mono transition-colors cursor-pointer ${
-                      size === sz
-                        ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                        : 'bg-[#202226] text-[#888888] hover:text-white border border-[#2e3036]'
-                    }`}
-                  >
-                    {sz}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* Strength Slider */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Strength (Intensity):</label>
-                <div className="flex items-center space-x-1">
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={strength}
-                    onChange={(e) =>
-                      onUpdateLiquifySettings?.({
-                        strength: Math.max(1, Math.min(100, Number(e.target.value) || 1)),
-                      })
-                    }
-                    className="w-14 bg-[#141517] text-white text-right px-1.5 py-0.5 rounded border border-[#383a40] text-xs font-mono"
-                  />
-                  <span className="text-[10px] text-[#777777]">%</span>
-                </div>
-              </div>
-              <input
-                type="range"
-                min={1}
-                max={100}
-                value={strength}
-                onChange={(e) => onUpdateLiquifySettings?.({ strength: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
-              />
-            </div>
-
-            {/* Hardness Slider */}
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
-                <label className="text-[11px] font-medium text-[#aaaaaa]">Hardness:</label>
-                <div className="flex items-center space-x-1">
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    value={hardness}
-                    onChange={(e) =>
-                      onUpdateLiquifySettings?.({
-                        hardness: Math.max(0, Math.min(100, Number(e.target.value) || 0)),
-                      })
-                    }
-                    className="w-14 bg-[#141517] text-white text-right px-1.5 py-0.5 rounded border border-[#383a40] text-xs font-mono"
-                  />
-                  <span className="text-[10px] text-[#777777]">%</span>
-                </div>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                value={hardness}
-                onChange={(e) => onUpdateLiquifySettings?.({ hardness: Number(e.target.value) })}
-                className="w-full accent-cyan-400"
-              />
-            </div>
-
-            {/* Pen Pressure sensitivity */}
-            <div className="pt-2 border-t border-[#26282c]">
-              <label className="flex items-center space-x-2 text-xs text-[#cccccc] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={usePressure}
-                  onChange={(e) => onUpdateLiquifySettings?.({ usePressure: e.target.checked })}
-                  className="rounded border-[#383a40] bg-[#141517] text-cyan-500 focus:ring-0"
-                />
-                <span>Pen Pressure Sensitivity</span>
-              </label>
-            </div>
-
-            {/* Reset to Defaults */}
-            <div className="pt-2">
-              <button
-                onClick={() =>
-                  onUpdateLiquifySettings?.({
-                    mode: 'push',
-                    size: 80,
-                    strength: 50,
-                    hardness: 50,
-                    usePressure: true,
-                  })
-                }
-                className="w-full py-1.5 px-2 bg-[#202226] hover:bg-[#282a2e] text-[#888888] hover:text-white rounded text-xs transition-colors flex items-center justify-center space-x-1.5 cursor-pointer border border-[#2f323a]"
-              >
-                <span>Reset to Defaults</span>
-              </button>
-            </div>
+    if (currentTool === 'frame') {
+      return (
+        <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
+          <div className="text-[11px] font-medium text-[#e5e5e5]">Frame Border</div>
+          <CompactSlider
+            label="Thickness"
+            valueLabel={`${frameSettings?.thickness ?? 4}px`}
+            min={1}
+            max={100}
+            value={frameSettings?.thickness ?? 4}
+            onChange={(v) => onUpdateFrameSettings?.({ thickness: v })}
+          />
+          <div className="grid grid-cols-2 gap-1 bg-[#161616] p-0.5 rounded">
+            <button
+              type="button"
+              onClick={() => onUpdateFrameSettings?.({ fillBackground: true })}
+              className={`py-1 rounded text-[10px] cursor-pointer ${
+                frameSettings?.fillBackground
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+              }`}
+            >
+              White
+            </button>
+            <button
+              type="button"
+              onClick={() => onUpdateFrameSettings?.({ fillBackground: false })}
+              className={`py-1 rounded text-[10px] cursor-pointer ${
+                !frameSettings?.fillBackground
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+              }`}
+            >
+              Empty
+            </button>
           </div>
         </div>
       );
     }
 
-    return null;
+    if (currentTool === 'balloon') {
+      return (
+        <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
+          <div className="text-[11px] font-medium text-[#e5e5e5]">Balloon</div>
+          <div className="space-y-0.5">
+            {(['ellipse', 'rounded-rect', 'jagged-flash', 'thought'] as const).map((shape) => (
+              <button
+                key={shape}
+                type="button"
+                onClick={() => onUpdateBalloonSettings?.({ shape })}
+                className={`w-full px-2 py-1 rounded text-left text-[11px] capitalize cursor-pointer ${
+                  balloonSettings?.shape === shape
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                }`}
+              >
+                {shape.replace('-', ' ')}
+              </button>
+            ))}
+          </div>
+          <CompactSlider
+            label="Border"
+            valueLabel={`${balloonSettings?.strokeWidth ?? 3}px`}
+            min={1}
+            max={15}
+            value={balloonSettings?.strokeWidth ?? 3}
+            onChange={(v) => onUpdateBalloonSettings?.({ strokeWidth: v })}
+          />
+        </div>
+      );
+    }
+
+    if (currentTool === 'vector-edit') {
+      const activeMode = vectorEditSettings?.mode || 'pinch';
+      return (
+        <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
+          <div className="text-[11px] font-medium text-[#e5e5e5]">Correct Line</div>
+          <div className="space-y-0.5">
+            {(['pinch', 'width', 'simplify'] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => onUpdateVectorEditSettings?.({ mode: m })}
+                className={`w-full px-2 py-1 rounded text-left text-[11px] capitalize cursor-pointer ${
+                  activeMode === m
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                }`}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+          <CompactSlider
+            label="Radius"
+            valueLabel={`${vectorEditSettings?.radius ?? 30}px`}
+            min={5}
+            max={150}
+            value={vectorEditSettings?.radius ?? 30}
+            onChange={(v) => onUpdateVectorEditSettings?.({ radius: v })}
+          />
+          {activeMode === 'pinch' && (
+            <CompactSlider
+              label="Pinch Level"
+              valueLabel={`${Math.round((vectorEditSettings?.pinchStrength ?? 0.65) * 100)}%`}
+              min={10}
+              max={100}
+              value={Math.round((vectorEditSettings?.pinchStrength ?? 0.65) * 100)}
+              onChange={(v) => onUpdateVectorEditSettings?.({ pinchStrength: v / 100 })}
+            />
+          )}
+          {activeMode === 'width' && (
+            <CompactSlider
+              label="Adjust Width"
+              valueLabel={`${(vectorEditSettings?.widthFactor ?? 1.2) >= 1 ? '+' : ''}${Math.round(((vectorEditSettings?.widthFactor ?? 1.2) - 1) * 100)}%`}
+              min={50}
+              max={200}
+              value={Math.round((vectorEditSettings?.widthFactor ?? 1.2) * 100)}
+              onChange={(v) => onUpdateVectorEditSettings?.({ widthFactor: v / 100 })}
+            />
+          )}
+          {activeMode === 'simplify' && (
+            <CompactSlider
+              label="Simplify"
+              valueLabel={`${(vectorEditSettings?.simplifyTolerance ?? 2.0).toFixed(1)}px`}
+              min={0.5}
+              max={12}
+              step={0.5}
+              value={vectorEditSettings?.simplifyTolerance ?? 2.0}
+              onChange={(v) => onUpdateVectorEditSettings?.({ simplifyTolerance: v })}
+            />
+          )}
+          {onOpenMangaEffects && (
+            <button
+              type="button"
+              onClick={onOpenMangaEffects}
+              className="w-full py-1.5 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#e5e5e5] cursor-pointer"
+            >
+              Effect Lines...
+            </button>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div className="p-2.5 text-[11px] text-[#8a8a8a]">
+        <div className="text-[#e5e5e5] font-medium capitalize mb-1">{currentTool}</div>
+        <p className="leading-relaxed">Click or drag directly on the canvas.</p>
+      </div>
+    );
   };
 
+  const visibleBuiltinBrushes = BUILTIN_BRUSHES.filter((b) => {
+    if (selectedCategory === 'all') return true;
+    if (selectedCategory === 'csp') return false;
+    return b.category === selectedCategory;
+  });
+
+  const showCspBrushes = selectedCategory === 'all' || selectedCategory === 'csp';
+  const currentAntiAlias = brushSettings.antiAlias ?? 2;
+
   return (
-    <div className="flex h-full select-none z-10 shrink-0">
-      {/* 1. Far Left Tool Strip */}
-      <aside className="w-12 bg-[#1b1c1e] border-r border-[#2b2d31] flex flex-col items-center py-2 z-20 shrink-0">
-        <div className="flex flex-col items-center space-y-1 w-full px-1">
-          {/* Brush (B) */}
-          <button
-            onClick={() => {
-              onSelectTool('brush');
-              if (isHidden) onToggleHidden();
-            }}
-            title="Brush Tool (B)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'brush'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Paintbrush className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Brush (B)
-            </div>
-          </button>
-
-          {/* Eraser (E) */}
-          <button
-            onClick={() => onSelectTool('eraser')}
-            title="Eraser Tool (E)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'eraser'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Eraser className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Eraser (E)
-            </div>
-          </button>
-
-          {/* Pipette / Eyedropper (I / Hold Alt) */}
-          <button
-            onClick={() => onSelectTool('pipette')}
-            title="Pipette / Eyedropper (I / Hold Alt)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'pipette'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Pipette className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Pipette (I / Hold Alt)
-            </div>
-          </button>
-
-          {/* Liquify Tool (J) */}
-          <button
-            onClick={() => {
-              onSelectTool('liquify');
-              if (isHidden) onToggleHidden();
-            }}
-            title="Liquify Tool (J)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'liquify'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <LiquifyIcon className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Liquify (J)
-            </div>
-          </button>
-
-          <div className="w-5 h-px bg-[#2b2d31] my-0.5" />
-
-          {/* Transform (Ctrl+T) */}
-          <button
-            onClick={() => {
-              onSelectTool('transform');
-              onTransformSelection?.();
-            }}
-            title="Free Transform (Ctrl+T)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'transform'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Scaling className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Transform (Ctrl+T)
-            </div>
-          </button>
-
-          {/* Rectangular Marquee (M) */}
-          <button
-            onClick={() => onSelectTool('select-rect')}
-            title="Rectangular Marquee (M)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'select-rect'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <BoxSelect className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Rect Marquee (M)
-            </div>
-          </button>
-
-          {/* Lasso Selection (L) */}
-          <button
-            onClick={() => onSelectTool('select-lasso')}
-            title="Lasso Selection (L)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'select-lasso'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Lasso className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Lasso Tool (L)
-            </div>
-          </button>
-
-          {/* Magic Wand (W) */}
-          <button
-            onClick={() => onSelectTool('select-wand')}
-            title="Magic Wand (W)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'select-wand'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Wand2 className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Magic Wand (W)
-            </div>
-          </button>
-
-          {/* Selection Pen */}
-          <button
-            onClick={() => onSelectTool('select-pen')}
-            title="Selection Pen"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'select-pen'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <PenTool className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Selection Pen
-            </div>
-          </button>
-
-          {/* Selection Eraser */}
-          <button
-            onClick={() => onSelectTool('select-eraser')}
-            title="Selection Eraser"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'select-eraser'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Eraser className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Selection Eraser
-            </div>
-          </button>
-
-          <div className="w-5 h-px bg-[#2b2d31] my-0.5" />
-
-          {/* Fill Tool (G) */}
-          <button
-            onClick={() => onSelectTool('fill')}
-            title="Fill Tool (G)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'fill'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <PaintBucket className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Fill Tool (G)
-            </div>
-          </button>
-
-          {/* Text Tool (T) */}
-          <button
-            onClick={() => onSelectTool('text')}
-            title="Text Tool (T)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'text'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Type className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Text Tool (T)
-            </div>
-          </button>
-
-          {/* Frame Border Tool (F) */}
-          <button
-            onClick={() => onSelectTool('frame')}
-            title="Frame Border Tool (F)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'frame'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Frame className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Frame Border (F)
-            </div>
-          </button>
-
-          {/* Speech Balloon Tool (B) */}
-          <button
-            onClick={() => onSelectTool('balloon')}
-            title="Speech Balloon Tool"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'balloon'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <MessageSquare className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Speech Balloon
-            </div>
-          </button>
-
-          {/* Correct Line (Vector Edit) Tool (Y) */}
-          <button
-            onClick={() => onSelectTool('vector-edit')}
-            title="Correct Line (Vector Pinch/Width/Simplify)"
-            className={`w-9 h-9 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
-              currentTool === 'vector-edit'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                : 'text-[#8c9099] hover:text-[#d0d3d9] hover:bg-[#25272a]'
-            }`}
-          >
-            <Spline className="w-4 h-4" />
-            <div className="absolute left-11 bg-[#18191b] text-[#cccccc] text-xs px-2 py-1 rounded border border-[#33353b] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50 shadow-md">
-              Correct Line (Vector)
-            </div>
-          </button>
+    <div className="flex h-full select-none z-10 shrink-0 gap-px bg-[#161616]">
+      {/* 1. Narrow 44px Tool Strip */}
+      <aside className="w-[44px] bg-[#202020] flex flex-col items-center py-1.5 z-20 shrink-0">
+        <div className="flex flex-col items-center gap-0.5 w-full px-1">
+          {toolItems.map((item) => {
+            const isActive = currentTool === item.id;
+            return (
+              <React.Fragment key={item.id}>
+                <button
+                  type="button"
+                  onClick={() => (item.onClick ? item.onClick() : onSelectTool(item.id))}
+                  title={item.label}
+                  className={`relative w-8 h-7 rounded flex items-center justify-center transition-colors cursor-pointer ${
+                    isActive
+                      ? 'bg-[#2c2c2c] text-[var(--accent)]'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                  }`}
+                >
+                  {isActive && (
+                    <span
+                      className="absolute left-0 top-1.5 bottom-1.5 w-[2px] rounded-full"
+                      style={{ backgroundColor: 'var(--accent)' }}
+                    />
+                  )}
+                  {item.icon}
+                </button>
+                {item.dividerAfter && <div className="w-4 h-px bg-[#2c2c2c] my-1" />}
+              </React.Fragment>
+            );
+          })}
         </div>
 
-        {/* Bottom Swatches, Swap Button, and Hide/Show Button */}
-        <div className="mt-auto flex flex-col items-center space-y-1.5 pb-2 w-full pt-2 border-t border-[#26282c]">
-          {/* Overlapping Primary / Secondary Color Swatches */}
-          <div className="relative w-8 h-8">
-            {/* Secondary Color Swatch (bottom-right) */}
+        {/* Bottom Color Swatches & Collapse Toggle */}
+        <div className="mt-auto flex flex-col items-center gap-1.5 pt-2 pb-1 w-full">
+          <div className="relative w-6 h-6">
             <div
               onClick={onSwapColors}
-              title={`Secondary Color: ${secondaryColor} (Click or press X to swap)`}
-              className="absolute bottom-0 right-0 w-5 h-5 rounded-[1px] border border-[#44464c] cursor-pointer hover:border-white shadow-xs z-0"
+              title={`Secondary: ${secondaryColor} (X to swap, D to reset)`}
+              className="absolute bottom-0 right-0 w-4 h-4 rounded-sm cursor-pointer shadow-[0_0_0_1px_rgba(255,255,255,0.18)]"
               style={{ backgroundColor: secondaryColor }}
             />
-
-            {/* Primary Color Swatch (top-left) */}
             <div
               onClick={() => {
-                if (isTransparentColor) {
-                  onToggleTransparentColor?.();
-                } else {
-                  onSwapColors();
-                }
+                if (isTransparentColor) onToggleTransparentColor?.();
+                else onSwapColors();
               }}
-              title={`Primary Active Color: ${primaryColor} (Click to select/swap)`}
-              className={`absolute top-0 left-0 w-5 h-5 rounded-[1px] cursor-pointer shadow-md z-10 transition-all ${
+              title={`Primary: ${primaryColor}`}
+              className={`absolute top-0 left-0 w-4 h-4 rounded-sm cursor-pointer z-10 ${
                 !isTransparentColor
-                  ? 'border border-white ring-1 ring-white/40'
-                  : 'border border-[#44464c] hover:border-white opacity-80'
+                  ? 'shadow-[0_0_0_1.5px_var(--accent)]'
+                  : 'opacity-70 shadow-[0_0_0_1px_rgba(255,255,255,0.2)]'
               }`}
               style={{ backgroundColor: primaryColor }}
             />
           </div>
 
-          {/* Transparent Color Swatch (Clip Studio Paint style 'C' key toggle) */}
           <div
             onClick={onToggleTransparentColor}
-            title="Transparent Ink / Color (C) - Brush as textured eraser"
-            className={`w-7 h-3 rounded-[1px] border cursor-pointer relative overflow-hidden transition-all ${
-              isTransparentColor
-                ? 'border-[#38bdf8] ring-1 ring-[#38bdf8] shadow-xs scale-105'
-                : 'border-[#44464c] hover:border-white opacity-80 hover:opacity-100'
+            title="Transparent Ink (C)"
+            className={`w-6 h-2.5 rounded-xs cursor-pointer transition-all ${
+              isTransparentColor ? 'shadow-[0_0_0_1.5px_var(--accent)]' : 'opacity-65 hover:opacity-100'
             }`}
             style={{
-              backgroundImage:
-                'linear-gradient(45deg, #777 25%, transparent 25%), linear-gradient(-45deg, #777 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #777 75%), linear-gradient(-45deg, transparent 75%, #777 75%)',
+              backgroundImage: 'repeating-conic-gradient(#777 0% 25%, #ccc 0% 50%)',
               backgroundSize: '4px 4px',
-              backgroundPosition: '0 0, 0 2px, 2px -2px, -2px 0px',
-              backgroundColor: '#bbb',
             }}
           />
 
-          {/* Swap Shortcut Button (X) */}
           <button
+            type="button"
             onClick={onSwapColors}
             title="Swap Colors (X)"
-            className="p-1 text-[#8c9099] hover:text-[#e0e0e0] hover:bg-[#282a2d] rounded transition-colors cursor-pointer"
+            className="w-7 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
             <ArrowLeftRight className="w-3 h-3" />
           </button>
 
-          {/* Panel Visibility Toggle Button */}
           <button
+            type="button"
             onClick={onToggleHidden}
-            title={isHidden ? 'Show Brush Settings ( [ )' : 'Hide Brush Settings ( [ )'}
-            className="p-1.5 text-[#8c9099] hover:text-[#5ce1e6] hover:bg-[#282a2d] rounded transition-colors cursor-pointer"
+            title={isHidden ? 'Show Panel (Shift+Tab)' : 'Hide Panel (Shift+Tab)'}
+            className="w-7 h-7 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
-            {isHidden ? <PanelLeftOpen className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
+            {isHidden ? <PanelLeftOpen className="w-3.5 h-3.5" /> : <PanelLeftClose className="w-3.5 h-3.5" />}
           </button>
         </div>
       </aside>
 
-      {/* 2. Tool Settings & Brushes Panel (Collapsible & Resizable) */}
+      {/* 2. CSP Sub-Tool List + Sub-Tool Detail Inspector */}
       {!isHidden && (
         <aside
           style={{ width }}
-          className="relative bg-[#1e2023] border-r border-[#2b2d31] flex flex-col text-[#cccccc] text-xs shrink-0 overflow-hidden"
+          className="relative bg-[#202020] flex flex-col text-[#e5e5e5] text-xs shrink-0 overflow-hidden"
         >
           {isBrushOrEraser ? (
             <>
-              {/* TOP SECTION: Brushes List */}
-              <div
-                style={{ height: topHeight }}
-                className="flex flex-col shrink-0 overflow-hidden border-b border-[#2b2d31]"
-              >
-            {/* Top Section Header: Sub Tool [Tool] with view toggle & hide button */}
-            <div className="h-8 px-2.5 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-              <span className="text-xs font-semibold tracking-tight text-white truncate max-w-[150px]" title={`Sub Tool [${activeToolLabel}]`}>
-                Sub Tool [{activeToolLabel}]
-              </span>
+              {/* Category Filter Strip + Import .sut */}
+              <div className="px-1.5 py-1.5 flex items-center gap-1 shrink-0">
+                <select
+                  value={selectedCategory}
+                  onChange={(e) => setSelectedCategory(e.target.value as 'all' | BrushCategory | 'csp')}
+                  aria-label="Brush Category"
+                  className="flex-1 min-w-0 h-5 bg-[#161616] text-[#e5e5e5] text-[11px] px-1.5 rounded cursor-pointer"
+                >
+                  <option value="all" className="bg-[#202020]">All Brushes</option>
+                  <option value="pencil-line" className="bg-[#202020]">Pencil &amp; Ink</option>
+                  <option value="color-paint" className="bg-[#202020]">Color &amp; Paint</option>
+                  <option value="csp" className="bg-[#202020]">CSP Imported</option>
+                </select>
 
-              <div className="flex items-center space-x-1">
-                {/* Import CSP Brush Button */}
                 <button
+                  type="button"
                   onClick={() => sutInputRef.current?.click()}
-                  title="Import Clip Studio Paint Brush (.sut)"
-                  className="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-[#202226] hover:bg-[#2a2e36] text-[#9fa3ad] hover:text-[#5ce1e6] border border-[#2f323a] text-[10px] font-medium transition-colors cursor-pointer"
+                  title="Import CSP Brush (.sut)"
+                  className="w-5 h-5 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
                 >
-                  <Plus className="w-3 h-3 text-[#5ce1e6]" />
-                  <span>Import .sut</span>
-                </button>
-
-                {/* View Mode Toggle (Preview vs Compact) */}
-                <button
-                  onClick={toggleBrushViewMode}
-                  title={brushViewMode === 'preview' ? 'Switch to Compact List View' : 'Switch to Stroke Preview View (CSP Style)'}
-                  className={`p-1 rounded transition-colors cursor-pointer ${
-                    brushViewMode === 'preview'
-                      ? 'text-[#5ce1e6] bg-[#293d45]/40 hover:bg-[#293d45]/70'
-                      : 'text-[#828690] hover:text-[#cccccc] hover:bg-[#282a2e]'
-                  }`}
-                >
-                  <LayoutList className="w-3.5 h-3.5" />
-                </button>
-
-                <button
-                  onClick={onToggleHidden}
-                  title="Hide Panel ( [ )"
-                  className="p-1 text-[#828690] hover:text-rose-400 hover:bg-[#282a2e] rounded transition-colors cursor-pointer"
-                >
-                  <X className="w-3.5 h-3.5" />
+                  <Plus className="w-3 h-3" />
                 </button>
               </div>
-            </div>
 
-            <input
-              type="file"
-              ref={sutInputRef}
-              accept=".sut"
-              className="hidden"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) {
-                  handleImportSut(file);
-                }
-                e.target.value = '';
-              }}
-            />
-
-            {/* Category Filter Tabs */}
-            <div className="px-2 pt-1 pb-1 flex items-center space-x-1 border-b border-[#25272c] overflow-x-auto no-scrollbar shrink-0 bg-[#161719]">
-              {[
-                { id: 'all', label: 'All' },
-                { id: 'pencil-line', label: 'Pencil & Line' },
-                { id: 'color-paint', label: 'Color & Paint' },
-                { id: 'csp', label: `CSP${customBrushes.length > 0 ? ` (${customBrushes.length})` : ''}` },
-              ].map((tab) => {
-                const isActive = selectedCategory === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    onClick={() => setSelectedCategory(tab.id as any)}
-                    className={`px-2 py-0.5 rounded text-[10px] font-medium transition-all whitespace-nowrap cursor-pointer ${
-                      isActive
-                        ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                        : 'text-[#828690] hover:text-[#d0d3d9] hover:bg-[#202226] border border-transparent'
-                    }`}
-                  >
-                    {tab.label}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Brushes List: Built-in Categories (Pencil & Line, Color & Paint) + Imported CSP Brushes */}
-            <div
-              onDragOver={(e) => {
-                if (e.dataTransfer.types.includes('Files')) {
-                  e.preventDefault();
-                  setIsDraggingFileOver(true);
-                }
-              }}
-              onDragLeave={() => setIsDraggingFileOver(false)}
-              onDrop={(e) => {
-                e.preventDefault();
-                setIsDraggingFileOver(false);
-                const files = Array.from(e.dataTransfer.files).filter((f) =>
-                  f.name.toLowerCase().endsWith('.sut')
-                );
-                if (files.length > 0) {
-                  for (const f of files) {
-                    handleImportSut(f);
-                  }
-                }
-              }}
-              className={`flex-1 overflow-y-auto p-2 space-y-1.5 relative ${
-                isDraggingFileOver ? 'ring-2 ring-inset ring-[#5ce1e6] bg-[#5ce1e6]/5' : ''
-              }`}
-            >
-              {/* Drag overlay indicator */}
-              {isDraggingFileOver && (
-                <div className="absolute inset-0 bg-[#161d22]/95 border-2 border-dashed border-[#5ce1e6] rounded z-30 flex flex-col items-center justify-center p-3 text-center pointer-events-none">
-                  <FolderDown className="w-6 h-6 text-[#5ce1e6] mb-1 animate-bounce" />
-                  <span className="text-xs font-semibold text-white">Drop .sut brush file</span>
-                  <span className="text-[10px] text-[#5ce1e6]">Import to Ink Studio</span>
-                </div>
-              )}
-
-              {/* Importing progress notice */}
-              {isImportingSut && (
-                <div className="p-2 rounded bg-[#1e2329] border border-[#37444d] text-center text-xs text-[#5ce1e6] flex items-center justify-center space-x-1.5 animate-pulse">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  <span>{importStatus || 'Importing Clip Studio Paint Brush...'}</span>
-                </div>
-              )}
-
-              {/* Category: Pencil & Line */}
-              {(selectedCategory === 'all' || selectedCategory === 'pencil-line') && (
-                <div className="space-y-1.5">
-                  {selectedCategory === 'all' && (
-                    <div className="pt-0.5 pb-0.5 px-1 flex items-center justify-between">
-                      <span className="text-[10px] font-semibold uppercase tracking-wider text-[#757a87]">
-                        Pencil & Line
-                      </span>
-                    </div>
-                  )}
-                  {BUILTIN_BRUSHES.filter((b) => b.category === 'pencil-line').map((item) => {
-                    const isSelected =
-                      currentTool === 'brush' &&
-                      (brushSettings.preset === item.id || (!brushSettings.preset && item.id === 'pencil-2b'));
-
-                    return (
-                      <div
-                        key={item.id}
-                        onClick={() => handleSelectBrushPreset(item.id)}
-                        title={`${item.name} - ${item.desc}`}
-                        className={`rounded cursor-pointer transition-colors border ${
-                          isSelected
-                            ? 'bg-[#293d45] text-white border-[#3e5e6b] shadow-xs'
-                            : 'bg-[#1b1c1f]/60 hover:bg-[#232529] text-[#9fa3ad] hover:text-white border-[#27292e]/60 hover:border-[#34373e]'
-                        } ${brushViewMode === 'preview' ? 'p-1.5' : 'px-2 py-1.5'}`}
-                      >
-                        <div className="flex items-center space-x-1.5 min-w-0">
-                          {item.icon === 'pencil' ? (
-                            <Pencil
-                              className={`w-3.5 h-3.5 shrink-0 ${
-                                isSelected ? 'text-amber-400' : 'text-[#8c9099]'
-                              }`}
-                            />
-                          ) : (
-                            <Paintbrush
-                              className={`w-3.5 h-3.5 shrink-0 ${
-                                isSelected ? 'text-[#5ce1e6]' : 'text-[#8c9099]'
-                              }`}
-                            />
-                          )}
-                          <div className="min-w-0">
-                            <span className="font-medium text-xs block truncate leading-tight">
-                              {item.name}
-                            </span>
-                            {brushViewMode === 'compact' && (
-                              <span className="text-[10px] text-[#717682] block truncate leading-tight">
-                                {item.desc}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-
-                        {brushViewMode === 'preview' && (
-                          <div
-                            className={`mt-1.5 w-full h-7 rounded-[3px] overflow-hidden flex items-center justify-center transition-colors ${
-                              isSelected
-                                ? 'bg-[#18262b] border border-[#3e5e6b]/40'
-                                : 'bg-[#141517] border border-[#24262b]'
-                            }`}
-                            title={`${item.name} stroke preview`}
-                          >
-                            <BrushPreview
-                              preset={item.id}
-                              strokeColor="#ffffff"
-                              height={28}
-                            />
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Category: Color & Paint (Soft Airbrush, Square Color Brush) */}
-              {(selectedCategory === 'all' || selectedCategory === 'color-paint') && (
-                <div className={`space-y-1.5 ${selectedCategory === 'all' ? 'pt-2' : ''}`}>
-                  {selectedCategory === 'all' && (
-                    <div className="pt-1 pb-0.5 px-1 flex items-center justify-between border-t border-[#26282c]">
-                      <span className="text-[10px] font-semibold uppercase tracking-wider text-[#757a87]">
-                        Color & Paint
-                      </span>
-                    </div>
-                  )}
-                  {BUILTIN_BRUSHES.filter((b) => b.category === 'color-paint').map((item) => {
-                    const isSelected =
-                      currentTool === 'brush' && brushSettings.preset === item.id;
-
-                    return (
-                      <div
-                        key={item.id}
-                        onClick={() => handleSelectBrushPreset(item.id)}
-                        className={`rounded cursor-pointer transition-colors border ${
-                          isSelected
-                            ? 'bg-[#293d45] text-white border-[#3e5e6b] shadow-xs'
-                            : 'bg-[#1b1c1f]/60 hover:bg-[#232529] text-[#9fa3ad] hover:text-white border-[#27292e]/60 hover:border-[#34373e]'
-                        } ${brushViewMode === 'preview' ? 'p-1.5' : 'px-2.5 py-1.5'}`}
-                      >
-                        <div className="flex items-center justify-between min-w-0">
-                          <div className="flex items-center space-x-1.5 min-w-0">
-                            {item.icon === 'palette' ? (
-                              <Palette
-                                className={`w-3.5 h-3.5 shrink-0 ${
-                                  isSelected ? 'text-emerald-400' : 'text-[#8c9099]'
-                                }`}
-                              />
-                            ) : item.icon === 'square' ? (
-                              <Square
-                                className={`w-3.5 h-3.5 shrink-0 ${
-                                  isSelected ? 'text-teal-400' : 'text-[#8c9099]'
-                                }`}
-                              />
-                            ) : (
-                              <Paintbrush
-                                className={`w-3.5 h-3.5 shrink-0 ${
-                                  isSelected ? 'text-[#5ce1e6]' : 'text-[#8c9099]'
-                                }`}
-                              />
-                            )}
-                            <div className="min-w-0">
-                              <span className="font-medium text-xs block truncate leading-tight">
-                                {item.name}
-                              </span>
-                              {brushViewMode === 'compact' && (
-                                <span className="text-[10px] text-[#717682] block truncate leading-tight">
-                                  {item.desc}
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-
-                        {brushViewMode === 'preview' && (
-                          <div
-                            className={`mt-1.5 w-full h-7 rounded-[3px] overflow-hidden flex items-center justify-center transition-colors ${
-                              isSelected
-                                ? 'bg-[#18262b] border border-[#3e5e6b]/40'
-                                : 'bg-[#141517] border border-[#24262b]'
-                            }`}
-                            title={`${item.name} stroke preview`}
-                          >
-                            <BrushPreview
-                              preset={item.id}
-                              strokeColor="#ffffff"
-                              height={28}
-                            />
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Category: Clip Studio Paint Imported Brushes */}
-              {(selectedCategory === 'all' || selectedCategory === 'csp') && (
-                <>
-                  {customBrushes.length > 0 ? (
-                    <div className={`space-y-1.5 ${selectedCategory === 'all' ? 'pt-2' : ''}`}>
-                      {selectedCategory === 'all' && (
-                        <div className="pt-1 pb-0.5 px-1 flex items-center justify-between border-t border-[#26282c]">
-                          <span className="text-[10px] font-semibold uppercase tracking-wider text-[#757a87]">
-                            Clip Studio Paint ({customBrushes.length})
-                          </span>
-                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-[#5ce1e6]/10 text-[#5ce1e6] font-mono">
-                            SUT
-                          </span>
-                        </div>
-                      )}
-
-                      {customBrushes.map((brush) => {
-                        const isSelected = currentTool === 'brush' && brushSettings.preset === brush.id;
-                        const tipImg = brush.tipDataUrl
-                          ? getPreloadedTipImage(brush.tipDataUrl) || undefined
-                          : undefined;
-
-                        return (
-                          <div
-                            key={brush.id}
-                            onClick={() => handleSelectCustomBrush(brush)}
-                            className={`rounded cursor-pointer transition-colors border group relative ${
-                              isSelected
-                                ? 'bg-[#293d45] text-white border-[#3e5e6b] shadow-xs'
-                                : 'bg-[#1b1c1f]/60 hover:bg-[#232529] text-[#9fa3ad] hover:text-white border-[#27292e]/60 hover:border-[#34373e]'
-                            } ${brushViewMode === 'preview' ? 'p-1.5' : 'px-2.5 py-1.5'}`}
-                          >
-                            <div className="flex items-center justify-between min-w-0">
-                              <div className="flex items-center space-x-1.5 min-w-0">
-                                {brush.tipDataUrl ? (
-                                  <div className="w-4 h-4 rounded-[2px] bg-[#121315] border border-[#2b2d31] flex items-center justify-center overflow-hidden shrink-0">
-                                    <img
-                                      src={brush.tipDataUrl}
-                                      alt=""
-                                      className="w-full h-full object-contain brightness-125"
-                                    />
-                                  </div>
-                                ) : (
-                                  <Sparkles
-                                    className={`w-3.5 h-3.5 shrink-0 ${
-                                      isSelected ? 'text-[#5ce1e6]' : 'text-[#8c9099]'
-                                    }`}
-                                  />
-                                )}
-                                <div className="min-w-0">
-                                  <span className="font-medium text-xs block truncate leading-tight">
-                                    {brush.name}
-                                  </span>
-                                  {brushViewMode === 'compact' && (
-                                    <span className="text-[10px] text-[#717682] block truncate leading-tight">
-                                      {brush.desc || 'Clip Studio Paint Brush'}
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-
-                              <div className="flex items-center space-x-1 shrink-0 ml-1.5">
-                                <button
-                                  onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
-                                  title="Delete brush"
-                                  className="opacity-0 group-hover:opacity-100 p-0.5 hover:text-rose-400 rounded transition-opacity"
-                                >
-                                  <Trash2 className="w-3 h-3" />
-                                </button>
-                              </div>
-                            </div>
-
-                            {/* Authentic CSP S-Curve Stroke Preview */}
-                            {brushViewMode === 'preview' && (
-                              <div
-                                className={`mt-1.5 w-full h-7 rounded-[3px] overflow-hidden flex items-center justify-center transition-colors ${
-                                  isSelected
-                                    ? 'bg-[#18262b] border border-[#3e5e6b]/40'
-                                    : 'bg-[#141517] border border-[#24262b]'
-                                }`}
-                                title={`${brush.name} stroke preview`}
-                              >
-                                <BrushPreview
-                                  preset={brush.id}
-                                  settings={brush}
-                                  customTipImage={tipImg}
-                                  customTipAngle={brush.angle}
-                                  strokeColor="#ffffff"
-                                  height={28}
-                                />
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : selectedCategory === 'csp' ? (
-                    <div className="text-center py-6 px-3 border border-dashed border-[#2d3036] rounded-lg my-2">
-                      <FolderDown className="w-6 h-6 text-[#5ce1e6]/60 mx-auto mb-1.5" />
-                      <p className="text-xs font-medium text-[#cccccc]">No imported CSP brushes</p>
-                      <p className="text-[10px] text-[#717682] mt-0.5 mb-2.5">
-                        Drag & drop any Clip Studio Paint .sut file here
-                      </p>
-                      <button
-                        onClick={() => sutInputRef.current?.click()}
-                        className="inline-flex items-center space-x-1 px-2.5 py-1 rounded bg-[#202226] hover:bg-[#293d45] text-[#5ce1e6] border border-[#33363e] text-xs font-medium transition-colors cursor-pointer"
-                      >
-                        <Plus className="w-3.5 h-3.5" />
-                        <span>Select .sut File</span>
-                      </button>
-                    </div>
-                  ) : null}
-                </>
-              )}
-            </div>
-          </div>
-
-          {/* RESIZABLE HORIZONTAL DIVIDER between Brushes and Tool Settings */}
-          <div
-            onMouseDown={handleHeightResizeMouseDown}
-            title="Drag to resize height"
-            className="group relative h-1.5 w-full cursor-row-resize flex items-center justify-center shrink-0 hover:bg-[#5ce1e6]/40 transition-colors z-20"
-          >
-            <div className="w-8 h-0.5 bg-[#3a3d44] group-hover:bg-[#5ce1e6] rounded-full transition-colors" />
-          </div>
-
-          {/* BOTTOM SECTION: Tool Property & Brush Size Presets */}
-          <div className="flex-1 flex flex-col overflow-hidden">
-            {/* Sub-Palette Tabs: Tool Property vs Brush Size */}
-            <div className="h-9 px-2 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0">
-              <div className="flex items-center space-x-1">
-                <button
-                  type="button"
-                  onClick={() => handleSelectBottomTab('settings')}
-                  className={`px-2 py-0.5 rounded text-xs font-medium transition-colors cursor-pointer truncate max-w-[140px] ${
-                    bottomTab === 'settings'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                      : 'text-[#828690] hover:text-[#cccccc] hover:bg-[#202226] border border-transparent'
-                  }`}
-                  title={`Tool property [${activeToolLabel}]`}
-                >
-                  Tool property [{activeToolLabel}]
-                </button>
-                <button
-                  type="button"
-                  onClick={() => handleSelectBottomTab('size')}
-                  className={`px-2.5 py-1 rounded text-xs font-medium transition-colors flex items-center space-x-1 cursor-pointer ${
-                    bottomTab === 'size'
-                      ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b] shadow-xs'
-                      : 'text-[#828690] hover:text-[#cccccc] hover:bg-[#202226] border border-transparent'
-                  }`}
-                >
-                  <span>Brush Size</span>
-                  <span className="text-[10px] font-mono text-[#5ce1e6] bg-[#141517] px-1 rounded border border-[#2b2d31]">
-                    {brushSettings.size}
-                  </span>
-                </button>
-              </div>
-            </div>
-
-            {bottomTab === 'size' ? (
-              <BrushSizePalette
-                currentSize={brushSettings.size}
-                onSelectSize={(newSize) => handleUpdateBrushSettings({ size: newSize })}
-                activeBrushName={
-                  currentTool === 'eraser'
-                    ? 'Eraser'
-                    : brushSettings.brushName || activeCustomBrush?.name || activeBuiltinBrush?.name || activePencilConfig?.name || 'Brush'
-                }
-                tool={currentTool}
-                presetId={currentTool === 'eraser' ? ERASER_PRESET_ID : brushSettings.preset}
-                onResetSizeToDefault={() => {
-                  const def = resetBrushSettingsToDefault(currentTool === 'eraser' ? ERASER_PRESET_ID : (brushSettings.preset || 'pencil-2b'), customBrushes);
-                  if (def.size !== undefined) {
-                    handleUpdateBrushSettings({ size: def.size });
-                  }
+              <input
+                type="file"
+                ref={sutInputRef}
+                accept=".sut"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleImportSut(file);
+                  e.target.value = '';
                 }}
-                onResetAllSettings={() => {
-                  const def = resetBrushSettingsToDefault(currentTool === 'eraser' ? ERASER_PRESET_ID : (brushSettings.preset || 'pencil-2b'), customBrushes);
-                  handleUpdateBrushSettings(def);
-                }}
-                className="flex-1 overflow-y-auto"
               />
-            ) : (
-              <div className="flex-1 overflow-y-auto p-3.5 space-y-4">
-              {/* Active Tool Name Indicator */}
-              <div className="flex items-center justify-between pb-1 text-white font-medium text-xs border-b border-[#26282c]">
-                <div className="flex items-center space-x-2 min-w-0">
-                  {currentTool === 'brush' ? (
-                    isPencilActive ? (
-                      <>
-                        <Pencil className="w-4 h-4 text-amber-400 shrink-0" />
-                        <span className="truncate">{activePencilConfig?.name || 'Pencil'}</span>
-                      </>
-                    ) : isCustomBrushActive ? (
-                      <>
-                        <Sparkles className="w-4 h-4 text-[#5ce1e6] shrink-0" />
-                        <span className="truncate">
-                          {brushSettings.brushName || activeCustomBrush?.name || 'CSP Brush'}
-                        </span>
-                      </>
-                    ) : activeBuiltinBrush ? (
-                      <>
-                        {activeBuiltinBrush.icon === 'palette' ? (
-                          <Palette className="w-4 h-4 text-emerald-400 shrink-0" />
-                        ) : activeBuiltinBrush.icon === 'square' ? (
-                          <Square className="w-4 h-4 text-teal-400 shrink-0" />
-                        ) : (
-                          <Paintbrush className="w-4 h-4 text-[#5ce1e6] shrink-0" />
-                        )}
-                        <span className="truncate">{activeBuiltinBrush.name}</span>
-                      </>
-                    ) : (
-                      <>
-                        <Paintbrush className="w-4 h-4 text-[#5ce1e6] shrink-0" />
-                        <span className="truncate">Round Brush</span>
-                      </>
-                    )
-                  ) : (
-                    <>
-                      <Eraser className="w-4 h-4 text-rose-400 shrink-0" />
-                      <span>Eraser</span>
-                    </>
-                  )}
-                </div>
 
-                {currentTool === 'brush' && isPencilActive && activePencilConfig && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30 uppercase shrink-0">
-                    Grade {activePencilConfig.gradeLabel}
-                  </span>
-                )}
-                {currentTool === 'brush' && activeBuiltinBrush && !isPencilActive && (
-                  <span className={`text-[10px] px-1.5 py-0.5 rounded font-mono border uppercase shrink-0 ${activeBuiltinBrush.badgeBg} ${activeBuiltinBrush.badgeText} ${activeBuiltinBrush.badgeBorder}`}>
-                    {activeBuiltinBrush.badge}
-                  </span>
-                )}
-                {currentTool === 'brush' && isCustomBrushActive && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 uppercase shrink-0">
-                    CSP
-                  </span>
-                )}
-              </div>
-
-              {/* Brush Tip Shape Card (Custom CSP or Procedural Tip) */}
-              {brushSettings.customTipDataUrl && (
-                <div className="bg-[#141517] border border-[#292b30] rounded p-2 flex items-center space-x-2.5">
-                  <div className="w-9 h-9 rounded bg-[#0d0e10] border border-[#2b2d31] flex items-center justify-center overflow-hidden shrink-0">
-                    <img
-                      src={brushSettings.customTipDataUrl}
-                      alt="Tip Shape"
-                      className="w-full h-full object-contain filter invert contrast-200"
-                    />
+              {/* Compact High-Density Sub-Tool List */}
+              <div
+                onDragOver={(e) => {
+                  if (e.dataTransfer.types.includes('Files')) {
+                    e.preventDefault();
+                    setIsDraggingFileOver(true);
+                  }
+                }}
+                onDragLeave={() => setIsDraggingFileOver(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setIsDraggingFileOver(false);
+                  const files = Array.from(e.dataTransfer.files).filter((f) =>
+                    f.name.toLowerCase().endsWith('.sut')
+                  );
+                  for (const f of files) handleImportSut(f);
+                }}
+                className="flex-1 overflow-y-auto px-1.5 py-0.5 space-y-0.5 relative min-h-[84px]"
+              >
+                {isDraggingFileOver && (
+                  <div className="absolute inset-1 bg-[#161616]/95 rounded flex flex-col items-center justify-center p-2 text-center z-30 pointer-events-none">
+                    <FolderDown className="w-4 h-4 text-[var(--accent)] mb-1" />
+                    <span className="text-[10px] text-[#e5e5e5]">Drop .sut</span>
                   </div>
-                  <div className="min-w-0 flex-1">
-                    <span className="text-[11px] font-medium text-[#cccccc] block truncate">
-                      {activeBuiltinBrush ? 'Procedural Tip Shape' : 'Extracted Tip Mask'}
-                    </span>
-                    <span className="text-[10px] text-[#717682] block truncate">
-                      {activeBuiltinBrush
-                        ? `${activeBuiltinBrush.name} Mask`
-                        : activeCustomBrush?.tipWidth && activeCustomBrush?.tipHeight
-                        ? `${activeCustomBrush.tipWidth} × ${activeCustomBrush.tipHeight} px`
-                        : 'SUT Tip Bitmap'}
-                    </span>
+                )}
+
+                {isImportingSut && (
+                  <div className="px-2 py-1 rounded bg-[#2c2c2c] text-[10px] text-[#e5e5e5] flex items-center gap-1.5">
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    <span className="truncate">Importing...</span>
                   </div>
-                </div>
-              )}
+                )}
 
-              {/* Dynamic Live Brush Dynamics Preview Card */}
-              <div className="bg-[#141517] border border-[#292b30] rounded p-2.5 space-y-1.5 shadow-sm">
-                <div className="flex items-center justify-between text-xs text-[#8c9099]">
-                  <span className="font-medium text-[#cccccc] flex items-center space-x-1.5 text-[11px]">
-                    <Sparkles className="w-3.5 h-3.5 text-[#5ce1e6]" />
-                    <span>Live Stroke Preview</span>
-                  </span>
+                {visibleBuiltinBrushes.map((item) => {
+                  const isSelected =
+                    currentTool === 'brush' &&
+                    (brushSettings.preset === item.id || (!brushSettings.preset && item.id === 'pencil-2b'));
 
-                  <button
-                    onClick={() => setUsePrimaryColorPreview(!usePrimaryColorPreview)}
-                    title={usePrimaryColorPreview ? 'Switch to Neutral White Preview' : 'Switch to Active Color Preview'}
-                    className="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-[#1f2125] hover:bg-[#282b30] border border-[#33363d] text-[10px] text-[#a0a4ae] hover:text-white transition-colors cursor-pointer"
-                  >
-                    <span
-                      className="w-2 h-2 rounded-full inline-block border border-white/40"
-                      style={{ backgroundColor: usePrimaryColorPreview ? primaryColor : '#ffffff' }}
-                    />
-                    <span>{usePrimaryColorPreview ? 'Color' : 'White'}</span>
-                  </button>
-                </div>
-
-                {/* S-curve stroke preview canvas */}
-                <div className="w-full h-11 rounded bg-[#0d0e10] border border-[#212327] overflow-hidden flex items-center justify-center">
-                  <BrushPreview
-                    preset={brushSettings.preset}
-                    settings={brushSettings}
-                    customTipImage={brushSettings.customTipImage}
-                    customTipAngle={brushSettings.customTipAngle}
-                    tool={currentTool}
-                    strokeColor={usePrimaryColorPreview ? primaryColor : '#ffffff'}
-                    height={44}
-                    isLiveCard={true}
-                  />
-                </div>
-
-                {/* Live parameters summary */}
-                <div className="flex items-center justify-between text-[10px] text-[#6e727d] font-mono px-0.5 pt-0.5">
-                  <span>{brushSettings.size}px</span>
-                  <span>{Math.round((brushSettings.flow ?? 0.85) * 100)}% flow</span>
-                  {isPencilActive ? (
-                    <span>{Math.round((brushSettings.grain ?? 0.95) * 100)}% tooth</span>
-                  ) : (
-                    <span>{Math.round((brushSettings.hardness ?? 1.0) * 100)}% hard</span>
-                  )}
-                  <span>{Math.round((brushSettings.opacity ?? 1.0) * 100)}% op</span>
-                </div>
-              </div>
-
-              {/* 1. Size Slider */}
-              <div className="space-y-1.5">
-                <div className="flex justify-between items-center text-xs">
-                  <span className="text-[#a0a4ae] font-medium">Size</span>
-                  <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-16">
-                    {brushSettings.size} px
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min="0.5"
-                  max={isPencilActive ? 80 : 250}
-                  step={isPencilActive ? 0.5 : 1}
-                  value={brushSettings.size}
-                  onChange={(e) => handleUpdateBrushSettings({ size: Number(e.target.value) })}
-                  className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                />
-
-                {/* Quick Presets Row under Size Slider */}
-                <div className="pt-1">
-                  <div className="flex items-center justify-between mb-1">
-                    <span className="text-[10px] text-[#717682] uppercase tracking-wider font-semibold">Presets</span>
+                  return (
                     <button
+                      key={item.id}
                       type="button"
-                      onClick={() => handleSelectBottomTab('size')}
-                      className="text-[10px] text-[#5ce1e6] hover:underline cursor-pointer flex items-center space-x-0.5"
+                      onClick={() => handleSelectBrushPreset(item.id)}
+                      title={`${item.name} - ${item.desc}`}
+                      className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-left transition-colors cursor-pointer ${
+                        isSelected
+                          ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                          : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                      }`}
                     >
-                      <span>All 40 Presets</span>
-                      <ChevronRight className="w-3 h-3" />
+                      {item.icon === 'pencil' ? (
+                        <Pencil className="w-3 h-3 shrink-0 opacity-80" />
+                      ) : item.icon === 'palette' ? (
+                        <Palette className="w-3 h-3 shrink-0 opacity-80" />
+                      ) : item.icon === 'square' ? (
+                        <Square className="w-3 h-3 shrink-0 opacity-80" />
+                      ) : (
+                        <Paintbrush className="w-3 h-3 shrink-0 opacity-80" />
+                      )}
+                      <span className="text-[11px] truncate leading-tight flex-1">{item.name}</span>
                     </button>
-                  </div>
-                  <div className="grid grid-cols-8 gap-1">
-                    {[1, 2, 4, 8, 12, 20, 30, 60].map((sz) => (
-                      <button
-                        key={sz}
-                        type="button"
-                        onClick={() => handleUpdateBrushSettings({ size: sz })}
-                        className={`py-0.5 rounded text-[10px] font-mono text-center transition-colors cursor-pointer border ${
-                          Math.abs(brushSettings.size - sz) < 0.05
-                            ? 'bg-[#37485e] border-[#4e6a88] text-white font-bold'
-                            : 'bg-[#151618] border-[#292b30] text-[#999fae] hover:text-white hover:bg-[#25282f]'
+                  );
+                })}
+
+                {showCspBrushes &&
+                  customBrushes.map((brush) => {
+                    const isSelected = currentTool === 'brush' && brushSettings.preset === brush.id;
+                    return (
+                      <div
+                        key={brush.id}
+                        onClick={() => handleSelectCustomBrush(brush)}
+                        title={brush.name}
+                        className={`group flex items-center justify-between gap-1 px-2 py-1 rounded cursor-pointer transition-colors ${
+                          isSelected
+                            ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                            : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
                         }`}
                       >
-                        {sz}
-                      </button>
-                    ))}
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          {brush.tipDataUrl ? (
+                            <img
+                              src={brush.tipDataUrl}
+                              alt=""
+                              className="w-3 h-3 object-contain shrink-0 brightness-125"
+                            />
+                          ) : (
+                            <Sparkles className="w-3 h-3 shrink-0 opacity-80" />
+                          )}
+                          <span className="text-[11px] truncate leading-tight">{brush.name}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
+                          title="Delete brush"
+                          className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-red-400 shrink-0 cursor-pointer"
+                        >
+                          <Trash2 className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
+                    );
+                  })}
+
+                {selectedCategory === 'csp' && customBrushes.length === 0 && (
+                  <div className="py-4 px-2 text-center space-y-2">
+                    <p className="text-[10px] text-[#8a8a8a]">Drop .sut brush file</p>
+                    <button
+                      type="button"
+                      onClick={() => sutInputRef.current?.click()}
+                      className="px-2 py-1 rounded bg-[#2c2c2c] text-[10px] text-[#e5e5e5] cursor-pointer"
+                    >
+                      Import .sut
+                    </button>
                   </div>
-                </div>
+                )}
               </div>
 
-              {/* 2. Opacity Slider */}
-              <div className="space-y-1.5">
-                <div className="flex justify-between items-center text-xs">
-                  <span className="text-[#a0a4ae] font-medium">Opacity</span>
-                  <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-16">
-                    {Math.round((brushSettings.opacity ?? 1.0) * 100)}%
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min="1"
-                  max="100"
+              {/* Live S-Curve Stroke Preview + Quick Size/Opacity Bar */}
+              <div className="shrink-0 bg-[#1b1b1b] border-t border-[#2a2a2a] px-2 py-1.5 space-y-1.5">
+                <canvas
+                  ref={previewCanvasRef}
+                  className="w-full h-8 rounded bg-[#161616] block"
+                />
+                <CompactSlider
+                  label="Brush Size ([ / ])"
+                  valueLabel={`${brushSettings.size < 10 ? brushSettings.size.toFixed(1) : Math.round(brushSettings.size)}px`}
+                  min={0.5}
+                  max={500}
+                  step={0.5}
+                  value={brushSettings.size}
+                  onChange={(v) => handleUpdateBrushSettings({ size: v })}
+                />
+                <CompactSlider
+                  label="Opacity"
+                  valueLabel={`${Math.round((brushSettings.opacity ?? 1.0) * 100)}%`}
+                  min={1}
+                  max={100}
                   value={Math.round((brushSettings.opacity ?? 1.0) * 100)}
-                  onChange={(e) => handleUpdateBrushSettings({ opacity: Number(e.target.value) / 100 })}
-                  className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                  onChange={(v) => handleUpdateBrushSettings({ opacity: v / 100 })}
                 />
               </div>
 
-              {/* 3. Flow Slider (Graphite Flow Rate) */}
-              <div className="space-y-1.5">
-                <div className="flex justify-between items-center text-xs">
-                  <span className="text-[#a0a4ae] font-medium">
-                    {isPencilActive ? 'Graphite Flow' : 'Flow'}
-                  </span>
-                  <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-16">
-                    {Math.round((brushSettings.flow ?? 0.85) * 100)}%
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min="1"
-                  max="100"
-                  value={Math.round((brushSettings.flow ?? 0.85) * 100)}
-                  onChange={(e) => handleUpdateBrushSettings({ flow: Number(e.target.value) / 100 })}
-                  className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                />
-              </div>
-
-              {/* 3b. Real Paper Grain Tooth Slider (for pencils) */}
-              {isPencilActive && (
-                <div className="space-y-1.5">
-                  <div className="flex justify-between items-center text-xs">
-                    <div className="flex items-center space-x-1.5">
-                      <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-                      <span className="text-[#a0a4ae] font-medium">Paper Tooth (Grain)</span>
+              {/* CSP Sub-Tool Detail Accordions */}
+              <div className="shrink-0 bg-[#161616] pt-px space-y-px max-h-[50%] overflow-y-auto">
+                {/* 1. Ink (Brush Density, Gap Compensation, Blend Tips, 4-stage Anti-Alias) */}
+                <div className="bg-[#202020]">
+                  <button
+                    type="button"
+                    onClick={() => toggleAccordion('ink')}
+                    className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
+                  >
+                    <span>Ink</span>
+                    <div className="flex items-center gap-1">
+                      <span className="font-mono text-[10px] text-[#e5e5e5]">
+                        {Math.round((brushSettings.flow ?? 0.85) * 100)}%
+                      </span>
+                      {openAccordion === 'ink' ? (
+                        <ChevronDown className="w-3 h-3" />
+                      ) : (
+                        <ChevronRight className="w-3 h-3" />
+                      )}
                     </div>
-                    <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-16">
-                      {Math.round((brushSettings.grain ?? 0.95) * 100)}%
-                    </div>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={Math.round((brushSettings.grain ?? 0.95) * 100)}
-                    onChange={(e) => handleUpdateBrushSettings({ grain: Number(e.target.value) / 100 })}
-                    className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-amber-400"
-                    title="Real Cold-Press Paper Grain: higher values produce richer organic sketchbook tooth"
-                  />
-                </div>
-              )}
+                  </button>
 
-              {/* 4. Spacing Slider */}
-              <div className="space-y-1.5">
-                <div className="flex justify-between items-center text-xs">
-                  <span className="text-[#a0a4ae] font-medium">Spacing</span>
-                  <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-16">
-                    {Math.round((brushSettings.spacing ?? 0.1) * 100)}%
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min="1"
-                  max="100"
-                  value={Math.round((brushSettings.spacing ?? 0.1) * 100)}
-                  onChange={(e) => handleUpdateBrushSettings({ spacing: Number(e.target.value) / 100 })}
-                  className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                />
-              </div>
-
-              {/* 5. Stabilization Slider */}
-              <div className="space-y-1.5">
-                <div className="flex justify-between items-center text-xs">
-                  <span className="text-[#a0a4ae] font-medium">Stabilization</span>
-                  <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-16">
-                    {brushSettings.stabilization ?? 15}
-                  </div>
-                </div>
-                <input
-                  type="range"
-                  min="0"
-                  max="50"
-                  value={brushSettings.stabilization ?? 15}
-                  onChange={(e) => handleUpdateBrushSettings({ stabilization: Number(e.target.value) })}
-                  className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                />
-              </div>
-
-              {/* 5b. Tip Angle Slider (for CSP / Custom Brushes) */}
-              {isCustomBrushActive && brushSettings.customTipDataUrl && (
-                <div className="space-y-1.5">
-                  <div className="flex justify-between items-center text-xs">
-                    <span className="text-[#a0a4ae] font-medium">Tip Angle</span>
-                    <div className="flex items-center space-x-1">
-                      <button
-                        onClick={() => handleUpdateBrushSettings({ customTipAngle: 0 })}
-                        className="text-[10px] text-[#717682] hover:text-[#5ce1e6] px-1.5 py-0.5 rounded bg-[#151618] border border-[#2e3035] transition-colors cursor-pointer"
-                        title="Reset Angle to 0°"
-                      >
-                        0°
-                      </button>
-                      <div className="bg-[#151618] border border-[#2e3035] rounded px-2 py-0.5 text-right font-mono text-[#dcdfe6] text-xs min-w-14">
-                        {Math.round(brushSettings.customTipAngle ?? 0)}°
-                      </div>
-                    </div>
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="360"
-                    value={Math.round(brushSettings.customTipAngle ?? 0)}
-                    onChange={(e) => handleUpdateBrushSettings({ customTipAngle: Number(e.target.value) })}
-                    className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                  />
-                </div>
-              )}
-
-              {/* Advanced Dynamics Accordion */}
-              <div className="pt-2 border-t border-[#2b2d31]">
-                <button
-                  onClick={() => setShowAdvanced(!showAdvanced)}
-                  className="w-full flex items-center justify-between text-xs text-[#8c9099] hover:text-white py-1 transition-colors cursor-pointer"
-                >
-                  <span>Advanced Dynamics</span>
-                  {showAdvanced ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                </button>
-
-                {showAdvanced && (
-                  <div className="pt-2 space-y-3">
-                    {/* Hardness */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Hardness</span>
-                        <span className="font-mono text-white">
-                          {Math.round((brushSettings.hardness ?? 1.0) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0.05"
-                        max="1.0"
-                        step="0.05"
-                        value={brushSettings.hardness ?? 1.0}
-                        onChange={(e) => handleUpdateBrushSettings({ hardness: Number(e.target.value) })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                  {openAccordion === 'ink' && (
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
+                      <CompactSlider
+                        label="Brush Density"
+                        valueLabel={`${Math.round((brushSettings.flow ?? 0.85) * 100)}%`}
+                        min={1}
+                        max={100}
+                        value={Math.round((brushSettings.flow ?? 0.85) * 100)}
+                        onChange={(v) =>
+                          handleUpdateBrushSettings({ flow: v / 100, brushDensity: v / 100 })
+                        }
                       />
-                    </div>
-
-                    {/* Stylus Pressure Sensitivity */}
-                    <div className="flex items-center justify-between py-1">
-                      <div className="flex items-center space-x-1.5">
-                        <Activity className="w-3.5 h-3.5 text-[#8c9099]" />
-                        <span className="text-xs text-[#cccccc]">Stylus Pressure</span>
-                      </div>
-                      <input
-                        type="checkbox"
-                        checked={brushSettings.usePressure}
-                        onChange={(e) => handleUpdateBrushSettings({ usePressure: e.target.checked })}
-                        className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
-                      />
-                    </div>
-
-                    {/* Min Pressure Taper */}
-                    {brushSettings.usePressure && (
-                      <div className="space-y-1">
-                        <div className="flex justify-between text-xs">
-                          <span className="text-[#8c9099]">Min Pressure Width</span>
-                          <span className="font-mono text-white">
-                            {Math.round(brushSettings.minSizeFactor * 100)}%
-                          </span>
-                        </div>
-                        <input
-                          type="range"
-                          min="0.05"
-                          max="0.8"
-                          step="0.05"
-                          value={brushSettings.minSizeFactor}
-                          onChange={(e) => handleUpdateBrushSettings({ minSizeFactor: Number(e.target.value) })}
-                          className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                        />
-                      </div>
-                    )}
-
-                    {/* Bézier Smoothing */}
-                    <div className="flex items-center justify-between py-1">
-                      <div className="flex items-center space-x-1.5">
-                        <Sparkles className="w-3.5 h-3.5 text-[#8c9099]" />
-                        <span className="text-xs text-[#cccccc]">Bézier Smoothing</span>
-                      </div>
-                      <input
-                        type="checkbox"
-                        checked={brushSettings.smoothing}
-                        onChange={(e) => handleUpdateBrushSettings({ smoothing: e.target.checked })}
-                        className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
-                      />
-                    </div>
-
-                    {/* GPU Video Card Hardware Acceleration */}
-                    <div className="pt-2 border-t border-[#26282c] space-y-2">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-1.5">
-                          <Zap className="w-3.5 h-3.5 text-[#5ce1e6]" />
-                          <span className="text-xs text-[#cccccc] font-medium">Video Card (GPU)</span>
-                        </div>
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Adjust by Gap</span>
                         <input
                           type="checkbox"
-                          checked={brushSettings.useGpu !== false}
-                          onChange={(e) => handleUpdateBrushSettings({ useGpu: e.target.checked })}
-                          className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
+                          checked={Boolean(brushSettings.adjustDensityByGap)}
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({ adjustDensityByGap: e.target.checked })
+                          }
                         />
-                      </div>
-                      <div className="bg-[#121315] border border-[#27292e] rounded p-2 text-[10px] space-y-0.5">
-                        <div className="flex items-center justify-between text-[#5ce1e6]">
-                          <span className="font-semibold">GPU Shader Core</span>
-                          <span className="px-1 py-0.2 rounded bg-[#5ce1e6]/10 text-[9px] font-mono">ACTIVE</span>
+                      </label>
+                      <div className="space-y-1">
+                        <span className="text-[11px] text-[#8a8a8a]">Blend Tips</span>
+                        <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                          {(
+                            [
+                              { id: 'normal', label: 'Normal' },
+                              { id: 'darken', label: 'Darken' },
+                              { id: 'compare', label: 'Compare' },
+                            ] as Array<{ id: CspBlendTipsMode; label: string }>
+                          ).map((mode) => (
+                            <button
+                              key={mode.id}
+                              type="button"
+                              onClick={() => handleUpdateBrushSettings({ blendTipsMode: mode.id })}
+                              className={`py-0.5 rounded text-[10px] cursor-pointer ${
+                                (brushSettings.blendTipsMode ?? 'normal') === mode.id
+                                  ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                              }`}
+                            >
+                              {mode.label}
+                            </button>
+                          ))}
                         </div>
-                        <div className="text-[#8c9099] truncate font-mono text-[9px]" title={gpuInfo.renderer}>
-                          {gpuInfo.renderer || 'Hardware Accelerated Video Card'}
+                      </div>
+                      <div className="space-y-1">
+                        <span className="text-[11px] text-[#8a8a8a]">Anti-Aliasing</span>
+                        <div className="grid grid-cols-4 gap-0.5 bg-[#161616] p-0.5 rounded">
+                          {(
+                            [
+                              { val: 0, label: 'None' },
+                              { val: 1, label: 'Weak' },
+                              { val: 2, label: 'Med' },
+                              { val: 3, label: 'Strong' },
+                            ] as const
+                          ).map((aa) => (
+                            <button
+                              key={aa.val}
+                              type="button"
+                              onClick={() => handleUpdateBrushSettings({ antiAlias: aa.val })}
+                              className={`py-0.5 rounded text-[10px] cursor-pointer ${
+                                currentAntiAlias === aa.val
+                                  ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                              }`}
+                            >
+                              {aa.label}
+                            </button>
+                          ))}
                         </div>
                       </div>
                     </div>
+                  )}
+                </div>
 
-                    {/* CSP Color Mixing */}
-                    <div className="pt-2 border-t border-[#26282c] space-y-2">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-1.5">
-                          <Droplets className="w-3.5 h-3.5 text-cyan-400" />
-                          <span className="text-xs text-[#cccccc] font-medium">Color Mixing</span>
-                          <span className="text-[9px] px-1 py-0.2 rounded bg-cyan-500/15 text-cyan-300 font-mono font-medium">SUBTRACTIVE</span>
+                {/* 2. Brush Tip (Hardness, Spacing, Thickness H/V, Angle + Dynamics, Flip H/V, Ribbon) */}
+                <div className="bg-[#202020]">
+                  <button
+                    type="button"
+                    onClick={() => toggleAccordion('tip')}
+                    className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
+                  >
+                    <span>Brush Tip</span>
+                    {openAccordion === 'tip' ? (
+                      <ChevronDown className="w-3 h-3" />
+                    ) : (
+                      <ChevronRight className="w-3 h-3" />
+                    )}
+                  </button>
+
+                  {openAccordion === 'tip' && (
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
+                      <CompactSlider
+                        label="Hardness"
+                        valueLabel={`${Math.round((brushSettings.hardness ?? 1.0) * 100)}%`}
+                        min={5}
+                        max={100}
+                        value={Math.round((brushSettings.hardness ?? 1.0) * 100)}
+                        onChange={(v) => handleUpdateBrushSettings({ hardness: v / 100 })}
+                      />
+                      <CompactSlider
+                        label="Gap (Spacing)"
+                        valueLabel={`${Math.round((brushSettings.spacing ?? 0.1) * 100)}%`}
+                        min={1}
+                        max={100}
+                        value={Math.round((brushSettings.spacing ?? 0.1) * 100)}
+                        onChange={(v) => handleUpdateBrushSettings({ spacing: v / 100 })}
+                      />
+                      <CompactSlider
+                        label="Thickness"
+                        valueLabel={`${Math.round((brushSettings.thickness ?? 1.0) * 100)}%`}
+                        min={5}
+                        max={100}
+                        value={Math.round((brushSettings.thickness ?? 1.0) * 100)}
+                        onChange={(v) => handleUpdateBrushSettings({ thickness: v / 100 })}
+                      />
+                      <div className="grid grid-cols-2 gap-0.5 bg-[#161616] p-0.5 rounded">
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateBrushSettings({ thicknessVertical: false })}
+                          className={`py-0.5 rounded text-[10px] cursor-pointer ${
+                            !brushSettings.thicknessVertical
+                              ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                              : 'text-[#8a8a8a]'
+                          }`}
+                        >
+                          Horizontal
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleUpdateBrushSettings({ thicknessVertical: true })}
+                          className={`py-0.5 rounded text-[10px] cursor-pointer ${
+                            brushSettings.thicknessVertical
+                              ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                              : 'text-[#8a8a8a]'
+                          }`}
+                        >
+                          Vertical
+                        </button>
+                      </div>
+                      <CompactSlider
+                        label="Angle"
+                        valueLabel={`${Math.round(brushSettings.customTipAngle ?? 0)}deg`}
+                        min={0}
+                        max={360}
+                        value={Math.round(brushSettings.customTipAngle ?? 0)}
+                        onChange={(v) => handleUpdateBrushSettings({ customTipAngle: v })}
+                      />
+                      <div className="space-y-1">
+                        <span className="text-[11px] text-[#8a8a8a]">Angle Dynamics</span>
+                        <select
+                          value={brushSettings.customTipAngleDynamics ?? 'none'}
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({
+                              customTipAngleDynamics: e.target.value as CspAngleDynamicsMode,
+                            })
+                          }
+                          className="w-full h-6 bg-[#161616] text-[#e5e5e5] text-[10px] px-1.5 rounded cursor-pointer"
+                        >
+                          <option value="none">None</option>
+                          <option value="direction">Direction of Line</option>
+                          <option value="tilt">Pen Tilt</option>
+                          <option value="twist">Barrel Twist</option>
+                          <option value="random">Random</option>
+                          <option value="direction-random">Direction + Random</option>
+                        </select>
+                      </div>
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] text-[#8a8a8a]">Flip H</span>
+                          <select
+                            value={brushSettings.flipH ?? 'none'}
+                            onChange={(e) =>
+                              handleUpdateBrushSettings({ flipH: e.target.value as CspTipFlipMode })
+                            }
+                            className="w-full h-5 bg-[#161616] text-[#e5e5e5] text-[10px] px-1 rounded cursor-pointer"
+                          >
+                            <option value="none">None</option>
+                            <option value="random">Random</option>
+                            <option value="alternate">Alternate</option>
+                          </select>
                         </div>
+                        <div className="space-y-0.5">
+                          <span className="text-[10px] text-[#8a8a8a]">Flip V</span>
+                          <select
+                            value={brushSettings.flipV ?? 'none'}
+                            onChange={(e) =>
+                              handleUpdateBrushSettings({ flipV: e.target.value as CspTipFlipMode })
+                            }
+                            className="w-full h-5 bg-[#161616] text-[#e5e5e5] text-[10px] px-1 rounded cursor-pointer"
+                          >
+                            <option value="none">None</option>
+                            <option value="random">Random</option>
+                            <option value="alternate">Alternate</option>
+                          </select>
+                        </div>
+                      </div>
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Ribbon</span>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(brushSettings.isRibbon)}
+                          onChange={(e) => handleUpdateBrushSettings({ isRibbon: e.target.checked })}
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
+
+                {/* 3. Stroke & Stabilization */}
+                <div className="bg-[#202020]">
+                  <button
+                    type="button"
+                    onClick={() => toggleAccordion('stroke')}
+                    className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
+                  >
+                    <span>Stabilization &amp; Stroke</span>
+                    <div className="flex items-center gap-1">
+                      <span className="font-mono text-[10px] text-[#e5e5e5]">
+                        {brushSettings.stabilization ?? 15}
+                      </span>
+                      {openAccordion === 'stroke' ? (
+                        <ChevronDown className="w-3 h-3" />
+                      ) : (
+                        <ChevronRight className="w-3 h-3" />
+                      )}
+                    </div>
+                  </button>
+
+                  {openAccordion === 'stroke' && (
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
+                      <CompactSlider
+                        label="Stabilization"
+                        valueLabel={`${brushSettings.stabilization ?? 15}`}
+                        min={0}
+                        max={50}
+                        value={brushSettings.stabilization ?? 15}
+                        onChange={(v) => handleUpdateBrushSettings({ stabilization: v })}
+                      />
+                      <CompactSlider
+                        label="Post-Correction"
+                        valueLabel={`${brushSettings.postCorrection ?? 0}`}
+                        min={0}
+                        max={5}
+                        value={brushSettings.postCorrection ?? 0}
+                        onChange={(v) => handleUpdateBrushSettings({ postCorrection: v })}
+                      />
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Sharp Angles</span>
+                        <input
+                          type="checkbox"
+                          checked={brushSettings.sharpCorners ?? true}
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({ sharpCorners: e.target.checked })
+                          }
+                        />
+                      </label>
+
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                          <span>Taper In</span>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(brushSettings.taper?.useIn)}
+                            onChange={(e) => handleUpdateTaper({ useIn: e.target.checked })}
+                          />
+                        </label>
+                        <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                          <span>Taper Out</span>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(brushSettings.taper?.useOut)}
+                            onChange={(e) => handleUpdateTaper({ useOut: e.target.checked })}
+                          />
+                        </label>
+                      </div>
+                      {(brushSettings.taper?.useIn || brushSettings.taper?.useOut) && (
+                        <CompactSlider
+                          label="Taper Length"
+                          valueLabel={`${Math.round(brushSettings.taper?.outLength ?? 32)}px`}
+                          min={4}
+                          max={200}
+                          value={Math.round(brushSettings.taper?.outLength ?? 32)}
+                          onChange={(v) =>
+                            handleUpdateTaper({ inLength: v, outLength: v })
+                          }
+                        />
+                      )}
+
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Pen Pressure</span>
+                        <input
+                          type="checkbox"
+                          checked={brushSettings.usePressure}
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({ usePressure: e.target.checked })
+                          }
+                        />
+                      </label>
+                      {brushSettings.usePressure && (
+                        <>
+                          <CompactSlider
+                            label="Min Width"
+                            valueLabel={`${Math.round(brushSettings.minSizeFactor * 100)}%`}
+                            min={0}
+                            max={95}
+                            value={Math.round(brushSettings.minSizeFactor * 100)}
+                            onChange={(v) => handleUpdateBrushSettings({ minSizeFactor: v / 100 })}
+                          />
+                          <div className="space-y-1">
+                            <span className="text-[10px] text-[#8a8a8a]">Pressure Curve</span>
+                            <div className="grid grid-cols-5 gap-0.5 bg-[#161616] p-0.5 rounded">
+                              {(
+                                [
+                                  { id: 'linear', short: 'Lin' },
+                                  { id: 'g-pen', short: 'G' },
+                                  { id: 'soft', short: 'Soft' },
+                                  { id: 'firm', short: 'Firm' },
+                                  { id: 'chisel', short: 'Hard' },
+                                ] as const
+                              ).map((p) => (
+                                <button
+                                  key={p.id}
+                                  type="button"
+                                  title={CSP_PRESSURE_CURVE_PRESETS[p.id]?.label}
+                                  onClick={() =>
+                                    handleUpdateBrushSettings({
+                                      pressureCurve: CSP_PRESSURE_CURVE_PRESETS[p.id]?.points,
+                                    })
+                                  }
+                                  className="py-0.5 rounded text-[9px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer"
+                                >
+                                  {p.short}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      )}
+
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Stylus Tilt</span>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(brushSettings.useTilt)}
+                          onChange={(e) => handleUpdateBrushSettings({ useTilt: e.target.checked })}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Velocity Dynamics</span>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(brushSettings.useVelocity)}
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({ useVelocity: e.target.checked })
+                          }
+                        />
+                      </label>
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Bezier Smoothing</span>
+                        <input
+                          type="checkbox"
+                          checked={brushSettings.smoothing}
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({ smoothing: e.target.checked })
+                          }
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const def = resetBrushSettingsToDefault(
+                            currentTool === 'eraser'
+                              ? ERASER_PRESET_ID
+                              : brushSettings.preset || 'pencil-2b',
+                            customBrushes
+                          );
+                          handleUpdateBrushSettings(def);
+                        }}
+                        className="w-full py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer"
+                      >
+                        Reset Brush to Default
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* 4. Color Mixing & Watercolor Edge */}
+                <div className="bg-[#202020]">
+                  <button
+                    type="button"
+                    onClick={() => toggleAccordion('mixing')}
+                    className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
+                  >
+                    <span>Color Mixing &amp; Edge</span>
+                    {openAccordion === 'mixing' ? (
+                      <ChevronDown className="w-3 h-3" />
+                    ) : (
+                      <ChevronRight className="w-3 h-3" />
+                    )}
+                  </button>
+
+                  {openAccordion === 'mixing' && (
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Color Mixing</span>
                         <input
                           type="checkbox"
                           checked={Boolean(brushSettings.colorMixing)}
-                          onChange={(e) => handleUpdateBrushSettings({ colorMixing: e.target.checked })}
-                          className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
+                          onChange={(e) =>
+                            handleUpdateBrushSettings({ colorMixing: e.target.checked })
+                          }
                         />
-                      </div>
-
+                      </label>
                       {brushSettings.colorMixing && (
-                        <div className="space-y-2.5 pt-1 pl-1 border-l border-[#2e3138]">
-                          {/* Mixing Mode: Blend vs Running Color */}
-                          <div className="flex rounded bg-[#151618] p-0.5 border border-[#2b2d32]">
-                            <button
-                              onClick={() => handleUpdateBrushSettings({ mixingMode: 'blend' })}
-                              className={`flex-1 py-0.5 text-[10px] rounded transition-colors ${
-                                (brushSettings.mixingMode || 'blend') === 'blend'
-                                    ? 'bg-[#293d45] text-[#5ce1e6] font-medium shadow-xs'
-                                    : 'text-[#828690] hover:text-[#cccccc]'
-                              }`}
-                            >
-                              Blend
-                            </button>
-                            <button
-                              onClick={() => handleUpdateBrushSettings({ mixingMode: 'running_color' })}
-                              className={`flex-1 py-0.5 text-[10px] rounded transition-colors ${
-                                brushSettings.mixingMode === 'running_color'
-                                    ? 'bg-[#293d45] text-[#5ce1e6] font-medium shadow-xs'
-                                    : 'text-[#828690] hover:text-[#cccccc]'
-                              }`}
-                            >
-                              Running Color
-                            </button>
+                        <>
+                          <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                            {(
+                              [
+                                { id: 'blend', label: 'Blend' },
+                                { id: 'running_color', label: 'Running' },
+                                { id: 'smear', label: 'Smear' },
+                              ] as const
+                            ).map((m) => (
+                              <button
+                                key={m.id}
+                                type="button"
+                                onClick={() => handleUpdateBrushSettings({ mixingMode: m.id })}
+                                className={`py-0.5 rounded text-[10px] cursor-pointer ${
+                                  (brushSettings.mixingMode || 'blend') === m.id
+                                    ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                                    : 'text-[#8a8a8a]'
+                                }`}
+                              >
+                                {m.label}
+                              </button>
+                            ))}
                           </div>
-
-                          {/* Amount of Paint */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">Amount of Paint</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.amountOfPaint ?? 0.7) * 100) === 0
-                                  ? '0% (Pure Smudge)'
-                                  : `${Math.round((brushSettings.amountOfPaint ?? 0.7) * 100)}%`}
-                              </span>
-                            </div>
+                          <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                            <span>Perceptual (OKLab)</span>
                             <input
-                              type="range"
-                              min="0"
-                              max="100"
-                              value={Math.round((brushSettings.amountOfPaint ?? 0.7) * 100)}
-                              onChange={(e) => handleUpdateBrushSettings({ amountOfPaint: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                              type="checkbox"
+                              checked={brushSettings.perceptualMixing ?? true}
+                              onChange={(e) =>
+                                handleUpdateBrushSettings({ perceptualMixing: e.target.checked })
+                              }
                             />
-                          </div>
-
-                          {/* Density of Paint */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">Density of Paint</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.densityOfPaint ?? 0.8) * 100)}%
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min="1"
-                              max="100"
-                              value={Math.round((brushSettings.densityOfPaint ?? 0.8) * 100)}
-                              onChange={(e) => handleUpdateBrushSettings({ densityOfPaint: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                            />
-                          </div>
-
-                          {/* Color Stretch */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">Color Stretch</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.colorStretch ?? 0.6) * 100)}%
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min="1"
-                              max="100"
-                              value={Math.round((brushSettings.colorStretch ?? 0.6) * 100)}
-                              onChange={(e) => handleUpdateBrushSettings({ colorStretch: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                            />
-                          </div>
-                        </div>
+                          </label>
+                          <CompactSlider
+                            label="Amount of Paint"
+                            valueLabel={`${Math.round((brushSettings.amountOfPaint ?? 0.7) * 100)}%`}
+                            min={0}
+                            max={100}
+                            value={Math.round((brushSettings.amountOfPaint ?? 0.7) * 100)}
+                            onChange={(v) => handleUpdateBrushSettings({ amountOfPaint: v / 100 })}
+                          />
+                          <CompactSlider
+                            label="Density of Paint"
+                            valueLabel={`${Math.round((brushSettings.densityOfPaint ?? 0.8) * 100)}%`}
+                            min={1}
+                            max={100}
+                            value={Math.round((brushSettings.densityOfPaint ?? 0.8) * 100)}
+                            onChange={(v) => handleUpdateBrushSettings({ densityOfPaint: v / 100 })}
+                          />
+                          <CompactSlider
+                            label="Color Stretch"
+                            valueLabel={`${Math.round((brushSettings.colorStretch ?? 0.6) * 100)}%`}
+                            min={0}
+                            max={100}
+                            value={Math.round((brushSettings.colorStretch ?? 0.6) * 100)}
+                            onChange={(v) => handleUpdateBrushSettings({ colorStretch: v / 100 })}
+                          />
+                        </>
+                      )}
+                      <CompactSlider
+                        label="Watercolor Edge"
+                        valueLabel={`${Math.round((brushSettings.wetEdge ?? 0) * 100)}%`}
+                        min={0}
+                        max={100}
+                        value={Math.round((brushSettings.wetEdge ?? 0) * 100)}
+                        onChange={(v) => handleUpdateBrushSettings({ wetEdge: v / 100 })}
+                      />
+                      {(brushSettings.wetEdge ?? 0) > 0.01 && (
+                        <CompactSlider
+                          label="Edge Width"
+                          valueLabel={`${brushSettings.wetEdgeRadius ?? 4}px`}
+                          min={1}
+                          max={20}
+                          value={Math.round(brushSettings.wetEdgeRadius ?? 4)}
+                          onChange={(v) => handleUpdateBrushSettings({ wetEdgeRadius: v })}
+                        />
                       )}
                     </div>
+                  )}
+                </div>
 
-                    {/* Wet Edge (Watercolor) */}
-                    <div className="space-y-1 pt-2 border-t border-[#26282c]">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Wet Edge (Watercolor)</span>
-                        <span className="font-mono text-white">
-                          {Math.round((brushSettings.wetEdge ?? 0) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
-                        value={Math.round((brushSettings.wetEdge ?? 0) * 100)}
-                        onChange={(e) => handleUpdateBrushSettings({ wetEdge: Number(e.target.value) / 100 })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-cyan-400"
+                {/* 5. Texture & Spraying Effect */}
+                <div className="bg-[#202020]">
+                  <button
+                    type="button"
+                    onClick={() => toggleAccordion('texture')}
+                    className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
+                  >
+                    <span>Texture &amp; Spray</span>
+                    {openAccordion === 'texture' ? (
+                      <ChevronDown className="w-3 h-3" />
+                    ) : (
+                      <ChevronRight className="w-3 h-3" />
+                    )}
+                  </button>
+
+                  {openAccordion === 'texture' && (
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
+                      <CompactSlider
+                        label="Texture Density"
+                        valueLabel={`${Math.round((brushSettings.grain ?? 0) * 100)}%`}
+                        min={0}
+                        max={100}
+                        value={Math.round((brushSettings.grain ?? 0) * 100)}
+                        onChange={(v) =>
+                          handleUpdateBrushSettings({ grain: v / 100, textureDensity: v / 100 })
+                        }
                       />
-                    </div>
+                      {(brushSettings.grain ?? 0) > 0.005 && (
+                        <>
+                          <div className="space-y-1">
+                            <span className="text-[11px] text-[#8a8a8a]">Texture Mode</span>
+                            <select
+                              value={brushSettings.paperTextureMode ?? 'subtract'}
+                              onChange={(e) =>
+                                handleUpdateBrushSettings({
+                                  paperTextureMode: e.target.value as CspPaperTextureMode,
+                                })
+                              }
+                              className="w-full h-6 bg-[#161616] text-[#e5e5e5] text-[10px] px-1.5 rounded cursor-pointer"
+                            >
+                              <option value="subtract">Subtract (Valley Fill)</option>
+                              <option value="multiply">Multiply</option>
+                              <option value="compare">Compare Density</option>
+                              <option value="overlay">Overlay</option>
+                              <option value="outline">Outline</option>
+                            </select>
+                          </div>
+                          <CompactSlider
+                            label="Texture Scale"
+                            valueLabel={`${Math.round((brushSettings.paperTextureScale ?? 1.0) * 100)}%`}
+                            min={10}
+                            max={400}
+                            step={5}
+                            value={Math.round((brushSettings.paperTextureScale ?? 1.0) * 100)}
+                            onChange={(v) =>
+                              handleUpdateBrushSettings({ paperTextureScale: v / 100 })
+                            }
+                          />
+                          <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                            <span>Invert Texture</span>
+                            <input
+                              type="checkbox"
+                              checked={Boolean(brushSettings.paperTextureInverted)}
+                              onChange={(e) =>
+                                handleUpdateBrushSettings({
+                                  paperTextureInverted: e.target.checked,
+                                })
+                              }
+                            />
+                          </label>
+                        </>
+                      )}
 
-                    {/* Paper Tooth Grain (for non-pencil brushes as well) */}
-                    {!isPencilActive && (
-                      <div className="space-y-1 pt-1">
-                        <div className="flex justify-between text-xs">
-                          <span className="text-[#8c9099]">Paper Tooth (Grain)</span>
-                          <span className="font-mono text-white">
-                            {Math.round((brushSettings.grain ?? 0) * 100)}%
-                          </span>
-                        </div>
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer pt-1">
+                        <span>Spraying Effect</span>
                         <input
-                          type="range"
-                          min="0"
-                          max="100"
-                          value={Math.round((brushSettings.grain ?? 0) * 100)}
-                          onChange={(e) => handleUpdateBrushSettings({ grain: Number(e.target.value) / 100 })}
-                          className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-amber-400"
+                          type="checkbox"
+                          checked={Boolean(brushSettings.spray?.enabled)}
+                          onChange={(e) => handleUpdateSpray({ enabled: e.target.checked })}
                         />
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              {/* Brush Dynamics (Multi-Axis Jitter Matrix) Accordion */}
-              <div className="pt-2 border-t border-[#2b2d31]">
-                <button
-                  type="button"
-                  onClick={() => setShowDynamics(!showDynamics)}
-                  className="w-full flex items-center justify-between text-xs text-[#8c9099] hover:text-white py-1 transition-colors cursor-pointer"
-                >
-                  <div className="flex items-center space-x-1.5">
-                    <Shuffle className="w-3.5 h-3.5 text-[#5ce1e6]" />
-                    <span className="font-medium">Brush Dynamics & Jitter</span>
-                    {isDynamicsActive && (
-                      <span className="px-1 py-0.2 rounded bg-[#5ce1e6]/15 text-[#5ce1e6] text-[9px] font-mono font-medium">
-                        ACTIVE
-                      </span>
-                    )}
-                  </div>
-                  {showDynamics ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                </button>
-
-                {showDynamics && (
-                  <div className="pt-2 space-y-3">
-                    {/* Header with Reset Button */}
-                    <div className="flex items-center justify-between pb-1 border-b border-[#26282c]">
-                      <span className="text-[10px] text-[#717682] uppercase tracking-wider font-semibold">Jitter Matrix</span>
-                      <button
-                        type="button"
-                        onClick={() => handleUpdateDynamics(DEFAULT_BRUSH_DYNAMICS)}
-                        className="text-[10px] text-[#717682] hover:text-[#5ce1e6] px-1.5 py-0.5 rounded bg-[#151618] border border-[#2e3035] transition-colors cursor-pointer"
-                        title="Reset all dynamics jitter to zero"
-                      >
-                        Reset Dynamics
-                      </button>
+                      </label>
+                      {brushSettings.spray?.enabled && (
+                        <>
+                          <CompactSlider
+                            label="Particle Size"
+                            valueLabel={`${brushSettings.spray.size ?? 4}px`}
+                            min={1}
+                            max={80}
+                            value={Math.round(brushSettings.spray.size ?? 4)}
+                            onChange={(v) => handleUpdateSpray({ size: v })}
+                          />
+                          <CompactSlider
+                            label="Spray Density"
+                            valueLabel={`${brushSettings.spray.density ?? 12}`}
+                            min={1}
+                            max={64}
+                            value={Math.round(brushSettings.spray.density ?? 12)}
+                            onChange={(v) => handleUpdateSpray({ density: v })}
+                          />
+                        </>
+                      )}
                     </div>
+                  )}
+                </div>
 
-                    {/* 1. Size Jitter */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Size Jitter</span>
-                        <span className="font-mono text-white">
-                          {Math.round((brushSettings.dynamics?.sizeJitter ?? 0) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
+                {/* 6. Dynamics & Jitter */}
+                <div className="bg-[#202020]">
+                  <button
+                    type="button"
+                    onClick={() => toggleAccordion('dynamics')}
+                    className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
+                  >
+                    <span>Dynamics &amp; Jitter</span>
+                    {openAccordion === 'dynamics' ? (
+                      <ChevronDown className="w-3 h-3" />
+                    ) : (
+                      <ChevronRight className="w-3 h-3" />
+                    )}
+                  </button>
+
+                  {openAccordion === 'dynamics' && (
+                    <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
+                      <CompactSlider
+                        label="Size Jitter"
+                        valueLabel={`${Math.round((brushSettings.dynamics?.sizeJitter ?? 0) * 100)}%`}
+                        min={0}
+                        max={100}
                         value={Math.round((brushSettings.dynamics?.sizeJitter ?? 0) * 100)}
-                        onChange={(e) => handleUpdateDynamics({ sizeJitter: Number(e.target.value) / 100 })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                        onChange={(v) => handleUpdateDynamics({ sizeJitter: v / 100 })}
                       />
-                    </div>
-
-                    {/* 2. Angle Jitter */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Angle Jitter</span>
-                        <span className="font-mono text-white">
-                          {Math.round((brushSettings.dynamics?.angleJitter ?? 0) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
+                      <CompactSlider
+                        label="Angle Jitter"
+                        valueLabel={`${Math.round((brushSettings.dynamics?.angleJitter ?? 0) * 100)}%`}
+                        min={0}
+                        max={100}
                         value={Math.round((brushSettings.dynamics?.angleJitter ?? 0) * 100)}
-                        onChange={(e) => handleUpdateDynamics({ angleJitter: Number(e.target.value) / 100 })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                        onChange={(v) => handleUpdateDynamics({ angleJitter: v / 100 })}
                       />
-                    </div>
-
-                    {/* 3. Roundness / Thickness Jitter */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Roundness Jitter</span>
-                        <span className="font-mono text-white">
-                          {Math.round((brushSettings.dynamics?.roundnessJitter ?? 0) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
+                      <CompactSlider
+                        label="Roundness Jitter"
+                        valueLabel={`${Math.round((brushSettings.dynamics?.roundnessJitter ?? 0) * 100)}%`}
+                        min={0}
+                        max={95}
                         value={Math.round((brushSettings.dynamics?.roundnessJitter ?? 0) * 100)}
-                        onChange={(e) => handleUpdateDynamics({ roundnessJitter: Number(e.target.value) / 100 })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                        onChange={(v) => handleUpdateDynamics({ roundnessJitter: v / 100 })}
                       />
-                    </div>
-
-                    {/* 4. Scatter Jitter */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Scatter</span>
-                        <span className="font-mono text-white">
-                          {(brushSettings.dynamics?.scatter ?? 0).toFixed(1)}x
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="5"
-                        step="0.1"
+                      <CompactSlider
+                        label="Scatter"
+                        valueLabel={`${(brushSettings.dynamics?.scatter ?? 0).toFixed(1)}x`}
+                        min={0}
+                        max={5}
+                        step={0.1}
                         value={brushSettings.dynamics?.scatter ?? 0}
-                        onChange={(e) => handleUpdateDynamics({ scatter: Number(e.target.value) })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                        onChange={(v) => handleUpdateDynamics({ scatter: v })}
                       />
-                    </div>
-
-                    {/* Scatter Both Axes Toggle */}
-                    <div className="flex items-center justify-between py-1">
-                      <span className="text-xs text-[#cccccc]">Scatter Both Axes</span>
-                      <input
-                        type="checkbox"
-                        checked={Boolean(brushSettings.dynamics?.scatterBothAxes)}
-                        onChange={(e) => handleUpdateDynamics({ scatterBothAxes: e.target.checked })}
-                        className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
-                      />
-                    </div>
-
-                    {/* 5. Count Slider */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Count (Dabs per Step)</span>
-                        <span className="font-mono text-white">
-                          {brushSettings.dynamics?.count ?? 1}
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="1"
-                        max="10"
-                        step="1"
+                      {(brushSettings.dynamics?.scatter ?? 0) > 0 && (
+                        <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                          <span>Scatter Both Axes</span>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(brushSettings.dynamics?.scatterBothAxes)}
+                            onChange={(e) =>
+                              handleUpdateDynamics({ scatterBothAxes: e.target.checked })
+                            }
+                          />
+                        </label>
+                      )}
+                      <CompactSlider
+                        label="Count"
+                        valueLabel={`${brushSettings.dynamics?.count ?? 1}`}
+                        min={1}
+                        max={10}
                         value={brushSettings.dynamics?.count ?? 1}
-                        onChange={(e) => handleUpdateDynamics({ count: Number(e.target.value) })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                        onChange={(v) => handleUpdateDynamics({ count: v })}
                       />
-                    </div>
-
-                    {/* 6. Flow / Opacity Jitter */}
-                    <div className="space-y-1">
-                      <div className="flex justify-between text-xs">
-                        <span className="text-[#8c9099]">Flow / Opacity Jitter</span>
-                        <span className="font-mono text-white">
-                          {Math.round((brushSettings.dynamics?.flowJitter ?? 0) * 100)}%
-                        </span>
-                      </div>
-                      <input
-                        type="range"
-                        min="0"
-                        max="100"
+                      <CompactSlider
+                        label="Flow Jitter"
+                        valueLabel={`${Math.round((brushSettings.dynamics?.flowJitter ?? 0) * 100)}%`}
+                        min={0}
+                        max={100}
                         value={Math.round((brushSettings.dynamics?.flowJitter ?? 0) * 100)}
-                        onChange={(e) => handleUpdateDynamics({ flowJitter: Number(e.target.value) / 100 })}
-                        className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                        onChange={(v) => handleUpdateDynamics({ flowJitter: v / 100 })}
                       />
-                    </div>
-
-                    {/* 7. Color Dynamics Section */}
-                    <div className="pt-2 border-t border-[#26282c] space-y-2">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center space-x-1.5">
-                          <Palette className="w-3.5 h-3.5 text-cyan-400" />
-                          <span className="text-xs text-[#cccccc] font-medium">Color Dynamics</span>
-                        </div>
+                      <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                        <span>Color Jitter</span>
                         <input
                           type="checkbox"
                           checked={Boolean(brushSettings.dynamics?.colorJitterEnabled)}
-                          onChange={(e) => handleUpdateDynamics({ colorJitterEnabled: e.target.checked })}
-                          className="rounded bg-[#1a1b1e] border-[#383a40] text-[#5ce1e6] focus:ring-0 cursor-pointer"
+                          onChange={(e) =>
+                            handleUpdateDynamics({ colorJitterEnabled: e.target.checked })
+                          }
                         />
-                      </div>
-
+                      </label>
                       {brushSettings.dynamics?.colorJitterEnabled && (
-                        <div className="space-y-2.5 pt-1 pl-1 border-l border-[#2e3138]">
-                          {/* Color preview swatch showing foreground & secondary color */}
-                          <div className="flex items-center justify-between text-[11px] text-[#8c9099] bg-[#151618] p-1.5 rounded border border-[#2b2d32]">
-                            <span>Mix FG & BG</span>
-                            <div className="flex items-center space-x-1.5">
-                              <span
-                                className="w-3.5 h-3.5 rounded-full border border-white/20"
-                                style={{ backgroundColor: brushSettings.color }}
-                                title={`Primary (FG): ${brushSettings.color}`}
-                              />
-                              <span className="text-[10px]">⇄</span>
-                              <span
-                                className="w-3.5 h-3.5 rounded-full border border-white/20"
-                                style={{ backgroundColor: secondaryColor }}
-                                title={`Secondary (BG): ${secondaryColor}`}
-                              />
-                            </div>
-                          </div>
-
-                          {/* Foreground / Background Jitter */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">FG/BG Jitter</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.dynamics?.foregroundBackgroundJitter ?? 0) * 100)}%
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min="0"
-                              max="100"
-                              value={Math.round((brushSettings.dynamics?.foregroundBackgroundJitter ?? 0) * 100)}
-                              onChange={(e) => handleUpdateDynamics({ foregroundBackgroundJitter: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                            />
-                          </div>
-
-                          {/* Hue Jitter */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">Hue Jitter</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.dynamics?.hueJitter ?? 0) * 100)}%
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min="0"
-                              max="100"
-                              value={Math.round((brushSettings.dynamics?.hueJitter ?? 0) * 100)}
-                              onChange={(e) => handleUpdateDynamics({ hueJitter: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                            />
-                          </div>
-
-                          {/* Saturation Jitter */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">Saturation Jitter</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.dynamics?.saturationJitter ?? 0) * 100)}%
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min="0"
-                              max="100"
-                              value={Math.round((brushSettings.dynamics?.saturationJitter ?? 0) * 100)}
-                              onChange={(e) => handleUpdateDynamics({ saturationJitter: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                            />
-                          </div>
-
-                          {/* Brightness Jitter */}
-                          <div className="space-y-1">
-                            <div className="flex justify-between text-xs">
-                              <span className="text-[#8c9099]">Brightness Jitter</span>
-                              <span className="font-mono text-white">
-                                {Math.round((brushSettings.dynamics?.brightnessJitter ?? 0) * 100)}%
-                              </span>
-                            </div>
-                            <input
-                              type="range"
-                              min="0"
-                              max="100"
-                              value={Math.round((brushSettings.dynamics?.brightnessJitter ?? 0) * 100)}
-                              onChange={(e) => handleUpdateDynamics({ brightnessJitter: Number(e.target.value) / 100 })}
-                              className="w-full h-1 bg-[#282a2e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
-                            />
-                          </div>
-                        </div>
+                        <>
+                          <CompactSlider
+                            label="Hue"
+                            valueLabel={`${Math.round((brushSettings.dynamics?.hueJitter ?? 0) * 100)}%`}
+                            min={0}
+                            max={100}
+                            value={Math.round((brushSettings.dynamics?.hueJitter ?? 0) * 100)}
+                            onChange={(v) => handleUpdateDynamics({ hueJitter: v / 100 })}
+                          />
+                          <CompactSlider
+                            label="Saturation"
+                            valueLabel={`${Math.round((brushSettings.dynamics?.saturationJitter ?? 0) * 100)}%`}
+                            min={0}
+                            max={100}
+                            value={Math.round((brushSettings.dynamics?.saturationJitter ?? 0) * 100)}
+                            onChange={(v) => handleUpdateDynamics({ saturationJitter: v / 100 })}
+                          />
+                          <CompactSlider
+                            label="Brightness"
+                            valueLabel={`${Math.round((brushSettings.dynamics?.brightnessJitter ?? 0) * 100)}%`}
+                            min={0}
+                            max={100}
+                            value={Math.round((brushSettings.dynamics?.brightnessJitter ?? 0) * 100)}
+                            onChange={(v) => handleUpdateDynamics({ brightnessJitter: v / 100 })}
+                          />
+                          <CompactSlider
+                            label="FG / BG Mix"
+                            valueLabel={`${Math.round((brushSettings.dynamics?.foregroundBackgroundJitter ?? 0) * 100)}%`}
+                            min={0}
+                            max={100}
+                            value={Math.round((brushSettings.dynamics?.foregroundBackgroundJitter ?? 0) * 100)}
+                            onChange={(v) => handleUpdateDynamics({ foregroundBackgroundJitter: v / 100 })}
+                          />
+                        </>
                       )}
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
+            </>
+          ) : (
+            renderContextualToolPanel()
           )}
-        </div>
-        </>
-      ) : (
-        renderToolSettings()
-      )}
 
-          {/* RESIZABLE RIGHT EDGE (Hover gives col-resize; dragging adjusts panel width) */}
+          {/* Subtle Drag Handle on Right Edge */}
           <div
-            onMouseDown={handleWidthResizeMouseDown}
-            title="Drag to resize brush settings panel width"
-            className="group absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-[#5ce1e6]/60 active:bg-[#5ce1e6] transition-colors z-30"
-          >
-            <div className="w-full h-full opacity-0 group-hover:opacity-100 bg-[#5ce1e6]/60 transition-opacity" />
-          </div>
+            onMouseDown={(e) => {
+              e.preventDefault();
+              setIsDraggingWidth(true);
+              dragStartXRef.current = e.clientX;
+              dragStartWidthRef.current = width;
+            }}
+            title="Resize brush panel"
+            className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-[var(--accent)]/40 transition-colors z-30"
+          />
         </aside>
       )}
     </div>

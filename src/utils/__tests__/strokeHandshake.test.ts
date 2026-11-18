@@ -142,4 +142,53 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
     // Final point should taper close to minimum
     expect(flick.points[flick.count - 1].width).toBeLessThan(5);
   });
+
+  it('preserves monochrome-1bit strokes across LOD 1, 2, and 3 mipmaps on large manga canvases', () => {
+    const layerId = 'layer-mono-manga';
+    const blankCanvas = {
+      width: 7016,
+      height: 9921,
+      __isBlank: true,
+    } as unknown as HTMLCanvasElement;
+
+    // 1. Ingest blank large monochrome canvas (simulating new B4 600 DPI manga document)
+    grid.ingestCanvas(layerId, blankCanvas, 'monochrome-1bit');
+    expect(grid.getLayerFormat(layerId)).toBe('monochrome-1bit');
+
+    // 2. Commit first black ink stroke at (300, 300) via writeImageData
+    const stroke1 = new Uint8ClampedArray(20 * 20 * 4);
+    for (let i = 0; i < 20 * 20; i++) {
+      stroke1[i * 4 + 3] = 255; // Solid black (R=0,G=0,B=0,A=255)
+    }
+    grid.writeImageData(layerId, { data: stroke1, width: 20, height: 20 }, 300, 300, 'monochrome-1bit');
+
+    // 3. Query zoomed-out LOD 1, LOD 2, and LOD 3 tiles (simulating fit-to-screen viewport compositor)
+    for (const lod of [1, 2, 3]) {
+      const lodTile = grid.generateLodTile(layerId, 0, 0, lod);
+      expect(lodTile).not.toBeNull();
+      expect(lodTile!.format).toBe('monochrome-1bit');
+      const rgba = grid.getTileAsRGBA(lodTile!);
+      let inkPixels = 0;
+      for (let i = 3; i < rgba.length; i += 4) {
+        if (rgba[i] === 255) inkPixels++;
+      }
+      expect(inkPixels).toBeGreaterThan(0);
+    }
+
+    // 4. Commit second stroke in the same LOD cluster at (420, 420) and verify dirty LOD regeneration
+    grid.writeImageData(layerId, { data: stroke1, width: 20, height: 20 }, 420, 420, 'monochrome-1bit');
+    expect(grid.isLodTileDirty(layerId, 0, 0, 1)).toBe(true);
+    expect(grid.isLodTileDirty(layerId, 0, 0, 2)).toBe(true);
+    expect(grid.isLodTileDirty(layerId, 0, 0, 3)).toBe(true);
+
+    const updatedLod2Tiles = grid.getTilesInBounds(layerId, 0, 0, 1024, 1024, 2);
+    expect(updatedLod2Tiles.length).toBe(1);
+    expect(grid.isLodTileDirty(layerId, 0, 0, 2)).toBe(false);
+    const rgbaAfterSecond = grid.getTileAsRGBA(updatedLod2Tiles[0]);
+    // Both (300>>2 = 75) and (420>>2 = 105) must have opaque black ink in LOD 2
+    const idxStroke1 = (76 * 256 + 76) * 4;
+    const idxStroke2 = (106 * 256 + 106) * 4;
+    expect(rgbaAfterSecond[idxStroke1 + 3]).toBe(255);
+    expect(rgbaAfterSecond[idxStroke2 + 3]).toBe(255);
+  });
 });

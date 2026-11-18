@@ -174,42 +174,88 @@ export function renderAnimationFrame(
   const activeCelLayerId = timeline.cels[frameIndex];
   const allCelLayerIds = new Set(Object.values(timeline.cels));
 
-  // 1. Render static background non-cel layers
+  // Helper to check parent folder visibility and effective opacity
+  const isEffectivelyVisible = (l: LayerItem): boolean => {
+    if (!l.visible) return false;
+    if (!l.parentId) return true;
+    const p = layers.find((item) => item.id === l.parentId);
+    return p ? isEffectivelyVisible(p) : true;
+  };
+  const getEffOpacity = (l: LayerItem): number => {
+    if (!l.parentId) return l.opacity;
+    const p = layers.find((item) => item.id === l.parentId);
+    return p ? l.opacity * getEffOpacity(p) : l.opacity;
+  };
+
+  let renderedOnionSkins = false;
+
+  // Render layers in true bottom-to-top stack order
   for (let i = layers.length - 1; i >= 0; i--) {
     const layer = layers[i];
-    if (allCelLayerIds.has(layer.id)) continue;
-    if (!layer.visible) continue;
+    if (layer.type === 'folder') continue;
+    if (!isEffectivelyVisible(layer)) continue;
+
+    if (allCelLayerIds.has(layer.id)) {
+      if (layer.id === activeCelLayerId) {
+        if (!renderedOnionSkins && includeOnionSkin && timeline.onionSkin.enabled) {
+          renderedOnionSkins = true;
+          const onionFrames = getOnionSkinFrames({
+            ...timeline,
+            currentFrame: frameIndex,
+          });
+          for (const info of onionFrames) {
+            const oc = layerCanvases.get(info.layerId);
+            if (oc) {
+              const tinted = renderTintedCanvas(oc, info.tint, info.opacity);
+              ctx.save?.();
+              ctx.globalAlpha = 1.0;
+              ctx.globalCompositeOperation = 'source-over';
+              ctx.drawImage(tinted, 0, 0);
+              ctx.restore?.();
+            }
+          }
+        }
+        const celCanvas = layerCanvases.get(activeCelLayerId);
+        if (celCanvas) {
+          ctx.save?.();
+          ctx.globalAlpha = getEffOpacity(layer);
+          ctx.globalCompositeOperation = (layer.blendMode === 'normal' || layer.blendMode === 'pass-through') ? 'source-over' : (layer.blendMode as GlobalCompositeOperation);
+          ctx.drawImage(celCanvas, 0, 0);
+          ctx.globalAlpha = 1.0;
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.restore?.();
+        }
+      }
+      continue;
+    }
 
     const c = layerCanvases.get(layer.id);
     if (c) {
-      ctx.globalAlpha = layer.opacity;
+      ctx.save?.();
+      ctx.globalAlpha = getEffOpacity(layer);
+      ctx.globalCompositeOperation = (layer.blendMode === 'normal' || layer.blendMode === 'pass-through') ? 'source-over' : (layer.blendMode as GlobalCompositeOperation);
       ctx.drawImage(c, 0, 0);
+      ctx.globalAlpha = 1.0;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.restore?.();
     }
   }
 
-  // 2. Render colored onion skin cels if requested
-  if (includeOnionSkin && timeline.onionSkin.enabled) {
+  // If onion skin was requested and active frame had no cel layer in stack, still render onion skin
+  if (!renderedOnionSkins && includeOnionSkin && timeline.onionSkin.enabled) {
     const onionFrames = getOnionSkinFrames({
       ...timeline,
       currentFrame: frameIndex,
     });
-
     for (const info of onionFrames) {
       const c = layerCanvases.get(info.layerId);
       if (c) {
         const tinted = renderTintedCanvas(c, info.tint, info.opacity);
+        ctx.save?.();
+        ctx.globalAlpha = 1.0;
         ctx.drawImage(tinted, 0, 0);
+        ctx.restore?.();
       }
-    }
-  }
-
-  // 3. Render active frame cel
-  if (activeCelLayerId) {
-    const celLayer = layers.find((l) => l.id === activeCelLayerId);
-    const celCanvas = layerCanvases.get(activeCelLayerId);
-    if (celLayer && celCanvas && celLayer.visible) {
-      ctx.globalAlpha = celLayer.opacity;
-      ctx.drawImage(celCanvas, 0, 0);
     }
   }
 
@@ -433,7 +479,8 @@ export async function exportAnimationToGif(
 
     let offset = 0;
     while (offset < indexedPixels.length) {
-      const blockSize = Math.min(254, indexedPixels.length - offset);
+      // Max 125 literals per Clear Code so 8-bit LZW dictionary (129 + 125 = 254 < 256) never overflows into 9-bit codes
+      const blockSize = Math.min(125, indexedPixels.length - offset);
       buffer.push(blockSize + 1);
       buffer.push(1 << minCodeSize); // Clear code
       for (let j = 0; j < blockSize; j++) {
@@ -523,11 +570,11 @@ export async function exportAnimationToApng(
   outChunks.push(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
   if (ihdrChunk) outChunks.push(ihdrChunk);
 
-  // acTL chunk (num_frames: 4 bytes, num_plays: 4 bytes: 0 for infinite loop)
+  // acTL chunk (num_frames: 4 bytes, num_plays: 4 bytes: 0 for infinite loop, 1 for once)
   const actlData = new Uint8Array(8);
   const actlDv = new DataView(actlData.buffer);
   actlDv.setUint32(0, numFrames);
-  actlDv.setUint32(4, 0);
+  actlDv.setUint32(4, timeline.loop === false ? 1 : 0);
   outChunks.push(createChunk('acTL', actlData));
 
   let seq = 0;

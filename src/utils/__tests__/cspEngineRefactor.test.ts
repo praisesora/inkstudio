@@ -87,6 +87,21 @@ describe('Clip Studio Paint Drawing Engine Refactor Tests', () => {
       // Decay should be smooth and damped (not jumping immediately to 0.1)
       expect(decaySample.pressure).toBeGreaterThan(0.2);
     });
+
+    it('remains stable when coalesced events share identical timestamps', () => {
+      const stab = new InputStabilizer();
+      stab.setStabilizerLevel(20);
+
+      stab.process(0, 0, 0.5, 100);
+      const s1X = stab.process(4, 0, 0.5, 116).x;
+      // Coalesced event with identical timestamp (116ms)
+      const s2X = stab.process(8, 0, 0.5, 116).x;
+
+      expect(Number.isFinite(s2X)).toBe(true);
+      expect(s2X).toBeGreaterThan(s1X);
+      // Should still be smoothed rather than snapping raw due to derivative explosion
+      expect(s2X).toBeLessThan(8);
+    });
   });
 
   describe('Phase 4: Japanese Inking Dynamics (TaperEngine)', () => {

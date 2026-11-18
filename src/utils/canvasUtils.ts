@@ -11,7 +11,10 @@ import {
   RadialMixingOptions,
 } from './stampEngine';
 import { LayerPixelSampler, PaintReservoir } from './colorMixingEngine';
-import { evaluateCspSpline } from './sutParser';
+import {
+  evaluateFastSpline,
+  applyCspPostCorrection,
+} from '../engine/CspBrushEngine';
 
 export const CANVAS_2D_CONTEXT_OPTIONS: CanvasRenderingContext2DSettings = {
   alpha: true,
@@ -31,7 +34,7 @@ export function get2DContext(
 
 /**
  * Calculates stroke width based on base brush size, pressure, pressure curve, and minimum size ratio.
- * Follows Clip Studio Paint's exact dynamics calculation.
+ * Follows Clip Studio Paint's exact dynamics calculation using O(1) LUT splines.
  */
 export function calculateStrokeWidth(
   baseSize: number,
@@ -47,7 +50,6 @@ export function calculateStrokeWidth(
     return Math.max(0.2, baseSize * velocityScale);
   }
 
-  // Tablet stylus pressure vs mouse fallback
   let effectivePressure = pressure;
   if (pointerType === 'mouse') {
     effectivePressure = 0.5;
@@ -58,10 +60,9 @@ export function calculateStrokeWidth(
     effectivePressure = Math.max(0, Math.min(1.0, effectivePressure));
   }
 
-  // Evaluate through authentic CSP cubic Hermite spline curve if available
   let curvePressure = effectivePressure;
   if (pressureCurve && pressureCurve.length > 0) {
-    curvePressure = evaluateCspSpline(effectivePressure, pressureCurve);
+    curvePressure = evaluateFastSpline(effectivePressure, pressureCurve);
   } else if (pressureCurveGamma !== 1.0) {
     curvePressure = Math.pow(Math.max(0, effectivePressure), pressureCurveGamma);
   }
@@ -105,9 +106,7 @@ export function getQuadraticBezierPoint(
 }
 
 /**
- * Converts 4 Catmull-Rom spline knots (p0, p1, p2, p3) into cubic Bézier control points (c1, c2)
- * for the segment from p1 to p2.
- * Uses centripetal parameterization (alpha = 0.5) to prevent overshooting or loops on tight turns.
+ * Converts 4 Catmull-Rom spline knots (p0, p1, p2, p3) into cubic Bézier control points (c1, c2).
  */
 export function catmullRomToBezier(
   p0: Point,
@@ -120,7 +119,6 @@ export function catmullRomToBezier(
 
 /**
  * Draws a smooth tapered segment along a cubic Bézier curve using analytical radial dabbing.
- * Delivers professional Clip Studio Paint / Photoshop quality without line banding or shadowBlur.
  */
 export function drawSmoothCubicBezierSegment(
   ctx: CanvasRenderingContext2D,
@@ -197,9 +195,11 @@ export function drawDot(
   isEraser: boolean = false,
   hardness: number = 1.0,
   flow: number = 1.0,
-  mixingOptions?: RadialMixingOptions
+  mixingOptions?: RadialMixingOptions,
+  thickness: number = 1.0,
+  angleRad: number = 0
 ) {
-  drawRadialDot(ctx, point, color, hardness, flow, isEraser, false, mixingOptions);
+  drawRadialDot(ctx, point, color, hardness, flow, isEraser, false, mixingOptions, thickness, angleRad);
 }
 
 let _sharedThumbCanvas: HTMLCanvasElement | null = null;
@@ -262,7 +262,7 @@ export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalComposi
 }
 
 /**
- * Generates an efficient mini thumbnail (48px wide) for layer and history preview.
+ * Generates an efficient mini thumbnail (60px wide) for layer and history preview.
  */
 export function createCanvasThumbnail(canvas: HTMLCanvasElement, preserveAlpha: boolean = false): string {
   try {
@@ -281,7 +281,6 @@ export function createCanvasThumbnail(canvas: HTMLCanvasElement, preserveAlpha: 
       tCtx.drawImage(canvas, 0, 0, targetW, targetH);
       return _sharedThumbCanvas.toDataURL('image/png');
     } else {
-      // Draw background white in thumbnail in case of opaque export
       tCtx.fillStyle = '#ffffff';
       tCtx.fillRect(0, 0, targetW, targetH);
       tCtx.drawImage(canvas, 0, 0, targetW, targetH);
@@ -293,19 +292,12 @@ export function createCanvasThumbnail(canvas: HTMLCanvasElement, preserveAlpha: 
   }
 }
 
-/**
- * Formats timestamp as HH:mm:ss for history entries.
- */
 export function formatTime(timestamp: number | Date = Date.now()): string {
   const d = typeof timestamp === 'number' ? new Date(timestamp) : timestamp;
   const pad = (n: number) => n.toString().padStart(2, '0');
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-/**
- * Maps a screen/viewport coordinate to canvas pixel coordinate accounting for pan, zoom, and rotation.
- * This 2D inverse affine matrix mapping guarantees 100% precision under any rotation angle.
- */
 export function screenToCanvas(
   clientX: number,
   clientY: number,
@@ -318,11 +310,9 @@ export function screenToCanvas(
   const vx = clientX - viewportRect.left;
   const vy = clientY - viewportRect.top;
 
-  // Vector from canvas center in viewport to mouse
   const rx = vx - pan.x;
   const ry = vy - pan.y;
 
-  // Unrotate by -rotation
   const rad = (rotation * Math.PI) / 180;
   const cos = Math.cos(rad);
   const sin = Math.sin(rad);
@@ -330,16 +320,12 @@ export function screenToCanvas(
   const unrotX = rx * cos + ry * sin;
   const unrotY = -rx * sin + ry * cos;
 
-  // Unscale and shift by canvas center
   const x = dimensions.width / 2 + unrotX / zoom;
   const y = dimensions.height / 2 + unrotY / zoom;
 
   return { x, y };
 }
 
-/**
- * Maps a canvas pixel coordinate to screen/viewport coordinate accounting for pan, zoom, and rotation.
- */
 export function canvasToScreen(
   canvasX: number,
   canvasY: number,
@@ -364,9 +350,6 @@ export function canvasToScreen(
   };
 }
 
-/**
- * Formats rotation angle in degrees for clean display.
- */
 export function formatRotationDegrees(degrees: number): string {
   let normalized = degrees % 360;
   if (normalized > 180) normalized -= 360;
@@ -386,10 +369,6 @@ export interface CanvasTransformMatrix {
   f: number;
 }
 
-/**
- * Calculates the exact 2D affine transform matrix that maps document canvas coordinates
- * to the viewport draft overlay canvas pixels, accounting for pan, zoom, rotation, and DPR.
- */
 export function getCanvasToViewportMatrix(
   pan: { x: number; y: number },
   zoom: number,
@@ -415,10 +394,6 @@ export function getCanvasToViewportMatrix(
   return { a, b, c, d, e, f };
 }
 
-/**
- * Calculates the visible bounding box of the canvas in canvas pixel coordinates
- * corresponding to the current viewport rect, pan, zoom, and rotation.
- */
 export function getVisibleCanvasBounds(
   viewportRect: DOMRect,
   pan: { x: number; y: number },
@@ -447,10 +422,6 @@ export function getVisibleCanvasBounds(
 
 let _reusableBakeCanvas: HTMLCanvasElement | null = null;
 
-/**
- * Retrieves a reusable offscreen canvas buffer for compositing dirty rectangles,
- * avoiding per-stroke memory allocation and garbage collection.
- */
 export function getReusableBakeCanvas(minWidth: number, minHeight: number): HTMLCanvasElement {
   if (!_reusableBakeCanvas) {
     _reusableBakeCanvas = document.createElement('canvas');
@@ -464,14 +435,6 @@ export function getReusableBakeCanvas(minWidth: number, minHeight: number): HTML
   return _reusableBakeCanvas;
 }
 
-/**
- * Renders an entire completed stroke path onto the target Canvas2D context.
- * Used for baking finished strokes into the high-resolution base canvas at native DPI.
- */
-/**
- * Applies parametric in/out tapering to a stroke's point array.
- * Smooths out stroke endings when lifting the pen quickly, or when in/out taper dynamics are active.
- */
 export function applyParametricTaper(
   points: Point[],
   options?: {
@@ -488,7 +451,6 @@ export function applyParametricTaper(
   const minRatio = Math.max(0.01, Math.min(1.0, options?.minSizeFactor ?? 0.05));
   const n = points.length;
 
-  // In-taper (lead-in)
   if (options?.useIn) {
     const inCount = Math.min(Math.floor(n / 2), options.inCount ?? Math.min(8, n));
     for (let i = 0; i < inCount; i++) {
@@ -500,7 +462,6 @@ export function applyParametricTaper(
     }
   }
 
-  // Out-taper (exit / lift-off)
   const useOut = options?.useOut ?? true;
   if (useOut) {
     let outCount = options?.outCount ?? 6;
@@ -510,7 +471,7 @@ export function applyParametricTaper(
     outCount = Math.min(Math.floor(n / 2), Math.max(2, outCount));
     const startIdx = n - outCount;
     for (let i = startIdx; i < n; i++) {
-      const step = n - 1 - i; // 0 for the very last point
+      const step = n - 1 - i;
       const u = (step + 1) / (outCount + 1);
       const taper = Math.sin((u * Math.PI) / 2);
       const factor = minRatio + (1.0 - minRatio) * taper;
@@ -534,38 +495,61 @@ export function renderCompleteStroke(
 ) {
   if (!points || points.length === 0) return;
 
+  const isMono = colorMode === 'monochrome';
+  const postCorrLevel = brushSettings.postCorrection ?? 0;
+  const postCorrectedPoints =
+    postCorrLevel > 0 && points.length >= 3
+      ? applyCspPostCorrection(points, postCorrLevel, brushSettings.sharpCorners !== false)
+      : points;
+
+  const effectivePoints = isMono
+    ? postCorrectedPoints.map((p) => (p.width < 1.25 ? { ...p, width: 1.25 } : p))
+    : postCorrectedPoints;
+
   const isEraser = tool === 'eraser';
-  const isPencil = !isEraser && (brushSettings.preset?.startsWith('pencil') ?? false);
+  const isPencil = !isEraser && !brushSettings.customTipImage && (brushSettings.preset?.startsWith('pencil') ?? false);
   const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(brushSettings.color, colorMode);
-  const strokeHardness = colorMode === 'monochrome' ? 1.0 : (brushSettings.hardness ?? 1.0);
-  const strokeFlow = brushSettings.flow ?? 1.0;
+  const strokeHardness = isMono ? 1.0 : (brushSettings.hardness ?? 1.0);
+  const strokeFlow = isMono ? 1.0 : (brushSettings.flow ?? 1.0);
   const strokeSpacing = brushSettings.spacing ?? 0.08;
   const isTransparentInk = Boolean(brushSettings.isTransparentInk);
+  const useTilt = Boolean(brushSettings.useTilt);
 
-  // Textured Custom Tip (Clip Studio Paint SUT Brush)
+  // Textured Custom Tip (Clip Studio Paint SUT Brush & Procedural Tip Presets)
   if (brushSettings.customTipImage) {
     const tipOptions: TexturedBrushOptions = {
       size: brushSettings.size,
       minSizeFactor: brushSettings.minSizeFactor,
       opacity: brushSettings.opacity,
       flow: strokeFlow,
+      adjustDensityByGap: brushSettings.adjustDensityByGap,
+      blendTipsMode: brushSettings.blendTipsMode,
       spacing: strokeSpacing,
       thickness: brushSettings.thickness,
       thicknessVertical: brushSettings.thicknessVertical,
+      flipH: brushSettings.flipH,
+      flipV: brushSettings.flipV,
+      isColorTip: brushSettings.isColorTip,
       angle: brushSettings.customTipAngle,
       angleDynamics: brushSettings.customTipAngleDynamics,
       rotationRandomScale: brushSettings.customTipRotationRandomScale,
       hardness: strokeHardness,
-      antiAlias: brushSettings.antiAlias,
+      antiAlias: isMono ? 0 : brushSettings.antiAlias,
       pressureCurve: brushSettings.pressureCurve,
       velocityCurve: brushSettings.velocityCurve,
+      usePressure: brushSettings.usePressure,
       useVelocity: brushSettings.useVelocity,
+      useTilt,
+      sizeSensor: brushSettings.sizeSensor,
+      opacitySensor: brushSettings.opacitySensor,
+      densitySensor: brushSettings.densitySensor,
       subTips: brushSettings.subTips,
       subTipOrder: brushSettings.subTipOrder,
       subTipImages: brushSettings.subTipImages,
       spray: brushSettings.spray,
       taper: brushSettings.taper,
       colorMixing: brushSettings.colorMixing,
+      perceptualMixing: brushSettings.perceptualMixing,
       amountOfPaint: brushSettings.amountOfPaint,
       densityOfPaint: brushSettings.densityOfPaint,
       colorStretch: brushSettings.colorStretch,
@@ -575,123 +559,152 @@ export function renderCompleteStroke(
       wetEdgeAlphaPower: brushSettings.wetEdgeAlphaPower,
       wetEdgeValuePower: brushSettings.wetEdgeValuePower,
       grain: brushSettings.grain ?? brushSettings.textureDensity,
+      paperTextureMode: brushSettings.paperTextureMode,
+      paperTextureBrightness: brushSettings.paperTextureBrightness,
+      paperTextureContrast: brushSettings.paperTextureContrast,
+      paperTextureInverted: brushSettings.paperTextureInverted,
       paperTextureImage: brushSettings.paperTextureImage,
       paperTextureScale: brushSettings.paperTextureScale,
       paperTextureRotate: brushSettings.paperTextureRotate,
+      dualBrush: brushSettings.dualBrush,
+      dualTipImage: brushSettings.dualTipImage,
+      dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
       useGpu: Boolean(brushSettings.useGpu),
       underlyingCanvas: underlyingCanvas || ctx.canvas,
       sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
-      reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
+      reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
       isEraser: isEraser && !isBgEraser,
       isBgEraser,
       alphaLocked,
       isTransparentInk,
+      dynamics: brushSettings.dynamics,
+      secondaryColor: brushSettings.secondaryColor,
     };
-    renderCompleteTexturedStroke(ctx, points, strokeColor, brushSettings.customTipImage, tipOptions);
+    renderCompleteTexturedStroke(ctx, effectivePoints, strokeColor, brushSettings.customTipImage, tipOptions);
     return;
   }
 
-  // Draw initial dot at points[0] to match the live preview start dot identically
+  const radialMixing: RadialMixingOptions = {
+    colorMixing: brushSettings.colorMixing,
+    perceptualMixing: brushSettings.perceptualMixing,
+    amountOfPaint: brushSettings.amountOfPaint,
+    densityOfPaint: brushSettings.densityOfPaint,
+    colorStretch: brushSettings.colorStretch,
+    mixingMode: brushSettings.mixingMode,
+    underlyingCanvas: underlyingCanvas || ctx.canvas,
+    sampler: brushSettings.colorMixing && underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+    reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
+    alphaLocked,
+    isTransparentInk,
+    dynamics: brushSettings.dynamics,
+    secondaryColor: brushSettings.secondaryColor,
+    useGpu: Boolean(brushSettings.useGpu),
+    dualBrush: brushSettings.dualBrush,
+    dualTipImage: brushSettings.dualTipImage,
+    dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
+    useTilt,
+    thicknessVertical: brushSettings.thicknessVertical,
+    flipH: brushSettings.flipH,
+    flipV: brushSettings.flipV,
+    antiAlias: isMono ? 0 : brushSettings.antiAlias,
+    angleDynamics: brushSettings.customTipAngleDynamics,
+    rotationRandomScale: brushSettings.customTipRotationRandomScale,
+    adjustDensityByGap: brushSettings.adjustDensityByGap,
+    blendTipsMode: brushSettings.blendTipsMode,
+    grain: brushSettings.grain ?? brushSettings.textureDensity,
+    paperTextureMode: brushSettings.paperTextureMode,
+    paperTextureBrightness: brushSettings.paperTextureBrightness,
+    paperTextureContrast: brushSettings.paperTextureContrast,
+    paperTextureInverted: brushSettings.paperTextureInverted,
+    paperTextureImage: brushSettings.paperTextureImage,
+    paperTextureScale: brushSettings.paperTextureScale,
+    paperTextureRotate: brushSettings.paperTextureRotate,
+    sizeSensor: brushSettings.sizeSensor,
+    opacitySensor: brushSettings.opacitySensor,
+    densitySensor: brushSettings.densitySensor,
+    taper: brushSettings.taper,
+  };
+
   if (isPencil) {
     const grade = (brushSettings.preset as PencilGrade) || 'pencil-2b';
+    const pencilTilt = brushSettings.useTilt ?? true;
     drawPencilDot(
       ctx,
-      points[0],
+      effectivePoints[0],
       strokeColor,
       grade,
-      brushSettings.flow ?? 0.74,
+      isMono ? 1.0 : (brushSettings.flow ?? 0.74),
       brushSettings.grain ?? 1.0,
-      brushSettings.hardness,
+      strokeHardness,
       alphaLocked,
       isTransparentInk
     );
-  } else {
-    const radialMixing: RadialMixingOptions = {
-      colorMixing: brushSettings.colorMixing,
-      amountOfPaint: brushSettings.amountOfPaint,
-      densityOfPaint: brushSettings.densityOfPaint,
-      colorStretch: brushSettings.colorStretch,
-      mixingMode: brushSettings.mixingMode,
-      underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: (brushSettings.colorMixing && underlyingCanvas) ? new LayerPixelSampler(underlyingCanvas) : undefined,
-      reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
-      alphaLocked,
-      isTransparentInk,
-    };
 
-    drawDot(
-      ctx,
-      points[0],
-      strokeColor,
-      isEraser && !isBgEraser,
-      strokeHardness,
-      strokeFlow,
-      radialMixing
-    );
-  }
+    if (effectivePoints.length === 1) return;
 
-  if (points.length === 1) {
-    return;
-  }
-
-  if (isPencil) {
-    const grade = (brushSettings.preset as PencilGrade) || 'pencil-2b';
-    const pFlow = brushSettings.flow ?? 0.74;
+    const pFlow = isMono ? 1.0 : (brushSettings.flow ?? 0.74);
     const pGrain = brushSettings.grain ?? 1.0;
+    let accDist = Math.max(0.25, effectivePoints[0].width * (brushSettings.spacing ?? 0.07));
 
-    if (points.length === 2) {
-      const p0 = points[0];
-      const p1 = points[1];
+    if (effectivePoints.length === 2) {
+      const p0 = effectivePoints[0];
+      const p1 = effectivePoints[1];
       const { c1, c2 } = catmullRomToBezier(p0, p0, p1, p1);
-      drawPencilCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
+      drawPencilCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
       return;
     }
 
-    const p0 = points[0];
-    const p1 = points[1];
-    const p2 = points[2];
+    const p0 = effectivePoints[0];
+    const p1 = effectivePoints[1];
+    const p2 = effectivePoints[2];
     const first = catmullRomToBezier(p0, p0, p1, p2);
-    drawPencilCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
+    accDist = drawPencilCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
 
-    for (let i = 2; i < points.length - 1; i++) {
-      const seg = catmullRomToBezier(points[i - 2], points[i - 1], points[i], points[i + 1]);
-      drawPencilCubicBezierSegment(ctx, points[i - 1], seg.c1, seg.c2, points[i], strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
+    for (let i = 2; i < effectivePoints.length - 1; i++) {
+      const seg = catmullRomToBezier(effectivePoints[i - 2], effectivePoints[i - 1], effectivePoints[i], effectivePoints[i + 1]);
+      accDist = drawPencilCubicBezierSegment(ctx, effectivePoints[i - 1], seg.c1, seg.c2, effectivePoints[i], strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
     }
 
-    const n = points.length;
-    const pPrev2 = points[n - 3];
-    const pPrev = points[n - 2];
-    const pLast = points[n - 1];
+    const n = effectivePoints.length;
+    const pPrev2 = effectivePoints[n - 3];
+    const pPrev = effectivePoints[n - 2];
+    const pLast = effectivePoints[n - 1];
     const last = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
-    drawPencilCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, grade, pFlow, pGrain, brushSettings.hardness, 0, alphaLocked, isTransparentInk);
-  } else {
-    const radialMixing: RadialMixingOptions = {
-      colorMixing: brushSettings.colorMixing,
-      amountOfPaint: brushSettings.amountOfPaint,
-      densityOfPaint: brushSettings.densityOfPaint,
-      colorStretch: brushSettings.colorStretch,
-      mixingMode: brushSettings.mixingMode,
-      underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: (brushSettings.colorMixing && underlyingCanvas) ? new LayerPixelSampler(underlyingCanvas) : undefined,
-      reservoir: (brushSettings.colorMixing && !isEraser) ? new PaintReservoir(strokeColor) : undefined,
-      alphaLocked,
-      isTransparentInk,
-    };
+    drawPencilCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
+    return;
+  }
 
-    renderCompleteRadialStroke(
+  const baseAngleRad = ((brushSettings.customTipAngle ?? 0) * Math.PI) / 180;
+  const baseThickness = brushSettings.thickness ?? 1.0;
+
+  if (effectivePoints.length === 1) {
+    drawDot(
       ctx,
-      points,
+      effectivePoints[0],
       strokeColor,
+      isEraser && !isBgEraser,
       strokeHardness,
       strokeFlow,
-      strokeSpacing,
-      isEraser && !isBgEraser,
-      isBgEraser,
-      brushSettings.thickness ?? 1.0,
-      ((brushSettings.customTipAngle ?? 0) * Math.PI) / 180,
-      radialMixing
+      radialMixing,
+      baseThickness,
+      baseAngleRad
     );
+    return;
   }
+
+  renderCompleteRadialStroke(
+    ctx,
+    effectivePoints,
+    strokeColor,
+    strokeHardness,
+    strokeFlow,
+    strokeSpacing,
+    isEraser && !isBgEraser,
+    isBgEraser,
+    baseThickness,
+    baseAngleRad,
+    radialMixing
+  );
 }
 
 let sampleCanvas: HTMLCanvasElement | null = null;
@@ -728,7 +741,6 @@ export function sampleCompositedColor(
 
   sampleCtx.clearRect(0, 0, 1, 1);
 
-  // Render bottom to top (reverse of layers list)
   const renderOrder = layers.slice().reverse();
   for (const layer of renderOrder) {
     if (layer.type === 'folder' || !isLayerVisible(layer)) continue;
@@ -737,7 +749,7 @@ export function sampleCompositedColor(
 
     sampleCtx.save();
     sampleCtx.globalAlpha = getLayerOpacity(layer);
-    sampleCtx.globalCompositeOperation = (layer.blendMode || 'source-over') as GlobalCompositeOperation;
+    sampleCtx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
     sampleCtx.drawImage(lCanvas, px, py, 1, 1, 0, 0, 1, 1);
     sampleCtx.restore();
   }
@@ -755,7 +767,6 @@ export function sampleCompositedColor(
     return '#ffffff';
   }
 
-  // Alpha blend over solid white background
   const a = data[3] / 255;
   const r = Math.round(data[0] * a + 255 * (1 - a));
   const g = Math.round(data[1] * a + 255 * (1 - a));
@@ -764,4 +775,3 @@ export function sampleCompositedColor(
   const toHex = (n: number) => n.toString(16).padStart(2, '0');
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
-

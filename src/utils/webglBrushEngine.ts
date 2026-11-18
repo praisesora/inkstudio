@@ -1,5 +1,7 @@
 import { Point, BrushSettings, ToolType } from '../types/editor';
 import { applyColorDynamics } from './stampEngine';
+import { paperGrainTable, GRAIN_SIZE } from './pencilEngine';
+import { computeSubpixelDabDimensions, dabHashFloat, resolveTipFlipSigns } from '../engine/CspBrushEngine';
 
 /**
  * Information about the host video card powering the WebGL brush engine.
@@ -26,10 +28,12 @@ export interface GpuDab {
   alpha: number;
   pressure: number;
   strokeDist: number;
+  flipX?: number; // +1 or -1
+  flipY?: number; // +1 or -1
 }
 
 // -------------------------------------------------------------
-// Shaders for GPU Video Card Execution (Track B: Instanced Dabs)
+// Shaders for GPU Video Card Execution (Track B: Instanced CSP Dabs)
 // -------------------------------------------------------------
 
 const VERTEX_SHADER_SRC = `
@@ -43,8 +47,10 @@ attribute vec4 a_color;      // dab color rgba
 attribute float a_alpha;     // dab stamp flow / alpha
 attribute float a_pressure;  // stylus pressure
 attribute float a_strokeDist;// cumulative stroke distance
+attribute vec2 a_flip;       // horizontal/vertical UV flip (+1 or -1)
 
 uniform vec2 u_canvasResolution;
+uniform vec2 u_dirtyOffset;
 
 varying vec2 v_uv;
 varying vec2 v_localPos;
@@ -53,14 +59,17 @@ varying float v_alpha;
 varying float v_pressure;
 varying float v_strokeDist;
 varying vec2 v_worldPos;
+varying vec2 v_size;
 
 void main() {
-  v_uv = a_quadVertex + 0.5;
+  vec2 flipSign = vec2(a_flip.x == 0.0 ? 1.0 : a_flip.x, a_flip.y == 0.0 ? 1.0 : a_flip.y);
+  v_uv = a_quadVertex * flipSign + 0.5;
   v_localPos = a_quadVertex * 2.0; // [-1.0, 1.0]
   v_color = a_color;
   v_alpha = a_alpha;
   v_pressure = a_pressure;
   v_strokeDist = a_strokeDist;
+  v_size = a_size;
 
   // Rotate quad vertex
   float cosA = cos(a_angle);
@@ -74,8 +83,8 @@ void main() {
   vec2 worldPixelPos = a_center + rotated;
   v_worldPos = worldPixelPos;
 
-  // Convert pixel coordinates [0, W] x [0, H] to WebGL clip space [-1, 1] x [1, -1]
-  vec2 clipPos = (worldPixelPos / u_canvasResolution) * 2.0 - 1.0;
+  // Convert local dirty-rect pixel coordinates [0, dirtyW] x [0, dirtyH] to WebGL clip space [-1, 1] x [1, -1]
+  vec2 clipPos = ((worldPixelPos - u_dirtyOffset) / u_canvasResolution) * 2.0 - 1.0;
   clipPos.y = -clipPos.y; // Invert Y for canvas coordinate system
 
   gl_Position = vec4(clipPos, 0.0, 1.0);
@@ -92,37 +101,74 @@ varying float v_alpha;
 varying float v_pressure;
 varying float v_strokeDist;
 varying vec2 v_worldPos;
+varying vec2 v_size;
 
 uniform bool u_hasTipTexture;
+uniform bool u_isColorTip;
 uniform sampler2D u_tipTexture;
 
 uniform bool u_hasDualTipTexture;
 uniform sampler2D u_dualTipTexture;
 uniform int u_dualBlendMode;     // 0: multiply, 1: subtract, 2: darken, 3: overlay, 4: screen
 
-uniform float u_hardness;        // 0.05 to 1.0
-uniform float u_wetEdge;         // 0.0 to 1.0 (CSP Watercolor Water Edge)
-uniform float u_paperGrain;      // 0.0 to 1.0 (CSP Paper Tooth)
+uniform int u_antiAlias;         // 0: None (binary), 1: Weak, 2: Medium, 3: Strong
+uniform float u_hardness;        // 0.0 to 1.0
+uniform float u_wetEdge;         // 0.0 to 1.0
+uniform float u_paperGrain;      // 0.0 to 1.0 (CSP Paper Tooth density)
 uniform float u_grainScale;      // scale of paper texture
+uniform float u_grainRotateRad;  // rotation of paper texture
+uniform int u_paperMode;         // 0: subtract, 1: multiply, 2: compare, 3: overlay, 4: outline
+uniform float u_paperBrightness; // [-1.0, 1.0]
+uniform float u_paperContrast;   // [-1.0, 1.0]
+uniform bool u_paperInvert;
+uniform bool u_hasPaperTex;
+uniform sampler2D u_paperTexture;
+uniform vec2 u_paperTexSize;
 
 uniform bool u_colorMixing;      // CSP Color Mixing active
 uniform bool u_perceptualMixing; // OKLab + Kubelka-Munk spectral pigment mixing
 uniform bool u_hasCanvasTexture;
 uniform sampler2D u_canvasTexture;
 uniform vec2 u_canvasResolution;
-uniform float u_amountOfPaint;   // 0.0 to 1.0 (CSP Amount of Paint)
-uniform float u_densityOfPaint;  // 0.0 to 1.0 (CSP Density of Paint)
-uniform float u_colorStretch;    // 0.0 to 1.0 (CSP Color Stretch)
+uniform vec2 u_docResolution;
+uniform float u_amountOfPaint;
+uniform float u_densityOfPaint;
+uniform float u_colorStretch;
 uniform bool u_isEraser;
 uniform bool u_isBgEraser;
 
-// Procedural multi-frequency paper grain tooth
-float getPaperGrain(vec2 p) {
-  vec2 coord = p * (0.08 * u_grainScale);
-  float n1 = sin(coord.x * 3.1415 + coord.y * 1.7) * cos(coord.y * 2.718 - coord.x * 0.9);
-  float n2 = sin(coord.x * 7.3 - coord.y * 5.1) * cos(coord.x * 4.2 + coord.y * 8.3);
-  float n3 = sin(coord.x * 15.1 + coord.y * 11.7);
-  return clamp((n1 * 0.5 + n2 * 0.35 + n3 * 0.15) * 0.5 + 0.5, 0.0, 1.0);
+// Evaluates seamless paper grain from uploaded 512x512 cold-press texture or custom paper image
+float samplePaperTooth(vec2 worldPos) {
+  float invScale = 1.0 / max(0.05, u_grainScale);
+  float c = cos(u_grainRotateRad);
+  float s = sin(u_grainRotateRad);
+  vec2 rotP = vec2(worldPos.x * c - worldPos.y * s, worldPos.x * s + worldPos.y * c) * invScale;
+
+  float g = 0.5;
+  if (u_hasPaperTex) {
+    vec2 uv = fract(rotP / max(vec2(1.0), u_paperTexSize));
+    vec4 pSample = texture2D(u_paperTexture, uv);
+    // Support both luminance (R=G=B) and alpha-encoded CSP paper textures
+    float lum = dot(pSample.rgb, vec3(0.299, 0.587, 0.114));
+    g = pSample.a < 0.98 ? (1.0 - pSample.a) : lum;
+  } else {
+    vec2 coord = rotP * 0.09;
+    float n1 = sin(coord.x * 3.1415 + coord.y * 1.7) * cos(coord.y * 2.718 - coord.x * 0.9);
+    float n2 = sin(coord.x * 7.3 - coord.y * 5.1) * cos(coord.x * 4.2 + coord.y * 8.3);
+    g = clamp((n1 * 0.6 + n2 * 0.4) * 0.5 + 0.5, 0.0, 1.0);
+  }
+
+  if (u_paperInvert) {
+    g = 1.0 - g;
+  }
+  if (abs(u_paperBrightness) > 0.001) {
+    g += u_paperBrightness;
+  }
+  if (abs(u_paperContrast) > 0.001) {
+    float cf = pow(max(0.05, 1.0 + u_paperContrast), 2.0);
+    g = (g - 0.5) * cf + 0.5;
+  }
+  return clamp(g, 0.0, 1.0);
 }
 
 // Perceptual Kubelka-Munk + Spectral Yellow-Blue Pigment Mixing on GPU
@@ -136,7 +182,6 @@ vec3 mixPigmentsGpu(vec3 c1, vec3 c2, float w2) {
   vec3 mixAbs = abs1 * w1 + abs2 * w2;
   vec3 sub = pow(max(vec3(0.0), vec3(1.0) - mixAbs), vec3(2.0));
 
-  // Spectral Yellow + Blue -> Green transmittance coupling
   float y1 = max(0.0, min(l1.r, l1.g) - l1.b);
   float y2 = max(0.0, min(l2.r, l2.g) - l2.b);
   float b1 = max(0.0, l1.b - l1.r);
@@ -153,19 +198,39 @@ vec3 mixPigmentsGpu(vec3 c1, vec3 c2, float w2) {
 
 void main() {
   float dist = length(v_localPos);
-  if (dist > 1.0) {
-    discard;
-  }
+  vec3 rgb = v_color.rgb;
 
-  // 1. Base tip profile and hardness
+  // 1. Base tip profile, CSP 4-level Anti-Aliasing, and Color Tip support
   float tipAlpha = 1.0;
   if (u_hasTipTexture) {
     vec4 tex = texture2D(u_tipTexture, v_uv);
     tipAlpha = tex.a;
+    if (u_isColorTip) {
+      rgb = tex.rgb;
+    }
+    if (u_antiAlias == 0) {
+      tipAlpha = tipAlpha >= 0.5 ? 1.0 : 0.0;
+    }
   } else {
-    // Procedural smooth Hermite profile based on hardness
-    float edge = clamp(u_hardness, 0.05, 0.98);
-    tipAlpha = 1.0 - smoothstep(edge, 1.0, dist);
+    if (dist > 1.0) {
+      discard;
+    }
+    if (u_antiAlias == 0) {
+      // Binary 1-bit manga pen (zero feather)
+      tipAlpha = dist <= 1.0 ? 1.0 : 0.0;
+    } else {
+      float aaPx = u_antiAlias == 1 ? 1.3 : (u_antiAlias == 3 ? 3.8 : 2.2);
+      float minDim = max(0.85, min(v_size.x, v_size.y));
+      float aa = clamp(aaPx / minDim, 0.015, 0.92);
+      float clampedH = clamp(u_hardness, 0.0, 1.0);
+      if (clampedH <= 0.05) {
+        // Silky Gaussian cosine falloff for soft airbrush
+        tipAlpha = 0.5 * (1.0 + cos(min(1.0, dist) * 3.14159265));
+      } else {
+        float edge = min(clampedH, 1.0 - aa);
+        tipAlpha = 1.0 - smoothstep(edge, 1.0, dist);
+      }
+    }
   }
 
   // 1b. Dual-Brush Texture Modulation
@@ -173,15 +238,15 @@ void main() {
     vec4 dualTex = texture2D(u_dualTipTexture, v_uv);
     float dualA = dualTex.a;
     if (u_dualBlendMode == 1) {
-      tipAlpha = max(0.0, tipAlpha - (1.0 - dualA)); // subtract
+      tipAlpha = max(0.0, tipAlpha - (1.0 - dualA));
     } else if (u_dualBlendMode == 2) {
-      tipAlpha = min(tipAlpha, dualA); // darken
+      tipAlpha = min(tipAlpha, dualA);
     } else if (u_dualBlendMode == 3) {
-      tipAlpha = tipAlpha < 0.5 ? (2.0 * tipAlpha * dualA) : (1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - dualA)); // overlay
+      tipAlpha = tipAlpha < 0.5 ? (2.0 * tipAlpha * dualA) : (1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - dualA));
     } else if (u_dualBlendMode == 4) {
-      tipAlpha = tipAlpha + dualA - tipAlpha * dualA; // screen
+      tipAlpha = tipAlpha + dualA - tipAlpha * dualA;
     } else {
-      tipAlpha *= dualA; // multiply (default)
+      tipAlpha *= dualA;
     }
   }
 
@@ -189,28 +254,42 @@ void main() {
     discard;
   }
 
-  vec3 rgb = v_color.rgb;
-
-  // 2. CSP Wet Edge (Water Edge - capillary accumulation at stroke perimeter)
-  if (u_wetEdge > 0.001) {
-    float rim = smoothstep(0.55, 0.94, dist) * (1.0 - smoothstep(0.95, 1.0, dist));
-    float edgeBoost = 1.0 + u_wetEdge * 2.2 * rim;
-    tipAlpha = clamp(tipAlpha * edgeBoost, 0.0, 1.0);
-    rgb = mix(rgb, rgb * 0.72, u_wetEdge * rim * 0.55);
-  }
-
-  // 3. CSP Paper Grain / Canvas Tooth
+  // 2. CSP 5-Mode Paper Grain / Canvas Tooth
   if (u_paperGrain > 0.001) {
-    float tooth = getPaperGrain(v_worldPos);
-    float penetration = clamp(v_pressure * 0.75, 0.0, 0.85);
-    float grainFactor = clamp(1.0 - u_paperGrain * (1.0 - tooth) * (1.0 - penetration), 0.05, 1.0);
-    tipAlpha *= grainFactor;
+    float g = samplePaperTooth(v_worldPos);
+    float penetration = clamp(v_pressure * 0.65, 0.0, 0.85);
+    float effDensity = u_paperGrain * (1.0 - penetration * 0.6);
+
+    if (u_paperMode == 1) {
+      // Multiply
+      tipAlpha *= (1.0 - effDensity * (1.0 - g));
+    } else if (u_paperMode == 2) {
+      // Compare
+      float thresh = (1.0 - g) * effDensity;
+      tipAlpha = tipAlpha > thresh ? clamp((tipAlpha - thresh) / max(0.08, 1.0 - thresh), 0.0, 1.0) : 0.0;
+    } else if (u_paperMode == 3) {
+      // Overlay
+      float ov = tipAlpha < 0.5 ? (2.0 * tipAlpha * g) : (1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - g));
+      tipAlpha = mix(tipAlpha, ov, effDensity);
+    } else if (u_paperMode == 4) {
+      // Outline
+      float edgeFactor = 4.0 * tipAlpha * (1.0 - tipAlpha);
+      tipAlpha *= (1.0 - effDensity * (1.0 - g) * (0.35 + 0.65 * edgeFactor));
+    } else {
+      // Subtract (CSP default valley-fill physics)
+      float sub = (1.0 - g) * effDensity * (1.0 - penetration * 0.5);
+      tipAlpha = max(0.0, tipAlpha - sub);
+    }
+
+    if (tipAlpha <= 0.002) {
+      discard;
+    }
   }
 
-  // 4. CSP Color Mixing & Smear
+  // 3. Optional GPU Color Mixing fallback
   if (u_colorMixing && u_hasCanvasTexture && !u_isEraser) {
-    vec2 canvasUv = v_worldPos / u_canvasResolution;
-    canvasUv.y = 1.0 - canvasUv.y;
+    vec2 docRes = max(vec2(1.0), u_docResolution);
+    vec2 canvasUv = clamp(v_worldPos / docRes, 0.0, 1.0);
     vec4 canvasColor = texture2D(u_canvasTexture, canvasUv);
 
     if (canvasColor.a > 0.02) {
@@ -226,11 +305,15 @@ void main() {
     }
   }
 
-  // 5. Final Alpha computation
+  // 4. Final Alpha computation
   float finalAlpha = clamp(tipAlpha * v_alpha, 0.0, 1.0);
+  if (u_antiAlias == 0) {
+    finalAlpha = finalAlpha >= 0.5 ? 1.0 : 0.0;
+    if (finalAlpha <= 0.0) discard;
+  }
 
   if (u_isBgEraser) {
-    gl_FragColor = vec4(1.0, 1.0, 1.0, finalAlpha);
+    gl_FragColor = vec4(1.0 * finalAlpha, 1.0 * finalAlpha, 1.0 * finalAlpha, finalAlpha);
   } else if (u_isEraser) {
     gl_FragColor = vec4(0.0, 0.0, 0.0, finalAlpha);
   } else {
@@ -242,18 +325,18 @@ void main() {
 
 // -------------------------------------------------------------
 // Shaders for Track A: Ribbon Inking Engine (G-Pen / Manga Lines)
-// Continuous polygonal triangle strip with analytical distance field SDF
 // -------------------------------------------------------------
 
 const RIBBON_VERTEX_SHADER_SRC = `
 precision highp float;
 
-attribute vec2 a_pos;        // world pixel position
-attribute float a_normalDist;// -1.0 for left, +1.0 for right
-attribute vec4 a_color;      // rgba
-attribute float a_width;     // pixel width
+attribute vec2 a_pos;
+attribute float a_normalDist;
+attribute vec4 a_color;
+attribute float a_width;
 
 uniform vec2 u_canvasResolution;
+uniform vec2 u_dirtyOffset;
 
 varying float v_normalDist;
 varying vec4 v_color;
@@ -264,8 +347,8 @@ void main() {
   v_color = a_color;
   v_width = a_width;
 
-  vec2 clipPos = (a_pos / u_canvasResolution) * 2.0 - 1.0;
-  clipPos.y = -clipPos.y; // Invert Y for canvas coordinate system
+  vec2 clipPos = ((a_pos - u_dirtyOffset) / u_canvasResolution) * 2.0 - 1.0;
+  clipPos.y = -clipPos.y;
 
   gl_Position = vec4(clipPos, 0.0, 1.0);
 }
@@ -280,7 +363,6 @@ varying float v_width;
 
 void main() {
   float dist = abs(v_normalDist);
-  // Analytical SDF sub-pixel antialiasing
   float aa = clamp(1.5 / max(1.0, v_width), 0.015, 0.45);
   float alpha = 1.0 - smoothstep(1.0 - aa, 1.0, dist);
 
@@ -293,15 +375,18 @@ void main() {
 }
 `;
 
+const MAX_TILE_CHUNK = 2048;
+
 /**
  * WebGL-accelerated GPU brush engine.
- * Computes all cutting-edge CSP brush mathematics directly on the video card!
+ * Executes authentic Clip Studio Paint brush mathematics on the GPU with zero per-call driver queries.
  */
 export class WebGlBrushEngine {
   private static instance: WebGlBrushEngine | null = null;
 
   private canvas: HTMLCanvasElement | null = null;
   private gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
+  private isWebGl2 = false;
   private program: WebGLProgram | null = null;
   private ribbonProgram: WebGLProgram | null = null;
   private isGpuAvailable = false;
@@ -312,17 +397,40 @@ export class WebGlBrushEngine {
     glVersion: 'None',
   };
 
-  // Uniform locations (Instanced Stamp)
+  // Cached Attribute Locations (Instanced Dab) — zero getAttribLocation calls during draw!
+  private aQuadVertexLoc: number = -1;
+  private aCenterLoc: number = -1;
+  private aSizeLoc: number = -1;
+  private aAngleLoc: number = -1;
+  private aColorLoc: number = -1;
+  private aAlphaLoc: number = -1;
+  private aPressureLoc: number = -1;
+  private aStrokeDistLoc: number = -1;
+  private aFlipLoc: number = -1;
+
+  // Cached Uniform Locations (Instanced Dab)
   private uCanvasResolutionLoc: WebGLUniformLocation | null = null;
+  private uDocResolutionLoc: WebGLUniformLocation | null = null;
+  private uDirtyOffsetLoc: WebGLUniformLocation | null = null;
   private uHasTipTextureLoc: WebGLUniformLocation | null = null;
+  private uIsColorTipLoc: WebGLUniformLocation | null = null;
   private uTipTextureLoc: WebGLUniformLocation | null = null;
   private uHasDualTipTextureLoc: WebGLUniformLocation | null = null;
   private uDualTipTextureLoc: WebGLUniformLocation | null = null;
   private uDualBlendModeLoc: WebGLUniformLocation | null = null;
+  private uAntiAliasLoc: WebGLUniformLocation | null = null;
   private uHardnessLoc: WebGLUniformLocation | null = null;
   private uWetEdgeLoc: WebGLUniformLocation | null = null;
   private uPaperGrainLoc: WebGLUniformLocation | null = null;
   private uGrainScaleLoc: WebGLUniformLocation | null = null;
+  private uGrainRotateRadLoc: WebGLUniformLocation | null = null;
+  private uPaperModeLoc: WebGLUniformLocation | null = null;
+  private uPaperBrightnessLoc: WebGLUniformLocation | null = null;
+  private uPaperContrastLoc: WebGLUniformLocation | null = null;
+  private uPaperInvertLoc: WebGLUniformLocation | null = null;
+  private uHasPaperTexLoc: WebGLUniformLocation | null = null;
+  private uPaperTextureLoc: WebGLUniformLocation | null = null;
+  private uPaperTexSizeLoc: WebGLUniformLocation | null = null;
   private uColorMixingLoc: WebGLUniformLocation | null = null;
   private uPerceptualMixingLoc: WebGLUniformLocation | null = null;
   private uHasCanvasTextureLoc: WebGLUniformLocation | null = null;
@@ -333,8 +441,9 @@ export class WebGlBrushEngine {
   private uIsEraserLoc: WebGLUniformLocation | null = null;
   private uIsBgEraserLoc: WebGLUniformLocation | null = null;
 
-  // Uniform locations (Ribbon Mesh)
+  // Cached Locations (Ribbon Mesh)
   private uRibbonCanvasResolutionLoc: WebGLUniformLocation | null = null;
+  private uRibbonDirtyOffsetLoc: WebGLUniformLocation | null = null;
   private aRibbonPosLoc: number = -1;
   private aRibbonNormalDistLoc: number = -1;
   private aRibbonColorLoc: number = -1;
@@ -342,26 +451,41 @@ export class WebGlBrushEngine {
 
   // Textures cache
   private tipTexturesMap = new Map<string, WebGLTexture>();
+  private builtinPaperTexture: WebGLTexture | null = null;
   private canvasLayerTexture: WebGLTexture | null = null;
 
-  // Dab geometry & instancing buffers
+  // Dab geometry & instancing buffers (stride 14 floats)
   private quadVertexBuffer: WebGLBuffer | null = null;
   private extInstanced: {
     drawArraysInstanced: (mode: number, first: number, count: number, instanceCount: number) => void;
     vertexAttribDivisor: (index: number, divisor: number) => void;
   } | null = null;
+  private extMinMax: { MAX_EXT: number } | null = null;
   private instanceBuffer: WebGLBuffer | null = null;
-  private instanceArray: Float32Array = new Float32Array(4096 * 12);
+  private instanceArray: Float32Array = new Float32Array(4096 * 14);
 
-  // Ribbon geometry buffers (stride 8: x, y, normalDist, width, r, g, b, a)
+  // Ribbon geometry buffers (stride 8)
   private ribbonBuffer: WebGLBuffer | null = null;
   private ribbonArray: Float32Array = new Float32Array(1024 * 8);
 
   private constructor() {
     if (typeof document !== 'undefined') {
-      this.canvas = document.createElement('canvas');
-      this.canvas.width = 1024;
-      this.canvas.height = 1024;
+      const c = document.createElement('canvas');
+      c.width = 1024;
+      c.height = 1024;
+      this.canvas = c;
+      if (typeof c.addEventListener === 'function') {
+        c.addEventListener('webglcontextlost', (ev) => {
+          ev.preventDefault();
+          this.isGpuAvailable = false;
+          this.tipTexturesMap.clear();
+          this.builtinPaperTexture = null;
+          this.canvasLayerTexture = null;
+        });
+        c.addEventListener('webglcontextrestored', () => {
+          this.initGl();
+        });
+      }
       this.initGl();
     }
   }
@@ -373,18 +497,15 @@ export class WebGlBrushEngine {
     return WebGlBrushEngine.instance;
   }
 
-  /**
-   * Initializes the WebGL context and GPU shader programs.
-   */
   private initGl() {
-    if (!this.canvas) {
+    if (!this.canvas || typeof this.canvas.getContext !== 'function') {
       this.isGpuAvailable = false;
       return;
     }
     try {
       const glOpts: WebGLContextAttributes = {
         alpha: true,
-        antialias: true,
+        antialias: false,
         depth: false,
         stencil: false,
         premultipliedAlpha: true,
@@ -392,7 +513,8 @@ export class WebGlBrushEngine {
         powerPreference: 'high-performance',
       };
 
-      const gl = (this.canvas.getContext('webgl2', glOpts) ||
+      const gl2 = this.canvas.getContext('webgl2', glOpts) as WebGL2RenderingContext | null;
+      const gl = (gl2 ||
         this.canvas.getContext('webgl', glOpts) ||
         this.canvas.getContext('experimental-webgl', glOpts)) as WebGLRenderingContext | null;
 
@@ -402,8 +524,8 @@ export class WebGlBrushEngine {
       }
 
       this.gl = gl;
+      this.isWebGl2 = Boolean(gl2 && 'MAX' in gl2);
 
-      // Query host video card information
       let renderer = 'Generic WebGL GPU';
       let vendor = 'Generic';
       if (typeof gl.getExtension === 'function') {
@@ -411,6 +533,9 @@ export class WebGlBrushEngine {
         if (ext) {
           renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || renderer;
           vendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || vendor;
+        }
+        if (!this.isWebGl2) {
+          this.extMinMax = gl.getExtension('EXT_blend_minmax') as any;
         }
       }
       const glVersion = (typeof gl.getParameter === 'function' && gl.getParameter(gl.VERSION)) || 'WebGL';
@@ -434,16 +559,40 @@ export class WebGlBrushEngine {
           gl.linkProgram(program);
           if (gl.getProgramParameter(program, gl.LINK_STATUS)) {
             this.program = program;
+            // Cache ALL attribute locations once at link time
+            this.aQuadVertexLoc = gl.getAttribLocation(program, 'a_quadVertex');
+            this.aCenterLoc = gl.getAttribLocation(program, 'a_center');
+            this.aSizeLoc = gl.getAttribLocation(program, 'a_size');
+            this.aAngleLoc = gl.getAttribLocation(program, 'a_angle');
+            this.aColorLoc = gl.getAttribLocation(program, 'a_color');
+            this.aAlphaLoc = gl.getAttribLocation(program, 'a_alpha');
+            this.aPressureLoc = gl.getAttribLocation(program, 'a_pressure');
+            this.aStrokeDistLoc = gl.getAttribLocation(program, 'a_strokeDist');
+            this.aFlipLoc = gl.getAttribLocation(program, 'a_flip');
+
+            // Cache ALL uniform locations once at link time
             this.uCanvasResolutionLoc = gl.getUniformLocation(program, 'u_canvasResolution');
+            this.uDocResolutionLoc = gl.getUniformLocation(program, 'u_docResolution');
+            this.uDirtyOffsetLoc = gl.getUniformLocation(program, 'u_dirtyOffset');
             this.uHasTipTextureLoc = gl.getUniformLocation(program, 'u_hasTipTexture');
+            this.uIsColorTipLoc = gl.getUniformLocation(program, 'u_isColorTip');
             this.uTipTextureLoc = gl.getUniformLocation(program, 'u_tipTexture');
             this.uHasDualTipTextureLoc = gl.getUniformLocation(program, 'u_hasDualTipTexture');
             this.uDualTipTextureLoc = gl.getUniformLocation(program, 'u_dualTipTexture');
             this.uDualBlendModeLoc = gl.getUniformLocation(program, 'u_dualBlendMode');
+            this.uAntiAliasLoc = gl.getUniformLocation(program, 'u_antiAlias');
             this.uHardnessLoc = gl.getUniformLocation(program, 'u_hardness');
             this.uWetEdgeLoc = gl.getUniformLocation(program, 'u_wetEdge');
             this.uPaperGrainLoc = gl.getUniformLocation(program, 'u_paperGrain');
             this.uGrainScaleLoc = gl.getUniformLocation(program, 'u_grainScale');
+            this.uGrainRotateRadLoc = gl.getUniformLocation(program, 'u_grainRotateRad');
+            this.uPaperModeLoc = gl.getUniformLocation(program, 'u_paperMode');
+            this.uPaperBrightnessLoc = gl.getUniformLocation(program, 'u_paperBrightness');
+            this.uPaperContrastLoc = gl.getUniformLocation(program, 'u_paperContrast');
+            this.uPaperInvertLoc = gl.getUniformLocation(program, 'u_paperInvert');
+            this.uHasPaperTexLoc = gl.getUniformLocation(program, 'u_hasPaperTex');
+            this.uPaperTextureLoc = gl.getUniformLocation(program, 'u_paperTexture');
+            this.uPaperTexSizeLoc = gl.getUniformLocation(program, 'u_paperTexSize');
             this.uColorMixingLoc = gl.getUniformLocation(program, 'u_colorMixing');
             this.uPerceptualMixingLoc = gl.getUniformLocation(program, 'u_perceptualMixing');
             this.uHasCanvasTextureLoc = gl.getUniformLocation(program, 'u_hasCanvasTexture');
@@ -470,6 +619,7 @@ export class WebGlBrushEngine {
           if (gl.getProgramParameter(rProgram, gl.LINK_STATUS)) {
             this.ribbonProgram = rProgram;
             this.uRibbonCanvasResolutionLoc = gl.getUniformLocation(rProgram, 'u_canvasResolution');
+            this.uRibbonDirtyOffsetLoc = gl.getUniformLocation(rProgram, 'u_dirtyOffset');
             this.aRibbonPosLoc = gl.getAttribLocation(rProgram, 'a_pos');
             this.aRibbonNormalDistLoc = gl.getAttribLocation(rProgram, 'a_normalDist');
             this.aRibbonColorLoc = gl.getAttribLocation(rProgram, 'a_color');
@@ -478,7 +628,7 @@ export class WebGlBrushEngine {
         }
       }
 
-      // Create static quad vertex buffer: two triangles forming [-0.5, 0.5] quad
+      // Static quad vertex buffer
       const quadVertices = new Float32Array([
         -0.5, -0.5,
          0.5, -0.5,
@@ -491,10 +641,9 @@ export class WebGlBrushEngine {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVertexBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
 
-      // Create ribbon dynamic vertex buffer
       this.ribbonBuffer = gl.createBuffer();
 
-      // Initialize hardware instanced array support
+      // Hardware instanced array support
       if ('drawArraysInstanced' in gl) {
         this.extInstanced = {
           drawArraysInstanced: (mode: number, first: number, count: number, instanceCount: number) => {
@@ -519,13 +668,45 @@ export class WebGlBrushEngine {
       }
       this.instanceBuffer = gl.createBuffer();
 
-      // Configure standard alpha blending
+      // Upload seamless 512x512 cold-press paper grain texture once at startup
+      this.uploadBuiltinPaperTexture(gl);
+
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
       this.isGpuAvailable = this.program !== null || this.ribbonProgram !== null;
     } catch {
       this.isGpuAvailable = false;
+    }
+  }
+
+  private uploadBuiltinPaperTexture(gl: WebGLRenderingContext): void {
+    try {
+      const tex = gl.createTexture();
+      if (!tex) return;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      // Expand 1-channel 512x512 paperGrainTable to LUMINANCE for WebGL1+2 universal compatibility
+      gl.texImage2D(
+        gl.TEXTURE_2D,
+        0,
+        gl.LUMINANCE,
+        GRAIN_SIZE,
+        GRAIN_SIZE,
+        0,
+        gl.LUMINANCE,
+        gl.UNSIGNED_BYTE,
+        paperGrainTable
+      );
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      this.builtinPaperTexture = tex;
+    } catch {
+      this.builtinPaperTexture = null;
     }
   }
 
@@ -547,36 +728,48 @@ export class WebGlBrushEngine {
   }
 
   public isAvailable(): boolean {
-    return this.isGpuAvailable && this.gl !== null;
+    if (!this.isGpuAvailable || !this.gl) return false;
+    if (typeof this.gl.isContextLost === 'function' && this.gl.isContextLost()) {
+      this.isGpuAvailable = false;
+      return false;
+    }
+    return true;
   }
 
   /**
-   * Retrieves or uploads a brush tip texture to GPU memory.
+   * Retrieves or uploads a brush tip or paper texture to GPU memory.
    */
-  public getOrCreateTipTexture(image: HTMLImageElement): WebGLTexture | null {
+  public getOrCreateTipTexture(image: HTMLImageElement, repeatWrap: boolean = false): WebGLTexture | null {
     if (!this.gl || !image || !image.src) return null;
-    const cached = this.tipTexturesMap.get(image.src);
+    const cacheKey = `${repeatWrap ? 'rep:' : 'tip:'}${image.src}`;
+    const cached = this.tipTexturesMap.get(cacheKey);
     if (cached) return cached;
 
     const gl = this.gl;
+    if (this.tipTexturesMap.size >= 64) {
+      const oldestKey = this.tipTexturesMap.keys().next().value;
+      if (oldestKey) {
+        const oldTex = this.tipTexturesMap.get(oldestKey);
+        if (oldTex) gl.deleteTexture(oldTex);
+        this.tipTexturesMap.delete(oldestKey);
+      }
+    }
     const tex = gl.createTexture();
     if (!tex) return null;
 
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const wrap = repeatWrap ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-    this.tipTexturesMap.set(image.src, tex);
+    this.tipTexturesMap.set(cacheKey, tex);
     return tex;
   }
 
-  /**
-   * Synchronizes underlying canvas layer texture for real-time CSP color mixing.
-   */
   public uploadCanvasTexture(sourceCanvas: HTMLCanvasElement): WebGLTexture | null {
     if (!this.gl) return null;
     const gl = this.gl;
@@ -598,9 +791,6 @@ export class WebGlBrushEngine {
     return tex;
   }
 
-  /**
-   * Parses hex or rgb color string into normalized RGB [0, 1].
-   */
   public parseColor(color: string): { r: number; g: number; b: number } {
     if (color.startsWith('#')) {
       let hex = color.slice(1);
@@ -614,13 +804,22 @@ export class WebGlBrushEngine {
         b: (num & 255) / 255,
       };
     }
+    if (color.startsWith('rgb')) {
+      const m = color.match(/\(([^)]+)\)/);
+      if (m) {
+        const parts = m[1].split(',');
+        return {
+          r: (parseFloat(parts[0]) || 0) / 255,
+          g: (parseFloat(parts[1]) || 0) / 255,
+          b: (parseFloat(parts[2]) || 0) / 255,
+        };
+      }
+    }
     return { r: 0.1, g: 0.1, b: 0.1 };
   }
 
   /**
-   * Track A: Ribbon Inking Engine (G-Pen, Manga Inking, Clean Vector/Raster Lines)
-   * Evaluates spline into continuous polygonal triangle strip (gl.TRIANGLE_STRIP)
-   * with normal extrusion and analytical distance field (SDF) antialiasing.
+   * Track A: Ribbon Inking Engine
    */
   public renderRibbonSegment(
     targetCtx: CanvasRenderingContext2D,
@@ -630,8 +829,8 @@ export class WebGlBrushEngine {
     p3: Point,
     color: string,
     opacity: number = 1.0,
-    canvasWidth: number,
-    canvasHeight: number,
+    _canvasWidth: number,
+    _canvasHeight: number,
     isEraser: boolean = false,
     isBgEraser: boolean = false
   ): boolean {
@@ -645,7 +844,6 @@ export class WebGlBrushEngine {
     const avgW = Math.max(0.5, (p0.width + p3.width) * 0.5);
     const steps = Math.max(8, Math.min(48, Math.ceil(chord / Math.max(1.0, avgW * 0.25))));
 
-    // Stride 8: [x, y, normalDist, width, r, g, b, a]
     const vertexCount = (steps + 1) * 2;
     const requiredFloats = vertexCount * 8;
     if (this.ribbonArray.length < requiredFloats) {
@@ -666,11 +864,9 @@ export class WebGlBrushEngine {
       const t = i / steps;
       const it = 1 - t;
 
-      // Position along cubic Bézier
       const px = it * it * it * p0.x + 3 * it * it * t * c1.x + 3 * it * t * t * c2.x + t * t * t * p3.x;
       const py = it * it * it * p0.y + 3 * it * it * t * c1.y + 3 * it * t * t * c2.y + t * t * t * p3.y;
 
-      // Derivative (tangent)
       const dpx = 3 * it * it * (c1.x - p0.x) + 6 * it * t * (c2.x - c1.x) + 3 * t * t * (p3.x - c2.x);
       const dpy = 3 * it * it * (c1.y - p0.y) + 6 * it * t * (c2.y - c1.y) + 3 * t * t * (p3.y - c2.y);
       const speed = Math.hypot(dpx, dpy);
@@ -682,24 +878,19 @@ export class WebGlBrushEngine {
         ny = dpx / speed;
       }
 
-      // Interpolated stroke width
       const w = Math.max(0.5, p0.width + (p3.width - p0.width) * t);
       const halfW = w * 0.5;
 
-      // Left vertex
       const lx = px + nx * halfW;
       const ly = py + ny * halfW;
-      // Right vertex
       const rx = px - nx * halfW;
       const ry = py - ny * halfW;
 
-      // Update dirty bounding box
       minX = Math.min(minX, lx, rx);
       minY = Math.min(minY, ly, ry);
       maxX = Math.max(maxX, lx, rx);
       maxY = Math.max(maxY, ly, ry);
 
-      // Left vertex (normalDist = -1.0)
       arr[vIdx++] = lx;
       arr[vIdx++] = ly;
       arr[vIdx++] = -1.0;
@@ -709,7 +900,6 @@ export class WebGlBrushEngine {
       arr[vIdx++] = rgb.b;
       arr[vIdx++] = alpha;
 
-      // Right vertex (normalDist = +1.0)
       arr[vIdx++] = rx;
       arr[vIdx++] = ry;
       arr[vIdx++] = 1.0;
@@ -721,31 +911,34 @@ export class WebGlBrushEngine {
     }
 
     const pad = 4;
-    const sx = Math.max(0, Math.floor(minX - pad));
-    const sy = Math.max(0, Math.floor(minY - pad));
-    const ex = Math.min(canvasWidth, Math.ceil(maxX + pad));
-    const ey = Math.min(canvasHeight, Math.ceil(maxY + pad));
-    const dw = ex - sx;
-    const dh = ey - sy;
+    const sx = Math.floor(minX - pad);
+    const sy = Math.floor(minY - pad);
+    const ex = Math.ceil(maxX + pad);
+    const ey = Math.ceil(maxY + pad);
+    const dw = Math.min(4096, Math.max(0, ex - sx));
+    const dh = Math.min(4096, Math.max(0, ey - sy));
 
     if (dw <= 0 || dh <= 0) return false;
 
-    // Resize GPU canvas if needed
-    if (canvas.width !== canvasWidth || canvas.height !== canvasHeight) {
-      canvas.width = canvasWidth;
-      canvas.height = canvasHeight;
+    if (canvas.width < dw || canvas.height < dh) {
+      canvas.width = Math.max(canvas.width, dw, 512);
+      canvas.height = Math.max(canvas.height, dh, 512);
     }
 
-    gl.viewport(0, 0, canvasWidth, canvasHeight);
+    const viewY = Math.max(0, canvas.height - dh);
+    gl.viewport(0, viewY, dw, dh);
     if (typeof gl.scissor === 'function') {
       gl.enable(gl.SCISSOR_TEST);
-      gl.scissor(sx, Math.max(0, canvasHeight - ey), dw, dh);
+      gl.scissor(0, viewY, dw, dh);
     }
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.useProgram(this.ribbonProgram);
-    gl.uniform2f(this.uRibbonCanvasResolutionLoc, canvasWidth, canvasHeight);
+    gl.uniform2f(this.uRibbonCanvasResolutionLoc, dw, dh);
+    if (this.uRibbonDirtyOffsetLoc) {
+      gl.uniform2f(this.uRibbonDirtyOffsetLoc, sx, sy);
+    }
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.ribbonBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, requiredFloats), gl.DYNAMIC_DRAW);
@@ -763,7 +956,6 @@ export class WebGlBrushEngine {
     gl.enableVertexAttribArray(this.aRibbonColorLoc);
     gl.vertexAttribPointer(this.aRibbonColorLoc, 4, gl.FLOAT, false, byteStride, 4 * 4);
 
-    // Render continuous triangle strip
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, vertexCount);
 
     if (typeof gl.scissor === 'function') {
@@ -775,33 +967,27 @@ export class WebGlBrushEngine {
     gl.disableVertexAttribArray(this.aRibbonWidthLoc);
     gl.disableVertexAttribArray(this.aRibbonColorLoc);
 
-    // Blit hardware GPU dirty rect onto target context
     targetCtx.save();
-    if (isBgEraser) {
-      targetCtx.globalCompositeOperation = 'source-over';
-    } else if (isEraser) {
-      targetCtx.globalCompositeOperation = 'destination-out';
-    } else {
-      targetCtx.globalCompositeOperation = 'source-over';
-    }
+    targetCtx.globalCompositeOperation = isBgEraser ? 'source-over' : (isEraser ? 'destination-out' : 'source-over');
     targetCtx.globalAlpha = 1.0;
-    targetCtx.drawImage(canvas, sx, sy, dw, dh, sx, sy, dw, dh);
+    targetCtx.drawImage(canvas, 0, 0, dw, dh, sx, sy, dw, dh);
     targetCtx.restore();
 
     return true;
   }
 
   /**
-   * Track B: GPU Instanced Stamp Engine (Pencils, Dry Brushes, Textured Tips)
-   * Batches thousands of textured dabs into a single GPU draw call per frame.
+   * Track B: GPU Instanced CSP Stamp Engine
+   * Supports unlimited document sizes (>4096px via automatic tile chunking),
+   * translated offscreen bake canvases, CSP 4-level AA, 5-mode paper tooth, and Compare-Density wash!
    */
   public renderDabsToContext(
     targetCtx: CanvasRenderingContext2D,
     dabs: GpuDab[],
-    settings: BrushSettings,
+    settings: BrushSettings & { alphaLocked?: boolean },
     tool: ToolType,
-    canvasWidth: number,
-    canvasHeight: number,
+    _canvasWidth: number,
+    _canvasHeight: number,
     underlyingCanvas?: HTMLCanvasElement
   ): boolean {
     const canvas = this.canvas;
@@ -810,8 +996,10 @@ export class WebGlBrushEngine {
     }
 
     const gl = this.gl;
-    const isEraser = tool === 'eraser';
-    const isBgEraser = isEraser && targetCtx.fillStyle === '#ffffff';
+    const isTransparentInk = Boolean(settings.isTransparentInk);
+    const isEraser = tool === 'eraser' || isTransparentInk;
+    const isBgEraser = tool === 'eraser' && targetCtx.fillStyle === '#ffffff';
+    const isAlphaLocked = Boolean(settings.alphaLocked);
 
     let minX = Infinity;
     let minY = Infinity;
@@ -827,59 +1015,142 @@ export class WebGlBrushEngine {
       if (d.y + rad > maxY) maxY = d.y + rad;
     }
 
-    const dirtyX = Math.max(0, Math.floor(minX));
-    const dirtyY = Math.max(0, Math.floor(minY));
-    const dirtyMaxX = Math.min(canvasWidth, Math.ceil(maxX));
-    const dirtyMaxY = Math.min(canvasHeight, Math.ceil(maxY));
-    const dirtyW = Math.max(0, dirtyMaxX - dirtyX);
-    const dirtyH = Math.max(0, dirtyMaxY - dirtyY);
+    const fullDirtyX = Math.floor(minX);
+    const fullDirtyY = Math.floor(minY);
+    const fullDirtyMaxX = Math.ceil(maxX);
+    const fullDirtyMaxY = Math.ceil(maxY);
+    const totalW = Math.max(0, fullDirtyMaxX - fullDirtyX);
+    const totalH = Math.max(0, fullDirtyMaxY - fullDirtyY);
 
-    if (dirtyW <= 0 || dirtyH <= 0) {
+    if (totalW <= 0 || totalH <= 0) {
       return false;
     }
 
-    // Resize GPU canvas if needed
-    if (canvas.width !== canvasWidth || canvas.height !== canvasHeight) {
-      canvas.width = canvasWidth;
-      canvas.height = canvasHeight;
+    // Pack instance buffer once across all dabs (stride 14 floats)
+    const stride = 14;
+    const requiredFloats = dabs.length * stride;
+    if (this.instanceArray.length < requiredFloats) {
+      this.instanceArray = new Float32Array(Math.max(requiredFloats, this.instanceArray.length * 2));
+    }
+    const arr = this.instanceArray;
+    const aaMode = settings.antiAlias ?? 2;
+    const minRenderDim = aaMode === 0 ? 1.0 : 0.75;
+
+    for (let i = 0; i < dabs.length; i++) {
+      const d = dabs[i];
+      const sub = computeSubpixelDabDimensions(d.width, d.height, d.alpha, minRenderDim);
+      const offset = i * stride;
+      arr[offset + 0] = d.x;
+      arr[offset + 1] = d.y;
+      arr[offset + 2] = sub.renderW;
+      arr[offset + 3] = sub.renderH;
+      arr[offset + 4] = d.angle;
+      arr[offset + 5] = d.r;
+      arr[offset + 6] = d.g;
+      arr[offset + 7] = d.b;
+      arr[offset + 8] = 1.0;
+      arr[offset + 9] = sub.effAlpha;
+      arr[offset + 10] = d.pressure;
+      arr[offset + 11] = d.strokeDist;
+      arr[offset + 12] = d.flipX ?? 1.0;
+      arr[offset + 13] = d.flipY ?? 1.0;
     }
 
-    gl.viewport(0, 0, canvasWidth, canvasHeight);
-    if (typeof gl.scissor === 'function') {
-      gl.enable(gl.SCISSOR_TEST);
-      gl.scissor(dirtyX, Math.max(0, canvasHeight - dirtyMaxY), dirtyW, dirtyH);
+    if (this.instanceBuffer) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, requiredFloats), gl.DYNAMIC_DRAW);
     }
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
 
     gl.useProgram(this.program);
 
-    gl.uniform2f(this.uCanvasResolutionLoc, canvasWidth, canvasHeight);
+    // Configure Blend Equation (Compare Density / Darken tips uses MAX alpha so washes never over-darken!)
+    const useCompareTips = settings.blendTipsMode === 'compare' || settings.blendTipsMode === 'darken';
+    if (useCompareTips && (this.isWebGl2 || this.extMinMax)) {
+      const maxEnum = this.isWebGl2 ? (gl as WebGL2RenderingContext).MAX : this.extMinMax!.MAX_EXT;
+      gl.blendEquationSeparate(gl.FUNC_ADD, maxEnum);
+      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE);
+    } else {
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
+
+    if (this.uDocResolutionLoc) {
+      const docW = underlyingCanvas ? underlyingCanvas.width : Math.max(1, _canvasWidth);
+      const docH = underlyingCanvas ? underlyingCanvas.height : Math.max(1, _canvasHeight);
+      gl.uniform2f(this.uDocResolutionLoc, docW, docH);
+    }
+
+    gl.uniform1i(this.uAntiAliasLoc, aaMode);
     gl.uniform1f(this.uHardnessLoc, settings.hardness ?? 1.0);
     gl.uniform1f(this.uWetEdgeLoc, settings.wetEdge ?? 0.0);
-    gl.uniform1f(this.uPaperGrainLoc, settings.grain ?? (settings.textureDensity ?? 0.0));
+
+    const paperDensity = settings.grain ?? (settings.textureDensity ?? 0.0);
+    gl.uniform1f(this.uPaperGrainLoc, paperDensity);
     gl.uniform1f(this.uGrainScaleLoc, settings.paperTextureScale ?? 1.0);
+    gl.uniform1f(this.uGrainRotateRadLoc, ((settings.paperTextureRotate ?? 0) * Math.PI) / 180);
+    const pMode =
+      settings.paperTextureMode === 'multiply'
+        ? 1
+        : settings.paperTextureMode === 'compare'
+        ? 2
+        : settings.paperTextureMode === 'overlay'
+        ? 3
+        : settings.paperTextureMode === 'outline'
+        ? 4
+        : 0; // subtract default
+    gl.uniform1i(this.uPaperModeLoc, pMode);
+    gl.uniform1f(this.uPaperBrightnessLoc, (settings.paperTextureBrightness ?? 0) / 100.0);
+    gl.uniform1f(this.uPaperContrastLoc, (settings.paperTextureContrast ?? 0) / 100.0);
+    gl.uniform1i(this.uPaperInvertLoc, settings.paperTextureInverted ? 1 : 0);
     gl.uniform1i(this.uIsEraserLoc, isEraser ? 1 : 0);
     gl.uniform1i(this.uIsBgEraserLoc, isBgEraser ? 1 : 0);
+
+    // Bind Paper Texture (custom paper image or built-in 512x512 cold-press grain)
+    if (paperDensity > 0.001) {
+      let paperTex: WebGLTexture | null = null;
+      let paperW = GRAIN_SIZE;
+      let paperH = GRAIN_SIZE;
+      if (settings.paperTextureImage && (settings.paperTextureImage.naturalWidth || settings.paperTextureImage.width)) {
+        paperTex = this.getOrCreateTipTexture(settings.paperTextureImage, true);
+        paperW = settings.paperTextureImage.naturalWidth || settings.paperTextureImage.width || GRAIN_SIZE;
+        paperH = settings.paperTextureImage.naturalHeight || settings.paperTextureImage.height || GRAIN_SIZE;
+      } else {
+        paperTex = this.builtinPaperTexture;
+      }
+      if (paperTex) {
+        gl.activeTexture(gl.TEXTURE3);
+        gl.bindTexture(gl.TEXTURE_2D, paperTex);
+        gl.uniform1i(this.uPaperTextureLoc, 3);
+        gl.uniform1i(this.uHasPaperTexLoc, 1);
+        gl.uniform2f(this.uPaperTexSizeLoc, paperW, paperH);
+      } else {
+        gl.uniform1i(this.uHasPaperTexLoc, 0);
+      }
+    } else {
+      gl.uniform1i(this.uHasPaperTexLoc, 0);
+    }
 
     // Primary Tip Texture
     let tipTex: WebGLTexture | null = null;
     if (settings.customTipImage) {
-      tipTex = this.getOrCreateTipTexture(settings.customTipImage);
+      tipTex = this.getOrCreateTipTexture(settings.customTipImage, false);
     }
+    const isColorTip = Boolean(settings.isColorTip || (settings.subTips && settings.subTips[0]?.isColor));
     if (tipTex) {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tipTex);
       gl.uniform1i(this.uTipTextureLoc, 0);
       gl.uniform1i(this.uHasTipTextureLoc, 1);
+      gl.uniform1i(this.uIsColorTipLoc, isColorTip ? 1 : 0);
     } else {
       gl.uniform1i(this.uHasTipTextureLoc, 0);
+      gl.uniform1i(this.uIsColorTipLoc, 0);
     }
 
-    // Dual-Brush Tip Texture Modulation
+    // Dual-Brush Tip Texture
     let dualTipTex: WebGLTexture | null = null;
     if (settings.dualBrush && settings.dualTipImage) {
-      dualTipTex = this.getOrCreateTipTexture(settings.dualTipImage);
+      dualTipTex = this.getOrCreateTipTexture(settings.dualTipImage, false);
     }
     if (dualTipTex) {
       gl.activeTexture(gl.TEXTURE2);
@@ -901,7 +1172,7 @@ export class WebGlBrushEngine {
       gl.uniform1i(this.uHasDualTipTextureLoc, 0);
     }
 
-    // Color Mixing (OKLab + Kubelka-Munk perceptual pigment mixing by default)
+    // Optional GPU Color Mixing
     const enableColorMix = Boolean(settings.colorMixing) && underlyingCanvas !== undefined;
     gl.uniform1i(this.uColorMixingLoc, enableColorMix ? 1 : 0);
     gl.uniform1i(this.uPerceptualMixingLoc, settings.perceptualMixing !== false ? 1 : 0);
@@ -923,128 +1194,154 @@ export class WebGlBrushEngine {
       gl.uniform1i(this.uHasCanvasTextureLoc, 0);
     }
 
-    const aQuadVertexLoc = gl.getAttribLocation(this.program, 'a_quadVertex');
+    // Setup vertex attributes once across tile chunks
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVertexBuffer);
-    gl.enableVertexAttribArray(aQuadVertexLoc);
-    gl.vertexAttribPointer(aQuadVertexLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.enableVertexAttribArray(this.aQuadVertexLoc);
+    gl.vertexAttribPointer(this.aQuadVertexLoc, 2, gl.FLOAT, false, 0, 0);
 
-    const aCenterLoc = gl.getAttribLocation(this.program, 'a_center');
-    const aSizeLoc = gl.getAttribLocation(this.program, 'a_size');
-    const aAngleLoc = gl.getAttribLocation(this.program, 'a_angle');
-    const aColorLoc = gl.getAttribLocation(this.program, 'a_color');
-    const aAlphaLoc = gl.getAttribLocation(this.program, 'a_alpha');
-    const aPressureLoc = gl.getAttribLocation(this.program, 'a_pressure');
-    const aStrokeDistLoc = gl.getAttribLocation(this.program, 'a_strokeDist');
-
-    if (this.extInstanced && this.instanceBuffer && dabs.length > 0) {
-      const stride = 12;
-      const requiredFloats = dabs.length * stride;
-      if (this.instanceArray.length < requiredFloats) {
-        this.instanceArray = new Float32Array(Math.max(requiredFloats, this.instanceArray.length * 2));
-      }
-      const arr = this.instanceArray;
-      for (let i = 0; i < dabs.length; i++) {
-        const d = dabs[i];
-        const offset = i * stride;
-        arr[offset + 0] = d.x;
-        arr[offset + 1] = d.y;
-        arr[offset + 2] = d.width;
-        arr[offset + 3] = d.height;
-        arr[offset + 4] = d.angle;
-        arr[offset + 5] = d.r;
-        arr[offset + 6] = d.g;
-        arr[offset + 7] = d.b;
-        arr[offset + 8] = 1.0;
-        arr[offset + 9] = d.alpha;
-        arr[offset + 10] = d.pressure;
-        arr[offset + 11] = d.strokeDist;
-      }
-
+    const useInstanced = Boolean(this.extInstanced && this.instanceBuffer);
+    if (useInstanced && this.extInstanced && this.instanceBuffer) {
       gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
-      gl.bufferData(gl.ARRAY_BUFFER, arr.subarray(0, requiredFloats), gl.DYNAMIC_DRAW);
-
       const byteStride = stride * 4;
 
-      gl.enableVertexAttribArray(aCenterLoc);
-      gl.vertexAttribPointer(aCenterLoc, 2, gl.FLOAT, false, byteStride, 0);
-      this.extInstanced.vertexAttribDivisor(aCenterLoc, 1);
+      gl.enableVertexAttribArray(this.aCenterLoc);
+      gl.vertexAttribPointer(this.aCenterLoc, 2, gl.FLOAT, false, byteStride, 0);
+      this.extInstanced.vertexAttribDivisor(this.aCenterLoc, 1);
 
-      gl.enableVertexAttribArray(aSizeLoc);
-      gl.vertexAttribPointer(aSizeLoc, 2, gl.FLOAT, false, byteStride, 2 * 4);
-      this.extInstanced.vertexAttribDivisor(aSizeLoc, 1);
+      gl.enableVertexAttribArray(this.aSizeLoc);
+      gl.vertexAttribPointer(this.aSizeLoc, 2, gl.FLOAT, false, byteStride, 2 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aSizeLoc, 1);
 
-      gl.enableVertexAttribArray(aAngleLoc);
-      gl.vertexAttribPointer(aAngleLoc, 1, gl.FLOAT, false, byteStride, 4 * 4);
-      this.extInstanced.vertexAttribDivisor(aAngleLoc, 1);
+      gl.enableVertexAttribArray(this.aAngleLoc);
+      gl.vertexAttribPointer(this.aAngleLoc, 1, gl.FLOAT, false, byteStride, 4 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aAngleLoc, 1);
 
-      gl.enableVertexAttribArray(aColorLoc);
-      gl.vertexAttribPointer(aColorLoc, 4, gl.FLOAT, false, byteStride, 5 * 4);
-      this.extInstanced.vertexAttribDivisor(aColorLoc, 1);
+      gl.enableVertexAttribArray(this.aColorLoc);
+      gl.vertexAttribPointer(this.aColorLoc, 4, gl.FLOAT, false, byteStride, 5 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aColorLoc, 1);
 
-      gl.enableVertexAttribArray(aAlphaLoc);
-      gl.vertexAttribPointer(aAlphaLoc, 1, gl.FLOAT, false, byteStride, 9 * 4);
-      this.extInstanced.vertexAttribDivisor(aAlphaLoc, 1);
+      gl.enableVertexAttribArray(this.aAlphaLoc);
+      gl.vertexAttribPointer(this.aAlphaLoc, 1, gl.FLOAT, false, byteStride, 9 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aAlphaLoc, 1);
 
-      gl.enableVertexAttribArray(aPressureLoc);
-      gl.vertexAttribPointer(aPressureLoc, 1, gl.FLOAT, false, byteStride, 10 * 4);
-      this.extInstanced.vertexAttribDivisor(aPressureLoc, 1);
+      gl.enableVertexAttribArray(this.aPressureLoc);
+      gl.vertexAttribPointer(this.aPressureLoc, 1, gl.FLOAT, false, byteStride, 10 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aPressureLoc, 1);
 
-      gl.enableVertexAttribArray(aStrokeDistLoc);
-      gl.vertexAttribPointer(aStrokeDistLoc, 1, gl.FLOAT, false, byteStride, 11 * 4);
-      this.extInstanced.vertexAttribDivisor(aStrokeDistLoc, 1);
+      gl.enableVertexAttribArray(this.aStrokeDistLoc);
+      gl.vertexAttribPointer(this.aStrokeDistLoc, 1, gl.FLOAT, false, byteStride, 11 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aStrokeDistLoc, 1);
 
-      this.extInstanced.drawArraysInstanced(gl.TRIANGLES, 0, 6, dabs.length);
-
-      this.extInstanced.vertexAttribDivisor(aCenterLoc, 0);
-      this.extInstanced.vertexAttribDivisor(aSizeLoc, 0);
-      this.extInstanced.vertexAttribDivisor(aAngleLoc, 0);
-      this.extInstanced.vertexAttribDivisor(aColorLoc, 0);
-      this.extInstanced.vertexAttribDivisor(aAlphaLoc, 0);
-      this.extInstanced.vertexAttribDivisor(aPressureLoc, 0);
-      this.extInstanced.vertexAttribDivisor(aStrokeDistLoc, 0);
-
-      gl.disableVertexAttribArray(aCenterLoc);
-      gl.disableVertexAttribArray(aSizeLoc);
-      gl.disableVertexAttribArray(aAngleLoc);
-      gl.disableVertexAttribArray(aColorLoc);
-      gl.disableVertexAttribArray(aAlphaLoc);
-      gl.disableVertexAttribArray(aPressureLoc);
-      gl.disableVertexAttribArray(aStrokeDistLoc);
-    } else {
-      for (const dab of dabs) {
-        gl.vertexAttrib2f(aCenterLoc, dab.x, dab.y);
-        gl.vertexAttrib2f(aSizeLoc, dab.width, dab.height);
-        gl.vertexAttrib1f(aAngleLoc, dab.angle);
-        gl.vertexAttrib4f(aColorLoc, dab.r, dab.g, dab.b, 1.0);
-        gl.vertexAttrib1f(aAlphaLoc, dab.alpha);
-        gl.vertexAttrib1f(aPressureLoc, dab.pressure);
-        gl.vertexAttrib1f(aStrokeDistLoc, dab.strokeDist);
-
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      if (this.aFlipLoc >= 0) {
+        gl.enableVertexAttribArray(this.aFlipLoc);
+        gl.vertexAttribPointer(this.aFlipLoc, 2, gl.FLOAT, false, byteStride, 12 * 4);
+        this.extInstanced.vertexAttribDivisor(this.aFlipLoc, 1);
       }
     }
 
-    if (typeof gl.scissor === 'function') {
-      gl.disable(gl.SCISSOR_TEST);
+    const chunkWMax = Math.min(MAX_TILE_CHUNK, totalW);
+    const chunkHMax = Math.min(MAX_TILE_CHUNK, totalH);
+    if (canvas.width < chunkWMax || canvas.height < chunkHMax) {
+      canvas.width = Math.max(canvas.width, chunkWMax, 512);
+      canvas.height = Math.max(canvas.height, chunkHMax, 512);
     }
 
+    const compositeOp: GlobalCompositeOperation = isBgEraser
+      ? 'source-over'
+      : isEraser
+      ? 'destination-out'
+      : isAlphaLocked
+      ? 'source-atop'
+      : 'source-over';
+
     targetCtx.save();
-    if (isBgEraser) {
-      targetCtx.globalCompositeOperation = 'source-over';
-    } else if (isEraser) {
-      targetCtx.globalCompositeOperation = 'destination-out';
-    } else {
-      targetCtx.globalCompositeOperation = 'source-over';
-    }
+    targetCtx.globalCompositeOperation = compositeOp;
     targetCtx.globalAlpha = 1.0;
-    targetCtx.drawImage(canvas, dirtyX, dirtyY, dirtyW, dirtyH, dirtyX, dirtyY, dirtyW, dirtyH);
+    if (aaMode === 0) {
+      targetCtx.imageSmoothingEnabled = false;
+    }
+
+    // Tile across dirty bounding box in <= 2048x2048 chunks so 70MP B4 600DPI strokes NEVER clip at 4096px!
+    for (let cy = fullDirtyY; cy < fullDirtyMaxY; cy += MAX_TILE_CHUNK) {
+      const dh = Math.min(MAX_TILE_CHUNK, fullDirtyMaxY - cy);
+      for (let cx = fullDirtyX; cx < fullDirtyMaxX; cx += MAX_TILE_CHUNK) {
+        const dw = Math.min(MAX_TILE_CHUNK, fullDirtyMaxX - cx);
+        const viewY = Math.max(0, canvas.height - dh);
+
+        gl.viewport(0, viewY, dw, dh);
+        if (typeof gl.scissor === 'function') {
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(0, viewY, dw, dh);
+        }
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        gl.uniform2f(this.uCanvasResolutionLoc, dw, dh);
+        if (this.uDirtyOffsetLoc) {
+          gl.uniform2f(this.uDirtyOffsetLoc, cx, cy);
+        }
+
+        if (useInstanced && this.extInstanced) {
+          this.extInstanced.drawArraysInstanced(gl.TRIANGLES, 0, 6, dabs.length);
+        } else {
+          for (let i = 0; i < dabs.length; i++) {
+            const offset = i * stride;
+            gl.vertexAttrib2f(this.aCenterLoc, arr[offset], arr[offset + 1]);
+            gl.vertexAttrib2f(this.aSizeLoc, arr[offset + 2], arr[offset + 3]);
+            gl.vertexAttrib1f(this.aAngleLoc, arr[offset + 4]);
+            gl.vertexAttrib4f(this.aColorLoc, arr[offset + 5], arr[offset + 6], arr[offset + 7], 1.0);
+            gl.vertexAttrib1f(this.aAlphaLoc, arr[offset + 9]);
+            gl.vertexAttrib1f(this.aPressureLoc, arr[offset + 10]);
+            gl.vertexAttrib1f(this.aStrokeDistLoc, arr[offset + 11]);
+            if (this.aFlipLoc >= 0) {
+              gl.vertexAttrib2f(this.aFlipLoc, arr[offset + 12], arr[offset + 13]);
+            }
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+          }
+        }
+
+        if (typeof gl.scissor === 'function') {
+          gl.disable(gl.SCISSOR_TEST);
+        }
+
+        targetCtx.drawImage(canvas, 0, 0, dw, dh, cx, cy, dw, dh);
+      }
+    }
+
     targetCtx.restore();
+
+    if (useInstanced && this.extInstanced) {
+      this.extInstanced.vertexAttribDivisor(this.aCenterLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aSizeLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aAngleLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aColorLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aAlphaLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aPressureLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aStrokeDistLoc, 0);
+      if (this.aFlipLoc >= 0) {
+        this.extInstanced.vertexAttribDivisor(this.aFlipLoc, 0);
+        gl.disableVertexAttribArray(this.aFlipLoc);
+      }
+
+      gl.disableVertexAttribArray(this.aCenterLoc);
+      gl.disableVertexAttribArray(this.aSizeLoc);
+      gl.disableVertexAttribArray(this.aAngleLoc);
+      gl.disableVertexAttribArray(this.aColorLoc);
+      gl.disableVertexAttribArray(this.aAlphaLoc);
+      gl.disableVertexAttribArray(this.aPressureLoc);
+      gl.disableVertexAttribArray(this.aStrokeDistLoc);
+    }
+
+    if (useCompareTips) {
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
 
     return true;
   }
 
   /**
-   * Generates arc-length sampled sub-pixel dabs along a Bézier curve.
+   * Generates deterministic arc-length sampled sub-pixel dabs along a quadratic Bézier curve.
    */
   public generateArcLengthDabs(
     p0: Point,
@@ -1057,14 +1354,16 @@ export class WebGlBrushEngine {
   ): { dabs: GpuDab[]; remainderDist: number; totalStrokeDist: number } {
     const dabs: GpuDab[] = [];
     const rgb = this.parseColor(color);
-    const spacingRatio = Math.max(0.06, Math.min(1.0, settings.spacing ?? 0.08));
-    const flow = settings.flow ?? 0.85;
+    const spacingRatio = Math.max(0.02, Math.min(1.0, settings.spacing ?? 0.08));
+    const flow = settings.brushDensity ?? settings.flow ?? 0.85;
     const aspect =
       settings.customTipImage && settings.customTipImage.naturalWidth
         ? (settings.customTipImage.naturalHeight || 1) / (settings.customTipImage.naturalWidth || 1)
         : 1.0;
     const baseAngleRad = ((settings.customTipAngle ?? 0) * Math.PI) / 180;
     const angleDynamics = settings.customTipAngleDynamics ?? 'none';
+    const baseThickness = settings.thickness ?? 1.0;
+    const isVertThickness = Boolean(settings.thicknessVertical);
 
     const chord = Math.hypot(p2.x - p0.x, p2.y - p0.y);
     const avgWidth = Math.max(1, (p0.width + p2.width) / 2);
@@ -1075,6 +1374,7 @@ export class WebGlBrushEngine {
 
     let prevX = p0.x;
     let prevY = p0.y;
+    let dabSeq = 0;
 
     const dynamics = settings.dynamics;
     const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
@@ -1103,59 +1403,58 @@ export class WebGlBrushEngine {
 
       const effPressure = p0.pressure + (p2.pressure - p0.pressure) * t;
       const rawWidth = p0.width + (p2.width - p0.width) * t;
-      const curWidth = Math.max(0.5, rawWidth);
+      const curWidth = Math.max(0.25, rawWidth);
 
-      const requiredSpacing = Math.max(0.5, curWidth * spacingRatio);
+      const requiredSpacing = Math.max(0.25, curWidth * spacingRatio);
 
       if (accDist >= requiredSpacing) {
+        dabSeq++;
         let baseAngle = baseAngleRad;
-        if (angleDynamics === 'direction' && stepDist > 0.001) {
+        if ((angleDynamics === 'direction' || angleDynamics === 'direction-random') && stepDist > 0.001) {
           baseAngle += Math.atan2(dy, dx);
-        } else if (angleDynamics === 'random' && settings.customTipRotationRandomScale) {
-          baseAngle += (Math.random() - 0.5) * Math.PI * 2 * settings.customTipRotationRandomScale;
+        }
+        if (angleDynamics === 'random' || angleDynamics === 'direction-random') {
+          const rScale = settings.customTipRotationRandomScale ?? 1.0;
+          baseAngle += (dabHashFloat(curX, curY, dabSeq, 11) - 0.5) * Math.PI * 2 * rScale;
         }
 
-        let tx = 0;
+        let tx = 1;
         let ty = 0;
         let nx = 0;
-        let ny = 0;
+        let ny = 1;
         if (stepDist > 0.001) {
           tx = dx / stepDist;
           ty = dy / stepDist;
           nx = -ty;
           ny = tx;
-        } else {
-          nx = 0;
-          ny = 1;
-          tx = 1;
-          ty = 0;
         }
 
         for (let k = 0; k < dabCount; k++) {
+          const seedIdx = dabSeq * 16 + k;
           let curDabW = curWidth;
           if (sizeJitter > 0) {
-            curDabW *= Math.max(0.01, 1.0 - Math.random() * sizeJitter);
+            curDabW *= Math.max(0.01, 1.0 - dabHashFloat(curX, curY, seedIdx, 1) * sizeJitter);
           }
           curDabW = Math.max(0.1, curDabW);
 
-          let curDabThickness = 1.0;
+          let curDabThickness = baseThickness;
           if (roundnessJitter > 0) {
-            curDabThickness *= Math.max(0.05, 1.0 - Math.random() * roundnessJitter);
+            curDabThickness *= Math.max(0.05, 1.0 - dabHashFloat(curX, curY, seedIdx, 2) * roundnessJitter);
           }
 
           let curDabAngle = baseAngle;
           if (angleJitter > 0) {
-            curDabAngle += (Math.random() - 0.5) * Math.PI * 2 * angleJitter;
+            curDabAngle += (dabHashFloat(curX, curY, seedIdx, 3) - 0.5) * Math.PI * 2 * angleJitter;
           }
 
           let curDabX = curX;
           let curDabY = curY;
           if (scatter > 0) {
-            const perpDist = (Math.random() * 2 - 1) * curWidth * scatter;
+            const perpDist = (dabHashFloat(curX, curY, seedIdx, 4) * 2 - 1) * curWidth * scatter;
             let sOffX = nx * perpDist;
             let sOffY = ny * perpDist;
             if (scatterBothAxes) {
-              const tangDist = (Math.random() * 2 - 1) * curWidth * scatter;
+              const tangDist = (dabHashFloat(curX, curY, seedIdx, 5) * 2 - 1) * curWidth * scatter;
               sOffX += tx * tangDist;
               sOffY += ty * tangDist;
             }
@@ -1165,33 +1464,38 @@ export class WebGlBrushEngine {
 
           let curDabAlpha = flow;
           if (flowJitter > 0) {
-            curDabAlpha *= Math.max(0.005, 1.0 - Math.random() * flowJitter);
+            curDabAlpha *= Math.max(0.005, 1.0 - dabHashFloat(curX, curY, seedIdx, 6) * flowJitter);
           }
 
           let dabR = rgb.r;
           let dabG = rgb.g;
           let dabB = rgb.b;
           if (colorJitterEnabled && dynamics && secondaryRgb) {
-            const cd = applyColorDynamics(rgb, secondaryRgb, dynamics);
+            let salt = 20;
+            const cd = applyColorDynamics(rgb, secondaryRgb, dynamics, () => dabHashFloat(curX, curY, seedIdx, salt++));
             dabR = cd.r;
             dabG = cd.g;
             dabB = cd.b;
           }
+
+          const flips = resolveTipFlipSigns(settings.flipH, settings.flipV, seedIdx, curDabX, curDabY);
+          const wOut = isVertThickness ? curDabW * curDabThickness : curDabW;
+          const hOut = isVertThickness ? curDabW * aspect : curDabW * aspect * curDabThickness;
 
           if (settings.spray?.enabled) {
             const pCount = settings.spray.density;
             const pSize = Math.max(1, settings.spray.size);
             const radius = curDabW / 2;
             for (let sp = 0; sp < pCount; sp++) {
-              const u1 = Math.random();
-              const u2 = Math.random();
+              const u1 = dabHashFloat(curDabX, curDabY, seedIdx * 64 + sp, 31);
+              const u2 = dabHashFloat(curDabX, curDabY, seedIdx * 64 + sp, 32);
               const r = radius * Math.sqrt(u1) * (1 - (settings.spray.bias || 0) * (1 - u2));
-              const th = Math.PI * 2 * Math.random();
+              const th = Math.PI * 2 * dabHashFloat(curDabX, curDabY, seedIdx * 64 + sp, 33);
               dabs.push({
                 x: curDabX + r * Math.cos(th),
                 y: curDabY + r * Math.sin(th),
-                width: pSize,
-                height: pSize * aspect * curDabThickness,
+                width: isVertThickness ? pSize * curDabThickness : pSize,
+                height: isVertThickness ? pSize * aspect : pSize * aspect * curDabThickness,
                 angle: curDabAngle,
                 r: dabR,
                 g: dabG,
@@ -1199,14 +1503,16 @@ export class WebGlBrushEngine {
                 alpha: curDabAlpha,
                 pressure: effPressure,
                 strokeDist,
+                flipX: flips.signX,
+                flipY: flips.signY,
               });
             }
           } else {
             dabs.push({
               x: curDabX,
               y: curDabY,
-              width: curDabW,
-              height: curDabW * aspect * curDabThickness,
+              width: wOut,
+              height: hOut,
               angle: curDabAngle,
               r: dabR,
               g: dabG,
@@ -1214,6 +1520,8 @@ export class WebGlBrushEngine {
               alpha: curDabAlpha,
               pressure: effPressure,
               strokeDist,
+              flipX: flips.signX,
+              flipY: flips.signY,
             });
           }
         }

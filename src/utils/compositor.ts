@@ -9,7 +9,7 @@
  */
 
 import { LayerItem, CanvasDimensions, BlendMode, CanvasColorMode, LayerStyles, SoftProofSettings } from '../types/editor';
-import { SparseTileGrid, TILE_SIZE, TileBuffer, globalTileGrid } from './tileEngine';
+import { SparseTileGrid, TILE_SIZE, TileBuffer, globalTileGrid, getTileKey } from './tileEngine';
 import { getCanvasCompositeOperation } from './canvasUtils';
 import {
   buildCurvesCombinedLut,
@@ -275,6 +275,12 @@ uniform vec2 u_docDimensions;
 uniform sampler2D u_maskTexture;
 uniform int u_maskEnabled;
 
+// CSP Expression Color Uniforms (0: color, 1: gray, 2: monochrome)
+uniform int u_expressionMode;
+uniform float u_monoThreshold;
+uniform int u_monoExpressBlack;
+uniform int u_monoExpressWhite;
+
 out vec4 fragColor;
 
 float fractVal(float x) {
@@ -398,8 +404,28 @@ void main() {
 
   vec4 finalColor = texColor;
 
+  if (u_expressionMode == 1) {
+    float gLum = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
+    finalColor.rgb = vec3(gLum);
+  } else if (u_expressionMode == 2) {
+    float mLum = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
+    if (mLum < u_monoThreshold) {
+      if (u_monoExpressBlack == 1) {
+        finalColor = vec4(0.0, 0.0, 0.0, step(0.1, finalColor.a));
+      } else {
+        discard;
+      }
+    } else {
+      if (u_monoExpressWhite == 1) {
+        finalColor = vec4(1.0, 1.0, 1.0, step(0.1, finalColor.a));
+      } else {
+        discard;
+      }
+    }
+  }
+
   if (u_toneEnabled == 1) {
-    finalColor = evaluateScreentone(texColor, v_docCoord);
+    finalColor = evaluateScreentone(finalColor, v_docCoord);
   }
 
   if (u_layerColorEnabled == 1) {
@@ -1062,9 +1088,22 @@ export class ViewportCompositor {
   private uLayerColorLoc: WebGLUniformLocation | null = null;
   private uLayerSubColorLoc: WebGLUniformLocation | null = null;
 
+  // Cached attribute locations (eliminates per-frame gl.getAttribLocation stalls)
+  private aQuadPosLoc: number = -1;
+  private aStylesQuadPosLoc: number = -1;
+  private aBlitQuadPosLoc: number = -1;
+  private aProofQuadPosLoc: number = -1;
+  private contextLost: boolean = false;
+  private onContextLostHandler: ((e: Event) => void) | null = null;
+  private onContextRestoredHandler: (() => void) | null = null;
+
   // Mask uniform locations & version-tracked cache
   private uMaskTextureLoc: WebGLUniformLocation | null = null;
   private uMaskEnabledLoc: WebGLUniformLocation | null = null;
+  private uExpressionModeLoc: WebGLUniformLocation | null = null;
+  private uMonoThresholdLoc: WebGLUniformLocation | null = null;
+  private uMonoExpressBlackLoc: WebGLUniformLocation | null = null;
+  private uMonoExpressWhiteLoc: WebGLUniformLocation | null = null;
   private maskTextureCache: Map<
     string,
     { texture: WebGLTexture; version: number; width: number; height: number }
@@ -1134,7 +1173,13 @@ export class ViewportCompositor {
   private uBlitHasBackdropLoc: WebGLUniformLocation | null = null;
   private uBlitBlendModeLoc: WebGLUniformLocation | null = null;
   private uBlitOpacityLoc: WebGLUniformLocation | null = null;
-  private folderFbos: { fbo: WebGLFramebuffer; texture: WebGLTexture; width: number; height: number }[] = [];
+  private folderFbos: {
+    fbo: WebGLFramebuffer;
+    texture: WebGLTexture;
+    stencilRb: WebGLRenderbuffer | null;
+    width: number;
+    height: number;
+  }[] = [];
 
   // Soft proofing program, uniforms, & snapshot texture
   private softProofProgram: WebGLProgram | null = null;
@@ -1147,20 +1192,68 @@ export class ViewportCompositor {
   private proofSnapshotWidth: number = 0;
   private proofSnapshotHeight: number = 0;
 
-  // Tile texture cache: tileKey -> { texture, version, hasMipmap, filterMode }
-  private textureCache: Map<
+  // Pre-allocated WebGL Texture Pool for dynamic texture streaming
+  private static readonly MAX_TEXTURE_POOL_SIZE = 2048;
+  private textureAccessCounter: number = 0;
+  private texturePool: Array<{
+    texture: WebGLTexture;
+    currentKey: string | null;
+    version: number;
+    lastUsed: number;
+    filterTier?: number;
+    hasStorage?: boolean;
+    hasMipmap?: boolean;
+  }> = [];
+  private activePoolByKey: Map<
     string,
-    { texture: WebGLTexture; version: number; lastUsed: number; filterTier?: number }
+    {
+      texture: WebGLTexture;
+      currentKey: string | null;
+      version: number;
+      lastUsed: number;
+      filterTier?: number;
+      hasStorage?: boolean;
+      hasMipmap?: boolean;
+    }
   > = new Map();
   private fallbackTileCanvas: HTMLCanvasElement | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
+    if (typeof canvas.addEventListener === 'function') {
+      this.onContextLostHandler = (e: Event) => {
+        e.preventDefault();
+        this.contextLost = true;
+        this.gl = null;
+        this.program = null;
+        this.adjProgram = null;
+        this.stylesProgram = null;
+        this.blitProgram = null;
+        this.softProofProgram = null;
+        this.texturePool = [];
+        this.activePoolByKey.clear();
+        this.maskTextureCache.clear();
+        this.folderFbos = [];
+        this.layerFbo = null;
+        this.layerTexture = null;
+        this.snapshotTexture = null;
+        this.lutTexture = null;
+        this.draftTexture = null;
+        this.proofSnapshotTexture = null;
+      };
+      this.onContextRestoredHandler = () => {
+        this.contextLost = false;
+        this.initGL();
+        globalTileGrid.notifyChange(true);
+      };
+      canvas.addEventListener('webglcontextlost', this.onContextLostHandler, false);
+      canvas.addEventListener('webglcontextrestored', this.onContextRestoredHandler, false);
+    }
     this.initGL();
   }
 
   public isReady(): boolean {
-    return this.gl !== null && this.program !== null;
+    return !this.contextLost && this.gl !== null && this.program !== null;
   }
 
   /**
@@ -1175,6 +1268,19 @@ export class ViewportCompositor {
         item.version = -1;
       }
     }
+  }
+
+  /**
+   * Explicitly invalidate and clear all cached tile textures in the pool.
+   */
+  public invalidateTileTextures(): void {
+    if (this.gl) {
+      for (const slot of this.texturePool) {
+        this.gl.deleteTexture(slot.texture);
+      }
+    }
+    this.texturePool = [];
+    this.activePoolByKey.clear();
   }
 
   private initGL(): boolean {
@@ -1256,6 +1362,11 @@ export class ViewportCompositor {
 
       this.uMaskTextureLoc = gl.getUniformLocation(prog, 'u_maskTexture');
       this.uMaskEnabledLoc = gl.getUniformLocation(prog, 'u_maskEnabled');
+      this.uExpressionModeLoc = gl.getUniformLocation(prog, 'u_expressionMode');
+      this.uMonoThresholdLoc = gl.getUniformLocation(prog, 'u_monoThreshold');
+      this.uMonoExpressBlackLoc = gl.getUniformLocation(prog, 'u_monoExpressBlack');
+      this.uMonoExpressWhiteLoc = gl.getUniformLocation(prog, 'u_monoExpressWhite');
+      this.aQuadPosLoc = gl.getAttribLocation(prog, 'a_quadPos');
 
       // Compile Adjustment Shader Program
       const adjFs = gl.createShader(gl.FRAGMENT_SHADER);
@@ -1307,6 +1418,7 @@ export class ViewportCompositor {
             gl.linkProgram(sProg);
             if (gl.getProgramParameter(sProg, gl.LINK_STATUS)) {
               this.stylesProgram = sProg;
+              this.aStylesQuadPosLoc = gl.getAttribLocation(sProg, 'a_quadPos');
               this.uStylesLayerTextureLoc = gl.getUniformLocation(sProg, 'u_layerTexture');
               this.uStylesViewportSizeLoc = gl.getUniformLocation(sProg, 'u_viewportSize');
               this.uStylesLayerOpacityLoc = gl.getUniformLocation(sProg, 'u_layerOpacity');
@@ -1346,6 +1458,7 @@ export class ViewportCompositor {
             gl.linkProgram(bProg);
             if (gl.getProgramParameter(bProg, gl.LINK_STATUS)) {
               this.blitProgram = bProg;
+              this.aBlitQuadPosLoc = gl.getAttribLocation(bProg, 'a_quadPos');
               this.uBlitTextureLoc = gl.getUniformLocation(bProg, 'u_blitTexture');
               this.uBlitBackdropTextureLoc = gl.getUniformLocation(bProg, 'u_backdropTexture');
               this.uBlitHasBackdropLoc = gl.getUniformLocation(bProg, 'u_hasBackdrop');
@@ -1372,6 +1485,7 @@ export class ViewportCompositor {
             gl.linkProgram(pProg);
             if (gl.getProgramParameter(pProg, gl.LINK_STATUS)) {
               this.softProofProgram = pProg;
+              this.aProofQuadPosLoc = gl.getAttribLocation(pProg, 'a_quadPos');
               this.uProofSceneTextureLoc = gl.getUniformLocation(pProg, 'u_sceneTexture');
               this.uProofStandardLoc = gl.getUniformLocation(pProg, 'u_standard');
               this.uProofEnabledLoc = gl.getUniformLocation(pProg, 'u_proofEnabled');
@@ -1462,84 +1576,114 @@ export class ViewportCompositor {
   }
 
   /**
-   * Get or upload a WebGLTexture for a tile with hardware mipmap pyramid and adaptive zoom filtering.
-   * - Zoom < 0.99: Trilinear mipmap filtering (gl.LINEAR_MIPMAP_LINEAR) eliminates line-art shimmering.
-   * - 0.99 <= Zoom < 2.0: Bilinear filtering (gl.LINEAR) for smooth rotation/sub-pixel pan.
-   * - Zoom >= 2.0: Nearest-neighbor magnification (gl.NEAREST) for crisp pixel-level inspection.
+   * Get or upload a WebGLTexture from the pre-allocated texture pool with adaptive zoom filtering.
+   * Only tiles currently intersecting the screen frustum are uploaded to GPU memory.
    */
   private getTileTexture(tile: TileBuffer, grid: SparseTileGrid): WebGLTexture | null {
     if (!this.gl) return null;
     const gl = this.gl;
-    const key = `${tile.layerId}:${tile.tileX}:${tile.tileY}`;
+    const key = getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0);
+    const accessTick = ++this.textureAccessCounter;
 
-    let cached = this.textureCache.get(key);
-    if (!cached) {
-      const tex = gl.createTexture();
-      if (!tex) return null;
-      cached = { texture: tex, version: -1, lastUsed: performance.now(), filterTier: -1 };
-      this.textureCache.set(key, cached);
+    let slot = this.activePoolByKey.get(key);
+
+    if (!slot) {
+      if (this.texturePool.length < ViewportCompositor.MAX_TEXTURE_POOL_SIZE) {
+        const tex = gl.createTexture();
+        if (!tex) return null;
+        slot = {
+          texture: tex,
+          currentKey: key,
+          version: -1,
+          lastUsed: accessTick,
+          filterTier: -1,
+          hasStorage: false,
+          hasMipmap: false,
+        };
+        this.texturePool.push(slot);
+        this.activePoolByKey.set(key, slot);
+      } else {
+        // Reuse least recently used texture slot from pool
+        let oldestSlot = this.texturePool[0];
+        for (let i = 1; i < this.texturePool.length; i++) {
+          if (this.texturePool[i].lastUsed < oldestSlot.lastUsed) {
+            oldestSlot = this.texturePool[i];
+          }
+        }
+        slot = oldestSlot;
+        if (slot.currentKey) {
+          this.activePoolByKey.delete(slot.currentKey);
+        }
+        slot.currentKey = key;
+        slot.version = -1;
+        slot.lastUsed = accessTick;
+        slot.filterTier = -1;
+        slot.hasMipmap = false;
+        this.activePoolByKey.set(key, slot);
+      }
     }
 
-    cached.lastUsed = performance.now();
+    slot.lastUsed = accessTick;
     const desiredTier = this.currentZoom < 0.99 ? 0 : this.currentZoom < 2.0 ? 1 : 2;
 
     // Re-upload if dirty or version bumped
-    if (cached.version !== tile.version || tile.dirty) {
-      gl.bindTexture(gl.TEXTURE_2D, cached.texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    if (slot.version !== tile.version || tile.dirty) {
+      gl.bindTexture(gl.TEXTURE_2D, slot.texture);
 
       const rgbaData = grid.getTileAsRGBA(tile);
-      const uploadBytes = rgbaData instanceof Uint8Array
-        ? rgbaData
-        : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
+      const uploadBytes =
+        rgbaData instanceof Uint8Array
+          ? rgbaData
+          : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
 
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        TILE_SIZE,
-        TILE_SIZE,
-        0,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        uploadBytes
-      );
-
-      // Generate hardware mipmap pyramid for anti-aliased zoomed-out viewing (256x256 POT)
-      if (typeof gl.generateMipmap === 'function') {
-        gl.generateMipmap(gl.TEXTURE_2D);
+      if (slot.hasStorage && typeof gl.texSubImage2D === 'function') {
+        gl.texSubImage2D(
+          gl.TEXTURE_2D,
+          0,
+          0,
+          0,
+          TILE_SIZE,
+          TILE_SIZE,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          uploadBytes
+        );
+      } else {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(
+          gl.TEXTURE_2D,
+          0,
+          gl.RGBA,
+          TILE_SIZE,
+          TILE_SIZE,
+          0,
+          gl.RGBA,
+          gl.UNSIGNED_BYTE,
+          uploadBytes
+        );
+        slot.hasStorage = true;
       }
 
-      cached.version = tile.version;
-      cached.filterTier = -1; // Force filter parameter refresh
+      slot.hasMipmap = false;
+      slot.version = tile.version;
+      slot.filterTier = -1; // Force filter parameter refresh
       tile.dirty = false;
     }
 
-    if (cached.filterTier !== desiredTier) {
-      gl.bindTexture(gl.TEXTURE_2D, cached.texture);
-      if (desiredTier === 0) {
-        gl.texParameteri(
-          gl.TEXTURE_2D,
-          gl.TEXTURE_MIN_FILTER,
-          typeof gl.generateMipmap === 'function' ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
-        );
-        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      } else if (desiredTier === 1) {
+    if (slot.filterTier !== desiredTier) {
+      gl.bindTexture(gl.TEXTURE_2D, slot.texture);
+      if (desiredTier <= 1) {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       } else {
-        gl.texParameteri(
-          gl.TEXTURE_2D,
-          gl.TEXTURE_MIN_FILTER,
-          typeof gl.generateMipmap === 'function' ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST
-        );
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
       }
-      cached.filterTier = desiredTier;
+      slot.filterTier = desiredTier;
     }
 
-    return cached.texture;
+    return slot.texture;
   }
 
   /**
@@ -1650,15 +1794,17 @@ export class ViewportCompositor {
     gl.uniform1i(this.uTileTextureLoc, 0);
     gl.uniform1i(this.uHasBackdropLoc, 0);
 
-    // Bind Quad Vertices
+    // Bind Quad Vertices using cached attribute location
     gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-    const posAttrib = gl.getAttribLocation(this.program, 'a_quadPos');
-    gl.enableVertexAttribArray(posAttrib);
-    gl.vertexAttribPointer(posAttrib, 2, gl.FLOAT, false, 0, 0);
+    if (this.aQuadPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aQuadPosLoc);
+      gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
 
     // 1. Render artboard background pass (paper white or checkerboard)
     gl.blendFunc(gl.ONE, gl.ZERO);
     gl.uniform1i(this.uIsBackgroundLoc, 1);
+    gl.uniform1i(this.uExpressionModeLoc, 0);
     gl.uniform1i(this.uShowCheckerboardLoc, _options.showCheckerboard ? 1 : 0);
     gl.uniform2f(this.uTileOriginLoc, 0, 0);
     gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
@@ -1677,6 +1823,13 @@ export class ViewportCompositor {
     );
 
     gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
+
+    // Dynamic Frustum Culling & Memory Budget Sync
+    const layerVis = new Map<string, boolean>();
+    for (const l of layers) {
+      layerVis.set(l.id, l.visible);
+    }
+    grid.getMemoryManager()?.updateViewport(frustum, _options.activeDraftLayerId, layerVis);
 
     // 2. Render colored onion skin cels if active in animation mode
     if (_options.onionSkinFrames && _options.onionSkinFrames.length > 0) {
@@ -1718,8 +1871,19 @@ export class ViewportCompositor {
       this.applySoftProofPass(gl, viewportW, viewportH, _options.softProof);
     }
 
-    // Clean up stale textures periodically (LRU)
-    if (this.textureCache.size > 2000) {
+    // Prune mask textures belonging to deleted layers
+    if (this.maskTextureCache.size > layers.length) {
+      for (const cachedLayerId of Array.from(this.maskTextureCache.keys())) {
+        if (!layerVis.has(cachedLayerId)) {
+          const entry = this.maskTextureCache.get(cachedLayerId);
+          if (entry) gl.deleteTexture(entry.texture);
+          this.maskTextureCache.delete(cachedLayerId);
+        }
+      }
+    }
+
+    // Clean up stale textures if pool exceeded limit
+    if (this.texturePool.length > ViewportCompositor.MAX_TEXTURE_POOL_SIZE) {
       this.evictStaleTextures();
     }
   }
@@ -1858,7 +2022,8 @@ export class ViewportCompositor {
             viewportH,
             transform,
             dpr,
-            baseEffectiveOpacity
+            baseEffectiveOpacity,
+            currentFbo
           );
           gl.stencilMask(0xFF);
         } else {
@@ -1882,7 +2047,8 @@ export class ViewportCompositor {
               viewportH,
               transform,
               dpr,
-              baseEffectiveOpacity
+              baseEffectiveOpacity,
+              currentFbo
             );
           } else {
             this.renderSingleLayer(gl, clippedLayer, dimensions, grid, frustum, baseEffectiveOpacity);
@@ -1903,7 +2069,8 @@ export class ViewportCompositor {
             viewportH,
             transform,
             dpr,
-            baseEffectiveOpacity
+            baseEffectiveOpacity,
+            currentFbo
           );
         } else {
           this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum, baseEffectiveOpacity);
@@ -2001,12 +2168,13 @@ export class ViewportCompositor {
         lutData = new Uint8Array(gMap.buffer, gMap.byteOffset, gMap.byteLength);
       } else if (adj.type === 'levels') {
         const lLut = buildLevelsLut(adj.blackPoint, adj.whitePoint, adj.gamma, adj.outputMin ?? 0, adj.outputMax ?? 255);
+        const ch = adj.channel || 'rgb';
         lutData = new Uint8Array(256 * 4);
         for (let i = 0; i < 256; i++) {
           const off = i * 4;
-          lutData[off] = lLut[i];
-          lutData[off + 1] = lLut[i];
-          lutData[off + 2] = lLut[i];
+          lutData[off] = ch === 'rgb' || ch === 'r' ? lLut[i] : i;
+          lutData[off + 1] = ch === 'rgb' || ch === 'g' ? lLut[i] : i;
+          lutData[off + 2] = ch === 'rgb' || ch === 'b' ? lLut[i] : i;
           lutData[off + 3] = 255;
         }
       } else { // color-balance
@@ -2098,6 +2266,22 @@ export class ViewportCompositor {
     gl.uniform1f(this.uLayerOpacityLoc, layer.opacity * opacityMultiplier);
     gl.uniform1i(this.uBlendModeLoc, BLEND_MODE_MAP[layer.blendMode] ?? 0);
 
+    // Configure Expression Color Uniforms
+    const isBgLayer = layer.id === 'layer-bg' || layer.id.startsWith('layer-bg');
+    const exprMode = isBgLayer
+      ? 0
+      : layer.expressionColor === 'monochrome'
+      ? 2
+      : layer.expressionColor === 'gray'
+      ? 1
+      : 0;
+    gl.uniform1i(this.uExpressionModeLoc, exprMode);
+    if (exprMode === 2) {
+      gl.uniform1f(this.uMonoThresholdLoc, (layer.monoThreshold ?? 128) / 255.0);
+      gl.uniform1i(this.uMonoExpressBlackLoc, layer.monoExpressBlack !== false ? 1 : 0);
+      gl.uniform1i(this.uMonoExpressWhiteLoc, layer.monoExpressWhite !== false ? 1 : 0);
+    }
+
     // Configure Screentone Uniforms
     const toneEnabled = Boolean(layer.toneEnabled);
     gl.uniform1i(this.uToneEnabledLoc, toneEnabled ? 1 : 0);
@@ -2142,18 +2326,38 @@ export class ViewportCompositor {
       }
     }
 
-    // Query tiles intersecting frustum
-    const visibleTiles = grid.getTilesInBounds(
-      layer.id,
-      frustum.minX,
-      frustum.minY,
-      frustum.maxX,
-      frustum.maxY
-    );
+    // Adaptive LOD Selection & Frustum Culling:
+    // Select LOD 1 when zoom <= 50%, LOD 2 when zoom <= 25%, LOD 3 when zoom <= 12.5%
+    const targetLod =
+      this.currentZoom <= 0.125 ? 3 :
+      this.currentZoom <= 0.25 ? 2 :
+      this.currentZoom <= 0.5 ? 1 : 0;
 
-    gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
+    const lodScale = 1 << targetLod;
+    const lodTileDocSize = TILE_SIZE * lodScale;
 
-    // Draw each visible tile with 1 draw call per tile
+    // Convert screen viewport bounding box in canvas coordinates to intersecting tile ranges
+    const startTileX = Math.floor(frustum.minX / lodTileDocSize);
+    const endTileX = Math.floor(frustum.maxX / lodTileDocSize);
+    const startTileY = Math.floor(frustum.minY / lodTileDocSize);
+    const endTileY = Math.floor(frustum.maxY / lodTileDocSize);
+
+    const visibleTiles: TileBuffer[] = [];
+    for (let ty = startTileY; ty <= endTileY; ty++) {
+      for (let tx = startTileX; tx <= endTileX; tx++) {
+        let tile = grid.getTile(layer.id, tx, ty, targetLod);
+        if (targetLod > 0 && (!tile || grid.isLodTileDirty(layer.id, tx, ty, targetLod))) {
+          tile = grid.generateLodTile(layer.id, tx, ty, targetLod);
+        }
+        if (tile) {
+          visibleTiles.push(tile);
+        }
+      }
+    }
+
+    gl.uniform2f(this.uTileSizeLoc, lodTileDocSize, lodTileDocSize);
+
+    // Draw each visible intersecting tile with 1 draw call per tile
     for (const tile of visibleTiles) {
       const tex = this.getTileTexture(tile, grid);
       if (!tex) continue;
@@ -2161,7 +2365,7 @@ export class ViewportCompositor {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
 
-      gl.uniform2f(this.uTileOriginLoc, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+      gl.uniform2f(this.uTileOriginLoc, tile.tileX * lodTileDocSize, tile.tileY * lodTileDocSize);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
 
@@ -2231,6 +2435,8 @@ export class ViewportCompositor {
       return true;
     }
 
+    const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+
     if (!this.layerFbo) {
       this.layerFbo = gl.createFramebuffer();
     }
@@ -2252,7 +2458,7 @@ export class ViewportCompositor {
     gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.layerTexture, 0);
 
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
 
     if (status !== gl.FRAMEBUFFER_COMPLETE) {
       console.error('Layer FBO incomplete:', status);
@@ -2272,12 +2478,15 @@ export class ViewportCompositor {
     while (this.folderFbos.length <= depth) {
       const fbo = gl.createFramebuffer();
       const texture = gl.createTexture();
+      const stencilRb = typeof gl.createRenderbuffer === 'function' ? gl.createRenderbuffer() : null;
       if (!fbo || !texture) return null;
-      this.folderFbos.push({ fbo, texture, width: 0, height: 0 });
+      this.folderFbos.push({ fbo, texture, stencilRb, width: 0, height: 0 });
     }
 
     const item = this.folderFbos[depth];
     if (item.width !== width || item.height !== height) {
+      const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+
       gl.bindTexture(gl.TEXTURE_2D, item.texture);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -2288,8 +2497,14 @@ export class ViewportCompositor {
       gl.bindFramebuffer(gl.FRAMEBUFFER, item.fbo);
       gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, item.texture, 0);
 
+      if (item.stencilRb && typeof gl.bindRenderbuffer === 'function') {
+        gl.bindRenderbuffer(gl.RENDERBUFFER, item.stencilRb);
+        gl.renderbufferStorage(gl.RENDERBUFFER, gl.STENCIL_INDEX8, width, height);
+        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.STENCIL_ATTACHMENT, gl.RENDERBUFFER, item.stencilRb);
+      }
+
       const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
 
       if (status !== gl.FRAMEBUFFER_COMPLETE) {
         console.error('Folder FBO incomplete:', status);
@@ -2333,9 +2548,10 @@ export class ViewportCompositor {
 
     gl.useProgram(this.blitProgram);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer);
-    const posAttr = gl.getAttribLocation(this.blitProgram, 'a_quadPos');
-    gl.enableVertexAttribArray(posAttr);
-    gl.vertexAttribPointer(posAttr, 2, gl.FLOAT, false, 0, 0);
+    if (this.aBlitQuadPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aBlitQuadPosLoc);
+      gl.vertexAttribPointer(this.aBlitQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -2351,9 +2567,10 @@ export class ViewportCompositor {
     if (this.program) {
       gl.useProgram(this.program);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-      const mainPosAttrib = gl.getAttribLocation(this.program, 'a_quadPos');
-      gl.enableVertexAttribArray(mainPosAttrib);
-      gl.vertexAttribPointer(mainPosAttrib, 2, gl.FLOAT, false, 0, 0);
+      if (this.aQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(this.aQuadPosLoc);
+        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
     }
   }
 
@@ -2409,9 +2626,10 @@ export class ViewportCompositor {
     const quadBuffer = this.stylesQuadBuffer || this.quadBuffer;
     if (quadBuffer) {
       gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
-      const posAttrib = gl.getAttribLocation(this.softProofProgram, 'a_quadPos');
-      gl.enableVertexAttribArray(posAttrib);
-      gl.vertexAttribPointer(posAttrib, 2, gl.FLOAT, false, 0, 0);
+      if (this.aProofQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(this.aProofQuadPosLoc);
+        gl.vertexAttribPointer(this.aProofQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
 
       gl.viewport(0, 0, viewportW, viewportH);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
@@ -2422,9 +2640,10 @@ export class ViewportCompositor {
     if (this.program) {
       gl.useProgram(this.program);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-      const mainPosAttrib = gl.getAttribLocation(this.program, 'a_quadPos');
-      gl.enableVertexAttribArray(mainPosAttrib);
-      gl.vertexAttribPointer(mainPosAttrib, 2, gl.FLOAT, false, 0, 0);
+      if (this.aQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(this.aQuadPosLoc);
+        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
     }
   }
 
@@ -2442,7 +2661,8 @@ export class ViewportCompositor {
     viewportH: number,
     transform: ViewportTransform,
     dpr: number,
-    opacityMultiplier: number = 1.0
+    opacityMultiplier: number = 1.0,
+    currentFbo: WebGLFramebuffer | null = null
   ): void {
     if (!this.ensureLayerFbo(viewportW, viewportH) || !this.stylesProgram) {
       this.renderSingleLayer(gl, layer, dimensions, grid, frustum, opacityMultiplier);
@@ -2482,8 +2702,8 @@ export class ViewportCompositor {
     const virtualLayer: LayerItem = { ...layer, opacity: 1.0, blendMode: 'normal' };
     this.renderSingleLayer(gl, virtualLayer, dimensions, grid, expandedFrustum, 1.0);
 
-    // 2. Restore default framebuffer (canvas)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    // 2. Restore active target framebuffer (folder FBO or default screen canvas)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, currentFbo);
     gl.viewport(0, 0, viewportW, viewportH);
 
     // 3. Set layer blend mode
@@ -2493,9 +2713,10 @@ export class ViewportCompositor {
     gl.useProgram(this.stylesProgram);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer);
-    const posAttr = gl.getAttribLocation(this.stylesProgram, 'a_quadPos');
-    gl.enableVertexAttribArray(posAttr);
-    gl.vertexAttribPointer(posAttr, 2, gl.FLOAT, false, 0, 0);
+    if (this.aStylesQuadPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aStylesQuadPosLoc);
+      gl.vertexAttribPointer(this.aStylesQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.layerTexture);
@@ -2553,26 +2774,26 @@ export class ViewportCompositor {
     if (this.program) {
       gl.useProgram(this.program);
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-      const mainPosAttrib = gl.getAttribLocation(this.program, 'a_quadPos');
-      gl.enableVertexAttribArray(mainPosAttrib);
-      gl.vertexAttribPointer(mainPosAttrib, 2, gl.FLOAT, false, 0, 0);
+      if (this.aQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(this.aQuadPosLoc);
+        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
     }
   }
 
 
   /**
-   * Evict least recently used tile textures when texture cache exceeds threshold.
+   * Evict least recently used tile textures when texture pool exceeds threshold.
    */
   private evictStaleTextures(): void {
-    if (!this.gl) return;
-    const entries = Array.from(this.textureCache.entries());
-    entries.sort((a, b) => a[1].lastUsed - b[1].lastUsed);
-
-    // Evict oldest 500 textures
-    const toRemove = entries.slice(0, 500);
-    for (const [key, item] of toRemove) {
-      this.gl.deleteTexture(item.texture);
-      this.textureCache.delete(key);
+    if (!this.gl || this.texturePool.length <= ViewportCompositor.MAX_TEXTURE_POOL_SIZE) return;
+    this.texturePool.sort((a, b) => a.lastUsed - b.lastUsed);
+    while (this.texturePool.length > ViewportCompositor.MAX_TEXTURE_POOL_SIZE) {
+      const slot = this.texturePool.shift();
+      if (slot) {
+        if (slot.currentKey) this.activePoolByKey.delete(slot.currentKey);
+        this.gl.deleteTexture(slot.texture);
+      }
     }
   }
 
@@ -2828,10 +3049,7 @@ export class ViewportCompositor {
    */
   public dispose(): void {
     if (this.gl) {
-      for (const item of this.textureCache.values()) {
-        this.gl.deleteTexture(item.texture);
-      }
-      this.textureCache.clear();
+      this.invalidateTileTextures();
       for (const item of this.maskTextureCache.values()) {
         this.gl.deleteTexture(item.texture);
       }
@@ -2879,6 +3097,9 @@ export class ViewportCompositor {
       for (const item of this.folderFbos) {
         this.gl.deleteFramebuffer(item.fbo);
         this.gl.deleteTexture(item.texture);
+        if (item.stencilRb && typeof this.gl.deleteRenderbuffer === 'function') {
+          this.gl.deleteRenderbuffer(item.stencilRb);
+        }
       }
       this.folderFbos = [];
       if (this.layerFbo) {
@@ -2896,6 +3117,14 @@ export class ViewportCompositor {
     }
     if (this.fallbackTileCanvas) {
       this.fallbackTileCanvas = null;
+    }
+    if (typeof this.canvas.removeEventListener === 'function') {
+      if (this.onContextLostHandler) {
+        this.canvas.removeEventListener('webglcontextlost', this.onContextLostHandler);
+      }
+      if (this.onContextRestoredHandler) {
+        this.canvas.removeEventListener('webglcontextrestored', this.onContextRestoredHandler);
+      }
     }
   }
 }

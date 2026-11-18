@@ -6,6 +6,8 @@ import {
 } from '../types/editor';
 import { getCanvasCompositeOperation } from './canvasUtils';
 import { groupLayersForCompositing } from './compositor';
+import { applyAdjustment } from './tonalEngine';
+import { recoveryService } from '../services/recoveryService';
 
 export interface SavedFileInfo {
   handle?: any; // FileSystemFileHandle
@@ -21,6 +23,7 @@ export interface SaveDocumentData {
   layerCanvasesMap: Map<string, HTMLCanvasElement>;
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
+  tabId?: string;
 }
 
 /**
@@ -67,14 +70,49 @@ export function compositeCanvas(
   const renderOrder = layers.slice().reverse();
   const groups = groupLayersForCompositing(renderOrder);
 
+  const getMaskedLayerCanvas = (layer: LayerItem, srcCanvas: HTMLCanvasElement): HTMLCanvasElement => {
+    if (!layer.maskCanvas || layer.maskEnabled === false) return srcCanvas;
+    const masked = document.createElement('canvas');
+    masked.width = dimensions.width;
+    masked.height = dimensions.height;
+    const mCtx = masked.getContext('2d');
+    const maskCtx = layer.maskCanvas.getContext('2d', { willReadFrequently: true });
+    if (!mCtx || !maskCtx) return srcCanvas;
+    mCtx.drawImage(srcCanvas, 0, 0);
+    const imgData = mCtx.getImageData(0, 0, dimensions.width, dimensions.height);
+    const maskData = maskCtx.getImageData(0, 0, dimensions.width, dimensions.height).data;
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] === 0) continue;
+      const maskLum = ((0.299 * maskData[i] + 0.587 * maskData[i + 1] + 0.114 * maskData[i + 2]) / 255) * (maskData[i + 3] / 255);
+      d[i + 3] = Math.round(d[i + 3] * maskLum);
+    }
+    mCtx.putImageData(imgData, 0, 0);
+    return masked;
+  };
+
   for (const group of groups) {
     const baseLayer = group.baseLayer;
     if (baseLayer.type === 'folder' || !isLayerEffectivelyVisible(baseLayer)) continue;
-    const baseCanvas = layerCanvasesMap.get(baseLayer.id);
-    if (!baseCanvas) continue;
+
+    if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
+      const imgData = ctx.getImageData(0, 0, dimensions.width, dimensions.height);
+      applyAdjustment(
+        imgData,
+        baseLayer.adjustmentData,
+        baseLayer.maskEnabled !== false ? baseLayer.maskCanvas : undefined,
+        getEffectiveOpacity(baseLayer)
+      );
+      ctx.putImageData(imgData, 0, 0);
+      continue;
+    }
+
+    const rawBaseCanvas = layerCanvasesMap.get(baseLayer.id);
+    if (!rawBaseCanvas) continue;
+    const baseCanvas = getMaskedLayerCanvas(baseLayer, rawBaseCanvas);
 
     const activeClipped = group.clippedLayers.filter(
-      (cl) => cl.type !== 'folder' && isLayerEffectivelyVisible(cl)
+      (cl) => cl.type !== 'folder' && cl.type !== 'adjustment' && isLayerEffectivelyVisible(cl)
     );
 
     if (activeClipped.length === 0) {
@@ -97,8 +135,9 @@ export function compositeCanvas(
       gCtx.restore();
 
       for (const clipped of activeClipped) {
-        const cCanvas = layerCanvasesMap.get(clipped.id);
-        if (!cCanvas) continue;
+        const rawClippedCanvas = layerCanvasesMap.get(clipped.id);
+        if (!rawClippedCanvas) continue;
+        const cCanvas = getMaskedLayerCanvas(clipped, rawClippedCanvas);
 
         gCtx.save();
         gCtx.globalAlpha = getEffectiveOpacity(clipped);
@@ -147,16 +186,18 @@ export async function serializeDocument(
 ): Promise<{ data: Blob | ArrayBuffer; mimeType: string }> {
   const ext = extension.toLowerCase();
 
-  // 1. PSD format with layers
+  // 1. PSD format with layers (ag-psd expects bottom-to-top order and opacity 0..255)
   if (ext === '.psd' || ext === '.psb') {
     const children = data.layers
-      .filter((l) => l.type === 'raster')
+      .slice()
+      .reverse()
+      .filter((l) => l.type === 'raster' || l.type === 'vector' || l.type === 'frame')
       .map((layer) => {
         const c = data.layerCanvasesMap.get(layer.id);
         return {
           name: layer.name,
           hidden: !layer.visible,
-          opacity: layer.opacity,
+          opacity: Math.round(Math.max(0, Math.min(1, layer.opacity ?? 1)) * 255),
           blendMode: toAgPsdBlendMode(layer.blendMode),
           canvas: c || undefined,
         };
@@ -189,23 +230,30 @@ export async function serializeDocument(
   // 2. Native Ink Studio Project (.ink, .sora) format
   if (ext === '.ink' || ext === '.sora') {
     const layerImages: Record<string, string> = {};
-    data.layers.forEach((l) => {
-      if (l.type === 'raster') {
+    const maskImages: Record<string, string> = {};
+    const serializableLayers = data.layers.map((l) => {
+      if (l.type === 'raster' || l.type === 'vector' || l.type === 'frame') {
         const c = data.layerCanvasesMap.get(l.id);
         if (c) {
           layerImages[l.id] = c.toDataURL('image/png');
         }
       }
+      if (l.maskCanvas && typeof l.maskCanvas.toDataURL === 'function') {
+        maskImages[l.id] = l.maskCanvas.toDataURL('image/png');
+      }
+      const { maskCanvas: _mc, ...rest } = l;
+      return rest;
     });
 
     const projectData = {
       app: 'Ink Studio',
-      version: '1.0',
+      version: '1.1',
       name: data.name,
       dimensions: data.dimensions,
       colorMode: data.colorMode,
-      layers: data.layers,
+      layers: serializableLayers,
       canvases: layerImages,
+      masks: maskImages,
     };
 
     const json = JSON.stringify(projectData);
@@ -328,6 +376,10 @@ export async function promptSaveAs(
       await writable.write(serialized.data);
       await writable.close();
 
+      if (data.tabId) {
+        recoveryService.markCleanSaved(data.tabId).catch(console.warn);
+      }
+
       return {
         handle,
         name: fileName,
@@ -346,6 +398,11 @@ export async function promptSaveAs(
     const ext = defaultExtension;
     const serialized = await serializeDocument(data, ext);
     downloadFile(serialized.data, suggestedName, serialized.mimeType);
+
+    if (data.tabId) {
+      recoveryService.markCleanSaved(data.tabId).catch(console.warn);
+    }
+
     return {
       name: suggestedName,
       extension: ext,
@@ -370,6 +427,10 @@ export async function saveToExistingHandle(
   const writable = await fileInfo.handle.createWritable();
   await writable.write(serialized.data);
   await writable.close();
+
+  if (data.tabId) {
+    recoveryService.markCleanSaved(data.tabId).catch(console.warn);
+  }
 }
 
 /**

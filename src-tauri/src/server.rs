@@ -170,29 +170,32 @@ async fn locate_or_download_cloudflared() -> Result<PathBuf, String> {
         }
     }
 
-    // 5. Automatic background download from official Cloudflare releases
+    // 5. Automatic background download from official Cloudflare releases (no shell interpolation)
     if let Some(parent) = target_path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    let download_cmd = format!(
-        "curl.exe -L \"https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe\" -o \"{}\"",
-        target_path.display()
-    );
-
-    let mut download_proc = tokio::process::Command::new("powershell");
-    download_proc.args(&["-NoProfile", "-Command", &download_cmd]);
+    let mut download_proc = tokio::process::Command::new("curl.exe");
+    download_proc.args([
+        "-f",
+        "-L",
+        "-s",
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe",
+        "-o",
+    ]);
+    download_proc.arg(&target_path);
     #[cfg(windows)]
     download_proc.creation_flags(CREATE_NO_WINDOW);
 
     let status = download_proc
         .status()
         .await
-        .map_err(|e| format!("Failed to run download process: {}", e))?;
+        .map_err(|e| format!("Failed to run curl.exe download process: {}", e))?;
 
     if status.success() && target_path.exists() {
         Ok(target_path)
     } else {
+        let _ = tokio::fs::remove_file(&target_path).await;
         Err("Failed to download cloudflared tunnel client".to_string())
     }
 }
@@ -214,13 +217,13 @@ fn extract_trycloudflare_url(line: &str) -> Option<String> {
 async fn start_cloudflare_tunnel(port: u16) -> Result<(tokio::process::Child, String), String> {
     let exe_path = locate_or_download_cloudflared().await?;
     let mut cmd = tokio::process::Command::new(exe_path);
-    cmd.args(&[
+    cmd.args([
         "tunnel",
         "--url",
         &format!("http://127.0.0.1:{}", port),
         "--no-autoupdate",
     ])
-    .stdout(Stdio::piped())
+    .stdout(Stdio::null())
     .stderr(Stdio::piped());
 
     #[cfg(windows)]
@@ -237,22 +240,26 @@ async fn start_cloudflare_tunnel(port: u16) -> Result<(tokio::process::Child, St
 
     let mut reader = BufReader::new(stderr).lines();
 
-    let find_url = async {
-        while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(url) = extract_trycloudflare_url(&line) {
-                return Some(url);
-            }
-        }
-        None
-    };
-
     let tunnel_url = tokio::select! {
-        url = find_url => url,
+        url = async {
+            while let Ok(Some(line)) = reader.next_line().await {
+                if let Some(url) = extract_trycloudflare_url(&line) {
+                    return Some(url);
+                }
+            }
+            None
+        } => url,
         _ = tokio::time::sleep(tokio::time::Duration::from_secs(18)) => None,
     };
 
     match tunnel_url {
-        Some(url) => Ok((child, url)),
+        Some(url) => {
+            // Keep draining stderr in the background so cloudflared never receives EPIPE
+            tokio::spawn(async move {
+                while let Ok(Some(_)) = reader.next_line().await {}
+            });
+            Ok((child, url))
+        }
         None => {
             let _ = child.kill().await;
             Err("Timed out waiting for Cloudflare tunnel URL".to_string())

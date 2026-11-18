@@ -34,7 +34,7 @@ import {
 import { applyLiquifyStep, createLiquifySelectionMask, DirtyRect } from './utils/liquifyEngine';
 import { PerspectiveRuler, ConstraintAxis } from './types/perspective';
 import { createDefaultPerspectiveRuler, applyWormsEyePreset } from './utils/perspectiveMath';
-import { executeFloodFill, compositeVisibleLayers, executeLassoFill } from './utils/floodFill';
+import { executeFloodFill, compositeVisibleLayers, compositeReferenceLayers, executeLassoFill } from './utils/floodFill';
 import {
   isPointInSelection,
   liftSelectionToFloating,
@@ -67,15 +67,14 @@ import {
   promptSaveAs,
   saveToExistingHandle,
   promptExportPngImage,
+  compositeCanvas,
   SaveDocumentData,
   SavedFileInfo,
 } from './utils/saveManager';
 import { Header } from './components/Header';
-import { DocumentTabBar } from './components/DocumentTabBar';
 import { LeftPanel } from './components/LeftPanel';
 import { CanvasArea } from './components/CanvasArea';
 import { RightSidebar } from './components/RightSidebar';
-import { StatusBar } from './components/StatusBar';
 import { NewCanvasModal } from './components/NewCanvasModal';
 import { ResizeCanvasModal } from './components/ResizeCanvasModal';
 import { SettingsModal } from './components/SettingsModal';
@@ -85,10 +84,10 @@ import { HostModal } from './components/HostModal';
 import { ClipboardInviteToast } from './components/ClipboardInviteToast';
 import { WebLandingModal } from './components/WebLandingModal';
 import { WelcomeScreen } from './components/WelcomeScreen';
-import { ModernPropertyBar } from './components/ModernPropertyBar';
-import { FirstTimeNameModal } from './components/FirstTimeNameModal';
 import { AdjustmentModal } from './components/AdjustmentModal';
 import { LayerStylesModal } from './components/LayerStylesModal';
+import { recoveryService, CrashedSessionInfo } from './services/recoveryService';
+import { CrashRecoveryModal } from './components/CrashRecoveryModal';
 import { applyFilter } from './utils/filterEngine';
 import { saveRecentDocument, RecentDocument } from './utils/recentDocumentsManager';
 import {
@@ -101,7 +100,7 @@ import {
   screenToCanvas,
   sampleCompositedColor,
 } from './utils/canvasUtils';
-import { globalTileGrid } from './utils/tileEngine';
+import { globalTileGrid, globalTileMemoryManager } from './utils/tileEngine';
 import { getNextCollabLayerName } from './hooks/useLayerManager';
 import { drawPencilDot, drawPencilBezierSegment, PencilGrade } from './utils/pencilEngine';
 import { Point } from './types/editor';
@@ -135,6 +134,7 @@ import {
   saveAppSettings,
   ResizeCanvasOptions,
   resolveModernAccentColor,
+  getAccentContrastColor,
   hexToRgb,
 } from './types/settings';
 import {
@@ -179,7 +179,6 @@ import {
   Sparkles,
   MessageSquare,
   Spline,
-  Check,
 } from 'lucide-react';
 import { parseSutFile } from './utils/sutParser';
 import {
@@ -189,7 +188,9 @@ import {
   loadCustomBrushes,
 } from './utils/brushStorage';
 import {
-  saveBrushSettingsImmediately,
+  saveBrushSettingsDebounced,
+  flushPendingBrushSettingsSave,
+  stepBrushSizePreset,
   getEffectiveBrushSettings,
   getActivePresetId,
   saveActivePresetId,
@@ -393,25 +394,26 @@ export function App() {
   const hasOpenDocument = Boolean(activeDocumentId && documents.some((d) => d.id === activeDocumentId));
   const [appView, setAppView] = useState<'home' | 'workspace'>('workspace');
 
-  // Panels width & visibility (global resizability)
+  // Panels width & visibility (compact defaults dedicating >80% viewport to canvas)
   const [leftPanelWidth, setLeftPanelWidth] = useState<number>(() => {
-    const s = localStorage.getItem('sora_paint_left_panel_width');
-    return s ? Number(s) : 260;
+    const s = localStorage.getItem('ink_left_panel_width_v3');
+    return s ? Number(s) : 118;
   });
   const [isLeftPanelHidden, setIsLeftPanelHidden] = useState<boolean>(false);
+  const [isRightSidebarHidden, setIsRightSidebarHidden] = useState<boolean>(false);
   const [rightSidebarWidth, setRightSidebarWidth] = useState<number>(() => {
-    const s = localStorage.getItem('sora_paint_right_sidebar_width');
-    return s ? Number(s) : 320;
+    const s = localStorage.getItem('ink_right_sidebar_width_v3');
+    return s ? Number(s) : 162;
   });
 
   const handleLeftPanelWidthChange = useCallback((w: number) => {
     setLeftPanelWidth(w);
-    localStorage.setItem('sora_paint_left_panel_width', String(w));
+    localStorage.setItem('ink_left_panel_width_v3', String(w));
   }, []);
 
   const handleRightSidebarWidthChange = useCallback((w: number) => {
     setRightSidebarWidth(w);
-    localStorage.setItem('sora_paint_right_sidebar_width', String(w));
+    localStorage.setItem('ink_right_sidebar_width_v3', String(w));
   }, []);
 
   const draftCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -424,32 +426,25 @@ export function App() {
   const [appSettings, setAppSettings] = useState<AppSettings>(loadAppSettings);
 
   useEffect(() => {
-    const theme = appSettings.themePreset || 'vintage-manga';
-    document.documentElement.setAttribute('data-theme', theme);
+    const accent = appSettings.modernAccent || 'neutral';
+    const hex = resolveModernAccentColor(accent, appSettings.modernCustomColor);
+    const rgb = hexToRgb(hex) || { r: 229, g: 229, b: 229 };
+    const contrast = getAccentContrastColor(hex);
 
-    if (theme === 'modern') {
-      const accent = appSettings.modernAccent || 'blue';
-      const hex = resolveModernAccentColor(accent, appSettings.modernCustomColor);
-      const rgb = hexToRgb(hex) || { r: 59, g: 130, b: 246 };
-      document.documentElement.setAttribute('data-accent', accent);
-      document.documentElement.setAttribute('data-tone', appSettings.uiTone || 'slate');
-      document.documentElement.style.setProperty('--modern-accent', hex);
-      document.documentElement.style.setProperty('--modern-accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
-      document.documentElement.style.setProperty('--modern-accent-glow', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.3)`);
-      document.documentElement.style.setProperty('--modern-accent-subtle', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.12)`);
-      document.documentElement.style.setProperty('--modern-accent-border', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.4)`);
-      document.documentElement.style.setProperty('--modern-accent-hover', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.2)`);
-    } else {
-      document.documentElement.removeAttribute('data-accent');
-      document.documentElement.removeAttribute('data-tone');
-      document.documentElement.style.removeProperty('--modern-accent');
-      document.documentElement.style.removeProperty('--modern-accent-rgb');
-      document.documentElement.style.removeProperty('--modern-accent-glow');
-      document.documentElement.style.removeProperty('--modern-accent-subtle');
-      document.documentElement.style.removeProperty('--modern-accent-border');
-      document.documentElement.style.removeProperty('--modern-accent-hover');
-    }
-  }, [appSettings.themePreset, appSettings.modernAccent, appSettings.modernCustomColor, appSettings.uiTone]);
+    const root = document.documentElement;
+    root.setAttribute('data-theme', 'modern');
+    root.setAttribute('data-accent', accent);
+    root.style.setProperty('--accent', hex);
+    root.style.setProperty('--accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
+    root.style.setProperty('--accent-contrast', contrast);
+    root.style.setProperty('--accent-subtle', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.14)`);
+    root.style.setProperty('--accent-border', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.32)`);
+    root.style.setProperty('--modern-accent', hex);
+    root.style.setProperty('--modern-accent-rgb', `${rgb.r}, ${rgb.g}, ${rgb.b}`);
+    root.style.setProperty('--modern-accent-subtle', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.14)`);
+    root.style.setProperty('--modern-accent-border', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.32)`);
+    root.style.setProperty('--modern-accent-hover', `rgba(${rgb.r}, ${rgb.g}, ${rgb.b}, 0.2)`);
+  }, [appSettings.modernAccent, appSettings.modernCustomColor]);
 
   const [isNewCanvasModalOpen, setIsNewCanvasModalOpen] = useState<boolean>(false);
   const [isResizeCanvasModalOpen, setIsResizeCanvasModalOpen] = useState<boolean>(false);
@@ -476,6 +471,26 @@ export function App() {
   }, [tonalModalState]);
   const [isLoadingFile, setIsLoadingFile] = useState<boolean>(false);
   const [loadingStatus, setLoadingStatus] = useState<string>('');
+
+  // Fault-Tolerant Crash Recovery (WAL Architecture) State
+  const [crashedSessions, setCrashedSessions] = useState<CrashedSessionInfo[]>([]);
+  const [isRecoveryModalOpen, setIsRecoveryModalOpen] = useState<boolean>(false);
+
+  // Crash Recovery: detect unfinalized crashed sessions on startup
+  useEffect(() => {
+    recoveryService
+      .checkForCrashedSessions()
+      .then((sessions) => {
+        if (sessions && sessions.length > 0) {
+          setCrashedSessions(sessions);
+          setIsRecoveryModalOpen(true);
+        }
+      })
+      .catch((err) => {
+        console.warn('[Recovery] Error scanning for crashed sessions:', err);
+      });
+  }, []);
+
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pasteFileInputRef = useRef<HTMLInputElement>(null);
@@ -629,7 +644,68 @@ export function App() {
     addAdjustmentLayer,
     updateAdjustmentData,
     updateLayerStyles,
-  } = useLayerManager({ dimensions });
+  } = useLayerManager({ dimensions, activeSessionId: activeDocumentId });
+
+  // Synchronize active document recovery session and WAL periodic checkpointing
+  const recoveryStateRef = useRef({
+    documents,
+    documentName,
+    dimensions,
+    colorMode,
+    layers,
+    activeLayerId,
+  });
+  recoveryStateRef.current = {
+    documents,
+    documentName,
+    dimensions,
+    colorMode,
+    layers,
+    activeLayerId,
+  };
+
+  useEffect(() => {
+    if (!activeDocumentId) return;
+    const st = recoveryStateRef.current;
+    const initDoc = st.documents.find((d) => d.id === activeDocumentId);
+    if (!initDoc) return;
+
+    recoveryService.initSession(
+      activeDocumentId,
+      () => {
+        const cur = recoveryStateRef.current;
+        const doc = cur.documents.find((d) => d.id === activeDocumentId);
+        return {
+          sessionId: activeDocumentId,
+          documentName: doc?.name || cur.documentName || 'Untitled Document',
+          width: doc?.dimensions.width || cur.dimensions.width,
+          height: doc?.dimensions.height || cur.dimensions.height,
+          dpi: doc?.dimensions.dpi || cur.dimensions.dpi || 600,
+          colorMode: doc?.colorMode || cur.colorMode || 'color',
+          layers: doc?.layers || cur.layers,
+          activeLayerId: doc?.activeLayerId || cur.activeLayerId,
+          timestamp: Date.now(),
+        };
+      },
+      async () => {
+        const cur = recoveryStateRef.current;
+        const doc = cur.documents.find((d) => d.id === activeDocumentId);
+        const firstCanvas =
+          layerCanvasesRef.current.get(doc?.activeLayerId || cur.activeLayerId) ||
+          layerCanvasesRef.current.values().next().value;
+        if (!firstCanvas) return null;
+        return new Promise((resolve) => {
+          firstCanvas.toBlob((blob: Blob | null) => {
+            if (!blob) return resolve(null);
+            blob
+              .arrayBuffer()
+              .then((buf: ArrayBuffer) => resolve(new Uint8Array(buf)))
+              .catch(() => resolve(null));
+          }, 'image/png');
+        });
+      }
+    );
+  }, [activeDocumentId, layerCanvasesRef]);
 
   // Active edit target for painting/erasing ('layer' content vs 'mask')
   const [activeEditTarget, setActiveEditTarget] = useState<'layer' | 'mask'>('layer');
@@ -759,29 +835,84 @@ export function App() {
     [layerStylesModalState.layerId, updateLayerStyles, showToast]
   );
 
+  const pushHistoryStepRef = useRef<any>(null);
+
   const handleApplyFilter = useCallback(
     (type: FilterType, params?: any) => {
       if (!hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked) {
         showToast('Select an unlocked raster layer to apply filter');
         return;
       }
-      const canvas = layerCanvasesRef.current.get(activeLayerId);
-      if (!canvas) return;
-      const ctx = get2DContext(canvas);
+      const isTone = Boolean(activeLayer.toneEnabled && layerSourceCanvasesRef.current?.get(activeLayerId));
+      const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+      const displayCanvas = layerCanvasesRef.current.get(activeLayerId);
+      const targetCanvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
+      if (!targetCanvas || !displayCanvas) return;
+      const ctx = get2DContext(targetCanvas);
       if (!ctx) return;
 
-      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const filtered = applyFilter(imgData, type, params);
-      ctx.putImageData(filtered, 0, 0);
+      const beforeImageData = ctx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+      const rawFiltered = applyFilter(
+        new ImageData(new Uint8ClampedArray(beforeImageData.data), beforeImageData.width, beforeImageData.height),
+        type,
+        params
+      );
 
-      const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
-      const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
-      globalTileGrid.writeImageData(activeLayerId, filtered, 0, 0, targetFormat);
+      let finalImageData = rawFiltered;
+      if (selection) {
+        const selMask = createSelectionMask(selection, targetCanvas.width, targetCanvas.height);
+        if (selMask) {
+          finalImageData = new ImageData(new Uint8ClampedArray(beforeImageData.data), targetCanvas.width, targetCanvas.height);
+          const src = beforeImageData.data;
+          const flt = rawFiltered.data;
+          const dst = finalImageData.data;
+          for (let i = 0; i < selMask.length; i++) {
+            const m = selMask[i];
+            if (m === 0) continue;
+            const p = i * 4;
+            if (m === 255) {
+              dst[p] = flt[p];
+              dst[p + 1] = flt[p + 1];
+              dst[p + 2] = flt[p + 2];
+              dst[p + 3] = flt[p + 3];
+            } else {
+              const a = m / 255;
+              const inv = 1 - a;
+              dst[p] = Math.round(src[p] * inv + flt[p] * a);
+              dst[p + 1] = Math.round(src[p + 1] * inv + flt[p + 1] * a);
+              dst[p + 2] = Math.round(src[p + 2] * inv + flt[p + 2] * a);
+              dst[p + 3] = Math.round(src[p + 3] * inv + flt[p + 3] * a);
+            }
+          }
+        }
+      }
+
+      ctx.putImageData(finalImageData, 0, 0);
+
+      if (!isTone && sourceCanvas) {
+        get2DContext(sourceCanvas)?.putImageData(finalImageData, 0, 0);
+      }
+
+      if (isTone && sourceCanvas) {
+        applyLayerEffects(sourceCanvas, displayCanvas, activeLayer, dimensions.dpi ?? 600);
+      } else {
+        const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
+        const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+        globalTileGrid.writeImageData(activeLayerId, finalImageData, 0, 0, targetFormat);
+      }
+
+      pushHistoryStepRef.current?.(
+        'filter',
+        `Filter: ${type.replace('-', ' ')}`,
+        beforeImageData,
+        finalImageData,
+        activeLayerId
+      );
       globalTileGrid.notifyChange(true);
       updateLayerThumbnail(activeLayerId, true);
       showToast(`Filter applied: ${type.replace('-', ' ')}`);
     },
-    [hasOpenDocument, activeLayer, activeLayerId, layerCanvasesRef, colorMode, updateLayerThumbnail, showToast]
+    [hasOpenDocument, activeLayer, activeLayerId, selection, dimensions.dpi, layerCanvasesRef, layerSourceCanvasesRef, colorMode, updateLayerThumbnail, showToast]
   );
 
   const {
@@ -838,7 +969,7 @@ export function App() {
     ctx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
     const bs = msg.brushSettings;
     const isEraser = msg.tool === 'eraser';
-    const isBgEraser = isEraser && msg.layerId === 'layer-bg';
+    const isBgEraser = isEraser && (msg.layerId === 'layer-bg' || msg.layerId.startsWith('layer-bg'));
     const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
     const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, colorMode);
 
@@ -875,7 +1006,7 @@ export function App() {
 
     const bs = strokeState.brushSettings;
     const isEraser = strokeState.tool === 'eraser';
-    const isBgEraser = isEraser && strokeState.layerId === 'layer-bg';
+    const isBgEraser = isEraser && (strokeState.layerId === 'layer-bg' || strokeState.layerId.startsWith('layer-bg'));
     const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
     const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, colorMode);
     const pts = strokeState.points;
@@ -1046,12 +1177,12 @@ export function App() {
               renderCompleteStroke(
                 bCtx,
                 strokeState.points,
-                bs,
+                { ...bs, opacity: 1.0, isTransparentInk: false },
                 strokeState.tool,
                 colorMode,
                 isBgEraser,
                 targetCanvas,
-                isAlphaLocked
+                false
               );
               ctx.save();
               ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
@@ -1156,12 +1287,14 @@ export function App() {
   }, [setActiveLayerId]);
 
   const handleRemoteJoinRequest = useCallback((peer: import('./types/multiplayer').CollabPeer) => {
-    // Automatically allocate a dedicated layer for the joining peer: "[Name] 1", "[Name] 2", etc.
+    // Automatically allocate a dedicated layer for the joining peer without hijacking host's active layer
     const layerName = getNextCollabLayerName(peer.name, layersRef.current);
     const layerId = `layer-${peer.id}-1`;
-    const newLayer = addLayer('raster', null, layerName, layerId);
+    const newLayer = addLayer('raster', null, layerName, layerId, false);
     multiplayerService.sendLayerAdd(newLayer);
-    const updated = [newLayer, ...layersRef.current.filter((l) => l.id !== newLayer.id)];
+    const updated = layersRef.current.some((l) => l.id === newLayer.id)
+      ? layersRef.current
+      : [newLayer, ...layersRef.current];
     return {
       assignedLayerId: layerId,
       updatedLayers: updated,
@@ -1186,12 +1319,16 @@ export function App() {
       if (targetCanvas) {
         const ctx = get2DContext(targetCanvas);
         if (ctx) {
-          if (layerId === 'layer-bg' || layerId.startsWith('layer-bg')) {
+          const isBg = layerId === 'layer-bg' || layerId.startsWith('layer-bg');
+          if (isBg) {
             ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, targetCanvas.width, targetCanvas.height);
+            globalTileGrid.ingestCanvas(layerId, targetCanvas, 'color-32bit');
           } else {
             ctx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+            globalTileGrid.clearLayer(layerId);
           }
+          globalTileGrid.notifyChange(true);
           updateLayerThumbnail(layerId, true);
         }
       }
@@ -1260,7 +1397,7 @@ export function App() {
 
   // When hosting starts, ensure host's primary drawing layer has the host's nickname
   const handleStartHosting = useCallback(
-    async (roomName: string, port: number, hostNickname?: string) => {
+    async (roomName: string, port: number, hostNickname?: string, isGlobal?: boolean) => {
       if (!hasOpenDocument) {
         showToast('Please create or open a canvas before hosting a session.');
         return false;
@@ -1268,7 +1405,7 @@ export function App() {
       const finalHostName = (hostNickname || collabMyPeer.name || 'Sora').trim();
       const defaultLayer =
         layersRef.current.find((l) => l.id === activeLayerId) ||
-        layersRef.current.find((l) => l.type === 'raster' && l.id !== 'layer-bg');
+        layersRef.current.find((l) => l.type === 'raster' && l.id !== 'layer-bg' && !l.id.startsWith('layer-bg'));
       if (
         defaultLayer &&
         (defaultLayer.name === 'Layer 1' ||
@@ -1280,9 +1417,9 @@ export function App() {
         );
         renameLayer(defaultLayer.id, hostLayerName);
       }
-      return await startHosting(roomName, port, finalHostName);
+      return await startHosting(roomName, port, finalHostName, isGlobal);
     },
-    [collabMyPeer.name, activeLayerId, renameLayer, startHosting]
+    [hasOpenDocument, showToast, collabMyPeer.name, activeLayerId, renameLayer, startHosting]
   );
 
   // Collaborative-aware Layer Operations
@@ -1365,6 +1502,7 @@ export function App() {
 
   const {
     interactionRef,
+    isDrawingRef,
     getActiveCanvas,
     pushHistoryStep,
     handlePointerDown: handleCanvasDrawingPointerDown,
@@ -1383,7 +1521,6 @@ export function App() {
     resetHistory,
     selectiveUndo,
     cursorPos,
-    currentPressure,
     isHovering,
   } = useCanvasDrawing({
     tool,
@@ -1396,6 +1533,7 @@ export function App() {
     zoom,
     rotation,
     activeLayerId,
+    activeSessionId: activeDocumentId,
     activeLayerLocked: activeLayer?.locked ?? false,
     activeLayerVisible: activeLayer ? isLayerEffectivelyVisible(activeLayer) : true,
     layerCanvasesRef,
@@ -1428,9 +1566,11 @@ export function App() {
     },
     perspectiveRuler: hasOpenDocument ? perspectiveRuler : null,
     onActiveConstraintAxisChange: handleActiveConstraintAxisChange,
+    selection: hasOpenDocument ? selection : null,
   });
 
   selectiveUndoRef.current = selectiveUndo;
+  pushHistoryStepRef.current = pushHistoryStep;
 
   const handleUndo = useCallback(() => {
     if (isCollabConnected && collabMyPeer.id) {
@@ -1473,7 +1613,7 @@ export function App() {
         ? ERASER_PRESET_ID
         : (next.preset || prev.preset || DEFAULT_BRUSH_PRESET_ID);
 
-      saveBrushSettingsImmediately(targetPresetId, next);
+      saveBrushSettingsDebounced(targetPresetId, next);
       if (next.preset && toolRef.current === 'brush') {
         saveActivePresetId(next.preset);
       }
@@ -1481,12 +1621,14 @@ export function App() {
     });
   }, []);
 
-  const handleBrushSizeChange = useCallback(
-    (size: number) => {
-      updateBrushSettings({ size });
-    },
-    [updateBrushSettings]
-  );
+  useEffect(() => {
+    const handleBeforeUnload = () => flushPendingBrushSettingsSave();
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      flushPendingBrushSettingsSave();
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, []);
 
 
   const addRecentColor = useCallback((color: string) => {
@@ -1597,20 +1739,27 @@ export function App() {
     commitFloatingSelection(canvas, selection.floating, sourceCanvas);
 
     const ctx = get2DContext(canvas);
-    if (ctx && selection.floating.beforeImageData) {
+    if (ctx) {
       const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      pushHistoryStep(
-        'selection-move',
-        'Move Selection',
-        selection.floating.beforeImageData,
-        afterData,
-        targetLayerId
-      );
+      if (selection.floating.beforeImageData) {
+        pushHistoryStep(
+          'selection-move',
+          'Move Selection',
+          selection.floating.beforeImageData,
+          afterData,
+          targetLayerId
+        );
+      } else {
+        const lyr = layers.find((l) => l.id === targetLayerId);
+        const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
+        globalTileGrid.writeImageData(targetLayerId, afterData, 0, 0, isMono ? 'monochrome-1bit' : 'color-32bit');
+      }
+      globalTileGrid.notifyChange(true);
     }
 
     updateLayerThumbnail(targetLayerId, true);
     setSelection((prev) => (prev ? { ...prev, floating: null } : null));
-  }, [selection, activeLayerId, layerCanvasesRef, getActiveCanvas, layerSourceCanvasesRef, pushHistoryStep, updateLayerThumbnail]);
+  }, [selection, activeLayerId, layers, colorMode, layerCanvasesRef, getActiveCanvas, layerSourceCanvasesRef, pushHistoryStep, updateLayerThumbnail]);
 
   const handleDeselect = useCallback(() => {
     if (selection?.floating) {
@@ -1622,6 +1771,22 @@ export function App() {
   const handleClearSelection = useCallback(() => {
     if (!selection) return;
     if (selection.floating) {
+      const targetLayerId = selection.floating.layerId || activeLayerId;
+      const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
+      if (canvas && selection.floating.beforeImageData) {
+        const ctx = get2DContext(canvas);
+        if (ctx) {
+          const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          pushHistoryStep(
+            'clear',
+            'Clear Selection',
+            selection.floating.beforeImageData,
+            afterData,
+            targetLayerId
+          );
+          globalTileGrid.notifyChange(true);
+        }
+      }
       setSelection(null);
       return;
     }
@@ -1633,6 +1798,7 @@ export function App() {
 
     const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+    const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
 
     const clearOn = (target: HTMLCanvasElement) => {
       const c = get2DContext(target);
@@ -1646,19 +1812,19 @@ export function App() {
         if (mCtx) {
           const mImg = mCtx.createImageData(target.width, target.height);
           for (let i = 0; i < selection.mask.length; i++) {
+            if (isBg) {
+              mImg.data[i * 4] = 255;
+              mImg.data[i * 4 + 1] = 255;
+              mImg.data[i * 4 + 2] = 255;
+            }
             mImg.data[i * 4 + 3] = selection.mask[i];
           }
           mCtx.putImageData(mImg, 0, 0);
-          if (activeLayerId === 'layer-bg') {
-            c.fillStyle = '#ffffff';
-            c.fillRect(selection.bounds.x, selection.bounds.y, selection.bounds.width, selection.bounds.height);
-          } else {
-            c.globalCompositeOperation = 'destination-out';
-            c.drawImage(maskCanvas, 0, 0);
-          }
+          c.globalCompositeOperation = isBg ? 'source-over' : 'destination-out';
+          c.drawImage(maskCanvas, 0, 0);
         }
       } else if (selection.type === 'rect') {
-        if (activeLayerId === 'layer-bg') {
+        if (isBg) {
           c.fillStyle = '#ffffff';
           c.fillRect(selection.bounds.x, selection.bounds.y, selection.bounds.width, selection.bounds.height);
         } else {
@@ -1671,7 +1837,7 @@ export function App() {
           c.lineTo(selection.polygon[i].x, selection.polygon[i].y);
         }
         c.closePath();
-        if (activeLayerId === 'layer-bg') {
+        if (isBg) {
           c.fillStyle = '#ffffff';
           c.fill();
         } else {
@@ -1695,7 +1861,8 @@ export function App() {
       afterImageData,
       activeLayerId
     );
-  }, [selection, getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
+    globalTileGrid.notifyChange(true);
+  }, [selection, getActiveCanvas, activeLayerId, layerCanvasesRef, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
 
   const handleFillSelectionColor = useCallback(() => {
     if (!selection) return;
@@ -2036,8 +2203,14 @@ export function App() {
           dpi: dimensions.dpi ?? 600,
         });
       }
+
+      if (displayCanvas) {
+        const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
+        globalTileGrid.ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        globalTileGrid.notifyChange(true);
+      }
     },
-    [layers, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]
+    [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]
   );
 
   const handleTonalApply = useCallback(
@@ -2083,6 +2256,7 @@ export function App() {
         finalData,
         targetLayerId
       );
+      globalTileGrid.notifyChange(true);
 
       const resetState = {
         isOpen: false,
@@ -2130,6 +2304,11 @@ export function App() {
               dpi: dimensions.dpi ?? 600,
             });
           }
+          if (displayCanvas) {
+            const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
+            globalTileGrid.ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+            globalTileGrid.notifyChange(true);
+          }
         }
       }
     }
@@ -2144,7 +2323,7 @@ export function App() {
     };
     tonalModalStateRef.current = resetState;
     setTonalModalState(resetState);
-  }, [layers, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]);
+  }, [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]);
 
   const handleApplyReverseGradient = useCallback(() => {
     if (!hasOpenDocument || !activeLayer || activeLayer.locked || activeLayer.type !== 'raster') return;
@@ -2269,6 +2448,9 @@ export function App() {
         if (!lifted) return;
         floatCanvas = lifted.floatingCanvas;
         beforeData = lifted.beforeImageData;
+        const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+        globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        globalTileGrid.notifyChange(true);
         updateLayerThumbnail(activeLayerId, true);
       }
 
@@ -2387,8 +2569,11 @@ export function App() {
               }
             }
           }
+          const isMono = colorMode === 'monochrome' || lyr.expressionColor === 'monochrome';
+          globalTileGrid.ingestCanvas(lyr.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           updateLayerThumbnail(lyr.id, true);
         }
+        globalTileGrid.notifyChange(true);
 
         const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
         setTransformSession({
@@ -2459,6 +2644,9 @@ export function App() {
         }
       }
 
+      const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+      globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      globalTileGrid.notifyChange(true);
       updateLayerThumbnail(activeLayerId, true);
 
       const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
@@ -2538,26 +2726,23 @@ export function App() {
           });
         }
 
+        const beforeDataForLayer = transformSession.layerBeforeImages?.get(lId);
+        const afterDataForLayer = cCtx.getImageData(0, 0, c.width, c.height);
+        const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
+        globalTileGrid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+        if (beforeDataForLayer) {
+          pushHistoryStep(
+            'transform',
+            'Batch Free Transform',
+            beforeDataForLayer,
+            afterDataForLayer,
+            lId
+          );
+        }
         updateLayerThumbnail(lId, true);
       }
 
-      if (transformSession.beforeImageData) {
-        const primaryCanvas = layerCanvasesRef.current.get(transformSession.layerId);
-        if (primaryCanvas) {
-          const primaryCtx = get2DContext(primaryCanvas);
-          if (primaryCtx) {
-            const afterImageData = primaryCtx.getImageData(0, 0, primaryCanvas.width, primaryCanvas.height);
-            pushHistoryStep(
-              'transform',
-              'Batch Free Transform',
-              transformSession.beforeImageData,
-              afterImageData,
-              transformSession.layerId
-            );
-          }
-        }
-      }
-
+      globalTileGrid.notifyChange(true);
       setTransformSession(null);
       setTool('brush');
       return;
@@ -2621,12 +2806,14 @@ export function App() {
       afterImageData,
       transformSession.layerId
     );
+    globalTileGrid.notifyChange(true);
 
     updateLayerThumbnail(transformSession.layerId, true);
     setTransformSession(null);
     setTool('brush');
   }, [
     transformSession,
+    colorMode,
     layerCanvasesRef,
     getActiveCanvas,
     layers,
@@ -2646,12 +2833,12 @@ export function App() {
           const ctx = get2DContext(c);
           ctx?.putImageData(beforeData, 0, 0);
 
+          const lyr = layers.find((l) => l.id === lId);
           const sourceCanvas = layerSourceCanvasesRef.current?.get(lId);
           if (sourceCanvas) {
             const sCtx = get2DContext(sourceCanvas);
             sCtx?.putImageData(beforeData, 0, 0);
 
-            const lyr = layers.find((l) => l.id === lId);
             if (lyr?.toneEnabled) {
               applyScreentone(sourceCanvas, c, {
                 frequency: lyr.toneFrequency ?? 60,
@@ -2661,9 +2848,12 @@ export function App() {
               });
             }
           }
+          const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
+          globalTileGrid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           updateLayerThumbnail(lId, true);
         }
       }
+      globalTileGrid.notifyChange(true);
       setTransformSession(null);
       setTool('brush');
       return;
@@ -2674,12 +2864,12 @@ export function App() {
       const ctx = get2DContext(canvas);
       ctx?.putImageData(transformSession.beforeImageData, 0, 0);
 
+      const layer = layers.find((l) => l.id === transformSession.layerId);
       const sourceCanvas = layerSourceCanvasesRef.current?.get(transformSession.layerId);
       if (sourceCanvas) {
         const sCtx = get2DContext(sourceCanvas);
         sCtx?.putImageData(transformSession.beforeImageData, 0, 0);
 
-        const layer = layers.find((l) => l.id === transformSession.layerId);
         if (layer?.toneEnabled) {
           applyScreentone(
             sourceCanvas,
@@ -2693,12 +2883,16 @@ export function App() {
           );
         }
       }
+      const isMono = colorMode === 'monochrome' || layer?.expressionColor === 'monochrome';
+      globalTileGrid.ingestCanvas(transformSession.layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      globalTileGrid.notifyChange(true);
       updateLayerThumbnail(transformSession.layerId, true);
     }
     setTransformSession(null);
     setTool('brush');
   }, [
     transformSession,
+    colorMode,
     layerCanvasesRef,
     getActiveCanvas,
     layers,
@@ -2735,6 +2929,7 @@ export function App() {
         outline: s.outline,
         outlineColor: s.outlineColor,
         outlineWidth: s.outlineWidth,
+        anchorTopLeft: true,
       });
     };
 
@@ -2750,6 +2945,7 @@ export function App() {
       afterImageData,
       activeLayerId
     );
+    globalTileGrid.notifyChange(true);
 
     setTextSession(null);
   }, [textSession, getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
@@ -2786,6 +2982,7 @@ export function App() {
       afterImageData,
       activeLayerId
     );
+    globalTileGrid.notifyChange(true);
 
     setActiveBalloon(null);
   }, [activeBalloon, getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
@@ -2820,6 +3017,7 @@ export function App() {
       const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       updateLayerThumbnail(activeLayerId, true);
       pushHistoryStep('brush', `Manga Effect (${type})`, beforeImageData, afterImageData, activeLayerId);
+      globalTileGrid.notifyChange(true);
       showToast(`Applied manga ${type} lines`);
     },
     [getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep, showToast]
@@ -2955,7 +3153,15 @@ export function App() {
             if (displayCanvas) {
               applyLayerEffects(sourceCanvas, displayCanvas, activeLayer, dimensions.dpi ?? 600, dirty);
             }
+          } else {
+            const dCtx = get2DContext(canvas);
+            if (dCtx && dirty.width > 0 && dirty.height > 0) {
+              const subData = dCtx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
+              const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+              globalTileGrid.writeImageData(activeLayerId, subData, dirty.x, dirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
+            }
           }
+          globalTileGrid.notifyChange(true);
         }
 
         liquifyRafIdRef.current = requestAnimationFrame(tick);
@@ -2963,11 +3169,11 @@ export function App() {
 
       liquifyRafIdRef.current = requestAnimationFrame(tick);
     },
-    [activeLayer, activeLayerId, dimensions.dpi, layerCanvasesRef]
+    [activeLayer, activeLayerId, colorMode, dimensions.dpi, layerCanvasesRef]
   );
 
   const handlePointerDown = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+    (e: React.PointerEvent<HTMLElement>, coalescedEvents?: PointerEvent[]) => {
       if (!hasOpenDocument || e.button !== 0) return;
 
       const pt = getCanvasCoords(e);
@@ -2998,9 +3204,7 @@ export function App() {
         isLiquifyingRef.current = true;
         prevLiquifyPointRef.current = pt;
         liquifyBeforeImageDataRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        if (!liquifyInitialImageDataRef.current) {
-          liquifyInitialImageDataRef.current = liquifyBeforeImageDataRef.current;
-        }
+        liquifyInitialImageDataRef.current = liquifyBeforeImageDataRef.current;
         liquifySelectionMaskRef.current = createLiquifySelectionMask(selection, canvas.width, canvas.height);
         liquifyDirtyRectRef.current = null;
         liquifyLastPointerPosRef.current = { pt, pressure: e.pressure || 1.0 };
@@ -3027,7 +3231,12 @@ export function App() {
             liquifyDirtyRectRef.current = dirty;
             if (activeLayer?.toneEnabled && sourceCanvas && displayCanvas) {
               applyLayerEffects(sourceCanvas, displayCanvas, activeLayer, dimensions.dpi ?? 600, dirty);
+            } else if (dirty.width > 0 && dirty.height > 0) {
+              const subData = ctx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
+              const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+              globalTileGrid.writeImageData(targetLayerId, subData, dirty.x, dirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
             }
+            globalTileGrid.notifyChange(true);
           }
           startLiquifyLoop(canvas, sourceCanvas, isTone);
         }
@@ -3038,7 +3247,7 @@ export function App() {
         if (selection?.floating) {
           handleCommitFloatingSelection();
         }
-        handleCanvasDrawingPointerDown(e);
+        handleCanvasDrawingPointerDown(e, coalescedEvents);
         return;
       }
 
@@ -3193,6 +3402,9 @@ export function App() {
             const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
             const lifted = liftSelectionToFloating(canvas, selection, sourceCanvas, isBg);
             if (lifted) {
+              const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+              globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+              globalTileGrid.notifyChange(true);
               updateLayerThumbnail(activeLayerId, true);
               const floatingObj = {
                 canvas: lifted.floatingCanvas,
@@ -3274,11 +3486,28 @@ export function App() {
         let refCanvas: HTMLCanvasElement;
         if (fillSettings.method === 'refer-all') {
           refCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions);
+        } else if (fillSettings.method === 'refer-reference') {
+          refCanvas = compositeReferenceLayers(layers, layerCanvasesRef.current, dimensions);
         } else {
           refCanvas = canvas;
         }
 
-        const fillRes = executeFloodFill(canvas, refCanvas, px, py, primaryColor, fillSettings.tolerance, sourceCanvas);
+        const selMask = selection ? createSelectionMask(selection, canvas.width, canvas.height) : null;
+        const fillRes = executeFloodFill(
+          canvas,
+          refCanvas,
+          px,
+          py,
+          primaryColor,
+          fillSettings.tolerance,
+          sourceCanvas,
+          {
+            closeGap: fillSettings.closeGap ?? 0,
+            areaScale: fillSettings.areaScale ?? 0,
+            antiAlias: fillSettings.antiAlias ?? true,
+            selectionMask: selMask,
+          }
+        );
         if (activeLayer?.toneEnabled && sourceCanvas) {
           applyLayerEffects(sourceCanvas, canvas, activeLayer, dimensions.dpi ?? 600, fillRes.dirtyRect ?? undefined);
         }
@@ -3292,6 +3521,7 @@ export function App() {
           afterImageData,
           activeLayerId
         );
+        globalTileGrid.notifyChange(true);
         return;
       }
 
@@ -3369,7 +3599,7 @@ export function App() {
   );
 
   const handlePointerMove = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+    (e: React.PointerEvent<HTMLElement>, coalescedEvents?: PointerEvent[], predictedEvents?: PointerEvent[]) => {
       if (tool === 'pipette') {
         if (isPipetteSamplingRef.current) {
           const pt = getCanvasCoords(e);
@@ -3379,7 +3609,7 @@ export function App() {
       }
 
       if (tool === 'brush' || tool === 'eraser') {
-        handleCanvasDrawingPointerMove(e);
+        handleCanvasDrawingPointerMove(e, coalescedEvents, predictedEvents);
         return;
       }
 
@@ -3427,6 +3657,9 @@ export function App() {
             if (ctx) {
               ctx.clearRect(0, 0, canvas.width, canvas.height);
               renderVectorLayer(ctx, newStrokes);
+              const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
+              globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+              globalTileGrid.notifyChange(true);
               updateLayerThumbnail(activeLayerId, true);
             }
           }
@@ -3491,7 +3724,15 @@ export function App() {
         if (overallDirty) {
           if (activeLayer?.toneEnabled && sourceCanvas && displayCanvas) {
             applyLayerEffects(sourceCanvas, displayCanvas, activeLayer, dimensions.dpi ?? 600, overallDirty);
+          } else if (overallDirty.width > 0 && overallDirty.height > 0) {
+            const cCtx = get2DContext(canvas);
+            if (cCtx) {
+              const subData = cCtx.getImageData(overallDirty.x, overallDirty.y, overallDirty.width, overallDirty.height);
+              const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+              globalTileGrid.writeImageData(targetLayerId, subData, overallDirty.x, overallDirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
+            }
           }
+          globalTileGrid.notifyChange(true);
           if (!liquifyDirtyRectRef.current) {
             liquifyDirtyRectRef.current = overallDirty;
           } else {
@@ -3530,28 +3771,6 @@ export function App() {
         mCtx.restore();
 
         selectionPenDrawingRef.current.lastPt = pt;
-
-        const w = dimensions.width;
-        const h = dimensions.height;
-        const mImgData = mCtx.getImageData(0, 0, w, h);
-        const newMask = new Uint8Array(w * h);
-        for (let i = 0; i < newMask.length; i++) {
-          newMask[i] = mImgData.data[i * 4 + 3] > 0 ? 255 : 0;
-        }
-        const b = maskToBounds(newMask, w, h);
-        if (b) {
-          const svg = maskToSvgPath(newMask, w, h);
-          setSelection({
-            type: 'mask',
-            bounds: b,
-            mask: newMask,
-            maskWidth: w,
-            maskHeight: h,
-            svgPath: svg,
-          });
-        } else {
-          setSelection(null);
-        }
         return;
       }
 
@@ -3617,7 +3836,23 @@ export function App() {
         return;
       }
     },
-    [tool, handleCanvasDrawingPointerMove, getCanvasCoords, fillSettings.method, handleSampleColor, brushSettings.size, dimensions]
+    [
+      tool,
+      activeLayer,
+      activeLayerId,
+      colorMode,
+      vectorEditSettings,
+      getActiveCanvas,
+      updateLayerThumbnail,
+      layerSourceCanvasesRef,
+      layerCanvasesRef,
+      handleCanvasDrawingPointerMove,
+      getCanvasCoords,
+      fillSettings.method,
+      handleSampleColor,
+      brushSettings.size,
+      dimensions,
+    ]
   );
 
   const handlePointerUp = useCallback(
@@ -3669,11 +3904,13 @@ export function App() {
                 afterImageData,
                 targetLayerId
               );
+              globalTileGrid.notifyChange(true);
               updateLayerThumbnail(targetLayerId, true);
             }
           }
 
           liquifyBeforeImageDataRef.current = null;
+          liquifyInitialImageDataRef.current = null;
           liquifySelectionMaskRef.current = null;
           liquifyDirtyRectRef.current = null;
           prevLiquifyPointRef.current = null;
@@ -3773,6 +4010,7 @@ export function App() {
           afterImageData,
           activeLayerId
         );
+        globalTileGrid.notifyChange(true);
         return;
       }
 
@@ -3819,6 +4057,7 @@ export function App() {
             afterImageData,
             activeLayerId
           );
+          globalTileGrid.notifyChange(true);
         }
         return;
       }
@@ -3836,19 +4075,23 @@ export function App() {
             undefined,
             { before: vectorEditBeforeStrokesRef.current, after: [...activeLayer.vectorStrokes] }
           );
+          globalTileGrid.notifyChange(true);
         }
         return;
       }
     },
     [
       tool,
+      activeLayer,
+      activeLayerId,
+      vectorEditSettings,
+      layerCanvasesRef,
       handleCanvasDrawingPointerUp,
       getCanvasCoords,
       selection,
       fillSettings.method,
       getActiveCanvas,
       layerSourceCanvasesRef,
-      activeLayerId,
       primaryColor,
       updateLayerThumbnail,
       pushHistoryStep,
@@ -3938,6 +4181,59 @@ export function App() {
     },
     [primaryColor, resetHistory, resetToNewCanvas, resetZoomAndCenter, showToast, updateBrushSettings]
   );
+
+  // Initialize a default white canvas on launch so >80% of the viewport is immediately dedicated to drawing
+  const hasAutoCreatedInitialDocRef = useRef(false);
+  useEffect(() => {
+    if (hasAutoCreatedInitialDocRef.current || documents.length > 0) return;
+    hasAutoCreatedInitialDocRef.current = true;
+    const initDims: CanvasDimensions = {
+      width: appSettings.defaultWidth || 1920,
+      height: appSettings.defaultHeight || 1080,
+      dpi: appSettings.defaultDpi || 300,
+    };
+    const initColorMode = appSettings.defaultColorMode || 'color';
+    const initBg = appSettings.defaultBgColor || '#ffffff';
+    const initName = 'Untitled*';
+    setDimensions(initDims);
+    setColorMode(initColorMode);
+    setDocumentName(initName);
+    const { layers: initialLayers, activeLayerId: topId } = resetToNewCanvas(
+      initDims,
+      initBg,
+      initColorMode,
+      60
+    );
+    needsAdaptiveFitRef.current = true;
+    pendingFitDimsRef.current = initDims;
+    resetZoomAndCenter(initDims);
+    resetHistory();
+    const newDocId = `doc-${Date.now()}`;
+    setDocuments([
+      {
+        id: newDocId,
+        name: initName,
+        dimensions: initDims,
+        colorMode: initColorMode,
+        layers: initialLayers,
+        activeLayerId: topId,
+        perspectiveRuler: null,
+        defaultFrequency: 60,
+      },
+    ]);
+    setActiveDocumentId(newDocId);
+    setAppView('workspace');
+  }, [
+    appSettings.defaultBgColor,
+    appSettings.defaultColorMode,
+    appSettings.defaultDpi,
+    appSettings.defaultHeight,
+    appSettings.defaultWidth,
+    documents.length,
+    resetHistory,
+    resetToNewCanvas,
+    resetZoomAndCenter,
+  ]);
 
   // Copy selected layer
   const handleCopySelectedLayer = useCallback(() => {
@@ -4040,6 +4336,7 @@ export function App() {
   const handleUpdateSettings = useCallback((newSettings: AppSettings) => {
     setAppSettings(newSettings);
     saveAppSettings(newSettings);
+    globalTileMemoryManager.setBudgetMb(newSettings.tileMemoryBudgetMb || 1024);
     setBrushSettings((prev) => ({
       ...prev,
       stabilization: newSettings.defaultStabilization,
@@ -4047,6 +4344,11 @@ export function App() {
       smoothing: newSettings.smoothingEnabled,
     }));
   }, []);
+
+  // Synchronize initial tile memory budget
+  useEffect(() => {
+    globalTileMemoryManager.setBudgetMb(appSettings.tileMemoryBudgetMb || 1024);
+  }, [appSettings.tileMemoryBudgetMb]);
 
   // File loading handler
   const handleProcessFile = useCallback(
@@ -4146,7 +4448,12 @@ export function App() {
     setDocuments((prev) => {
       const curr = prev.find((d) => d.id === activeDocumentId);
       if (!curr) return prev;
-      if (curr.layers === layers && curr.activeLayerId === activeLayerId) {
+      if (
+        curr.layers === layers &&
+        curr.activeLayerId === activeLayerId &&
+        curr.layerCanvasesMap &&
+        curr.layerCanvasesMap.size === layerCanvasesRef.current.size
+      ) {
         return prev;
       }
       return prev.map((d) =>
@@ -4248,8 +4555,120 @@ export function App() {
         }
         return next;
       });
+      if (id) {
+        recoveryService.closeSession(id).catch(console.warn);
+      }
     },
     [activeDocumentId, clearDocument, loadDocument, resetHistory]
+  );
+
+  // Fault-Tolerant Crash Recovery Restore Handler
+  const handleRestoreCrashedSession = useCallback(
+    async (session: CrashedSessionInfo) => {
+      try {
+        const replayData = await recoveryService.loadSessionData(session.session_id);
+        const { manifest, replayedStrokesCount, replayedMutationsCount } =
+          recoveryService.replaySessionData(replayData, globalTileGrid);
+
+        const restoredDims: CanvasDimensions = {
+          width: manifest.width,
+          height: manifest.height,
+          dpi: manifest.dpi,
+        };
+
+        // Reconstruct layer canvases backing buffers
+        const restoredLayerCanvases = new Map<string, HTMLCanvasElement>();
+        for (const layer of manifest.layers) {
+          if (layer.type === 'raster' || layer.type === 'vector' || layer.type === 'frame') {
+            const canvas = document.createElement('canvas');
+            canvas.width = restoredDims.width;
+            canvas.height = restoredDims.height;
+            globalTileGrid.renderLayerToCanvas(layer.id, canvas);
+            restoredLayerCanvases.set(layer.id, canvas);
+          }
+        }
+
+        // Load document into useLayerManager
+        loadDocument({
+          name: manifest.documentName,
+          dimensions: restoredDims,
+          colorMode: manifest.colorMode,
+          layers: manifest.layers,
+          layerCanvases: restoredLayerCanvases,
+        });
+        if (manifest.activeLayerId) {
+          setActiveLayerId(manifest.activeLayerId);
+        }
+
+        // Set dimensions & color mode
+        setDimensions(restoredDims);
+        setColorMode(manifest.colorMode);
+        setDocumentName(manifest.documentName);
+
+        const restoredDoc: DocumentTab = {
+          id: session.session_id,
+          name: manifest.documentName,
+          dimensions: restoredDims,
+          colorMode: manifest.colorMode,
+          layers: manifest.layers,
+          activeLayerId: manifest.activeLayerId || manifest.layers[0]?.id || '',
+          layerCanvasesMap: restoredLayerCanvases,
+        };
+
+        setDocuments((prev) => {
+          const filtered = prev.filter((d) => d.id !== session.session_id);
+          return [restoredDoc, ...filtered];
+        });
+        setActiveDocumentId(session.session_id);
+        setAppView('workspace');
+
+        needsAdaptiveFitRef.current = true;
+        pendingFitDimsRef.current = restoredDims;
+        resetZoomAndCenter(restoredDims);
+        resetHistory();
+
+        // Push undo history entry
+        pushHistoryStep(
+          'initial',
+          'Session restored from crash',
+          null,
+          null,
+          manifest.activeLayerId || manifest.layers[0]?.id || ''
+        );
+
+        // Invalidate GPU textures & trigger compositor
+        globalTileGrid.notifyChange(true);
+
+        setIsRecoveryModalOpen(false);
+        setCrashedSessions((prev) => prev.filter((s) => s.session_id !== session.session_id));
+        showToast(
+          `Restored "${manifest.documentName}" (${replayedStrokesCount} strokes, ${replayedMutationsCount} mutations recovered)`
+        );
+      } catch (err: any) {
+        console.error('[Recovery] Restore error:', err);
+        alert('Failed to restore crashed session: ' + err.message);
+      }
+    },
+    [loadDocument, resetHistory, resetZoomAndCenter, showToast, pushHistoryStep, setActiveLayerId]
+  );
+
+  const handleDiscardCrashedSession = useCallback(
+    async (session: CrashedSessionInfo) => {
+      try {
+        await recoveryService.discardCrashedSession(session.session_id);
+        setCrashedSessions((prev) => {
+          const next = prev.filter((s) => s.session_id !== session.session_id);
+          if (next.length === 0) {
+            setIsRecoveryModalOpen(false);
+          }
+          return next;
+        });
+        showToast('Crashed session discarded');
+      } catch (err: any) {
+        console.warn('[Recovery] Discard error:', err);
+      }
+    },
+    [showToast]
   );
 
   const handleRenameDocument = useCallback(
@@ -4289,6 +4708,7 @@ export function App() {
       layerCanvasesMap: layerCanvasesRef.current,
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
+      tabId: activeDocumentId || undefined,
     };
 
     // If haven't saved the file yet, prompt to select a path and file extension
@@ -4387,6 +4807,7 @@ export function App() {
       layerCanvasesMap: layerCanvasesRef.current,
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
+      tabId: activeDocumentId || undefined,
     };
 
     try {
@@ -4458,140 +4879,234 @@ export function App() {
     showToast,
   ]);
 
-  // Global Keyboard Shortcuts (Ctrl+N, Ctrl+O, Ctrl+S, Ctrl+Shift+S, B, E, X)
+  const isAnyModalOpen =
+    isRecoveryModalOpen ||
+    isNewCanvasModalOpen ||
+    isResizeCanvasModalOpen ||
+    isSettingsModalOpen ||
+    tonalModalState.isOpen ||
+    adjustmentModalState.isOpen ||
+    layerStylesModalState.isOpen ||
+    isToneModalOpen ||
+    isHostModalOpen ||
+    isMangaEffectsModalOpen ||
+    isWebtoonExportModalOpen ||
+    isLoadingFile;
+
+  const isAnyModalOpenRef = useRef<boolean>(isAnyModalOpen);
+  isAnyModalOpenRef.current = isAnyModalOpen;
+
+  const tempToolHoldRef = useRef<{
+    code: string;
+    prevTool: ToolType;
+    targetTool: ToolType;
+    downAt: number;
+    usedWhileHeld: boolean;
+  } | null>(null);
+
+  const handleResetDefaultColors = useCallback(() => {
+    setIsTransparentColor(false);
+    const prim = enforceColorMode('#000000', colorMode);
+    const sec = enforceColorMode('#ffffff', colorMode);
+    setPrimaryColor(prim);
+    setSecondaryColor(sec);
+    updateBrushSettings({ color: prim, secondaryColor: sec, isTransparentInk: false });
+  }, [colorMode, updateBrushSettings]);
+
+  // Global Keyboard Shortcuts (Layout-Independent e.code + CSP Hold-and-Release Temporary Tools)
   useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      if (!(target instanceof HTMLElement)) return false;
+      const tag = target.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+    };
+
+    const CODE_TO_TOOL: Record<string, ToolType> = {
+      KeyB: 'brush',
+      KeyE: 'eraser',
+      KeyI: 'pipette',
+      KeyJ: 'liquify',
+      KeyM: 'select-rect',
+      KeyL: 'select-lasso',
+      KeyW: 'select-wand',
+      KeyG: 'fill',
+      KeyT: 'text',
+      KeyF: 'frame',
+      KeyO: 'balloon',
+      KeyY: 'vector-edit',
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) {
+      if (isAnyModalOpenRef.current || isEditableTarget(e.target)) {
         return;
       }
 
       const key = e.key.toLowerCase();
+      const code = e.code;
 
       // Ctrl / Cmd shortcuts
       if (e.ctrlKey || e.metaKey) {
+        // Toggle Animation Timeline: Ctrl+Alt+A
+        if (e.altKey && !e.shiftKey && (code === 'KeyA' || key === 'a')) {
+          if (!hasOpenDocument) return;
+          e.preventDefault();
+          if (activeAnimationTimeline) {
+            handleUpdateAnimationTimeline(null);
+          } else {
+            handleUpdateAnimationTimeline(createDefaultAnimationTimeline(layers));
+          }
+          return;
+        }
+
+        // Soft Proof Colors: Ctrl+Alt+Y
+        if (e.altKey && !e.shiftKey && (code === 'KeyY' || key === 'y')) {
+          if (!hasOpenDocument) return;
+          e.preventDefault();
+          toggleSoftProof();
+          return;
+        }
+
+        // Ignore other Ctrl+Alt combinations (reserved for Ctrl+Alt+Drag resize & Ctrl+Alt+0 reset rotation)
+        if (e.altKey) return;
+
         // Undo: Ctrl+Z (Cmd+Z)
-        if (!e.shiftKey && (key === 'z' || e.code === 'KeyZ')) {
+        if (!e.shiftKey && (code === 'KeyZ' || key === 'z')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleUndo();
           return;
         }
-        // Redo: Ctrl+Shift+Z
-        if (e.shiftKey && (key === 'z' || e.code === 'KeyZ')) {
+        // Redo: Ctrl+Shift+Z or Ctrl+Y
+        if (
+          (e.shiftKey && (code === 'KeyZ' || key === 'z')) ||
+          (!e.shiftKey && (code === 'KeyY' || key === 'y'))
+        ) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           redo();
           return;
         }
-        // Proof Colors (Ctrl+Y) & Gamut Warning (Ctrl+Shift+Y)
-        if (key === 'y' || e.code === 'KeyY') {
+        // Gamut Warning: Ctrl+Shift+Y
+        if (e.shiftKey && (code === 'KeyY' || key === 'y')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
-          if (e.shiftKey) {
-            toggleGamutWarning();
-          } else {
-            toggleSoftProof();
-          }
+          toggleGamutWarning();
           return;
         }
-        if (!e.shiftKey && key === 'n') {
+        // New Raster Layer: Ctrl+Shift+N
+        if (e.shiftKey && (code === 'KeyN' || key === 'n')) {
+          if (!hasOpenDocument) return;
+          e.preventDefault();
+          handleAddLayer('raster');
+          return;
+        }
+        // New Canvas: Ctrl+N
+        if (!e.shiftKey && (code === 'KeyN' || key === 'n')) {
           e.preventDefault();
           setIsNewCanvasModalOpen(true);
           return;
         }
-        if (!e.shiftKey && key === 'o') {
+        // Open File: Ctrl+O
+        if (!e.shiftKey && (code === 'KeyO' || key === 'o')) {
           e.preventDefault();
           handleTriggerOpenFile();
           return;
         }
         // Save As: Ctrl+Shift+S
-        if (e.shiftKey && key === 's') {
+        if (e.shiftKey && (code === 'KeyS' || key === 's')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleSaveAs();
           return;
         }
         // Save: Ctrl+S
-        if (!e.shiftKey && key === 's') {
+        if (!e.shiftKey && (code === 'KeyS' || key === 's')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleSave();
           return;
         }
+        // Duplicate Layer: Ctrl+J
+        if (!e.shiftKey && (code === 'KeyJ' || key === 'j')) {
+          if (!hasOpenDocument || !activeLayer) return;
+          e.preventDefault();
+          duplicateLayer(activeLayerId);
+          return;
+        }
         // Copy Layer: Ctrl+C (only when no text is selected)
-        if (!e.shiftKey && key === 'c') {
+        if (!e.shiftKey && (code === 'KeyC' || key === 'c')) {
           if (!hasOpenDocument) return;
-          const selection = window.getSelection()?.toString();
-          if (!selection || selection.length === 0) {
+          const textSel = window.getSelection()?.toString();
+          if (!textSel || textSel.length === 0) {
             e.preventDefault();
             handleCopySelectedLayer();
             return;
           }
         }
         // Paste Layer: Ctrl+V
-        if (!e.shiftKey && key === 'v') {
+        if (!e.shiftKey && (code === 'KeyV' || key === 'v')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handlePasteSelectedLayer();
           return;
         }
         // Group Layers: Ctrl+G
-        if (!e.shiftKey && (key === 'g' || e.code === 'KeyG')) {
+        if (!e.shiftKey && (code === 'KeyG' || key === 'g')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleGroupSelectedLayers();
           return;
         }
         // Transform: Ctrl+T
-        if (!e.shiftKey && (key === 't' || e.code === 'KeyT')) {
+        if (!e.shiftKey && (code === 'KeyT' || key === 't')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleStartTransform();
           return;
         }
         // Select All: Ctrl+A
-        if (!e.shiftKey && (key === 'a' || e.code === 'KeyA')) {
+        if (!e.shiftKey && (code === 'KeyA' || key === 'a')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleSelectAll();
           return;
         }
         // Deselect: Ctrl+D
-        if (!e.shiftKey && (key === 'd' || e.code === 'KeyD')) {
+        if (!e.shiftKey && (code === 'KeyD' || key === 'd')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleDeselect();
           return;
         }
         // Invert Selection: Ctrl+Shift+I
-        if (e.shiftKey && (key === 'i' || e.code === 'KeyI')) {
+        if (e.shiftKey && (code === 'KeyI' || key === 'i')) {
           if (!hasOpenDocument) return;
           e.preventDefault();
           handleInvertSelection();
           return;
         }
         // Reverse Gradient (Invert Colors): Ctrl+I
-        if (!e.shiftKey && (key === 'i' || e.code === 'KeyI')) {
+        if (!e.shiftKey && (code === 'KeyI' || key === 'i')) {
           if (!hasOpenDocument || !activeLayer || activeLayer.locked || activeLayer.type !== 'raster') return;
           e.preventDefault();
           handleApplyReverseGradient();
           return;
         }
         // Hue / Saturation / Luminosity: Ctrl+U
-        if (!e.shiftKey && (key === 'u' || e.code === 'KeyU')) {
+        if (!e.shiftKey && (code === 'KeyU' || key === 'u')) {
           if (!hasOpenDocument || !activeLayer || activeLayer.locked || activeLayer.type !== 'raster') return;
           e.preventDefault();
           handleOpenTonalModal('hue-saturation');
           return;
         }
         // Settings: Ctrl+,
-        if (!e.shiftKey && (key === ',' || key === '<')) {
+        if (!e.shiftKey && (code === 'Comma' || key === ',' || key === '<')) {
           e.preventDefault();
           setIsSettingsModalOpen(true);
           return;
         }
         // Toggle Perspective Ruler: Ctrl+Shift+R
-        if (e.shiftKey && (key === 'r' || e.code === 'KeyR')) {
+        if (e.shiftKey && (code === 'KeyR' || key === 'r')) {
           e.preventDefault();
           updatePerspectiveRuler((prev) => {
             if (!prev) {
@@ -4606,7 +5121,7 @@ export function App() {
           return;
         }
         // Toggle Perspective Snapping: Ctrl+Shift+P
-        if (e.shiftKey && (key === 'p' || e.code === 'KeyP')) {
+        if (e.shiftKey && (code === 'KeyP' || key === 'p')) {
           e.preventDefault();
           updatePerspectiveRuler((prev) => {
             if (!prev) return null;
@@ -4616,108 +5131,210 @@ export function App() {
           });
           return;
         }
+        return;
       }
 
-      // Tool shortcuts (without modifier keys)
-      if (!e.ctrlKey && !e.metaKey && !e.altKey) {
-        if (key === 'b') {
-          handleSelectTool('brush');
-        } else if (key === 'e') {
-          handleSelectTool('eraser');
-        } else if (key === 'w') {
-          handleSelectTool('select-wand');
-        } else if (key === 'm') {
-          handleSelectTool('select-rect');
-        } else if (key === 'l') {
-          handleSelectTool('select-lasso');
-        } else if (key === 'g') {
-          handleSelectTool('fill');
-        } else if (key === 't') {
-          handleSelectTool('text');
-        } else if (key === 'f') {
-          handleSelectTool('frame');
-        } else if (key === 'i') {
-          handleSelectTool('pipette');
-        } else if (key === 'j') {
-          handleSelectTool('liquify');
-        } else if (key === 'x') {
-          handleSwapColors();
-        } else if (key === 'c') {
-          toggleTransparentColor();
-        } else if (key === '[') {
-          setIsLeftPanelHidden((prev) => !prev);
-        } else if (key === 'delete' || key === 'backspace') {
-          if (!hasOpenDocument) return;
+      // Alt-only shortcuts: Alt+C -> Add Animation Cel
+      if (e.altKey && !e.ctrlKey && !e.metaKey) {
+        if (!e.shiftKey && (code === 'KeyC' || key === 'c')) {
+          if (!hasOpenDocument || !activeAnimationTimeline) return;
           e.preventDefault();
-          if (selection) {
-            handleClearSelection();
-          } else {
-            handleDeleteSelectedLayer();
+          // Revert temporary Alt pipette if it activated on Alt down
+          if (isAltActiveRef.current && previousToolBeforeAltRef.current !== null) {
+            setTool(previousToolBeforeAltRef.current);
+            previousToolBeforeAltRef.current = null;
+            isAltActiveRef.current = false;
           }
-        } else if (key === 'escape') {
-          if (transformSession?.active) {
-            e.preventDefault();
-            handleCancelTransform();
-          } else if (textSession) {
-            e.preventDefault();
-            handleCancelText();
-          } else if (selection) {
-            e.preventDefault();
-            handleDeselect();
+          handleAddAnimationCel(activeAnimationTimeline.currentFrame);
+        }
+        return;
+      }
+
+      // Tab / Shift+Tab: Toggle UI Panels (CSP workspace hide)
+      if (code === 'Tab' && !textSession) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          setIsLeftPanelHidden((prev) => !prev);
+        } else {
+          const hideBoth = !(isLeftPanelHidden && isRightSidebarHidden);
+          setIsLeftPanelHidden(hideBoth);
+          setIsRightSidebarHidden(hideBoth);
+        }
+        return;
+      }
+
+      // Brush Size Stepper: [ and ] (BracketLeft / BracketRight, supports key-repeat)
+      if (!e.shiftKey && (code === 'BracketLeft' || code === 'BracketRight')) {
+        e.preventDefault();
+        const dir: -1 | 1 = code === 'BracketLeft' ? -1 : 1;
+        if (toolRef.current === 'liquify') {
+          const nextSize = Math.max(4, Math.min(500, Math.round(stepBrushSizePreset(liquifySettings.size, dir))));
+          handleUpdateLiquifySettings({ size: nextSize });
+        } else {
+          const nextSize = stepBrushSizePreset(brushSettings.size, dir);
+          updateBrushSettings({ size: nextSize });
+        }
+        return;
+      }
+
+      // Single-key tool & color shortcuts (no modifiers)
+      if (!e.shiftKey) {
+        const mappedTool = CODE_TO_TOOL[code];
+        if (mappedTool) {
+          if (e.repeat) return;
+          const prev = toolRef.current;
+          if (prev !== mappedTool) {
+            tempToolHoldRef.current = {
+              code,
+              prevTool: prev,
+              targetTool: mappedTool,
+              downAt: performance.now(),
+              usedWhileHeld: false,
+            };
+            handleSelectTool(mappedTool);
           }
-        } else if (key === 'enter') {
-          if (transformSession?.active) {
-            e.preventDefault();
-            handleApplyTransform();
-          }
+          return;
+        }
+
+        if (code === 'KeyX' || key === 'x') {
+          if (!e.repeat) handleSwapColors();
+          return;
+        }
+        if (code === 'KeyD' || key === 'd') {
+          if (!e.repeat) handleResetDefaultColors();
+          return;
+        }
+        if (code === 'KeyC' || key === 'c') {
+          if (!e.repeat) toggleTransparentColor();
+          return;
+        }
+      }
+
+      if (key === 'delete' || key === 'backspace') {
+        if (!hasOpenDocument) return;
+        e.preventDefault();
+        if (selection) {
+          handleClearSelection();
+        } else {
+          handleDeleteSelectedLayer();
+        }
+      } else if (key === 'escape') {
+        if (transformSession?.active) {
+          e.preventDefault();
+          handleCancelTransform();
+        } else if (textSession) {
+          e.preventDefault();
+          handleCancelText();
+        } else if (selection) {
+          e.preventDefault();
+          handleDeselect();
+        }
+      } else if (key === 'enter') {
+        if (transformSession?.active) {
+          e.preventDefault();
+          handleApplyTransform();
         }
       }
     };
 
+    const handleKeyUp = (e: KeyboardEvent) => {
+      const hold = tempToolHoldRef.current;
+      if (hold && e.code === hold.code) {
+        const heldMs = performance.now() - hold.downAt;
+        tempToolHoldRef.current = null;
+        if ((heldMs >= 220 || hold.usedWhileHeld) && toolRef.current === hold.targetTool) {
+          handleSelectTool(hold.prevTool);
+        }
+      }
+    };
+
+    const handlePointerDownMarkUsed = () => {
+      if (tempToolHoldRef.current) {
+        tempToolHoldRef.current.usedWhileHeld = true;
+      }
+    };
+
+    const handleWindowBlur = () => {
+      tempToolHoldRef.current = null;
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('pointerdown', handlePointerDownMarkUsed, true);
+    window.addEventListener('blur', handleWindowBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('pointerdown', handlePointerDownMarkUsed, true);
+      window.removeEventListener('blur', handleWindowBlur);
+    };
   }, [
-    handleCopySelectedLayer,
-    handleDeleteSelectedLayer,
-    handleGroupSelectedLayers,
-    handleExportImage,
-    handlePasteSelectedLayer,
-    handleSave,
-    handleSaveAs,
-    handleSwapColors,
-    toggleTransparentColor,
-    handleTriggerOpenFile,
-    hasOpenDocument,
+    activeAnimationTimeline,
     activeLayer,
-    redo,
-    handleUndo,
-    handleStartTransform,
-    handleDeselect,
-    handleSelectAll,
-    handleInvertSelection,
-    handleClearSelection,
-    handleCancelTransform,
+    activeLayerId,
+    brushSettings.size,
+    dimensions,
+    duplicateLayer,
+    handleAddAnimationCel,
+    handleAddLayer,
+    handleApplyReverseGradient,
     handleApplyTransform,
     handleCancelText,
-    handleApplyReverseGradient,
+    handleCancelTransform,
+    handleClearSelection,
+    handleCopySelectedLayer,
+    handleDeleteSelectedLayer,
+    handleDeselect,
+    handleGroupSelectedLayers,
+    handleInvertSelection,
     handleOpenTonalModal,
-    selection,
-    transformSession,
-    textSession,
+    handlePasteSelectedLayer,
+    handleResetDefaultColors,
+    handleSave,
+    handleSaveAs,
+    handleSelectAll,
     handleSelectTool,
-    toggleSoftProof,
+    handleStartTransform,
+    handleSwapColors,
+    handleTriggerOpenFile,
+    handleUndo,
+    handleUpdateAnimationTimeline,
+    handleUpdateLiquifySettings,
+    hasOpenDocument,
+    isLeftPanelHidden,
+    isRightSidebarHidden,
+    layers,
+    liquifySettings.size,
+    redo,
+    selection,
+    showToast,
+    textSession,
     toggleGamutWarning,
+    toggleSoftProof,
+    toggleTransparentColor,
+    transformSession,
+    updateBrushSettings,
+    updatePerspectiveRuler,
   ]);
 
   // Pipette tool: hold Alt to activate, release Alt to switch back to previous tool
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) {
+      const target = e.target as HTMLElement | null;
+      if (
+        isAnyModalOpenRef.current ||
+        (target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable))
+      ) {
         return;
       }
 
       if (e.key === 'Alt') {
-        if (!e.ctrlKey && !e.metaKey) {
+        if (
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !isDrawingRef.current &&
+          !selectionPenDrawingRef.current?.isDrawing
+        ) {
           e.preventDefault();
           if (!isAltActiveRef.current && !e.repeat) {
             isAltActiveRef.current = true;
@@ -4730,8 +5347,8 @@ export function App() {
         return;
       }
 
-      // If user holds Ctrl while Alt is active (e.g. initiating Ctrl+Alt brush resize), revert pipette
-      if ((e.ctrlKey || e.metaKey) && isAltActiveRef.current) {
+      // If user presses Ctrl or Space while Alt is active (Ctrl+Alt resize or Alt+Space play), revert pipette
+      if (((e.ctrlKey || e.metaKey) || e.code === 'Space') && isAltActiveRef.current) {
         if (previousToolBeforeAltRef.current !== null) {
           setTool(previousToolBeforeAltRef.current);
           previousToolBeforeAltRef.current = null;
@@ -4772,7 +5389,7 @@ export function App() {
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
     };
-  }, []);
+  }, [isDrawingRef]);
 
   // Drag and drop onto application window
   useEffect(() => {
@@ -4821,8 +5438,8 @@ export function App() {
     };
   }, [handleProcessFile, showToast, updateBrushSettings]);
 
-  // Application Menu Bar Sections
-  const menuSections: MenuSection[] = [
+  // Application Menu Bar Sections (Memoized to prevent 240Hz navigation re-allocations)
+  const menuSections: MenuSection[] = useMemo(() => [
     {
       id: 'file',
       label: 'File',
@@ -5539,7 +6156,8 @@ export function App() {
                 disabled: !hasOpenDocument,
                 submenu: [2, 4, 6, 8, 12, 16].map((count) => ({
                   id: `ruler-rays-${count}`,
-                  label: `${count} Rays per VP${(perspectiveRuler.guideRayCount || 6) === count ? ' ✓' : ''}`,
+                  label: `${count} Rays per VP`,
+                  checked: (perspectiveRuler.guideRayCount || 6) === count,
                   onClick: () =>
                     updatePerspectiveRuler((prev) =>
                       prev ? { ...prev, guideRayCount: count } : null
@@ -5703,21 +6321,18 @@ export function App() {
               id: 'proof-setup-us-web',
               label: 'Working CMYK - U.S. Web Coated (SWOP) v2',
               checked: softProofSettings.standard === 'us-web-coated-swop',
-              icon: softProofSettings.standard === 'us-web-coated-swop' ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
               onClick: () => setProofStandard('us-web-coated-swop'),
             },
             {
               id: 'proof-setup-japan',
               label: 'Japan Color 2001 Coated',
               checked: softProofSettings.standard === 'japan-color-2001',
-              icon: softProofSettings.standard === 'japan-color-2001' ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
               onClick: () => setProofStandard('japan-color-2001'),
             },
             {
               id: 'proof-setup-iso',
               label: 'ISO Coated v2 (ECI)',
               checked: softProofSettings.standard === 'iso-coated-v2',
-              icon: softProofSettings.standard === 'iso-coated-v2' ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
               onClick: () => setProofStandard('iso-coated-v2'),
             },
           ],
@@ -5725,9 +6340,8 @@ export function App() {
         {
           id: 'view-proof-colors',
           label: 'Proof Colors',
-          shortcut: 'Ctrl+Y',
+          shortcut: 'Ctrl+Alt+Y',
           checked: softProofSettings.enabled,
-          icon: softProofSettings.enabled ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
           disabled: !hasOpenDocument,
           onClick: toggleSoftProof,
         },
@@ -5736,7 +6350,6 @@ export function App() {
           label: 'Gamut Warning',
           shortcut: 'Ctrl+Shift+Y',
           checked: softProofSettings.gamutWarning,
-          icon: softProofSettings.gamutWarning ? <Check className="w-3.5 h-3.5 text-cyan-400" /> : undefined,
           disabled: !hasOpenDocument,
           onClick: toggleGamutWarning,
         },
@@ -5850,39 +6463,83 @@ export function App() {
           icon: <InfoIcon className="w-3.5 h-3.5 text-[#93c5fd]" />,
           onClick: () => {
             alert(
-              'Ink Studio — Professional Digital Painting & Manga Studio\n\n' +
-                '• Full Layer Management with 12 Blend Modes\n' +
-                '• Supports Opening PSD (Photoshop) & CSP (Clip Studio Paint) with layers\n' +
-                '• Supports Common Images: PNG, JPG, WEBP, GIF, BMP, SVG\n' +
-                '• Save & Save As: PSD (layered), Ink Studio Project (.sora / .ink), PNG, JPG, WebP\n' +
-                '• Export Image: High-resolution PNG\n' +
-                '• Color Modes: Full Color (RGB), Grayscale, and 1-bit Manga Monochrome\n' +
-                '• Tablet Pressure & Inking Stabilization'
+              'Ink Studio - Professional Digital Painting & Manga Studio\n\n' +
+                '- Full Layer Management with 17 Blend Modes\n' +
+                '- Supports Opening PSD (Photoshop) & CSP (Clip Studio Paint) with layers\n' +
+                '- Supports Common Images: PNG, JPG, WEBP, GIF, BMP, SVG\n' +
+                '- Save & Save As: PSD (layered), Ink Studio Project (.sora / .ink), PNG, JPG, WebP\n' +
+                '- Export Image: High-resolution PNG\n' +
+                '- Color Modes: Full Color (RGB), Grayscale, and 1-bit Manga Monochrome\n' +
+                '- CSP Sub-Tool Engine, Tablet Pressure, Tilt & Inking Stabilization'
             );
           },
         },
       ],
     },
-  ];
-
-  const handleSaveFirstTimeName = useCallback(
-    (name: string) => {
-      const updated: AppSettings = {
-        ...appSettings,
-        userName: name,
-        hasPromptedName: true,
-      };
-      setAppSettings(updated);
-      saveAppSettings(updated);
-      try {
-        localStorage.setItem('sora_paint_nickname', name);
-      } catch {
-        // ignore
-      }
-      showToast(`Welcome, ${name}!`);
-    },
-    [appSettings, showToast]
-  );
+  ], [
+    activeAnimationTimeline,
+    activeLayer,
+    activeLayerId,
+    addLayerMask,
+    canRedo,
+    canUndo,
+    clearCanvas,
+    deleteLayer,
+    dimensions,
+    duplicateLayer,
+    handleAddAnimationCel,
+    handleAddLayer,
+    handleApplyFilter,
+    handleApplyReverseGradient,
+    handleClearActiveLayer,
+    handleContractSelection,
+    handleConvertLayer,
+    handleCopySelectedLayer,
+    handleDeleteSelectedLayer,
+    handleDeselect,
+    handleExpandSelection,
+    handleExportImage,
+    handleFeatherSelection,
+    handleFillSelectionColor,
+    handleInvertSelection,
+    handleOpenAdjustmentModal,
+    handleOpenLayerStylesModal,
+    handleOpenTonalModal,
+    handlePasteSelectedLayer,
+    handleSave,
+    handleSaveAs,
+    handleSelectAll,
+    handleSelectTool,
+    handleStartTransform,
+    handleTriggerImport3DFile,
+    handleTriggerOpenFile,
+    handleTriggerPasteFromFile,
+    handleUndo,
+    handleUpdateAnimationTimeline,
+    hasOpenDocument,
+    isWebtoonMode,
+    layers,
+    perspectiveRuler,
+    redo,
+    removeLayerMask,
+    resetRotation,
+    resetZoomAndCenter,
+    selection,
+    setProofStandard,
+    showToast,
+    softProofSettings.enabled,
+    softProofSettings.gamutWarning,
+    softProofSettings.standard,
+    toggleGamutWarning,
+    toggleLayerColor,
+    toggleLayerMask,
+    toggleMaskLinked,
+    toggleSoftProof,
+    updateBrushSettings,
+    updatePerspectiveRuler,
+    zoomIn,
+    zoomOut,
+  ]);
 
   const handleSelectWelcomeDocument = useCallback(
     async (doc: RecentDocument) => {
@@ -5921,29 +6578,33 @@ export function App() {
     [handleCreateNewCanvas, handleProcessFile, showToast]
   );
 
-  const isModernTheme = appSettings.themePreset === 'modern';
-  const modernAccent = appSettings.modernAccent || 'blue';
+  const modernAccent = appSettings.modernAccent || 'neutral';
   const modernAccentHex = resolveModernAccentColor(modernAccent, appSettings.modernCustomColor);
-  const modernAccentRgb = hexToRgb(modernAccentHex) || { r: 59, g: 130, b: 246 };
+  const modernAccentRgb = hexToRgb(modernAccentHex) || { r: 229, g: 229, b: 229 };
+  const modernAccentContrast = getAccentContrastColor(modernAccentHex);
 
-  const modernStyleVars = useMemo(() => {
-    if (!isModernTheme) return undefined;
-    return {
-      '--modern-accent': modernAccentHex,
-      '--modern-accent-rgb': `${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}`,
-      '--modern-accent-glow': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.28)`,
-      '--modern-accent-subtle': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.12)`,
-      '--modern-accent-border': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.42)`,
-      '--modern-accent-hover': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.2)`,
-    } as React.CSSProperties;
-  }, [isModernTheme, modernAccentHex, modernAccentRgb.r, modernAccentRgb.g, modernAccentRgb.b]);
+  const modernStyleVars = useMemo(
+    () =>
+      ({
+        '--accent': modernAccentHex,
+        '--accent-rgb': `${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}`,
+        '--accent-contrast': modernAccentContrast,
+        '--accent-subtle': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.14)`,
+        '--accent-border': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.32)`,
+        '--modern-accent': modernAccentHex,
+        '--modern-accent-rgb': `${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}`,
+        '--modern-accent-subtle': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.14)`,
+        '--modern-accent-border': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.32)`,
+        '--modern-accent-hover': `rgba(${modernAccentRgb.r}, ${modernAccentRgb.g}, ${modernAccentRgb.b}, 0.2)`,
+      }) as React.CSSProperties,
+    [modernAccentHex, modernAccentRgb.r, modernAccentRgb.g, modernAccentRgb.b, modernAccentContrast]
+  );
 
   return (
     <div
-      className="flex flex-col w-screen h-screen overflow-hidden bg-[#1e1e1e] text-[#cccccc] font-sans app-root-container"
-      data-theme={appSettings.themePreset || 'vintage-manga'}
-      data-accent={isModernTheme ? modernAccent : undefined}
-      data-tone={isModernTheme ? (appSettings.uiTone || 'slate') : undefined}
+      className="flex flex-col w-screen h-screen overflow-hidden bg-[#161616] text-[#e5e5e5] font-sans gap-px app-root-container"
+      data-theme="modern"
+      data-accent={modernAccent}
       style={modernStyleVars}
     >
       {/* Hidden File Input for Native File Picker */}
@@ -5973,13 +6634,8 @@ export function App() {
         className="hidden"
       />
 
-      {/* Top Application Bar */}
+      {/* Consolidated Single Slim 36px Header Bar */}
       <Header
-        tool={tool}
-        preset={brushSettings.preset}
-        brushName={brushSettings.brushName}
-        brushSize={brushSettings.size}
-        onBrushSizeChange={handleBrushSizeChange}
         canUndo={hasOpenDocument && canUndo}
         canRedo={hasOpenDocument && canRedo}
         onUndo={handleUndo}
@@ -5994,11 +6650,17 @@ export function App() {
         colorMode={colorMode}
         menuSections={menuSections}
         hasOpenDocument={hasOpenDocument}
+        documents={documents}
+        activeDocumentId={activeDocumentId}
+        onSelectDocument={handleSelectDocument}
+        onCloseDocument={handleCloseDocument}
+        onNewDocument={() => setIsNewCanvasModalOpen(true)}
+        onRenameDocument={handleRenameDocument}
         isCollabConnected={isCollabConnected}
         collabPeerCount={collabPeers.length + 1}
         onOpenCollabModal={() => setIsHostModalOpen(true)}
+        onOpenSettings={() => setIsSettingsModalOpen(true)}
         themePreset={appSettings.themePreset}
-        activeDocumentTitle={documents.find((d) => d.id === activeDocumentId)?.name}
         softProofSettings={softProofSettings}
         appView={appView}
         onSelectAppView={(view) => {
@@ -6010,19 +6672,8 @@ export function App() {
         }}
       />
 
-      {/* Modern Horizontal Property Bar below Header in Workspace matching Reference 3 */}
-      {isModernTheme && hasOpenDocument && appView === 'workspace' && (
-        <ModernPropertyBar
-          tool={tool}
-          brushSettings={brushSettings}
-          onUpdateBrushSettings={updateBrushSettings}
-          onToggleBrushEditor={() => setIsLeftPanelHidden((prev) => !prev)}
-          isBrushEditorOpen={!isLeftPanelHidden}
-        />
-      )}
-
       {/* Main Workspace */}
-      <div className="flex flex-1 overflow-hidden relative">
+      <div className="flex flex-1 overflow-hidden relative gap-px bg-[#161616]">
         {!hasOpenDocument || appView === 'home' ? (
           <WelcomeScreen
             userName={appSettings.userName}
@@ -6035,237 +6686,226 @@ export function App() {
         ) : (
           <>
             <LeftPanel
-          currentTool={tool}
-          onSelectTool={handleSelectTool}
-          brushSettings={brushSettings}
-          onUpdateBrushSettings={updateBrushSettings}
-          primaryColor={primaryColor}
-          secondaryColor={secondaryColor}
-          isTransparentColor={isTransparentColor}
-          onToggleTransparentColor={toggleTransparentColor}
-          onPrimaryColorChange={handlePrimaryColorChange}
-          onSecondaryColorChange={handleSecondaryColorChange}
-          onSwapColors={handleSwapColors}
-          recentColors={recentColors}
-          width={leftPanelWidth}
-          onWidthChange={handleLeftPanelWidthChange}
-          isHidden={isLeftPanelHidden}
-          onToggleHidden={() => setIsLeftPanelHidden((prev) => !prev)}
-          fillSettings={fillSettings}
-          onUpdateFillSettings={(newSettings) => setFillSettings((prev) => ({ ...prev, ...newSettings }))}
-          textSettings={textSettings}
-          onUpdateTextSettings={(newSettings) => setTextSettings((prev) => ({ ...prev, ...newSettings }))}
-          frameSettings={frameSettings}
-          onUpdateFrameSettings={(newSettings) => setFrameSettings((prev) => ({ ...prev, ...newSettings }))}
-          hasSelection={Boolean(selection)}
-          onDeselect={handleDeselect}
-          onTransformSelection={handleStartTransform}
-          onFillScreentone={handleFillScreentone}
-          liquifySettings={liquifySettings}
-          onUpdateLiquifySettings={handleUpdateLiquifySettings}
-          balloonSettings={balloonSettings}
-          onUpdateBalloonSettings={(newSettings) => setBalloonSettings((prev) => ({ ...prev, ...newSettings }))}
-          vectorEditSettings={vectorEditSettings}
-          onUpdateVectorEditSettings={(newSettings) => setVectorEditSettings((prev) => ({ ...prev, ...newSettings }))}
-          onOpenMangaEffects={() => setIsMangaEffectsModalOpen(true)}
-          wandSettings={wandSettings}
-          onUpdateWandSettings={(newSettings) => setWandSettings((prev) => ({ ...prev, ...newSettings }))}
-          onExpandSelection={handleExpandSelection}
-          onContractSelection={handleContractSelection}
-          onFeatherSelection={handleFeatherSelection}
-          onInvertSelection={handleInvertSelection}
-        />
+              currentTool={tool}
+              onSelectTool={handleSelectTool}
+              brushSettings={brushSettings}
+              onUpdateBrushSettings={updateBrushSettings}
+              primaryColor={primaryColor}
+              secondaryColor={secondaryColor}
+              isTransparentColor={isTransparentColor}
+              onToggleTransparentColor={toggleTransparentColor}
+              onPrimaryColorChange={handlePrimaryColorChange}
+              onSecondaryColorChange={handleSecondaryColorChange}
+              onSwapColors={handleSwapColors}
+              recentColors={recentColors}
+              width={leftPanelWidth}
+              onWidthChange={handleLeftPanelWidthChange}
+              isHidden={isLeftPanelHidden}
+              onToggleHidden={() => setIsLeftPanelHidden((prev) => !prev)}
+              fillSettings={fillSettings}
+              onUpdateFillSettings={(newSettings) => setFillSettings((prev) => ({ ...prev, ...newSettings }))}
+              textSettings={textSettings}
+              onUpdateTextSettings={(newSettings) => setTextSettings((prev) => ({ ...prev, ...newSettings }))}
+              frameSettings={frameSettings}
+              onUpdateFrameSettings={(newSettings) => setFrameSettings((prev) => ({ ...prev, ...newSettings }))}
+              hasSelection={Boolean(selection)}
+              onDeselect={handleDeselect}
+              onTransformSelection={handleStartTransform}
+              onFillScreentone={handleFillScreentone}
+              liquifySettings={liquifySettings}
+              onUpdateLiquifySettings={handleUpdateLiquifySettings}
+              balloonSettings={balloonSettings}
+              onUpdateBalloonSettings={(newSettings) => setBalloonSettings((prev) => ({ ...prev, ...newSettings }))}
+              vectorEditSettings={vectorEditSettings}
+              onUpdateVectorEditSettings={(newSettings) => setVectorEditSettings((prev) => ({ ...prev, ...newSettings }))}
+              onOpenMangaEffects={() => setIsMangaEffectsModalOpen(true)}
+              wandSettings={wandSettings}
+              onUpdateWandSettings={(newSettings) => setWandSettings((prev) => ({ ...prev, ...newSettings }))}
+              onExpandSelection={handleExpandSelection}
+              onContractSelection={handleContractSelection}
+              onFeatherSelection={handleFeatherSelection}
+              onInvertSelection={handleInvertSelection}
+            />
 
-        {/* Center Workspace: Document Tab Bar (Projects) + Canvas Area */}
-        <div className="flex flex-col flex-1 min-w-0 overflow-hidden relative">
-          <DocumentTabBar
-            documents={documents}
-            activeDocumentId={activeDocumentId}
-            onSelectDocument={handleSelectDocument}
-            onCloseDocument={handleCloseDocument}
-            onNewDocument={() => setIsNewCanvasModalOpen(true)}
-            onRenameDocument={handleRenameDocument}
-            themePreset={appSettings.themePreset}
-          />
+            {/* Center Workspace: >80% Viewport Dedicated to Drawing Canvas */}
+            <div className="flex flex-col flex-1 min-w-0 overflow-hidden relative">
+              <CanvasArea
+                viewportRef={viewportRef}
+                onViewportReady={handleViewportReady}
+                dimensions={dimensions}
+                brushSettings={brushSettings}
+                onUpdateBrushSettings={updateBrushSettings}
+                zoom={zoom}
+                pan={pan}
+                rotation={rotation}
+                isSpaceDown={isSpaceDown}
+                isShiftDown={isShiftDown}
+                isRotateModifier={isRotateModifier}
+                isPanning={isPanning}
+                isRotating={isRotating}
+                onStartPan={startPan}
+                onStartRotate={startRotate}
+                isHovering={isHovering}
+                cursorPos={cursorPos}
+                onPointerDown={handlePointerDown}
+                onPointerMove={handlePointerMove}
+                onPointerUp={handlePointerUp}
+                onPointerEnter={handlePointerEnter}
+                onPointerLeave={handlePointerLeave}
+                layers={layers}
+                activeLayerId={activeLayerId}
+                colorMode={colorMode}
+                layerCanvasesRef={layerCanvasesRef}
+                registerLayerCanvas={registerLayerCanvas}
+                getEffectiveOpacity={getEffectiveOpacity}
+                isLayerEffectivelyVisible={isLayerEffectivelyVisible}
+                interactionRef={interactionRef}
+                showCheckerboard={appSettings.showCheckerboard}
+                showCursorCoordinates={appSettings.showCursorCoordinates}
+                showPressureInStatusBar={appSettings.showPressureInStatusBar}
+                hasOpenDocument={hasOpenDocument}
+                draftCanvasRef={draftCanvasRef}
+                strokeCanvasRef={strokeCanvasRef}
+                peers={collabPeers}
+                activePings={collabActivePings}
+                remoteDraftCanvasesRef={remoteDraftCanvasesRef}
+                tool={tool}
+                liquifySettings={liquifySettings}
+                onUpdateLiquifySettings={handleUpdateLiquifySettings}
+                primaryColor={primaryColor}
+                onSwapColors={handleSwapColors}
+                selection={selection}
+                onDeselect={handleDeselect}
+                onTransformSelection={handleStartTransform}
+                onFillScreentone={handleFillScreentone}
+                onFillColor={handleFillSelectionColor}
+                onClearSelection={handleClearSelection}
+                onInvertSelection={handleInvertSelection}
+                onExpandSelection={handleExpandSelection}
+                onContractSelection={handleContractSelection}
+                onFeatherSelection={handleFeatherSelection}
+                transformSession={transformSession}
+                onUpdateTransformSession={(updater) =>
+                  setTransformSession((prev) => (prev ? updater(prev) : null))
+                }
+                onApplyTransform={handleApplyTransform}
+                onCancelTransform={handleCancelTransform}
+                textSession={textSession}
+                onUpdateTextSettings={(updater) =>
+                  setTextSession((prev) => (prev ? { ...prev, settings: updater(prev.settings) } : null))
+                }
+                onMoveTextSession={(newX, newY) =>
+                  setTextSession((prev) => (prev ? { ...prev, x: newX, y: newY } : null))
+                }
+                onConfirmText={handleConfirmText}
+                onCancelText={handleCancelText}
+                perspectiveRuler={hasOpenDocument ? perspectiveRuler : null}
+                onUpdatePerspectiveRuler={updatePerspectiveRuler}
+                activeLockedAxis={activeLockedAxis}
+                is3DLayerOpen={is3DLayerOpen}
+                initial3DFile={initial3DFile}
+                onClose3DLayer={() => {
+                  setIs3DLayerOpen(false);
+                  setInitial3DFile(null);
+                }}
+                onInsertRasterLayer={handleInsert3DRasterLayer}
+                isWebtoonMode={isWebtoonMode}
+                onToggleWebtoonMode={() => setIsWebtoonMode((prev) => !prev)}
+                onOpenWebtoonExport={() => setIsWebtoonExportModalOpen(true)}
+                activeBalloon={activeBalloon}
+                onUpdateBalloon={(updater) => setActiveBalloon((prev) => (prev ? updater(prev) : null))}
+                onConfirmBalloon={handleConfirmBalloon}
+                onDeleteBalloon={handleDeleteBalloon}
+                animationTimeline={activeAnimationTimeline}
+                onUpdateAnimationTimeline={handleUpdateAnimationTimeline}
+                onAddAnimationCel={handleAddAnimationCel}
+                onDeleteAnimationCel={handleDeleteAnimationCel}
+                onSelectCelLayer={setActiveLayerId}
+                softProofSettings={softProofSettings}
+              />
+            </div>
 
-          <CanvasArea
-            viewportRef={viewportRef}
-            onViewportReady={handleViewportReady}
-            dimensions={dimensions}
-            brushSettings={brushSettings}
-            onUpdateBrushSettings={updateBrushSettings}
-            zoom={zoom}
-            pan={pan}
-            rotation={rotation}
-            isSpaceDown={isSpaceDown}
-            isShiftDown={isShiftDown}
-            isRotateModifier={isRotateModifier}
-            isPanning={isPanning}
-            isRotating={isRotating}
-            onStartPan={startPan}
-            onStartRotate={startRotate}
-            isHovering={isHovering}
-            cursorPos={cursorPos}
-            onPointerDown={handlePointerDown}
-            onPointerMove={handlePointerMove}
-            onPointerUp={handlePointerUp}
-            onPointerEnter={handlePointerEnter}
-            onPointerLeave={handlePointerLeave}
-            layers={layers}
-            activeLayerId={activeLayerId}
-            colorMode={colorMode}
-            layerCanvasesRef={layerCanvasesRef}
-            registerLayerCanvas={registerLayerCanvas}
-            getEffectiveOpacity={getEffectiveOpacity}
-            isLayerEffectivelyVisible={isLayerEffectivelyVisible}
-            interactionRef={interactionRef}
-            showCheckerboard={appSettings.showCheckerboard}
-            hasOpenDocument={hasOpenDocument}
-            draftCanvasRef={draftCanvasRef}
-            strokeCanvasRef={strokeCanvasRef}
-            peers={collabPeers}
-            activePings={collabActivePings}
-            remoteDraftCanvasesRef={remoteDraftCanvasesRef}
-            tool={tool}
-            liquifySettings={liquifySettings}
-            selection={selection}
-            onDeselect={handleDeselect}
-            onTransformSelection={handleStartTransform}
-            onFillScreentone={handleFillScreentone}
-            onFillColor={handleFillSelectionColor}
-            onClearSelection={handleClearSelection}
-            onInvertSelection={handleInvertSelection}
-            onExpandSelection={handleExpandSelection}
-            onContractSelection={handleContractSelection}
-            onFeatherSelection={handleFeatherSelection}
-            transformSession={transformSession}
-            onUpdateTransformSession={(updater) =>
-              setTransformSession((prev) => (prev ? updater(prev) : null))
-            }
-            onApplyTransform={handleApplyTransform}
-            onCancelTransform={handleCancelTransform}
-            textSession={textSession}
-            onUpdateTextSettings={(updater) =>
-              setTextSession((prev) => (prev ? { ...prev, settings: updater(prev.settings) } : null))
-            }
-            onMoveTextSession={(newX, newY) =>
-              setTextSession((prev) => (prev ? { ...prev, x: newX, y: newY } : null))
-            }
-            onConfirmText={handleConfirmText}
-            onCancelText={handleCancelText}
-            perspectiveRuler={hasOpenDocument ? perspectiveRuler : null}
-            onUpdatePerspectiveRuler={setPerspectiveRuler}
-            activeLockedAxis={activeLockedAxis}
-            is3DLayerOpen={is3DLayerOpen}
-            initial3DFile={initial3DFile}
-            onClose3DLayer={() => {
-              setIs3DLayerOpen(false);
-              setInitial3DFile(null);
-            }}
-            onInsertRasterLayer={handleInsert3DRasterLayer}
-            isWebtoonMode={isWebtoonMode}
-            onToggleWebtoonMode={() => setIsWebtoonMode((prev) => !prev)}
-            onOpenWebtoonExport={() => setIsWebtoonExportModalOpen(true)}
-            activeBalloon={activeBalloon}
-            onUpdateBalloon={(updater) => setActiveBalloon((prev) => (prev ? updater(prev) : null))}
-            onConfirmBalloon={handleConfirmBalloon}
-            onDeleteBalloon={handleDeleteBalloon}
-            animationTimeline={activeAnimationTimeline}
-            onUpdateAnimationTimeline={handleUpdateAnimationTimeline}
-            onAddAnimationCel={handleAddAnimationCel}
-            onDeleteAnimationCel={handleDeleteAnimationCel}
-            onSelectCelLayer={setActiveLayerId}
-            softProofSettings={softProofSettings}
-          />
-        </div>
-
-        <RightSidebar
-          hasOpenDocument={hasOpenDocument}
-          onNewCanvas={() => setIsNewCanvasModalOpen(true)}
-          onOpenFile={handleTriggerOpenFile}
-          primaryColor={primaryColor}
-          secondaryColor={secondaryColor}
-          onPrimaryColorChange={handlePrimaryColorChange}
-          onSecondaryColorChange={handleSecondaryColorChange}
-          onSwapColors={handleSwapColors}
-          recentColors={recentColors}
-          currentTool={tool}
-          onSelectTool={setTool}
-          colorMode={colorMode}
-          historyList={hasOpenDocument ? historyList : []}
-          historyIndex={hasOpenDocument ? historyIndex : -1}
-          onJumpToHistory={jumpToHistoryIndex}
-          canUndo={hasOpenDocument && canUndo}
-          canRedo={hasOpenDocument && canRedo}
-          onUndo={handleUndo}
-          onRedo={redo}
-          layers={hasOpenDocument ? layers : []}
-          activeLayerId={hasOpenDocument ? activeLayerId : ''}
-          selectedLayerIds={hasOpenDocument ? selectedLayerIds : []}
-          onSelectLayer={setActiveLayerId}
-          onToggleLayerSelection={toggleLayerSelection}
-          onGroupSelectedLayers={handleGroupSelectedLayers}
-          onDeleteSelectedLayers={handleDeleteSelectedLayers}
-          onAddLayer={handleAddLayer}
-          onOpen3DLayer={hasOpenDocument ? () => setIs3DLayerOpen(true) : undefined}
-          onDuplicateLayer={duplicateLayer}
-          onDeleteLayer={handleDeleteLayer}
-          onToggleVisibility={handleToggleVisibility}
-          onSetOpacity={handleSetOpacity}
-          onSetBlendMode={setBlendMode}
-          onToggleLock={toggleLock}
-          onToggleAlphaLock={toggleAlphaLock}
-          onToggleClipping={toggleClipping}
-          onToggleCollapse={toggleCollapse}
-          onRenameLayer={handleRenameLayer}
-          onMoveLayer={moveLayer}
-          onMoveLayerToFolder={moveLayerToFolder}
-          onReorderLayers={reorderLayers}
-          onToggleReferenceLayer={handleToggleReferenceLayer}
-          onToggleTone={toggleTone}
-          onSetToneFrequency={setToneFrequency}
-          onSetToneAngle={setToneAngle}
-          onSetToneDotShape={setToneDotShape}
-          onSetToneDensity={setToneDensity}
-          onSetToneDensityType={setToneDensityType}
-          onToggleLayerColor={toggleLayerColor}
-          onSetLayerColor={setLayerColor}
-          onSetLayerSubColor={setLayerSubColor}
-          onSetLayerExpressionColor={setLayerExpressionColor}
-          onSetLayerMonoThreshold={setLayerMonoThreshold}
-          onSetLayerMonoExpressMode={setLayerMonoExpressMode}
-          onApplyExpressionColor={handleApplyExpressionColor}
-          onApplyLayerColor={handleApplyLayerColor}
-          activeEditTarget={activeEditTarget}
-          onSelectEditTarget={setActiveEditTarget}
-          onAddLayerMask={addLayerMask}
-          onRemoveLayerMask={removeLayerMask}
-          onToggleLayerMask={toggleLayerMask}
-          onToggleMaskLinked={toggleMaskLinked}
-          onOpenAdjustmentModal={handleOpenAdjustmentModal}
-          onOpenLayerStylesModal={handleOpenLayerStylesModal}
-          width={rightSidebarWidth}
-          onWidthChange={handleRightSidebarWidthChange}
-        />
-        </>
+            {!isRightSidebarHidden && (
+              <RightSidebar
+                hasOpenDocument={hasOpenDocument}
+              onNewCanvas={() => setIsNewCanvasModalOpen(true)}
+              onOpenFile={handleTriggerOpenFile}
+              primaryColor={primaryColor}
+              secondaryColor={secondaryColor}
+              onPrimaryColorChange={handlePrimaryColorChange}
+              onSecondaryColorChange={handleSecondaryColorChange}
+              onSwapColors={handleSwapColors}
+              recentColors={recentColors}
+              currentTool={tool}
+              onSelectTool={handleSelectTool}
+              colorMode={colorMode}
+              historyList={hasOpenDocument ? historyList : []}
+              historyIndex={hasOpenDocument ? historyIndex : -1}
+              onJumpToHistory={jumpToHistoryIndex}
+              canUndo={hasOpenDocument && canUndo}
+              canRedo={hasOpenDocument && canRedo}
+              onUndo={handleUndo}
+              onRedo={redo}
+              layers={hasOpenDocument ? layers : []}
+              activeLayerId={hasOpenDocument ? activeLayerId : ''}
+              selectedLayerIds={hasOpenDocument ? selectedLayerIds : []}
+              onSelectLayer={setActiveLayerId}
+              onToggleLayerSelection={toggleLayerSelection}
+              onGroupSelectedLayers={handleGroupSelectedLayers}
+              onDeleteSelectedLayers={handleDeleteSelectedLayers}
+              onAddLayer={handleAddLayer}
+              onOpen3DLayer={hasOpenDocument ? () => setIs3DLayerOpen(true) : undefined}
+              onDuplicateLayer={duplicateLayer}
+              onDeleteLayer={handleDeleteLayer}
+              onToggleVisibility={handleToggleVisibility}
+              onSetOpacity={handleSetOpacity}
+              onSetBlendMode={setBlendMode}
+              onToggleLock={toggleLock}
+              onToggleAlphaLock={toggleAlphaLock}
+              onToggleClipping={toggleClipping}
+              onToggleCollapse={toggleCollapse}
+              onRenameLayer={handleRenameLayer}
+              onMoveLayer={moveLayer}
+              onMoveLayerToFolder={moveLayerToFolder}
+              onReorderLayers={reorderLayers}
+              onToggleReferenceLayer={handleToggleReferenceLayer}
+              onToggleTone={toggleTone}
+              onSetToneFrequency={setToneFrequency}
+              onSetToneAngle={setToneAngle}
+              onSetToneDotShape={setToneDotShape}
+              onSetToneDensity={setToneDensity}
+              onSetToneDensityType={setToneDensityType}
+              onToggleLayerColor={toggleLayerColor}
+              onSetLayerColor={setLayerColor}
+              onSetLayerSubColor={setLayerSubColor}
+              onSetLayerExpressionColor={setLayerExpressionColor}
+              onSetLayerMonoThreshold={setLayerMonoThreshold}
+              onSetLayerMonoExpressMode={setLayerMonoExpressMode}
+              onApplyExpressionColor={handleApplyExpressionColor}
+              onApplyLayerColor={handleApplyLayerColor}
+              activeEditTarget={activeEditTarget}
+              onSelectEditTarget={setActiveEditTarget}
+              onAddLayerMask={addLayerMask}
+              onRemoveLayerMask={removeLayerMask}
+              onToggleLayerMask={toggleLayerMask}
+              onToggleMaskLinked={toggleMaskLinked}
+              onOpenAdjustmentModal={handleOpenAdjustmentModal}
+              onOpenLayerStylesModal={handleOpenLayerStylesModal}
+              width={rightSidebarWidth}
+              onWidthChange={handleRightSidebarWidthChange}
+            />
+            )}
+          </>
         )}
       </div>
 
-      {/* Bottom Status Bar */}
-      <StatusBar
-        cursorPos={cursorPos}
-        currentPressure={currentPressure}
-        tool={tool}
-        brushSettings={brushSettings}
-        zoom={zoom}
-        rotation={rotation}
-        onResetRotation={resetRotation}
-        colorMode={colorMode}
-        showCursorCoordinates={appSettings.showCursorCoordinates}
-        showPressureInStatusBar={appSettings.showPressureInStatusBar}
-        hasOpenDocument={hasOpenDocument}
-        themePreset={appSettings.themePreset}
-        softProofSettings={softProofSettings}
+      {/* Fault-Tolerant Crash Recovery Modal */}
+      <CrashRecoveryModal
+        isOpen={isRecoveryModalOpen}
+        sessions={crashedSessions}
+        onRestore={handleRestoreCrashedSession}
+        onDiscard={handleDiscardCrashedSession}
+        onClose={() => setIsRecoveryModalOpen(false)}
       />
 
       {/* New Canvas Modal Dialog */}
@@ -6377,12 +7017,12 @@ export function App() {
 
       {/* Loading Modal when parsing large PSD or CSP files */}
       {isLoadingFile && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs select-none animate-in fade-in duration-100">
-          <div className="bg-[#252528] border border-[#3e3e42] rounded-lg shadow-2xl px-6 py-4 flex items-center space-x-3 text-xs text-white">
-            <Loader2 className="w-5 h-5 text-[#38bdf8] animate-spin" />
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 select-none">
+          <div className="bg-[#202020] rounded-md shadow-[0_16px_48px_rgba(0,0,0,0.75)] px-5 py-3.5 flex items-center gap-3 text-xs text-[#e5e5e5]">
+            <Loader2 className="w-4 h-4 text-[var(--accent)] animate-spin" />
             <div className="flex flex-col">
-              <span className="font-semibold text-sm">{loadingStatus || 'Opening Document...'}</span>
-              <span className="text-[#888888] text-[11px]">Extracting layers, blend modes, and pixel data</span>
+              <span className="font-medium text-xs">{loadingStatus || 'Opening Document...'}</span>
+              <span className="text-[#8a8a8a] text-[10px]">Extracting layers and pixel data</span>
             </div>
           </div>
         </div>
@@ -6390,17 +7030,11 @@ export function App() {
 
       {/* Toast Notification */}
       {toastMessage && (
-        <div className="fixed bottom-12 right-6 z-50 bg-[#252528] border border-[#007acc] text-white px-4 py-2.5 rounded-md shadow-2xl flex items-center space-x-2.5 text-xs animate-in slide-in-from-bottom-2 fade-in duration-150">
-          <CheckCircle2 className="w-4 h-4 text-[#38bdf8]" />
+        <div className="fixed bottom-5 right-5 z-50 bg-[#202020] text-[#e5e5e5] px-3.5 py-2 rounded-md shadow-[0_12px_32px_rgba(0,0,0,0.65)] flex items-center gap-2 text-xs">
+          <CheckCircle2 className="w-3.5 h-3.5 text-[var(--accent)]" />
           <span className="font-medium">{toastMessage}</span>
         </div>
       )}
-
-      {/* First Time Setup Name Modal */}
-      <FirstTimeNameModal
-        isOpen={!appSettings.hasPromptedName && !appSettings.userName}
-        onSaveName={handleSaveFirstTimeName}
-      />
 
       {/* Manga Effect Lines Generator Modal */}
       <MangaEffectsModal
@@ -6415,7 +7049,16 @@ export function App() {
       <WebtoonExportModal
         isOpen={isWebtoonExportModalOpen}
         onClose={() => setIsWebtoonExportModalOpen(false)}
-        getActiveCanvas={getActiveCanvas}
+        getActiveCanvas={() =>
+          compositeCanvas(
+            dimensions,
+            layers,
+            layerCanvasesRef.current,
+            getEffectiveOpacity,
+            isLayerEffectivelyVisible,
+            false
+          )
+        }
         canvasWidth={dimensions.width}
         canvasHeight={dimensions.height}
         documentTitle={documents.find((d) => d.id === activeDocumentId)?.name || 'webtoon_chapter'}

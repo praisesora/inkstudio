@@ -5,9 +5,15 @@ import { createCanvasThumbnail, get2DContext } from '../utils/canvasUtils';
 import { applyLayerEffects, applyExpressionColorToImageData } from '../utils/layerEffectsEngine';
 import { HalftoneDotShape } from '../utils/screentoneEngine';
 import { globalTileGrid } from '../utils/tileEngine';
+import { recoveryService } from '../services/recoveryService';
 
 interface UseLayerManagerProps {
   dimensions: CanvasDimensions;
+  activeSessionId?: string | null;
+}
+
+export function isBackgroundLayerId(id: string): boolean {
+  return id === 'layer-bg' || id.startsWith('layer-bg');
 }
 
 // Helper to generate the next collaborative layer name (e.g. "Sora 1", "Sora 2", "Alex 1")
@@ -337,7 +343,7 @@ export function computeBatchLock(
   return layers.map((l) => (selectedSet.has(l.id) ? { ...l, locked: newLocked } : l));
 }
 
-export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProps) {
+export function useLayerManager({ dimensions: _dimensions, activeSessionId }: UseLayerManagerProps) {
   // Store canvas DOM elements for each raster layer by layer ID
   const layerCanvasesRef = useRef<Map<string, HTMLCanvasElement>>(new Map());
 
@@ -364,6 +370,19 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   const selectionPivotIdRef = useRef<string>('');
   const layersRef = useRef(layers);
   layersRef.current = layers;
+
+  // Track layer mutations and log to recovery service WAL
+  const isInitialLayerMount = useRef(true);
+  useEffect(() => {
+    if (isInitialLayerMount.current) {
+      isInitialLayerMount.current = false;
+      return;
+    }
+    const sId = activeSessionId || recoveryService.getCurrentSessionId();
+    if (sId && layers.length > 0) {
+      recoveryService.logLayerMutation(sId, 'update', layers, activeLayerId);
+    }
+  }, [layers, activeSessionId, activeLayerId]);
 
   const setSelectedLayerIds = useCallback((ids: string[] | ((prev: string[]) => string[])) => {
     setSelectedLayerIdsState((prev) => {
@@ -434,23 +453,35 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
             if (initialData !== 'transparent') {
               ctx.fillStyle = initialData;
               ctx.fillRect(0, 0, canvas.width, canvas.height);
+              if (initialData.toLowerCase() === '#ffffff' || initialData.toLowerCase() === '#fff' || initialData.toLowerCase() === 'white') {
+                (canvas as any).__isSolidWhite = true;
+              }
+            } else {
+              (canvas as any).__isBlank = true;
             }
           } else {
             ctx.drawImage(initialData, 0, 0);
           }
         }
         pendingInitialDataRef.current.delete(id);
-      } else if (id === 'layer-bg' || id.startsWith('layer-bg')) {
+      } else if (isBackgroundLayerId(id)) {
         // If it's the background layer and uninitialized, fill with solid white
         const ctx = get2DContext(canvas);
         if (ctx) {
           ctx.fillStyle = '#ffffff';
           ctx.fillRect(0, 0, canvas.width, canvas.height);
+          (canvas as any).__isSolidWhite = true;
+        }
+      } else if (!sourceId) {
+        if (globalTileGrid.isLayerIngested(id)) {
+          globalTileGrid.renderLayerToCanvas(id, canvas);
+        } else {
+          (canvas as any).__isBlank = true;
         }
       }
 
-      // Ingest into globalTileGrid if unindexed
-      if (!globalTileGrid.hasTile(id, 0, 0) && globalTileGrid.getLayerTiles(id).length === 0) {
+      // Ingest into globalTileGrid if unindexed or if freshly copied/initialized
+      if (!globalTileGrid.isLayerIngested(id) || sourceId || initialData) {
         const layer = layersRef.current.find((l) => l.id === id);
         const isMono = layer?.expressionColor === 'monochrome';
         globalTileGrid.ingestCanvas(id, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
@@ -460,7 +491,11 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       requestAnimationFrame(() => {
         const c = layerCanvasesRef.current.get(id);
         if (c) {
-          const thumb = createCanvasThumbnail(c, id !== 'layer-bg');
+          const targetW = 60;
+          const targetH = Math.max(38, Math.round((c.height / Math.max(1, c.width)) * targetW));
+          const thumb = (c.width * c.height > 1024 * 1024 && globalTileGrid.isLayerIngested(id))
+            ? globalTileGrid.generateThumbnail(id, targetW, targetH, { width: c.width, height: c.height })
+            : createCanvasThumbnail(c, !isBackgroundLayerId(id));
           setLayers((prev) =>
             prev.map((l) => (l.id === id && !l.thumbnailUrl ? { ...l, thumbnailUrl: thumb } : l))
           );
@@ -483,7 +518,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       }
     });
 
-    // When a layer is removed, delete its canvas from layerCanvasesRef.current
+    // When a layer is removed, delete its canvas from layerCanvasesRef.current and clean up tile grid
     const currentLayerIds = new Set(layers.map((l) => l.id));
     for (const id of Array.from(layerCanvasesRef.current.keys())) {
       if (!currentLayerIds.has(id)) {
@@ -499,12 +534,21 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   const updateLayerThumbnail = useCallback((id: string, immediate: boolean = false) => {
     const run = () => {
       const canvas = layerCanvasesRef.current.get(id);
-      if (!canvas) return;
+      const dims = canvas ? { width: canvas.width, height: canvas.height } : _dimensions;
+      const targetW = 60;
+      const targetH = Math.max(38, Math.round((dims.height / Math.max(1, dims.width)) * targetW));
+      const isLarge = dims.width * dims.height > 1024 * 1024;
+      const thumb = (isLarge && globalTileGrid.isLayerIngested(id))
+        ? globalTileGrid.generateThumbnail(id, targetW, targetH, dims)
+        : (canvas ? createCanvasThumbnail(canvas, !isBackgroundLayerId(id)) : globalTileGrid.generateThumbnail(id, targetW, targetH, dims));
 
-      const thumb = createCanvasThumbnail(canvas, id !== 'layer-bg');
-      setLayers((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, thumbnailUrl: thumb } : l))
-      );
+      if (!thumb) return;
+
+      setLayers((prev) => {
+        const existingLayer = prev.find((l) => l.id === id);
+        if (!existingLayer || existingLayer.thumbnailUrl === thumb) return prev;
+        return prev.map((l) => (l.id === id ? { ...l, thumbnailUrl: thumb } : l));
+      });
     };
 
     const existing = thumbDebounceTimersRef.current.get(id);
@@ -517,10 +561,10 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       const timer = setTimeout(() => {
         thumbDebounceTimersRef.current.delete(id);
         run();
-      }, 150);
+      }, 350);
       thumbDebounceTimersRef.current.set(id, timer);
     }
-  }, []);
+  }, [_dimensions]);
 
   // Add a new raster layer, folder, or adjustment layer
   const addLayer = useCallback(
@@ -528,74 +572,93 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       type: 'raster' | 'folder' | 'vector' | 'frame' | 'adjustment' = 'raster',
       explicitParentId?: string | null,
       customName?: string,
-      customId?: string
+      customId?: string,
+      selectNewLayer: boolean = true
     ): LayerItem => {
-      let createdLayer: LayerItem | null = null;
       const id = customId || `${type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const currentLayers = layersRef.current;
+      const currentActiveIdx = currentLayers.findIndex((l) => l.id === activeLayerIdRef.current);
+      const currentActiveLayer = currentLayers[currentActiveIdx];
+
+      let initialParentId: string | null = null;
+      if (explicitParentId !== undefined) {
+        initialParentId = explicitParentId;
+      } else if (currentActiveLayer) {
+        initialParentId = currentActiveLayer.type === 'folder' ? currentActiveLayer.id : currentActiveLayer.parentId;
+      }
+
+      const resolveLayerName = (list: LayerItem[]) => {
+        if (customName) return customName;
+        let count = 1;
+        const prefix =
+          type === 'folder' ? 'Folder ' :
+          type === 'vector' ? 'Vector ' :
+          type === 'frame' ? 'Frame ' :
+          type === 'adjustment' ? 'Adjustment ' : 'Layer ';
+        list.forEach((l) => {
+          if (l.type === type && l.name.startsWith(prefix)) {
+            const num = parseInt(l.name.replace(prefix, ''), 10);
+            if (!isNaN(num) && num >= count) {
+              count = num + 1;
+            }
+          }
+        });
+        return `${prefix}${count}`;
+      };
+
+      const createdLayer: LayerItem = {
+        id,
+        name: resolveLayerName(currentLayers),
+        type,
+        visible: true,
+        opacity: 1,
+        blendMode: type === 'folder' ? 'pass-through' : 'normal',
+        locked: false,
+        collapsed: false,
+        parentId: initialParentId,
+        thumbnailUrl: '',
+        expressionColor:
+          currentActiveLayer?.expressionColor === 'monochrome'
+            ? 'monochrome'
+            : currentActiveLayer?.expressionColor === 'gray'
+            ? 'gray'
+            : 'color',
+        monoThreshold: currentActiveLayer?.monoThreshold ?? 128,
+        monoExpressBlack: currentActiveLayer?.monoExpressBlack ?? true,
+        monoExpressWhite: currentActiveLayer?.monoExpressWhite ?? true,
+      };
 
       setLayers((prev) => {
-        // Find active layer to determine placement
-        const activeIdx = prev.findIndex((l) => l.id === activeLayerId);
+        if (prev.some((l) => l.id === id)) return prev;
+        const activeIdx = prev.findIndex((l) => l.id === activeLayerIdRef.current);
         const activeLayer = prev[activeIdx];
 
         let parentId: string | null = null;
         if (explicitParentId !== undefined) {
           parentId = explicitParentId;
         } else if (activeLayer) {
-          if (activeLayer.type === 'folder') {
-            parentId = activeLayer.id;
-          } else {
-            parentId = activeLayer.parentId;
-          }
-        }
-
-        let name = customName;
-        if (!name) {
-          let count = 1;
-          const prefix =
-            type === 'folder' ? 'Folder ' :
-            type === 'vector' ? 'Vector ' :
-            type === 'frame' ? 'Frame ' :
-            type === 'adjustment' ? 'Adjustment ' : 'Layer ';
-          prev.forEach((l) => {
-            if (l.type === type && l.name.startsWith(prefix)) {
-              const num = parseInt(l.name.replace(prefix, ''), 10);
-              if (!isNaN(num) && num >= count) {
-                count = num + 1;
-              }
-            }
-          });
-          name = `${prefix}${count}`;
+          parentId = activeLayer.type === 'folder' ? activeLayer.id : activeLayer.parentId;
         }
 
         const newLayer: LayerItem = {
-          id,
-          name,
-          type,
-          visible: true,
-          opacity: 1,
-          blendMode: type === 'folder' ? 'pass-through' : 'normal',
-          locked: false,
-          collapsed: false,
+          ...createdLayer,
+          name: resolveLayerName(prev),
           parentId,
-          thumbnailUrl: '',
-          expressionColor: activeLayer?.expressionColor === 'monochrome' ? 'monochrome' : activeLayer?.expressionColor === 'gray' ? 'gray' : 'color',
-          monoThreshold: activeLayer?.monoThreshold ?? 128,
-          monoExpressBlack: activeLayer?.monoExpressBlack ?? true,
-          monoExpressWhite: activeLayer?.monoExpressWhite ?? true,
         };
-        createdLayer = newLayer;
 
         const insertIndex = activeIdx >= 0 ? activeIdx : 0;
         const nextLayers = [...prev];
         nextLayers.splice(insertIndex, 0, newLayer);
+        layersRef.current = nextLayers;
         return nextLayers;
       });
 
-      setActiveLayerId(id);
-      return createdLayer!;
+      if (selectNewLayer) {
+        setActiveLayerId(id);
+      }
+      return createdLayer;
     },
-    [activeLayerId]
+    [setActiveLayerId]
   );
 
   // Add a layer that originated from a remote peer
@@ -610,6 +673,9 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
             if (ctx) {
               ctx.clearRect(0, 0, canvas.width, canvas.height);
               ctx.drawImage(img, 0, 0);
+              const isMono = layerItem.expressionColor === 'monochrome';
+              globalTileGrid.ingestCanvas(layerItem.id, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+              globalTileGrid.notifyChange(true);
               updateLayerThumbnail(layerItem.id, true);
             }
           } else {
@@ -622,7 +688,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       setLayers((prev) => {
         if (prev.some((l) => l.id === layerItem.id)) return prev;
         const next = [...prev];
-        const bgIdx = next.findIndex((l) => l.id === 'layer-bg' || l.id.startsWith('layer-bg'));
+        const bgIdx = next.findIndex((l) => isBackgroundLayerId(l.id));
         if (bgIdx >= 0) {
           next.splice(bgIdx, 0, layerItem);
         } else {
@@ -638,6 +704,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   const deleteRemoteLayer = useCallback((layerId: string) => {
     setLayers((prev) => prev.filter((l) => l.id !== layerId));
     layerCanvasesRef.current.delete(layerId);
+    layerSourceCanvasesRef.current.delete(layerId);
+    globalTileGrid.clearLayer(layerId);
   }, []);
 
   // Sync entire document state from remote host
@@ -652,7 +720,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       if (assignedLayerId) {
         setActiveLayerId(assignedLayerId);
       } else {
-        const topRaster = syncedLayers.find((l) => l.type === 'raster' && l.id !== 'layer-bg' && !l.id.startsWith('layer-bg'));
+        const topRaster = syncedLayers.find((l) => l.type === 'raster' && !isBackgroundLayerId(l.id));
         if (topRaster) {
           setActiveLayerId(topRaster.id);
         }
@@ -670,6 +738,9 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
               if (ctx) {
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
                 ctx.drawImage(img, 0, 0);
+                const isMono = layer.expressionColor === 'monochrome';
+                globalTileGrid.ingestCanvas(layer.id, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+                globalTileGrid.notifyChange(true);
                 updateLayerThumbnail(layer.id, true);
               }
             } else {
@@ -684,30 +755,29 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         }
       });
     },
-    [updateLayerThumbnail]
+    [setActiveLayerId, updateLayerThumbnail]
   );
 
-  // Duplicate an existing layer with a single click
+  // Duplicate an existing layer or folder hierarchy with a single click
   const duplicateLayer = useCallback((id: string) => {
     setLayers((prev) => {
       const sourceIdx = prev.findIndex((l) => l.id === id);
       if (sourceIdx < 0) return prev;
 
-      const source = prev[sourceIdx];
-      const newId = `${source.type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const cloneSingleLayer = (source: LayerItem, newParentId: string | null, nameSuffix: string = ' Copy'): LayerItem => {
+        const newId = `${source.type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
-      if (source.type === 'raster') {
-        // Record pending copy so when canvas mounts it copies pixel data
-        pendingCanvasCopiesRef.current.set(newId, source.id);
+        if (source.type === 'raster' || source.type === 'vector' || source.type === 'frame') {
+          pendingCanvasCopiesRef.current.set(newId, source.id);
 
-        // Also duplicate offscreen source canvas if it exists
-        const srcSource = layerSourceCanvasesRef.current.get(source.id);
-        if (srcSource) {
-          const newSource = document.createElement('canvas');
-          newSource.width = srcSource.width;
-          newSource.height = srcSource.height;
-          get2DContext(newSource)?.drawImage(srcSource, 0, 0);
-          layerSourceCanvasesRef.current.set(newId, newSource);
+          const srcSource = layerSourceCanvasesRef.current.get(source.id);
+          if (srcSource) {
+            const newSource = document.createElement('canvas');
+            newSource.width = srcSource.width;
+            newSource.height = srcSource.height;
+            get2DContext(newSource)?.drawImage(srcSource, 0, 0);
+            layerSourceCanvasesRef.current.set(newId, newSource);
+          }
         }
 
         let newMaskCanvas: HTMLCanvasElement | undefined;
@@ -721,85 +791,77 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
           newMaskThumb = source.maskThumbnailUrl;
         }
 
-        const newLayer: LayerItem = {
+        return {
           ...source,
           id: newId,
-          name: `${source.name} Copy`,
+          name: `${source.name}${nameSuffix}`,
+          parentId: newParentId,
           thumbnailUrl: source.thumbnailUrl,
           maskCanvas: newMaskCanvas,
           maskThumbnailUrl: newMaskThumb,
+          maskVersion: source.maskCanvas ? 1 : undefined,
+          vectorStrokes: source.vectorStrokes ? JSON.parse(JSON.stringify(source.vectorStrokes)) : undefined,
+          comicFrames: source.comicFrames ? JSON.parse(JSON.stringify(source.comicFrames)) : undefined,
+          balloons: source.balloons ? JSON.parse(JSON.stringify(source.balloons)) : undefined,
           adjustmentData: source.adjustmentData ? JSON.parse(JSON.stringify(source.adjustmentData)) : undefined,
+          styles: source.styles ? JSON.parse(JSON.stringify(source.styles)) : undefined,
         };
+      };
 
+      const source = prev[sourceIdx];
+      if (source.type !== 'folder') {
+        const newLayer = cloneSingleLayer(source, source.parentId, ' Copy');
         const nextLayers = [...prev];
         nextLayers.splice(sourceIdx, 0, newLayer);
-        setActiveLayerId(newId);
-        return nextLayers;
-      } else {
-        // Duplicate folder and all child layers inside
-        const folderCopyId = newId;
-        const newFolder: LayerItem = {
-          ...source,
-          id: folderCopyId,
-          name: `${source.name} Copy`,
-        };
-
-        // Find all child layers inside this folder
-        const childLayers = prev.filter((l) => l.parentId === source.id);
-        const childCopies: LayerItem[] = childLayers.map((child) => {
-          const childCopyId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-          pendingCanvasCopiesRef.current.set(childCopyId, child.id);
-          return {
-            ...child,
-            id: childCopyId,
-            name: `${child.name} Copy`,
-            parentId: folderCopyId,
-          };
-        });
-
-        const nextLayers = [...prev];
-        nextLayers.splice(sourceIdx, 0, newFolder, ...childCopies);
-        setActiveLayerId(folderCopyId);
+        setActiveLayerId(newLayer.id);
         return nextLayers;
       }
-    });
-  }, []);
 
-  // Delete a layer or folder
-  const deleteLayer = useCallback((id: string) => {
-    setLayers((prev) => {
-      // Don't delete if it's the only raster layer
-      const rasterCount = prev.filter((l) => l.type === 'raster').length;
-      const target = prev.find((l) => l.id === id);
-      if (!target) return prev;
-
-      if (target.type === 'raster' && rasterCount <= 1) {
-        return prev;
-      }
-
-      // If deleting folder, also delete all child layers
-      let nextLayers: LayerItem[];
-      if (target.type === 'folder') {
-        nextLayers = prev.filter((l) => l.id !== id && l.parentId !== id);
-      } else {
-        nextLayers = prev.filter((l) => l.id !== id);
-      }
-
-      // If deleted active layer, choose next available layer
-      if (activeLayerId === id || (target.type === 'folder' && prev.find((l) => l.id === activeLayerId)?.parentId === id)) {
-        const nextActive = nextLayers.find((l) => l.type === 'raster') || nextLayers[0];
-        if (nextActive) {
-          setActiveLayerId(nextActive.id);
+      // Recursively duplicate folder and all nested descendants in stack order
+      const clonedItems: LayerItem[] = [];
+      const cloneFolderSubtree = (folder: LayerItem, targetParentId: string | null, isRootFolder: boolean) => {
+        const folderCopy = cloneSingleLayer(folder, targetParentId, isRootFolder ? ' Copy' : '');
+        clonedItems.push(folderCopy);
+        const directChildren = prev.filter((l) => l.parentId === folder.id);
+        for (const child of directChildren) {
+          if (child.type === 'folder') {
+            cloneFolderSubtree(child, folderCopy.id, false);
+          } else {
+            clonedItems.push(cloneSingleLayer(child, folderCopy.id, ' Copy'));
+          }
         }
-      } else {
-        setSelectedLayerIds((prevSelected) => prevSelected.filter((sid) => sid !== id));
-      }
+      };
 
-      layerCanvasesRef.current.delete(id);
-      layerSourceCanvasesRef.current.delete(id);
+      cloneFolderSubtree(source, source.parentId, true);
+      const nextLayers = [...prev];
+      nextLayers.splice(sourceIdx, 0, ...clonedItems);
+      if (clonedItems[0]) {
+        setActiveLayerId(clonedItems[0].id);
+      }
       return nextLayers;
     });
-  }, [activeLayerId, setActiveLayerId, setSelectedLayerIds]);
+  }, [setActiveLayerId]);
+
+  // Delete a layer or folder (including nested folder hierarchies)
+  const deleteLayer = useCallback((id: string) => {
+    setLayers((prev) => {
+      const res = computeBatchDeleteLayers(prev, [id], activeLayerIdRef.current);
+      if (res.deletedIds.length === 0) return prev;
+
+      for (const delId of res.deletedIds) {
+        layerCanvasesRef.current.delete(delId);
+        layerSourceCanvasesRef.current.delete(delId);
+        globalTileGrid.clearLayer(delId);
+      }
+
+      if (res.deletedIds.includes(activeLayerIdRef.current)) {
+        setActiveLayerId(res.nextActiveId);
+      } else {
+        setSelectedLayerIds((prevSelected) => prevSelected.filter((sid) => !res.deletedIds.includes(sid)));
+      }
+      return res.nextLayers;
+    });
+  }, [setActiveLayerId, setSelectedLayerIds]);
 
   // Delete all selected layers or folders
   const deleteSelectedLayers = useCallback(() => {
@@ -865,7 +927,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   const toggleClipping = useCallback((id: string) => {
     setLayers((prev) => {
       const idx = prev.findIndex((l) => l.id === id);
-      if (idx === -1 || idx === prev.length - 1 || id === 'layer-bg') {
+      if (idx === -1 || idx === prev.length - 1 || isBackgroundLayerId(id)) {
         return prev;
       }
       return prev.map((l) => (l.id === id ? { ...l, clipped: !l.clipped } : l));
@@ -901,6 +963,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
           maskEnabled: true,
           maskLinked: true,
           maskThumbnailUrl: thumb,
+          maskVersion: 1,
         };
       })
     );
@@ -931,6 +994,26 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
                   d[i + 3] = Math.round(d[i + 3] * maskLum);
                 }
                 ctx.putImageData(imgData, 0, 0);
+
+                const sCanvas = layerSourceCanvasesRef.current.get(layerId);
+                if (sCanvas) {
+                  const sCtx = get2DContext(sCanvas);
+                  if (sCtx) {
+                    const sData = sCtx.getImageData(0, 0, sCanvas.width, sCanvas.height);
+                    const sd = sData.data;
+                    for (let i = 0; i < sd.length; i += 4) {
+                      if (sd[i + 3] === 0) continue;
+                      const maskLum =
+                        ((0.299 * maskData[i] + 0.587 * maskData[i + 1] + 0.114 * maskData[i + 2]) / 255) *
+                        (maskData[i + 3] / 255);
+                      sd[i + 3] = Math.round(sd[i + 3] * maskLum);
+                    }
+                    sCtx.putImageData(sData, 0, 0);
+                  }
+                }
+
+                const isMono = l.expressionColor === 'monochrome';
+                globalTileGrid.ingestCanvas(layerId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
                 updateLayerThumbnail(layerId, true);
               }
             }
@@ -942,6 +1025,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
             maskEnabled: undefined,
             maskLinked: undefined,
             maskThumbnailUrl: undefined,
+            maskVersion: undefined,
           };
         })
       );
@@ -972,8 +1056,13 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       if (!target?.maskCanvas) return;
       const thumb = createCanvasThumbnail(target.maskCanvas, false);
       setLayers((prev) =>
-        prev.map((l) => (l.id === layerId ? { ...l, maskThumbnailUrl: thumb } : l))
+        prev.map((l) =>
+          l.id === layerId
+            ? { ...l, maskThumbnailUrl: thumb, maskVersion: (l.maskVersion || 0) + 1 }
+            : l
+        )
       );
+      globalTileGrid.notifyChange(true);
     };
 
     if (immediate) {
@@ -1457,6 +1546,9 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
       sCtx.drawImage(displayCanvas, 0, 0);
 
+      const isMono = target.expressionColor === 'monochrome';
+      globalTileGrid.ingestCanvas(id, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      globalTileGrid.notifyChange(true);
       updateLayerThumbnail(id, true);
 
       return { beforeImageData, afterImageData };
@@ -1493,6 +1585,9 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         prev.map((l) => (l.id === id ? { ...l, layerColorEnabled: false } : l))
       );
 
+      const isMono = target.expressionColor === 'monochrome';
+      globalTileGrid.ingestCanvas(id, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      globalTileGrid.notifyChange(true);
       updateLayerThumbnail(id, true);
 
       return { beforeImageData, afterImageData };
@@ -1544,6 +1639,9 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
 
       const afterImageData = dCtx.getImageData(0, 0, displayCanvas.width, displayCanvas.height);
 
+      const isMono = targetMode === 'monochrome';
+      globalTileGrid.ingestCanvas(id, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      globalTileGrid.notifyChange(true);
       setLayers((prev) => prev.map((l) => (l.id === id ? updatedLayer : l)));
       updateLayerThumbnail(id, true);
 
@@ -1678,18 +1776,21 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
     const ctx = get2DContext(canvas);
     if (!ctx) return;
 
-    if (activeLayerId === 'layer-bg') {
+    const isBg = isBackgroundLayerId(activeLayerId);
+    if (isBg) {
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
+      (canvas as any).__isSolidWhite = true;
     } else {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
+      (canvas as any).__isBlank = true;
     }
 
     const sCanvas = layerSourceCanvasesRef.current.get(activeLayerId);
     if (sCanvas) {
       const sCtx = get2DContext(sCanvas);
       if (sCtx) {
-        if (activeLayerId === 'layer-bg') {
+        if (isBg) {
           sCtx.fillStyle = '#ffffff';
           sCtx.fillRect(0, 0, sCanvas.width, sCanvas.height);
         } else {
@@ -1698,6 +1799,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       }
     }
 
+    if (isBg) {
+      globalTileGrid.ingestCanvas(activeLayerId, canvas, 'color-32bit');
+    } else {
+      globalTileGrid.clearLayer(activeLayerId);
+    }
+    globalTileGrid.notifyChange(true);
     updateLayerThumbnail(activeLayerId);
   }, [activeLayerId, updateLayerThumbnail]);
 
@@ -1705,6 +1812,12 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
   const resetToNewCanvas = useCallback(
     (_dims: CanvasDimensions, backgroundColor: string = '#ffffff', _mode: CanvasColorMode = 'color', defaultToneFrequency: number = 60) => {
       defaultToneFrequencyRef.current = Math.max(20, Math.min(85, Math.round(defaultToneFrequency || 60)));
+      for (const oldId of Array.from(layerCanvasesRef.current.keys())) {
+        globalTileGrid.clearLayer(oldId);
+      }
+      for (const l of layersRef.current) {
+        globalTileGrid.clearLayer(l.id);
+      }
       pendingCanvasCopiesRef.current.clear();
       pendingInitialDataRef.current.clear();
       layerCanvasesRef.current.clear();
@@ -1751,21 +1864,34 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
       setActiveLayerId(topId);
       return { layers: initialLayers, activeLayerId: topId };
     },
-    []
+    [setActiveLayerId]
   );
 
   // Clear all layers and canvas references when no document is active
   const clearDocument = useCallback(() => {
+    for (const oldId of Array.from(layerCanvasesRef.current.keys())) {
+      globalTileGrid.clearLayer(oldId);
+    }
+    for (const l of layersRef.current) {
+      globalTileGrid.clearLayer(l.id);
+    }
     pendingCanvasCopiesRef.current.clear();
     pendingInitialDataRef.current.clear();
     layerCanvasesRef.current.clear();
     layerSourceCanvasesRef.current.clear();
     setLayers([]);
     setActiveLayerId('');
-  }, []);
+    globalTileGrid.notifyChange(true);
+  }, [setActiveLayerId]);
 
   // Load an entire document (from PSD, CSP, or Image)
   const loadDocument = useCallback((doc: LoadedDocument) => {
+    for (const oldId of Array.from(layerCanvasesRef.current.keys())) {
+      globalTileGrid.clearLayer(oldId);
+    }
+    for (const l of layersRef.current) {
+      globalTileGrid.clearLayer(l.id);
+    }
     pendingCanvasCopiesRef.current.clear();
     pendingInitialDataRef.current.clear();
     layerCanvasesRef.current.clear();
@@ -1773,8 +1899,11 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
 
     if (doc.layerCanvases) {
       doc.layerCanvases.forEach((c, id) => {
+        layerCanvasesRef.current.set(id, c);
         pendingInitialDataRef.current.set(id, c);
         const layerMeta = doc.layers.find((l) => l.id === id);
+        const isMono = layerMeta?.expressionColor === 'monochrome';
+        globalTileGrid.ingestCanvas(id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
         if (
           layerMeta &&
           (layerMeta.toneEnabled ||
@@ -1793,7 +1922,8 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
     setLayers(doc.layers);
     const topRaster = doc.layers.find((l) => l.type === 'raster');
     setActiveLayerId(topRaster ? topRaster.id : doc.layers[0]?.id || '');
-  }, []);
+    globalTileGrid.notifyChange(true);
+  }, [setActiveLayerId]);
 
   // Internal Layer Clipboard
   const layerClipboardRef = useRef<{
@@ -1885,7 +2015,23 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         sCtx.fillStyle = `rgb(${grayVal},${grayVal},${grayVal})`;
 
         if (selection) {
-          if (selection.type === 'rect') {
+          if (selection.mask) {
+            const imgData = sCtx.createImageData(targetW, targetH);
+            const d = imgData.data;
+            const m = selection.mask;
+            const len = Math.min(m.length, targetW * targetH);
+            for (let i = 0; i < len; i++) {
+              const a = m[i];
+              if (a > 0) {
+                const p = i * 4;
+                d[p] = grayVal;
+                d[p + 1] = grayVal;
+                d[p + 2] = grayVal;
+                d[p + 3] = a;
+              }
+            }
+            sCtx.putImageData(imgData, 0, 0);
+          } else if (selection.type === 'rect') {
             sCtx.fillRect(
               selection.bounds.x,
               selection.bounds.y,
@@ -1932,6 +2078,7 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         toneDensityType: densityType,
       };
 
+      globalTileGrid.ingestCanvas(newId, sourceCanvas, 'color-32bit');
       applyLayerEffects(sourceCanvas, displayCanvas, newLayer, _dimensions.dpi ?? 600, selection ? selection.bounds : undefined);
 
       const thumb = createCanvasThumbnail(displayCanvas, true);
@@ -2221,8 +2368,33 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         }
       });
 
-      // Re-apply screentone and layer effects for layers that have them enabled
+      // Re-apply screentone and layer effects for layers that have them enabled, and resize mask canvases
+      const updatedMasks = new Map<string, { maskCanvas: HTMLCanvasElement; maskThumb: string }>();
       layers.forEach((l) => {
+        if (l.maskCanvas) {
+          const tempMask = document.createElement('canvas');
+          tempMask.width = l.maskCanvas.width;
+          tempMask.height = l.maskCanvas.height;
+          get2DContext(tempMask)?.drawImage(l.maskCanvas, 0, 0);
+
+          l.maskCanvas.width = newW;
+          l.maskCanvas.height = newH;
+          const mCtx = get2DContext(l.maskCanvas);
+          if (mCtx) {
+            mCtx.fillStyle = '#ffffff';
+            mCtx.fillRect(0, 0, newW, newH);
+            if (scaleContent) {
+              mCtx.drawImage(tempMask, 0, 0, tempMask.width, tempMask.height, 0, 0, newW, newH);
+            } else {
+              mCtx.drawImage(tempMask, offsetX, offsetY);
+            }
+          }
+          updatedMasks.set(l.id, {
+            maskCanvas: l.maskCanvas,
+            maskThumb: createCanvasThumbnail(l.maskCanvas, false),
+          });
+        }
+
         if (l.toneEnabled || l.layerColorEnabled || (l.expressionColor && l.expressionColor !== 'color')) {
           const sCanvas = layerSourceCanvasesRef.current.get(l.id);
           const dCanvas = layerCanvasesRef.current.get(l.id);
@@ -2234,10 +2406,31 @@ export function useLayerManager({ dimensions: _dimensions }: UseLayerManagerProp
         }
       });
 
+      // Re-ingest all resized canvases into globalTileGrid
+      layerCanvasesRef.current.forEach((canvas, layerId) => {
+        const l = layers.find((item) => item.id === layerId);
+        const isMono = l?.expressionColor === 'monochrome';
+        globalTileGrid.clearLayer(layerId);
+        globalTileGrid.ingestCanvas(layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      });
+      globalTileGrid.notifyChange(true);
+
       setLayers((prev) =>
         prev.map((l) => {
           const newThumb = updatedThumbnails.get(l.id);
-          return newThumb ? { ...l, thumbnailUrl: newThumb } : l;
+          const maskInfo = updatedMasks.get(l.id);
+          if (!newThumb && !maskInfo) return l;
+          return {
+            ...l,
+            ...(newThumb ? { thumbnailUrl: newThumb } : {}),
+            ...(maskInfo
+              ? {
+                  maskCanvas: maskInfo.maskCanvas,
+                  maskThumbnailUrl: maskInfo.maskThumb,
+                  maskVersion: (l.maskVersion || 0) + 1,
+                }
+              : {}),
+          };
         })
       );
     },

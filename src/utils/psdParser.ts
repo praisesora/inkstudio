@@ -90,7 +90,9 @@ export async function parsePsdFile(buffer: ArrayBuffer, fileName: string): Promi
     const id = `psd-${isFolder ? 'folder' : 'layer'}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const name = psdLayer.name || (isFolder ? 'Folder' : 'Layer');
     const visible = !psdLayer.hidden;
-    const opacity = typeof psdLayer.opacity === 'number' ? Math.max(0, Math.min(1, psdLayer.opacity)) : 1;
+    const rawOpacity = typeof psdLayer.opacity === 'number' ? psdLayer.opacity : 1;
+    const normalizedOpacity = rawOpacity > 1 ? rawOpacity / 255 : rawOpacity;
+    const opacity = Math.max(0, Math.min(1, normalizedOpacity));
     const blendMode = mapPsdBlendMode(psdLayer.blendMode);
     const locked = Boolean(
       psdLayer.protected?.transparency ||
@@ -112,10 +114,10 @@ export async function parsePsdFile(buffer: ArrayBuffer, fileName: string): Promi
       };
       layers.push(folderItem);
 
-      // Process children
+      // Process children in reverse (ag-psd is bottom-to-top; Ink Studio is top-to-bottom)
       if (psdLayer.children) {
-        for (const child of psdLayer.children) {
-          processPsdLayer(child, id);
+        for (let i = psdLayer.children.length - 1; i >= 0; i--) {
+          processPsdLayer(psdLayer.children[i], id);
         }
       }
     } else {
@@ -162,8 +164,9 @@ export async function parsePsdFile(buffer: ArrayBuffer, fileName: string): Promi
   }
 
   if (psd.children && psd.children.length > 0) {
-    for (const child of psd.children) {
-      processPsdLayer(child, null);
+    // ag-psd stores layers bottom-to-top; reverse to match Ink Studio's top-to-bottom stack order
+    for (let i = psd.children.length - 1; i >= 0; i--) {
+      processPsdLayer(psd.children[i], null);
     }
   } else if (psd.canvas) {
     // Single flattened composite

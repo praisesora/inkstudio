@@ -29,6 +29,7 @@ import { Smartphone, Archive } from 'lucide-react';
 import { AnimationTimeline } from './AnimationTimeline';
 import { AnimationTimeline as AnimationTimelineType } from '../types/editor';
 import { getOnionSkinFrames } from '../utils/animationEngine';
+import { FloatingBrushPill } from './FloatingBrushPill';
 
 const PIPETTE_CURSOR_CSS = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cg stroke='%23000000' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3Cg stroke='%23ffffff' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3C/svg%3E") 2 22, crosshair`;
 
@@ -98,6 +99,11 @@ interface CanvasAreaProps {
   onInsertRasterLayer?: (layer: LayerItem, canvas: HTMLCanvasElement) => void;
   onBake3DSuccess?: (layer: LayerItem) => void;
   liquifySettings?: LiquifySettings;
+  onUpdateLiquifySettings?: (newSettings: Partial<LiquifySettings>) => void;
+  primaryColor?: string;
+  onSwapColors?: () => void;
+  showCursorCoordinates?: boolean;
+  showPressureInStatusBar?: boolean;
   isWebtoonMode?: boolean;
   onToggleWebtoonMode?: () => void;
   onOpenWebtoonExport?: () => void;
@@ -215,6 +221,11 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onInsertRasterLayer,
   onBake3DSuccess,
   liquifySettings,
+  onUpdateLiquifySettings,
+  primaryColor = '#000000',
+  onSwapColors,
+  showCursorCoordinates = false,
+  showPressureInStatusBar = false,
   animationTimeline = null,
   onUpdateAnimationTimeline,
   onAddAnimationCel,
@@ -310,6 +321,33 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
   // Zero-latency direct DOM cursor preview element
   const cursorRingRef = useRef<HTMLDivElement | null>(null);
+  const pointerStatRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!showCursorCoordinates && !showPressureInStatusBar) return;
+    let rafId = 0;
+    const handlePointerStat = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        const el = pointerStatRef.current;
+        if (!el || !detail) return;
+        const parts: string[] = [];
+        if (showCursorCoordinates && detail.x !== null && detail.x !== undefined) {
+          parts.push(`${detail.x}, ${detail.y}`);
+        }
+        if (showPressureInStatusBar && detail.pressure > 0) {
+          parts.push(`${Math.round(detail.pressure * 100)}%`);
+        }
+        el.textContent = parts.join('  ·  ');
+      });
+    };
+    window.addEventListener('canvas-pointer-stat', handlePointerStat);
+    return () => {
+      window.removeEventListener('canvas-pointer-stat', handlePointerStat);
+      cancelAnimationFrame(rafId);
+    };
+  }, [showCursorCoordinates, showPressureInStatusBar]);
 
   // Update cursor rotation in-place when viewport rotates or brush tip angle changes while hovering
   useEffect(() => {
@@ -330,6 +368,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
 
     window.addEventListener('resize', updateRect);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(updateRect) : null;
+    ro?.observe(viewport);
 
     const handleWindowPointerMove = (e: PointerEvent) => {
       const ring = cursorRingRef.current;
@@ -378,6 +418,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
     return () => {
       window.removeEventListener('resize', updateRect);
+      ro?.disconnect();
       viewport.removeEventListener('pointermove', handleWindowPointerMove);
       viewport.removeEventListener('pointerleave', handlePointerLeave);
     };
@@ -407,6 +448,26 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   // Unified GPU Viewport Compositor
   const viewportCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositorRef = useRef<ViewportCompositor | null>(null);
+  const renderParamsRef = useRef({
+    effectiveLayers,
+    pan,
+    zoom,
+    rotation,
+    dimensions,
+    showCheckerboard,
+    onionSkinFrames,
+    softProofSettings,
+  });
+  renderParamsRef.current = {
+    effectiveLayers,
+    pan,
+    zoom,
+    rotation,
+    dimensions,
+    showCheckerboard,
+    onionSkinFrames,
+    softProofSettings,
+  };
 
   // Synchronize viewport and draft overlay canvas resolution with the screen viewport
   useEffect(() => {
@@ -426,12 +487,19 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           compositorRef.current = new ViewportCompositor(vCanvas);
         }
         compositorRef.current.resize(w, h);
+        const rp = renderParamsRef.current;
         compositorRef.current.render(
-          effectiveLayers,
-          { pan, zoom, rotation },
-          dimensions,
+          rp.effectiveLayers,
+          { pan: rp.pan, zoom: rp.zoom, rotation: rp.rotation },
+          rp.dimensions,
           globalTileGrid,
-          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames, softProof: softProofSettings }
+          {
+            dimensions: rp.dimensions,
+            showCheckerboard: rp.showCheckerboard,
+            devicePixelRatio: dpr,
+            onionSkinFrames: rp.onionSkinFrames,
+            softProof: rp.softProofSettings,
+          }
         );
       }
 
@@ -450,8 +518,17 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
     updateCanvasSizes();
     window.addEventListener('resize', updateCanvasSizes);
-    return () => window.removeEventListener('resize', updateCanvasSizes);
-  }, [viewportRef, effectiveDraftCanvasRef, effectivePredictedCanvasRef, effectiveLayers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames, softProofSettings]);
+    const ro = typeof ResizeObserver !== 'undefined' && viewportRef.current
+      ? new ResizeObserver(updateCanvasSizes)
+      : null;
+    if (ro && viewportRef.current) {
+      ro.observe(viewportRef.current);
+    }
+    return () => {
+      window.removeEventListener('resize', updateCanvasSizes);
+      ro?.disconnect();
+    };
+  }, [viewportRef, effectiveDraftCanvasRef, effectivePredictedCanvasRef]);
 
   useEffect(() => {
     if (viewportRef.current) {
@@ -483,8 +560,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             c.height = dimensions.height;
             registerLayerCanvas(layer.id, c);
           }
-          if (c && !globalTileGrid.hasTile(layer.id, 0, 0) && globalTileGrid.getLayerTiles(layer.id).length === 0) {
-            const isMono = layer.expressionColor === 'monochrome';
+          if (c && !globalTileGrid.isLayerIngested(layer.id)) {
+            const isBg = layer.id === 'layer-bg' || layer.id.startsWith('layer-bg');
+            const isMono = !isBg && (layer.expressionColor === 'monochrome' || colorMode === 'monochrome');
             globalTileGrid.ingestCanvas(layer.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           }
         }
@@ -507,12 +585,19 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     const renderCompositor = () => {
       if (compositorRef.current) {
         const dpr = window.devicePixelRatio || 1;
+        const rp = renderParamsRef.current;
         compositorRef.current.render(
-          effectiveLayers,
-          { pan, zoom, rotation },
-          dimensions,
+          rp.effectiveLayers,
+          { pan: rp.pan, zoom: rp.zoom, rotation: rp.rotation },
+          rp.dimensions,
           globalTileGrid,
-          { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames, softProof: softProofSettings }
+          {
+            dimensions: rp.dimensions,
+            showCheckerboard: rp.showCheckerboard,
+            devicePixelRatio: dpr,
+            onionSkinFrames: rp.onionSkinFrames,
+            softProof: rp.softProofSettings,
+          }
         );
       }
     };
@@ -538,7 +623,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       unsubscribe();
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, onionSkinFrames, softProofSettings]);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -582,18 +667,30 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   useEffect(() => {
     if (!isResizingBrush) return;
 
+    let rafId: number | null = null;
+    let pendingSize = resizeStartSettingsRef.current.size;
+    let pendingHardness = resizeStartSettingsRef.current.hardness;
+
+    const commitResize = () => {
+      rafId = null;
+      if (tool === 'liquify' && onUpdateLiquifySettings) {
+        onUpdateLiquifySettings({ size: Math.round(pendingSize) });
+      } else {
+        onUpdateBrushSettings({ size: pendingSize, hardness: pendingHardness });
+      }
+    };
+
     const handleWindowPointerMove = (e: PointerEvent) => {
       const dx = e.clientX - resizeOriginRef.current.clientX;
       const dy = resizeOriginRef.current.clientY - e.clientY;
 
-      // Horizontal drag: adjusts size (1 to 250px)
-      const newSize = Math.max(
-        1,
-        Math.min(250, Math.round(resizeStartSettingsRef.current.size + dx * 0.75))
-      );
+      // Exponential + linear hybrid sensitivity for 0.5px..1000px precision (CSP-style)
+      const baseSize = Math.max(0.5, resizeStartSettingsRef.current.size);
+      const rawSize = baseSize * Math.exp(dx * 0.006) + dx * 0.15;
+      const clampedSize = Math.max(0.5, Math.min(1000, rawSize));
+      pendingSize = clampedSize < 10 ? Math.round(clampedSize * 10) / 10 : Math.round(clampedSize);
 
-      // Vertical drag: adjusts hardness (0.0 to 1.0)
-      const newHardness = Math.max(
+      pendingHardness = Math.max(
         0.05,
         Math.min(
           1.0,
@@ -601,10 +698,16 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         )
       );
 
-      onUpdateBrushSettings({ size: newSize, hardness: newHardness });
+      if (rafId === null) {
+        rafId = requestAnimationFrame(commitResize);
+      }
     };
 
     const handleWindowPointerUp = () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+        commitResize();
+      }
       setIsResizingBrush(false);
     };
 
@@ -618,16 +721,28 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     document.body.style.userSelect = 'none';
 
     return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
       window.removeEventListener('pointermove', handleWindowPointerMove);
       window.removeEventListener('pointerup', handleWindowPointerUp);
       window.removeEventListener('pointercancel', handleWindowPointerUp);
       document.body.style.cursor = prevCursor;
       document.body.style.userSelect = prevUserSelect;
     };
-  }, [isResizingBrush, onUpdateBrushSettings]);
+  }, [isResizingBrush, onUpdateBrushSettings, onUpdateLiquifySettings, tool]);
+
+  const releaseExternalFocus = () => {
+    const active = document.activeElement as HTMLElement | null;
+    if (!active || active === document.body) return;
+    if (viewportRef.current?.contains(active)) return;
+    const tag = active.tagName;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'BUTTON') {
+      active.blur();
+    }
+  };
 
   // Viewport background pointer down (clicking gray area to pan or rotate)
   const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    releaseExternalFocus();
     if (e.button === 1) {
       onStartPan(e);
       return;
@@ -652,13 +767,14 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     setIsResizingBrush(true);
     resizeOriginRef.current = { clientX: e.clientX, clientY: e.clientY };
     resizeStartSettingsRef.current = {
-      size: brushSettings.size,
+      size: tool === 'liquify' && liquifySettings ? liquifySettings.size : brushSettings.size,
       hardness: brushSettings.hardness ?? 1.0,
     };
   };
 
   // Canvas pointer down: check for resize, rotate, pan, or normal draw
   const handleCanvasPointerDown = (e: React.PointerEvent<HTMLElement>) => {
+    releaseExternalFocus();
     if (e.button === 1) {
       onStartPan(e);
       return;
@@ -736,7 +852,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   };
 
   // Viewport bounds for positioning floating preview
-  const viewportRect = viewportRef.current?.getBoundingClientRect();
+  const viewportRect = isResizingBrush ? viewportRef.current?.getBoundingClientRect() : null;
   const resizePreviewX = viewportRect
     ? resizeOriginRef.current.clientX - viewportRect.left
     : pan.x;
@@ -749,21 +865,41 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     return (
       <main
         ref={viewportRef}
-        className="flex-1 bg-[#1e1e1e] overflow-hidden relative select-none"
+        className="flex-1 bg-[#161616] overflow-hidden relative select-none"
       />
     );
   }
+
+  const showFloatingPill =
+    tool === 'brush' ||
+    tool === 'eraser' ||
+    tool === 'liquify' ||
+    tool === 'select-pen' ||
+    tool === 'select-eraser';
 
   return (
     <main
       ref={viewportRef}
       onPointerDown={handleViewportPointerDown}
-      className="flex-1 bg-[#282828] overflow-hidden relative select-none"
+      className="flex-1 bg-[#161616] overflow-hidden relative select-none canvas-viewport"
       style={{
         touchAction: 'none',
         ...getCursorStyle(false),
       }}
     >
+      {/* Sleek Floating Pill Slider near Canvas Edge for Brush Size & Opacity */}
+      {showFloatingPill && (
+        <FloatingBrushPill
+          tool={tool}
+          brushSettings={brushSettings}
+          onUpdateBrushSettings={onUpdateBrushSettings}
+          liquifySettings={liquifySettings}
+          onUpdateLiquifySettings={onUpdateLiquifySettings}
+          primaryColor={primaryColor}
+          onSwapColors={onSwapColors}
+          zoom={zoom}
+        />
+      )}
       {/* Unified GPU Viewport Canvas (WebGL2 with Frustum Culling & Shaders) */}
       <canvas
         ref={viewportCanvasRef}
@@ -830,7 +966,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
                 style={{ backgroundColor: peer.color }}
               >
                 <span>{peer.name}</span>
-                {peer.isDrawing && <span className="text-[9px]">✏️</span>}
+                {peer.isDrawing && <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />}
               </div>
             </div>
           );
@@ -855,7 +991,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
               className="absolute top-5 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded text-[10px] font-bold text-white whitespace-nowrap shadow-md"
               style={{ backgroundColor: ping.color }}
             >
-              {ping.name} 📍
+              {ping.name}
             </div>
           </div>
         ))}
@@ -1154,50 +1290,50 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
           {/* Floating HUD Tooltip Card */}
           <div
-            className="absolute top-full mt-3 bg-[#1e1e1e]/95 backdrop-blur border border-[#444444] text-[#cccccc] px-3.5 py-1.5 rounded-[3px] shadow-2xl flex flex-col items-center pointer-events-none whitespace-nowrap min-w-36"
+            className="absolute top-full mt-3 bg-[#202020] text-[#e5e5e5] px-3 py-1.5 rounded-md shadow-[0_8px_24px_rgba(0,0,0,0.65)] flex flex-col items-center pointer-events-none whitespace-nowrap min-w-36"
             style={{ zIndex: 60 }}
           >
-            <div className="flex items-center space-x-2.5 text-xs font-mono font-semibold text-white">
-              <span className="text-emerald-400">Size: {brushSettings.size}px</span>
-              <span className="text-[#555555]">|</span>
-              <span className="text-amber-300">
-                Hardness: {Math.round((brushSettings.hardness ?? 1.0) * 100)}%
-              </span>
-            </div>
-            <div className="text-[10px] text-[#888888] mt-0.5 font-sans">
-              ↔ Drag horizontal: Size • ↕ Vertical: Hardness
+            <div className="flex items-center gap-2 text-[11px] font-mono font-medium text-[#e5e5e5]">
+              <span>Size {brushSettings.size}px</span>
+              <span className="text-[#8a8a8a]">·</span>
+              <span>Hard {Math.round((brushSettings.hardness ?? 1.0) * 100)}%</span>
             </div>
           </div>
         </div>
       )}
 
-      {/* Floating Webtoon Mode Quick-Access Bar */}
-      <div className="absolute top-3 right-4 z-40 flex items-center space-x-2 select-none">
-        <button
-          onClick={onToggleWebtoonMode}
-          className={`px-3 py-1.5 rounded-full text-xs font-medium flex items-center space-x-1.5 shadow-lg border transition-colors cursor-pointer ${
-            isWebtoonMode
-              ? 'bg-[#1e382d] text-[#55eaab] border-[#2a7a5c]'
-              : 'bg-[#222326]/90 text-[#aaaaaa] hover:text-white border-[#3b3d45]'
-          }`}
-          title="Toggle Webtoon Studio Mode (Smartphone Simulator & Vertical Scrolling)"
-        >
-          <Smartphone className="w-3.5 h-3.5" />
-          <span>Webtoon Mode</span>
-          {isWebtoonMode && <span className="w-1.5 h-1.5 rounded-full bg-[#55eaab] animate-pulse" />}
-        </button>
-
-        {isWebtoonMode && onOpenWebtoonExport && (
+      {/* Floating Webtoon Mode Controls (only shown when Webtoon Mode is active) */}
+      {isWebtoonMode && (
+        <div className="absolute top-3 right-3 z-40 flex items-center gap-1.5 select-none">
           <button
-            onClick={onOpenWebtoonExport}
-            className="px-3 py-1.5 rounded-full text-xs font-medium bg-[#1a2d3e] hover:bg-[#234059] text-cyan-300 border border-[#2d5573] flex items-center space-x-1.5 shadow-lg transition-colors cursor-pointer"
-            title="Export Chapter Slices (.zip)"
+            onClick={onToggleWebtoonMode}
+            className="px-2.5 py-1 rounded-full text-[11px] font-medium flex items-center gap-1.5 bg-[#202020] hover:bg-[#2c2c2c] text-[#e5e5e5] shadow-lg transition-colors cursor-pointer"
+            title="Exit Webtoon Studio Mode"
           >
-            <Archive className="w-3.5 h-3.5" />
-            <span>Export Slices</span>
+            <Smartphone className="w-3.5 h-3.5 text-[var(--accent)]" />
+            <span>Exit Webtoon</span>
           </button>
-        )}
-      </div>
+
+          {onOpenWebtoonExport && (
+            <button
+              onClick={onOpenWebtoonExport}
+              className="px-2.5 py-1 rounded-full text-[11px] font-medium bg-[#202020] hover:bg-[#2c2c2c] text-[#e5e5e5] flex items-center gap-1.5 shadow-lg transition-colors cursor-pointer"
+              title="Export Chapter Slices (.zip)"
+            >
+              <Archive className="w-3.5 h-3.5 text-[#8a8a8a]" />
+              <span>Export Slices</span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Subtle Zero-Height Canvas Coordinate / Pressure Readout */}
+      {(showCursorCoordinates || showPressureInStatusBar) && (
+        <div
+          ref={pointerStatRef}
+          className="pointer-events-none absolute bottom-2 right-3 z-30 text-[10px] font-mono text-[#8a8a8a]/70 select-none"
+        />
+      )}
 
       {/* Smartphone Viewport Simulator in Webtoon Mode */}
       {isWebtoonMode && (

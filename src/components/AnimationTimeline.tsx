@@ -53,8 +53,13 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [exportProgress, setExportProgress] = useState<string>('');
 
+  const timelineRootRef = useRef<HTMLDivElement | null>(null);
   const scrubberRef = useRef<HTMLDivElement | null>(null);
   const playTimerRef = useRef<number | null>(null);
+  const timelineRef = useRef<TimelineData>(timeline);
+  timelineRef.current = timeline;
+  const onChangeTimelineRef = useRef(onChangeTimeline);
+  onChangeTimelineRef.current = onChangeTimeline;
 
   // Playback timer loop
   useEffect(() => {
@@ -66,19 +71,22 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
       return;
     }
 
-    const intervalMs = Math.max(10, Math.round(1000 / timeline.fps));
+    const intervalMs = Math.max(10, Math.round(1000 / Math.max(1, timeline.fps)));
     playTimerRef.current = window.setInterval(() => {
-      onChangeTimeline({
-        ...timeline,
-        currentFrame:
-          timeline.currentFrame + 1 >= timeline.totalFrames
-            ? timeline.loop
-              ? 0
-              : timeline.totalFrames - 1
-            : timeline.currentFrame + 1,
+      const curr = timelineRef.current;
+      const nextFrame =
+        curr.currentFrame + 1 >= curr.totalFrames
+          ? curr.loop
+            ? 0
+            : curr.totalFrames - 1
+          : curr.currentFrame + 1;
+
+      onChangeTimelineRef.current({
+        ...curr,
+        currentFrame: nextFrame,
       });
 
-      if (!timeline.loop && timeline.currentFrame + 1 >= timeline.totalFrames) {
+      if (!curr.loop && curr.currentFrame + 1 >= curr.totalFrames) {
         setIsPlaying(false);
       }
     }, intervalMs);
@@ -89,7 +97,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
         playTimerRef.current = null;
       }
     };
-  }, [isPlaying, timeline, onChangeTimeline]);
+  }, [isPlaying, timeline.fps]);
 
   // Synchronize active cel layer when frame changes
   useEffect(() => {
@@ -130,15 +138,35 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
     window.addEventListener('pointerup', onPointerUp);
   };
 
-  // Keyboard navigation shortcuts
+  // Keyboard navigation shortcuts (Alt+Space anywhere, or Space when timeline has focus, avoiding canvas Space-pan collision)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        target?.isContentEditable ||
+        document.querySelector('[role="dialog"]')
+      ) {
+        return;
+      }
 
       if (e.code === 'Space') {
-        e.preventDefault();
-        setIsPlaying((p) => !p);
-      } else if (e.code === 'ArrowLeft') {
+        if (e.repeat || e.ctrlKey || e.metaKey) return;
+        const isTimelineFocused = Boolean(
+          timelineRootRef.current && document.activeElement && timelineRootRef.current.contains(document.activeElement)
+        );
+        if (e.altKey || isTimelineFocused) {
+          e.preventDefault();
+          setIsPlaying((p) => !p);
+        }
+        return;
+      }
+
+      if (e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+
+      if (e.code === 'ArrowLeft') {
         e.preventDefault();
         onChangeTimeline({
           ...timeline,
@@ -198,7 +226,11 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
   const currentCelLayer = currentCelId ? layers.find((l) => l.id === currentCelId) : null;
 
   return (
-    <div className="absolute inset-x-0 bottom-0 z-40 bg-[#17191e]/95 backdrop-blur-md border-t border-[#2e323b] shadow-2xl flex flex-col select-none text-xs text-gray-300">
+    <div
+      ref={timelineRootRef}
+      tabIndex={-1}
+      className="absolute inset-x-0 bottom-0 z-40 bg-[#17191e]/95 backdrop-blur-md border-t border-[#2e323b] shadow-2xl flex flex-col select-none text-xs text-gray-300 outline-none"
+    >
       {/* 1. Header & Transport Controls Dock */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#242730] bg-[#1a1d24]">
         {/* Playback Transport */}
@@ -232,7 +264,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                 ? 'bg-amber-600 hover:bg-amber-500 text-white'
                 : 'bg-emerald-600 hover:bg-emerald-500 text-white'
             }`}
-            title="Play / Pause (Space)"
+            title="Play / Pause (Alt+Space)"
           >
             {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
             <span className="text-[11px] font-semibold">{isPlaying ? 'Pause' : 'Play'}</span>

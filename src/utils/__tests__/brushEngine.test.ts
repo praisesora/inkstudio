@@ -702,4 +702,83 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       expect(fastTaperedCount).toBeGreaterThan(slowTaperedCount);
     });
   });
+
+  describe('8. Multi-Resolution Mipmap Masters, Corner Knots & Deterministic Bake Parity', () => {
+    it('selects optimal resolution buckets in getRadialDabMaster when targetSize is provided', () => {
+      const mSmall = getRadialDabMaster(1.0, '#000000', false, 4);
+      const mMed = getRadialDabMaster(1.0, '#000000', false, 16);
+      const mLarge = getRadialDabMaster(1.0, '#000000', false, 48);
+      const mHuge = getRadialDabMaster(1.0, '#000000', false, 100);
+
+      expect(mSmall.width).toBe(24);
+      expect(mMed.width).toBe(48);
+      expect(mLarge.width).toBe(64);
+      expect(mHuge.width).toBe(128);
+    });
+
+    it('breaks tangent influence across sharp corners when isCorner is set on knots', () => {
+      const p0: Point = { x: 0, y: 50, pressure: 0.5, width: 10 };
+      const p1: Point = { x: 50, y: 0, pressure: 0.5, width: 10, isCorner: true };
+      const p2: Point = { x: 100, y: 0, pressure: 0.5, width: 10 };
+      const p3: Point = { x: 150, y: 0, pressure: 0.5, width: 10 };
+
+      const { c1, c2 } = centripetalCatmullRomToBezier(p0, p1, p2, p3);
+      // Since p1.isCorner is true, c1 should lie strictly on the horizontal chord y = 0 without pulling toward p0 (y = 50)
+      expect(c1.y).toBeCloseTo(0, 4);
+      expect(c2.y).toBeCloseTo(0, 4);
+    });
+
+    it('produces identical scattered/jittered dab coordinates across repeated renderCompleteStroke calls', () => {
+      const c1 = createMockCanvas(200, 200);
+      const c2 = createMockCanvas(200, 200);
+      const ctx1 = c1.getContext('2d') as unknown as CanvasRenderingContext2D;
+      const ctx2 = c2.getContext('2d') as unknown as CanvasRenderingContext2D;
+
+      const pts: Point[] = [
+        { x: 20, y: 40, pressure: 0.6, width: 12 },
+        { x: 60, y: 50, pressure: 0.8, width: 14 },
+        { x: 110, y: 45, pressure: 0.7, width: 13 },
+      ];
+
+      const settings: BrushSettings = {
+        size: 14,
+        minSizeFactor: 0.2,
+        opacity: 1.0,
+        color: '#2255aa',
+        secondaryColor: '#ffaa00',
+        flow: 0.9,
+        spacing: 0.1,
+        smoothing: true,
+        stabilization: 10,
+        hardness: 0.9,
+        usePressure: true,
+        dynamics: {
+          sizeJitter: 0.5,
+          angleJitter: 0.4,
+          roundnessJitter: 0.3,
+          scatter: 1.2,
+          scatterBothAxes: true,
+          count: 2,
+          flowJitter: 0.3,
+          colorJitterEnabled: true,
+          hueJitter: 0.2,
+          saturationJitter: 0.2,
+          brightnessJitter: 0.2,
+          foregroundBackgroundJitter: 0.3,
+        },
+      };
+
+      renderCompleteStroke(ctx1, pts, settings, 'brush', 'color', false);
+      renderCompleteStroke(ctx2, pts, settings, 'brush', 'color', false);
+
+      expect(c1.drawnDabs.length).toBeGreaterThan(10);
+      expect(c1.drawnDabs.length).toBe(c2.drawnDabs.length);
+      for (let i = 0; i < c1.drawnDabs.length; i++) {
+        expect(c1.drawnDabs[i].x).toBeCloseTo(c2.drawnDabs[i].x, 5);
+        expect(c1.drawnDabs[i].y).toBeCloseTo(c2.drawnDabs[i].y, 5);
+        expect(c1.drawnDabs[i].width).toBeCloseTo(c2.drawnDabs[i].width, 5);
+        expect(c1.drawnDabs[i].alpha).toBeCloseTo(c2.drawnDabs[i].alpha, 5);
+      }
+    });
+  });
 });

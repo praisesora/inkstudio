@@ -216,13 +216,13 @@ export class SplineGenerator {
 
     this.segment.c1.x = p1.x + dx1;
     this.segment.c1.y = p1.y + dy1;
-    this.segment.c1.pressure = p1.pressure + (p2.pressure - p0.pressure) / 6.0;
-    this.segment.c1.width = p1.width + (p2.width - p0.width) / 6.0;
+    this.segment.c1.pressure = Math.max(0, Math.min(1, p1.pressure + (p2.pressure - p0.pressure) / 6.0));
+    this.segment.c1.width = Math.max(0.1, p1.width + (p2.width - p0.width) / 6.0);
 
     this.segment.c2.x = p2.x - dx2;
     this.segment.c2.y = p2.y - dy2;
-    this.segment.c2.pressure = p2.pressure - (p3.pressure - p1.pressure) / 6.0;
-    this.segment.c2.width = p2.width - (p3.width - p1.width) / 6.0;
+    this.segment.c2.pressure = Math.max(0, Math.min(1, p2.pressure - (p3.pressure - p1.pressure) / 6.0));
+    this.segment.c2.width = Math.max(0.1, p2.width - (p3.width - p1.width) / 6.0);
 
     this.segment.p3.x = p2.x;
     this.segment.p3.y = p2.y;
@@ -230,9 +230,13 @@ export class SplineGenerator {
     this.segment.p3.width = p2.width;
 
     // Cache tangent at P2 for subsequent Hermite provisional segment stitching
-    this.lastTangentX = dx2 * 3.0;
-    this.lastTangentY = dy2 * 3.0;
-    this.hasLastTangent = true;
+    if (Math.hypot(dx2, dy2) > 1e-4) {
+      this.lastTangentX = dx2 * 3.0;
+      this.lastTangentY = dy2 * 3.0;
+      this.hasLastTangent = true;
+    } else {
+      this.hasLastTangent = false;
+    }
 
     return this.segment;
   }

@@ -36,8 +36,8 @@ describe('Sparse Virtual Tile Engine', () => {
 
   it('correctly creates 1-bit monochrome tiles consuming exactly 8,192 bytes', () => {
     const tile = createTileBuffer('layer-1', 0, 0, 'monochrome-1bit');
-    expect(tile.data.byteLength).toBe(BYTES_1BIT);
-    expect(tile.data.byteLength).toBe(8192);
+    expect(tile.data!.byteLength).toBe(BYTES_1BIT);
+    expect(tile.data!.byteLength).toBe(8192);
 
     // Verify 32x memory reduction compared to 32-bit RGBA
     expect(BYTES_32BIT / BYTES_1BIT).toBe(32);
@@ -45,38 +45,38 @@ describe('Sparse Virtual Tile Engine', () => {
 
   it('correctly creates 8-bit grayscale tiles consuming exactly 65,536 bytes', () => {
     const tile = createTileBuffer('layer-1', 0, 0, 'grayscale-8bit');
-    expect(tile.data.byteLength).toBe(BYTES_8BIT);
-    expect(tile.data.byteLength).toBe(65536);
+    expect(tile.data!.byteLength).toBe(BYTES_8BIT);
+    expect(tile.data!.byteLength).toBe(65536);
   });
 
   it('supports bitwise 1-bit pixel read and write', () => {
     const tile = createTileBuffer('layer-1', 0, 0, 'monochrome-1bit');
 
     // Initially 0
-    expect(getPixel1Bit(tile.data, 0, 0)).toBe(0);
-    expect(getPixel1Bit(tile.data, 7, 0)).toBe(0);
-    expect(getPixel1Bit(tile.data, 8, 0)).toBe(0);
-    expect(getPixel1Bit(tile.data, 255, 255)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 0, 0)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 7, 0)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 8, 0)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 255, 255)).toBe(0);
 
     // Set pixels
-    setPixel1Bit(tile.data, 0, 0, true);
-    setPixel1Bit(tile.data, 7, 0, true);
-    setPixel1Bit(tile.data, 8, 0, true);
-    setPixel1Bit(tile.data, 255, 255, true);
+    setPixel1Bit(tile.data!, 0, 0, true);
+    setPixel1Bit(tile.data!, 7, 0, true);
+    setPixel1Bit(tile.data!, 8, 0, true);
+    setPixel1Bit(tile.data!, 255, 255, true);
 
-    expect(getPixel1Bit(tile.data, 0, 0)).toBe(1);
-    expect(getPixel1Bit(tile.data, 7, 0)).toBe(1);
-    expect(getPixel1Bit(tile.data, 8, 0)).toBe(1);
-    expect(getPixel1Bit(tile.data, 255, 255)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 0, 0)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 7, 0)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 8, 0)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 255, 255)).toBe(1);
 
     // Neighboring pixel remains 0
-    expect(getPixel1Bit(tile.data, 1, 0)).toBe(0);
-    expect(getPixel1Bit(tile.data, 6, 0)).toBe(0);
-    expect(getPixel1Bit(tile.data, 254, 255)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 1, 0)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 6, 0)).toBe(0);
+    expect(getPixel1Bit(tile.data!, 254, 255)).toBe(0);
 
     // Clear pixel
-    setPixel1Bit(tile.data, 7, 0, false);
-    expect(getPixel1Bit(tile.data, 7, 0)).toBe(0);
+    setPixel1Bit(tile.data!, 7, 0, false);
+    expect(getPixel1Bit(tile.data!, 7, 0)).toBe(0);
   });
 
   it('accurately packs RGBA into 1-bit and unpacks back via 32-bit LUT', () => {
@@ -115,9 +115,9 @@ describe('Sparse Virtual Tile Engine', () => {
 
   it('compresses and decompresses tile buffers via RLE losslessly', () => {
     const tile = createTileBuffer('layer-ink', 2, 3, 'monochrome-1bit');
-    setPixel1Bit(tile.data, 50, 50, true);
-    setPixel1Bit(tile.data, 51, 50, true);
-    setPixel1Bit(tile.data, 52, 50, true);
+    setPixel1Bit(tile.data!, 50, 50, true);
+    setPixel1Bit(tile.data!, 51, 50, true);
+    setPixel1Bit(tile.data!, 52, 50, true);
 
     const serialized = serializeTileBuffer(tile);
     // Highly sparse tile should compress dramatically
@@ -127,10 +127,10 @@ describe('Sparse Virtual Tile Engine', () => {
     expect(deserialized.tileX).toBe(2);
     expect(deserialized.tileY).toBe(3);
     expect(deserialized.format).toBe('monochrome-1bit');
-    expect(getPixel1Bit(deserialized.data, 50, 50)).toBe(1);
-    expect(getPixel1Bit(deserialized.data, 51, 50)).toBe(1);
-    expect(getPixel1Bit(deserialized.data, 52, 50)).toBe(1);
-    expect(getPixel1Bit(deserialized.data, 53, 50)).toBe(0);
+    expect(getPixel1Bit(deserialized.data!, 50, 50)).toBe(1);
+    expect(getPixel1Bit(deserialized.data!, 51, 50)).toBe(1);
+    expect(getPixel1Bit(deserialized.data!, 52, 50)).toBe(1);
+    expect(getPixel1Bit(deserialized.data!, 53, 50)).toBe(0);
   });
 
   it('correctly handles multi-tile write and read in SparseTileGrid', () => {
@@ -182,7 +182,7 @@ describe('Sparse Virtual Tile Engine', () => {
 
     // Draw something
     const tile = grid.getOrCreateTile('layer-1', 0, 0, 'monochrome-1bit');
-    setPixel1Bit(tile.data, 10, 10, true);
+    setPixel1Bit(tile.data!, 10, 10, true);
 
     // Compute deltas
     const deltas = grid.computeDeltasFromSnapshot(snapshot, 'layer-1', bounds);
@@ -206,7 +206,7 @@ describe('Sparse Virtual Tile Engine', () => {
     grid.applyTileDeltas(restoredDeltas, 'redo');
     const redoTile = grid.getTile('layer-1', 0, 0);
     expect(redoTile).not.toBeNull();
-    expect(getPixel1Bit(redoTile!.data, 10, 10)).toBe(1);
+    expect(getPixel1Bit(redoTile!.data!, 10, 10)).toBe(1);
   });
 });
 

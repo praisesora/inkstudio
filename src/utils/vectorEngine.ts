@@ -32,7 +32,8 @@ export interface IntersectionPoint {
 }
 
 /**
- * Catmull-Rom cubic spline interpolation between p1 and p2 using control points p0 and p3.
+ * Centripetal Catmull-Rom cubic spline interpolation between p1 and p2 using control points p0 and p3.
+ * Prevents self-intersecting loops and cusps on uneven knot spacing while preserving monotonic width.
  */
 export function evaluateCatmullRom(
   p0: VectorKnot,
@@ -41,19 +42,71 @@ export function evaluateCatmullRom(
   p3: VectorKnot,
   t: number
 ): VectorKnot {
+  const d01 = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+  const d12 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+  const d23 = Math.hypot(p3.x - p2.x, p3.y - p2.y);
+
+  const dt0 = Math.max(1e-4, Math.sqrt(d01));
+  const dt1 = Math.max(1e-4, Math.sqrt(d12));
+  const dt2 = Math.max(1e-4, Math.sqrt(d23));
+
+  const t1x = (p2.x - p1.x) / dt1 - (p1.x - p0.x) / dt0 + (p2.x - p0.x) / (dt0 + dt1);
+  const t1y = (p2.y - p1.y) / dt1 - (p1.y - p0.y) / dt0 + (p2.y - p0.y) / (dt0 + dt1);
+  const t2x = (p3.x - p2.x) / dt2 - (p2.x - p1.x) / dt1 + (p3.x - p1.x) / (dt1 + dt2);
+  const t2y = (p3.y - p2.y) / dt2 - (p2.y - p1.y) / dt1 + (p3.y - p1.y) / (dt1 + dt2);
+
+  let dx1 = (t1x * dt1) / 3;
+  let dy1 = (t1y * dt1) / 3;
+  let dx2 = (t2x * dt1) / 3;
+  let dy2 = (t2y * dt1) / 3;
+
+  if (d12 > 1e-3) {
+    const maxHandle = d12 * 0.48;
+    const len1 = Math.hypot(dx1, dy1);
+    if (len1 > maxHandle) {
+      const s = maxHandle / len1;
+      dx1 *= s;
+      dy1 *= s;
+    }
+    const len2 = Math.hypot(dx2, dy2);
+    if (len2 > maxHandle) {
+      const s = maxHandle / len2;
+      dx2 *= s;
+      dy2 *= s;
+    }
+  }
+
+  const c1x = p1.x + dx1;
+  const c1y = p1.y + dy1;
+  const c2x = p2.x - dx2;
+  const c2y = p2.y - dy2;
+
+  const invT = 1.0 - t;
+  const invT2 = invT * invT;
+  const invT3 = invT2 * invT;
   const t2 = t * t;
   const t3 = t2 * t;
 
-  const f0 = -0.5 * t3 + t2 - 0.5 * t;
-  const f1 = 1.5 * t3 - 2.5 * t2 + 1.0;
-  const f2 = -1.5 * t3 + 2.0 * t2 + 0.5 * t;
-  const f3 = 0.5 * t3 - 0.5 * t2;
+  const a = invT3;
+  const b = 3.0 * invT2 * t;
+  const c = 3.0 * invT * t2;
+  const d = t3;
+
+  const minP = Math.min(p1.pressure, p2.pressure);
+  const maxP = Math.max(p1.pressure, p2.pressure);
+  const c1p = Math.max(minP, Math.min(maxP, p1.pressure + (p2.pressure - p0.pressure) / 6));
+  const c2p = Math.max(minP, Math.min(maxP, p2.pressure - (p3.pressure - p1.pressure) / 6));
+
+  const minW = Math.min(p1.width, p2.width);
+  const maxW = Math.max(p1.width, p2.width);
+  const c1w = Math.max(minW, Math.min(maxW, p1.width + (p2.width - p0.width) / 6));
+  const c2w = Math.max(minW, Math.min(maxW, p2.width - (p3.width - p1.width) / 6));
 
   return {
-    x: p0.x * f0 + p1.x * f1 + p2.x * f2 + p3.x * f3,
-    y: p0.y * f0 + p1.y * f1 + p2.y * f2 + p3.y * f3,
-    pressure: Math.max(0, Math.min(1, p0.pressure * f0 + p1.pressure * f1 + p2.pressure * f2 + p3.pressure * f3)),
-    width: Math.max(0.5, p0.width * f0 + p1.width * f1 + p2.width * f2 + p3.width * f3),
+    x: a * p1.x + b * c1x + c * c2x + d * p2.x,
+    y: a * p1.y + b * c1y + c * c2y + d * p2.y,
+    pressure: Math.max(0, Math.min(1, a * p1.pressure + b * c1p + c * c2p + d * p2.pressure)),
+    width: Math.max(0.5, a * p1.width + b * c1w + c * c2w + d * p2.width),
     angle: p1.angle,
     timestamp: p1.timestamp + (p2.timestamp - p1.timestamp) * t,
   };
@@ -76,7 +129,8 @@ export function tessellateStroke(stroke: VectorStroke, stepsPerSegment = 6): Vec
     const p2 = knots[i + 1];
     const p3 = i + 2 < knots.length ? knots[i + 2] : p2;
 
-    const steps = stepsPerSegment;
+    const chord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const steps = Math.max(stepsPerSegment, Math.min(24, Math.ceil(chord / 3)));
     for (let s = 0; s < steps; s++) {
       const t = s / steps;
       result.push(evaluateCatmullRom(p0, p1, p2, p3, t));
@@ -370,10 +424,27 @@ export function splitStrokeAtIntersection(
 
   const remainingStrokes: VectorStroke[] = [];
 
+  const interpolateKnotAt = (param: number): VectorKnot => {
+    const idx = Math.max(0, Math.min(targetStroke.knots.length - 2, Math.floor(param)));
+    const frac = Math.max(0, Math.min(1, param - idx));
+    const kA = targetStroke.knots[idx];
+    const kB = targetStroke.knots[idx + 1] || kA;
+    return {
+      x: kA.x + (kB.x - kA.x) * frac,
+      y: kA.y + (kB.y - kA.y) * frac,
+      pressure: kA.pressure + (kB.pressure - kA.pressure) * frac,
+      width: kA.width + (kB.width - kA.width) * frac,
+      timestamp: Math.round(kA.timestamp + (kB.timestamp - kA.timestamp) * frac),
+    };
+  };
+
   // Keep part before leftJunction if significant
-  if (leftJunction > 0.5) {
+  if (leftJunction > 0.05) {
     const leftEndIdx = Math.floor(leftJunction);
     const subKnots = targetStroke.knots.slice(0, leftEndIdx + 1);
+    if (leftJunction - leftEndIdx > 0.02) {
+      subKnots.push(interpolateKnotAt(leftJunction));
+    }
     if (subKnots.length >= 2) {
       remainingStrokes.push({
         id: `vstroke-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -389,9 +460,12 @@ export function splitStrokeAtIntersection(
   }
 
   // Keep part after rightJunction if significant
-  if (rightJunction < targetStroke.knots.length - 1.5) {
+  if (rightJunction < targetStroke.knots.length - 1.05) {
     const rightStartIdx = Math.ceil(rightJunction);
     const subKnots = targetStroke.knots.slice(rightStartIdx);
+    if (rightStartIdx - rightJunction > 0.02) {
+      subKnots.unshift(interpolateKnotAt(rightJunction));
+    }
     if (subKnots.length >= 2) {
       remainingStrokes.push({
         id: `vstroke-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
@@ -606,14 +680,17 @@ export function simplifyPathPoints(knots: VectorKnot[], tolerance = 1.0): Vector
       if (lenSq < 1e-9) {
         const dX = p.x - p1.x;
         const dY = p.y - p1.y;
-        sqDist = dX * dX + dY * dY;
+        const dW = (p.width - p1.width) * 0.5;
+        sqDist = dX * dX + dY * dY + dW * dW;
       } else {
         const t = Math.max(0, Math.min(1, ((p.x - p1.x) * dx + (p.y - p1.y) * dy) / lenSq));
         const projX = p1.x + t * dx;
         const projY = p1.y + t * dy;
+        const projW = p1.width + t * (p2.width - p1.width);
         const dX = p.x - projX;
         const dY = p.y - projY;
-        sqDist = dX * dX + dY * dY;
+        const dW = (p.width - projW) * 0.5;
+        sqDist = dX * dX + dY * dY + dW * dW;
       }
 
       if (sqDist > maxSqDist) {
@@ -867,6 +944,18 @@ export function findNearestVectorStroke(
       if (d < minDist) {
         minDist = d;
         closest = { stroke, knotIndex: i, distance: d };
+      }
+      if (i < stroke.knots.length - 1) {
+        const nextK = stroke.knots[i + 1];
+        const segRes = pointToSegmentDistance(point.x, point.y, k.x, k.y, nextK.x, nextK.y);
+        if (segRes.distance < minDist) {
+          minDist = segRes.distance;
+          closest = {
+            stroke,
+            knotIndex: segRes.t < 0.5 ? i : i + 1,
+            distance: segRes.distance,
+          };
+        }
       }
     }
   }

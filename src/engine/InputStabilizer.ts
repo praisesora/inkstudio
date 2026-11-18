@@ -69,8 +69,11 @@ export class OneEuroAxis {
       return x;
     }
 
-    const dt = Math.max(1e-4, (timestampMs - this.tPrev) * 0.001); // dt in seconds
-    this.tPrev = timestampMs;
+    const rawElapsedMs = timestampMs - this.tPrev;
+    // Synthesize monotonic 4ms (250Hz) sub-step when hardware coalesced events share identical timestamps
+    const effectiveMs = rawElapsedMs <= 0.5 ? 4.0 : rawElapsedMs;
+    const dt = Math.max(0.002, effectiveMs * 0.001);
+    this.tPrev = rawElapsedMs <= 0.5 ? this.tPrev + 4.0 : Math.max(this.tPrev, timestampMs);
     const rate = 1.0 / dt;
 
     // Filter derivative
@@ -128,6 +131,8 @@ export class InputStabilizer {
   private hasPrevDir: boolean = false;
   private rawPrevX: number = 0;
   private rawPrevY: number = 0;
+  private lastRawSampleX: number = 0;
+  private lastRawSampleY: number = 0;
 
   // Single pre-allocated sample object for output to eliminate GC allocation
   private outputSample: StabilizedSample = {
@@ -142,10 +147,22 @@ export class InputStabilizer {
   };
 
   private isStarted: boolean = false;
+  private zoomScale: number = 1.0;
+  private sharpCornersEnabled: boolean = true;
   private config: StabilizerConfig = { ...DEFAULT_STABILIZER_CONFIG };
 
   public configure(config: Partial<StabilizerConfig>): void {
     Object.assign(this.config, config);
+  }
+
+  public setZoomScale(zoom: number): void {
+    if (Number.isFinite(zoom) && zoom > 0) {
+      this.zoomScale = zoom;
+    }
+  }
+
+  public setSharpCorners(enabled: boolean): void {
+    this.sharpCornersEnabled = enabled;
   }
 
   public setStabilizerLevel(level: number): void {
@@ -157,8 +174,8 @@ export class InputStabilizer {
     } else {
       // Pure unconditionally stable 1-Euro adaptive curve (Clip Studio Paint style)
       const t = Math.min(1.0, level / 50.0);
-      this.config.minCutoff = Math.max(0.6, 5.0 - t * 4.4); // 5.0 -> 0.6 Hz
-      this.config.beta = Math.max(0.008, 0.06 - t * 0.05);   // 0.06 -> 0.01
+      this.config.minCutoff = Math.max(0.45, 5.0 - t * 4.55); // 5.0 -> 0.45 Hz
+      this.config.beta = Math.max(0.005, 0.055 - t * 0.048);  // 0.055 -> 0.007
       this.config.springMass = 0; // Pure 1-Euro without oscillating spring artifacts
     }
   }
@@ -183,7 +200,13 @@ export class InputStabilizer {
     this.hasPrevDir = false;
     this.rawPrevX = 0;
     this.rawPrevY = 0;
+    this.lastRawSampleX = 0;
+    this.lastRawSampleY = 0;
     this.isStarted = false;
+  }
+
+  public getLastSample(): Readonly<StabilizedSample> {
+    return this.outputSample;
   }
 
   public process(
@@ -199,6 +222,8 @@ export class InputStabilizer {
       this.lastTime = timestampMs;
       this.rawPrevX = rawX;
       this.rawPrevY = rawY;
+      this.lastRawSampleX = rawX;
+      this.lastRawSampleY = rawY;
       this.smX = rawX;
       this.smY = rawY;
       this.smVx = 0;
@@ -224,17 +249,25 @@ export class InputStabilizer {
     const dtMs = Math.max(1, timestampMs - this.lastTime);
     const dtSec = dtMs * 0.001;
 
-    // 1. Critical Angle Detection (Corner Snapping)
+    const stepRawDx = rawX - this.lastRawSampleX;
+    const stepRawDy = rawY - this.lastRawSampleY;
+    const stepRawDist = Math.hypot(stepRawDx, stepRawDy);
+    this.lastRawSampleX = rawX;
+    this.lastRawSampleY = rawY;
+
+    // 1. Zoom-Aware Critical Angle Detection (Corner Snapping)
+    // Screen-space 6px chord threshold prevents zoomed-out 600 DPI canvases from false-snapping on 1px hand tremor
     const rawDx = rawX - this.rawPrevX;
     const rawDy = rawY - this.rawPrevY;
     const rawDist = Math.hypot(rawDx, rawDy);
+    const minCornerChord = 6.0 / Math.max(0.15, Math.min(4.0, this.zoomScale));
     let isCorner = false;
 
-    if (rawDist >= 6.0) {
+    if (rawDist >= minCornerChord) {
       const curDirX = rawDx / rawDist;
       const curDirY = rawDy / rawDist;
 
-      if (this.hasPrevDir) {
+      if (this.hasPrevDir && this.sharpCornersEnabled) {
         // Dot product between consecutive motion vectors
         const dot = Math.max(-1.0, Math.min(1.0, this.prevDirX * curDirX + this.prevDirY * curDirY));
         const angle = Math.acos(dot);
@@ -259,16 +292,25 @@ export class InputStabilizer {
       this.rawPrevY = rawY;
     }
 
-    // 2. Velocity-Adaptive Damping Scaling
-    // On high-speed ballistic flicks, scale cutoff up and latency toward zero
-    const estimatedSpeed = rawDist / dtMs; // px / ms
-    const speedBoost = Math.min(15.0, estimatedSpeed * 4.0);
+    // 2. Velocity-Adaptive Damping Scaling (screen-normalized speed, smooth saturation so fast arcs stay silky)
+    const screenSpeed = (stepRawDist * Math.max(0.15, Math.min(4.0, this.zoomScale))) / dtMs; // screen px / ms
+    const speedBoost = Math.min(6.0, screenSpeed * 2.2);
     const dynamicMinCutoff = this.config.minCutoff * (1.0 + speedBoost);
-    const dynamicBeta = this.config.beta * (1.0 + speedBoost * 0.8);
+    const dynamicBeta = this.config.beta * (1.0 + speedBoost * 0.35);
 
-    // 3. Coordinate Filtering
-    let fX = isCorner ? rawX : this.filterX.filter(rawX, timestampMs, dynamicMinCutoff, dynamicBeta, this.config.dCutoff);
-    let fY = isCorner ? rawY : this.filterY.filter(rawY, timestampMs, dynamicMinCutoff, dynamicBeta, this.config.dCutoff);
+    // 3. Coordinate Filtering with sub-pixel deadzone suppression
+    let fX: number;
+    let fY: number;
+    if (isCorner) {
+      fX = rawX;
+      fY = rawY;
+    } else if (stepRawDist < this.config.deadzone && this.config.minCutoff < 50.0) {
+      fX = this.lastX;
+      fY = this.lastY;
+    } else {
+      fX = this.filterX.filter(rawX, timestampMs, dynamicMinCutoff, dynamicBeta, this.config.dCutoff);
+      fY = this.filterY.filter(rawY, timestampMs, dynamicMinCutoff, dynamicBeta, this.config.dCutoff);
+    }
 
     // 4. Asymmetric Pressure Filtering (Fast Attack, Critically Damped Decay)
     const pressureDelta = rawPressure - this.lastRawPressure;
@@ -284,7 +326,7 @@ export class InputStabilizer {
       const m = this.config.springMass;
 
       // Dynamic damping reduction on fast flicks
-      const effectiveDamping = Math.max(c * 0.35, c / (1.0 + estimatedSpeed * 0.5));
+      const effectiveDamping = Math.max(c * 0.35, c / (1.0 + screenSpeed * 0.5));
 
       const disX = fX - this.smX;
       const disY = fY - this.smY;

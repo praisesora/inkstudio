@@ -146,6 +146,8 @@ export function mixSubtractivePigments(
   weight2: number // 0.0 = 100% c1, 1.0 = 100% c2
 ): RgbColor {
   const w2 = Math.max(0, Math.min(1, weight2));
+  if (w2 <= 0.0001) return { r: c1.r, g: c1.g, b: c1.b };
+  if (w2 >= 0.9999) return { r: c2.r, g: c2.g, b: c2.b };
   const w1 = 1 - w2;
 
   // Convert to linear reflectance
@@ -196,7 +198,7 @@ export function mixSubtractivePigments(
 
   const subLab = linearRgbToOklab(subR, subG, subB);
   const tunedLab = {
-    L: Math.max(0.01, targetLightness * 0.72 + subLab.L * 0.28),
+    L: Math.max(0, targetLightness * 0.72 + subLab.L * 0.28),
     a: subLab.a,
     b: subLab.b,
   };
@@ -349,6 +351,7 @@ export class LayerPixelSampler {
       let sumG = 0;
       let sumB = 0;
       let weightSum = 0;
+      let radialAreaSum = 0;
       const rSq = r * r;
 
       for (let y = y0; y <= y1; y += step) {
@@ -360,11 +363,13 @@ export class LayerPixelSampler {
           const dx = x - ix;
           const distSq = dx * dx + dySq;
           if (distSq <= rSq) {
+            const geomWeight = 1 - distSq / rSq;
+            radialAreaSum += geomWeight;
             const tile = this.getOrLoadTile(x >> 8, ty);
             const idx = (lyOffset + (x & 255)) << 2;
             const alpha = tile[idx + 3];
             if (alpha > 4) {
-              const radialWeight = (1 - distSq / rSq) * (alpha / 255);
+              const radialWeight = geomWeight * (alpha / 255);
               sumR += tile[idx] * radialWeight;
               sumG += tile[idx + 1] * radialWeight;
               sumB += tile[idx + 2] * radialWeight;
@@ -374,12 +379,12 @@ export class LayerPixelSampler {
         }
       }
 
-      if (weightSum > 0.001) {
+      if (weightSum > 0.001 && radialAreaSum > 0) {
         return {
           r: sumR / weightSum,
           g: sumG / weightSum,
           b: sumB / weightSum,
-          a: Math.min(1.0, weightSum),
+          a: Math.min(1.0, weightSum / radialAreaSum),
         };
       }
       return { r: 255, g: 255, b: 255, a: 0 };
@@ -409,6 +414,7 @@ export class LayerPixelSampler {
     let sumG = 0;
     let sumB = 0;
     let weightSum = 0;
+    let radialAreaSum = 0;
     const rSq = r * r;
 
     for (let y = y0; y <= y1; y += step) {
@@ -419,11 +425,13 @@ export class LayerPixelSampler {
         const dx = x - ix;
         const distSq = dx * dx + dySq;
         if (distSq <= rSq) {
+          const geomWeight = 1 - distSq / rSq;
+          radialAreaSum += geomWeight;
           const idx = (rowOffset + x) * 4;
           const alpha = this.data[idx + 3];
           if (alpha > 4) {
             // Inverse-distance radial weight
-            const radialWeight = (1 - distSq / rSq) * (alpha / 255);
+            const radialWeight = geomWeight * (alpha / 255);
             sumR += this.data[idx] * radialWeight;
             sumG += this.data[idx + 1] * radialWeight;
             sumB += this.data[idx + 2] * radialWeight;
@@ -433,12 +441,12 @@ export class LayerPixelSampler {
       }
     }
 
-    if (weightSum > 0.001) {
+    if (weightSum > 0.001 && radialAreaSum > 0) {
       return {
         r: sumR / weightSum,
         g: sumG / weightSum,
         b: sumB / weightSum,
-        a: Math.min(1.0, weightSum),
+        a: Math.min(1.0, weightSum / radialAreaSum),
       };
     }
 
@@ -632,65 +640,119 @@ export class PaintReservoir {
     amountOfPaint: number, // 0.0 (pure smudge) to 1.0 (fresh pigment only)
     densityOfPaint: number, // 0.0 to 1.0 (paint deposition opacity)
     colorStretch: number, // 0.0 to 1.0 (drag length)
-    mixingMode: 'blend' | 'running_color' = 'blend',
+    mixingMode: 'blend' | 'running_color' | 'smear' = 'blend',
     pressure: number = 0.5,
     flow: number = 0.85,
-    stepDist: number = 0
+    stepDist: number = 0,
+    perceptualMixing: boolean = true
   ): { r: number; g: number; b: number; alpha: number; colorHex: string } {
     this.cumulativeDistance += stepDist;
 
-    const isPureSmudge = amountOfPaint <= 0.005;
+    const clampedAmount = Math.max(0, Math.min(1, amountOfPaint));
+    const isPureSmudge = clampedAmount <= 0.005 || mixingMode === 'smear';
     const canvasAlpha = sampledColor.a;
+
+    const mixFn = (c1: RgbColor, c2: RgbColor, w2: number): RgbColor => {
+      if (perceptualMixing) {
+        return mixSubtractivePigments(c1, c2, w2);
+      }
+      const w = Math.max(0, Math.min(1, w2));
+      return {
+        r: c1.r + (c2.r - c1.r) * w,
+        g: c1.g + (c2.g - c1.g) * w,
+        b: c1.b + (c2.b - c1.b) * w,
+      };
+    };
 
     if (canvasAlpha > 0.015) {
       // Contact with existing paint on canvas
       const pressureInfluence = pressure * 0.5 + 0.5;
-      const pickupRate = isPureSmudge
-        ? Math.min(0.98, canvasAlpha * 0.96 * pressureInfluence)
-        : Math.min(0.94, (1.0 - amountOfPaint) * canvasAlpha * pressureInfluence);
-
+      const origColor: RgbColor = {
+        r: this.originalR,
+        g: this.originalG,
+        b: this.originalB,
+      };
       const targetColor: RgbColor = {
         r: sampledColor.r,
         g: sampledColor.g,
         b: sampledColor.b,
       };
-
       const currentColor: RgbColor = {
         r: this.r,
         g: this.g,
         b: this.b,
       };
 
-      if (mixingMode === 'running_color' || isPureSmudge) {
-        // Running color: wet paint smear where canvas paint dynamically replaces reservoir
-        const blendFactor = Math.min(0.95, pickupRate * 1.3);
-        const mixed = mixSubtractivePigments(currentColor, targetColor, blendFactor);
+      if (isPureSmudge) {
+        // Pure Smudge / Smear: drags underlying pigment with zero fresh ink injection
+        const pickupRate = Math.min(0.96, canvasAlpha * (0.35 + (1.0 - colorStretch) * 0.55) * pressureInfluence);
+        const mixed = mixFn(currentColor, targetColor, pickupRate);
+        this.r = mixed.r;
+        this.g = mixed.g;
+        this.b = mixed.b;
+        this.a = Math.min(1.0, this.a * 0.7 + canvasAlpha * 0.3);
+        this.isLoadedWithCanvasColor = true;
+        this.cumulativeDistance = 0;
+      } else if (mixingMode === 'running_color') {
+        // Step 1: Absorb underlying canvas pigment into wet bristles (does not self-brighten on own trail)
+        const pickupScale = stepDist > 0 ? Math.min(1.0, Math.max(0.2, stepDist / 2.5)) : 1.0;
+        const pickupRate = Math.min(
+          0.9,
+          (1.0 - clampedAmount * 0.6) * canvasAlpha * pressureInfluence * pickupScale * 1.15
+        );
+        let mixed = mixFn(currentColor, targetColor, pickupRate);
+        // Step 2: Distance-normalized fresh pigment feed from bristle ferrule governed by colorStretch
+        const replenishDist = Math.max(
+          24,
+          (0.15 + colorStretch * 0.85) * (320 / Math.max(0.12, clampedAmount))
+        );
+        const feedRate =
+          stepDist > 0 ? 1.0 - Math.exp(-stepDist / replenishDist) : clampedAmount * 0.35;
+        mixed = mixFn(mixed, origColor, feedRate);
         this.r = mixed.r;
         this.g = mixed.g;
         this.b = mixed.b;
         this.a = Math.min(1.0, this.a + 0.3);
         this.isLoadedWithCanvasColor = true;
-        this.cumulativeDistance = 0; // Reset distance from latest color pickup
+        this.cumulativeDistance = 0;
       } else {
-        // Blend mode: continuous harmonious subtractive blending
-        const blendFactor = Math.min(0.85, pickupRate);
-        const mixed = mixSubtractivePigments(currentColor, targetColor, blendFactor);
-        this.r = mixed.r;
-        this.g = mixed.g;
-        this.b = mixed.b;
+        // CSP Blend mode: Step 1 absorb canvas pigment; Step 2 continuous ferrule replenishment per distance
+        if (stepDist <= 0) {
+          const equilibrium = mixFn(targetColor, origColor, clampedAmount);
+          const mixed = mixFn(currentColor, equilibrium, 0.65 * canvasAlpha * pressureInfluence);
+          this.r = mixed.r;
+          this.g = mixed.g;
+          this.b = mixed.b;
+        } else {
+          const stepScale = Math.min(1.0, Math.max(0.18, stepDist / 3.0));
+          const pickupRate = Math.min(
+            0.82,
+            (1.0 - clampedAmount * 0.72) * canvasAlpha * pressureInfluence * stepScale
+          );
+          let mixed = mixFn(currentColor, targetColor, pickupRate);
+          const replenishDist = Math.max(
+            14,
+            (0.2 + colorStretch * 0.8) * (160 / Math.max(0.12, clampedAmount))
+          );
+          const feedRate = 1.0 - Math.exp(-stepDist / replenishDist);
+          mixed = mixFn(mixed, origColor, feedRate);
+          this.r = mixed.r;
+          this.g = mixed.g;
+          this.b = mixed.b;
+        }
         this.isLoadedWithCanvasColor = true;
       }
     } else {
       // Moving into unpainted / dry area: apply Color Stretch decay
       if (this.isLoadedWithCanvasColor && stepDist > 0) {
-        const stretchDistanceLimit = Math.max(30, colorStretch * 850);
+        const stretchDistanceLimit = Math.max(24, colorStretch * 800);
         const decayRate = 1.0 - Math.exp(-stepDist / stretchDistanceLimit);
 
         if (isPureSmudge) {
           // Pure Smudge runs out of paint when dragging away from painted areas
           this.a = Math.max(0, this.a * (1.0 - decayRate * 1.6));
         } else {
-          // Slowly recovers brush's initial fresh color
+          // Smoothly recovers brush's fresh foreground pigment
           const origColor: RgbColor = {
             r: this.originalR,
             g: this.originalG,
@@ -701,7 +763,7 @@ export class PaintReservoir {
             g: this.g,
             b: this.b,
           };
-          const recovered = mixSubtractivePigments(currColor, origColor, decayRate);
+          const recovered = mixFn(currColor, origColor, Math.min(1.0, decayRate * (0.6 + clampedAmount * 0.8)));
           this.r = recovered.r;
           this.g = recovered.g;
           this.b = recovered.b;

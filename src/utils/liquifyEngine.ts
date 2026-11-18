@@ -518,6 +518,15 @@ export function createLiquifySelectionMask(
 ): Uint8Array | null {
   if (!selection) return null;
 
+  if (selection.mask && selection.maskWidth === width && selection.maskHeight === height) {
+    const mask = new Uint8Array(width * height);
+    const src = selection.mask;
+    for (let i = 0; i < src.length; i++) {
+      if (src[i] >= 64) mask[i] = 1;
+    }
+    return mask;
+  }
+
   const mask = new Uint8Array(width * height);
   const { bounds, type, polygon } = selection;
 

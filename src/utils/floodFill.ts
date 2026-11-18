@@ -1,4 +1,5 @@
 import { LayerItem, CanvasDimensions, DirtyRect } from '../types/editor';
+import { getCanvasCompositeOperation } from './canvasUtils';
 
 /**
  * Parses color string (hex #RRGGBB, #RGB, or rgba) to [r, g, b, a (0-255)].
@@ -44,6 +45,8 @@ export interface FloodFillOptions {
   areaScale?: number;
   /** Smooths boundary pixels against anti-aliased line art */
   antiAlias?: boolean;
+  /** Optional active selection mask (1/255 = inside selection, 0 = outside) */
+  selectionMask?: Uint8Array | null;
 }
 
 /**
@@ -70,7 +73,7 @@ export function compositeVisibleLayers(
 
     ctx.save();
     ctx.globalAlpha = layer.opacity ?? 1.0;
-    ctx.globalCompositeOperation = (layer.blendMode as GlobalCompositeOperation) || 'source-over';
+    ctx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
     ctx.drawImage(lCanvas, 0, 0);
     ctx.restore();
   }
@@ -105,7 +108,7 @@ export function compositeReferenceLayers(
 
     ctx.save();
     ctx.globalAlpha = layer.opacity ?? 1.0;
-    ctx.globalCompositeOperation = (layer.blendMode as GlobalCompositeOperation) || 'source-over';
+    ctx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
     ctx.drawImage(lCanvas, 0, 0);
     ctx.restore();
   }
@@ -286,8 +289,16 @@ export function executeFloodFill(
     barrierMask = closed;
   }
 
+  const selectionMask = options?.selectionMask;
+  if (selectionMask && selectionMask.length === totalPixels && selectionMask[py * width + px] === 0) {
+    return { dirtyRect: null, modified: false };
+  }
+
   const matchesSeed = (x: number, y: number): boolean => {
     const pIdx = y * width + x;
+    if (selectionMask && selectionMask.length === totalPixels && selectionMask[pIdx] === 0) {
+      return false;
+    }
     if (barrierMask) {
       return barrierMask[pIdx] === 0;
     }
@@ -442,11 +453,21 @@ export function executeFloodFill(
     finalMask = erodeBinaryMask(visited, width, height, Math.abs(areaScale));
   }
 
+  if (antiAlias) {
+    minX = Math.max(0, minX - 1);
+    minY = Math.max(0, minY - 1);
+    maxX = Math.min(width - 1, maxX + 1);
+    maxY = Math.min(height - 1, maxY + 1);
+  }
+
   // Write filled pixels to targetData
   for (let y = minY; y <= maxY; y++) {
     const rowOffset = y * width;
     for (let x = minX; x <= maxX; x++) {
       const pIdx = rowOffset + x;
+      if (selectionMask && selectionMask.length === totalPixels && selectionMask[pIdx] === 0) {
+        continue;
+      }
       if (finalMask[pIdx]) {
         const tIdx = pIdx * 4;
         targetData[tIdx] = fillR;
@@ -474,13 +495,6 @@ export function executeFloodFill(
         }
       }
     }
-  }
-
-  if (antiAlias) {
-    minX = Math.max(0, minX - 1);
-    minY = Math.max(0, minY - 1);
-    maxX = Math.min(width - 1, maxX + 1);
-    maxY = Math.min(height - 1, maxY + 1);
   }
 
   targetCtx.putImageData(targetImgData, 0, 0);

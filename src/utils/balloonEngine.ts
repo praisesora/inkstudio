@@ -200,16 +200,45 @@ export function renderSpeechBalloon(
     ctx.stroke();
   }
 
-  // 3. Fill Body over tail attachment
-  traceBalloonBodyPath(ctx, balloon);
-  ctx.fillStyle = fillColor;
-  ctx.fill();
+  // 3. Fill & Stroke Body over tail attachment
+  if (balloon.shape === 'thought') {
+    traceBalloonBodyPath(ctx, balloon);
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+    if (strokeWidth > 0) {
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = strokeWidth;
+      ctx.stroke();
+    }
+    // Fill interior ellipse to mask inner puff circle strokes and provide solid backing behind text
+    const cx = bounds.x + bounds.width * 0.5;
+    const cy = bounds.y + bounds.height * 0.5;
+    const rx = Math.max(10, bounds.width * 0.5);
+    const ry = Math.max(10, bounds.height * 0.5);
+    const puffRadius = Math.min(rx, ry) * 0.35;
+    ctx.beginPath();
+    ctx.ellipse(
+      cx,
+      cy,
+      Math.max(4, rx - puffRadius * 0.45),
+      Math.max(4, ry - puffRadius * 0.45),
+      0,
+      0,
+      Math.PI * 2
+    );
+    ctx.fillStyle = fillColor;
+    ctx.fill();
+  } else {
+    traceBalloonBodyPath(ctx, balloon);
+    ctx.fillStyle = fillColor;
+    ctx.fill();
 
-  // 4. Stroke Body
-  if (strokeWidth > 0) {
-    ctx.strokeStyle = strokeColor;
-    ctx.lineWidth = strokeWidth;
-    ctx.stroke();
+    // 4. Stroke Body
+    if (strokeWidth > 0) {
+      ctx.strokeStyle = strokeColor;
+      ctx.lineWidth = strokeWidth;
+      ctx.stroke();
+    }
   }
 
   // 5. If thought bubble, draw little thought trailing bubbles

@@ -4,6 +4,7 @@ import {
   BrushSettings,
   Point,
   CanvasDimensions,
+  CanvasSelection,
   HistoryActionType,
   HistoryItem,
   HistoryItemMeta,
@@ -14,8 +15,9 @@ import {
   VectorStroke,
   VectorKnot,
 } from '../types/editor';
-import { globalTileGrid } from '../utils/tileEngine';
+import { globalTileGrid, TILE_SIZE, TileFormat } from '../utils/tileEngine';
 import { globalUndoCache } from '../utils/undoCache';
+import { recoveryService } from '../services/recoveryService';
 import {
   applyVectorEraser,
   renderVectorLayer,
@@ -39,7 +41,8 @@ import {
 } from '../utils/canvasUtils';
 import { InputStabilizer } from '../engine/InputStabilizer';
 import { TaperEngine } from '../engine/TaperEngine';
-import { enforceColorMode, binarizeCanvasRect, binarizeImageDataBuffer } from '../utils/colorUtils';
+import { applyCspWatercolorEdge } from '../engine/CspBrushEngine';
+import { enforceColorMode, binarizeImageDataBuffer } from '../utils/colorUtils';
 import { drawPencilCubicBezierSegment, drawPencilDot, PencilGrade } from '../utils/pencilEngine';
 import {
   drawTexturedCubicBezierSegment,
@@ -52,10 +55,97 @@ import { applyLayerEffects } from '../utils/layerEffectsEngine';
 import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
 import { PerspectiveSnapSession } from '../utils/perspectiveSnapping';
 
+function isBackgroundLayerId(id: string): boolean {
+  return id === 'layer-bg' || id.startsWith('layer-bg');
+}
+
+function applySelectionCanvasClip(
+  ctx: CanvasRenderingContext2D,
+  sel: CanvasSelection | null | undefined
+): void {
+  if (!sel) return;
+  if (sel.type === 'rect') {
+    ctx.beginPath();
+    ctx.rect(sel.bounds.x, sel.bounds.y, sel.bounds.width, sel.bounds.height);
+    ctx.clip();
+  } else if (sel.type === 'lasso' && sel.polygon && sel.polygon.length >= 3) {
+    ctx.beginPath();
+    ctx.moveTo(sel.polygon[0].x, sel.polygon[0].y);
+    for (let i = 1; i < sel.polygon.length; i++) {
+      ctx.lineTo(sel.polygon[i].x, sel.polygon[i].y);
+    }
+    ctx.closePath();
+    ctx.clip();
+  } else if (sel.svgPath && typeof Path2D !== 'undefined') {
+    try {
+      ctx.clip(new Path2D(sel.svgPath), 'evenodd');
+    } catch {
+      // Fallback to bounds clip if svgPath fails
+      ctx.beginPath();
+      ctx.rect(sel.bounds.x, sel.bounds.y, sel.bounds.width, sel.bounds.height);
+      ctx.clip();
+    }
+  }
+}
+
+function applySelectionMaskToImageData(
+  beforeData: ImageData,
+  afterData: ImageData,
+  rx: number,
+  ry: number,
+  sel: CanvasSelection | null | undefined
+): void {
+  if (!sel || !sel.mask || !sel.maskWidth || !sel.maskHeight) return;
+  const mask = sel.mask;
+  const mw = sel.maskWidth;
+  const mh = sel.maskHeight;
+  const w = afterData.width;
+  const h = afterData.height;
+  const src = beforeData.data;
+  const dst = afterData.data;
+
+  for (let ly = 0; ly < h; ly++) {
+    const docY = ry + ly;
+    const inY = docY >= 0 && docY < mh;
+    const maskRow = docY * mw;
+    const imgRow = ly * w;
+    for (let lx = 0; lx < w; lx++) {
+      const docX = rx + lx;
+      const mAlpha = inY && docX >= 0 && docX < mw ? mask[maskRow + docX] : 0;
+      if (mAlpha === 255) continue;
+      const idx = (imgRow + lx) * 4;
+      if (mAlpha === 0) {
+        dst[idx] = src[idx];
+        dst[idx + 1] = src[idx + 1];
+        dst[idx + 2] = src[idx + 2];
+        dst[idx + 3] = src[idx + 3];
+      } else {
+        const wAfter = mAlpha / 255;
+        const wBefore = 1 - wAfter;
+        const aB = (src[idx + 3] / 255) * wBefore;
+        const aA = (dst[idx + 3] / 255) * wAfter;
+        const outA = aB + aA;
+        if (outA <= 0.0001) {
+          dst[idx] = 0;
+          dst[idx + 1] = 0;
+          dst[idx + 2] = 0;
+          dst[idx + 3] = 0;
+        } else {
+          dst[idx] = Math.round((src[idx] * aB + dst[idx] * aA) / outA);
+          dst[idx + 1] = Math.round((src[idx + 1] * aB + dst[idx + 1] * aA) / outA);
+          dst[idx + 2] = Math.round((src[idx + 2] * aB + dst[idx + 2] * aA) / outA);
+          dst[idx + 3] = Math.round(outA * 255);
+        }
+      }
+    }
+  }
+}
+
 interface UseCanvasDrawingProps {
   tool: ToolType;
   brushSettings: BrushSettings;
   dimensions: CanvasDimensions;
+  selection?: CanvasSelection | null;
   colorMode?: CanvasColorMode;
   disabled?: boolean;
   viewportRef: React.RefObject<HTMLDivElement | null>;
@@ -80,12 +170,14 @@ interface UseCanvasDrawingProps {
   onCollabCursorMove?: (x: number, y: number, isDrawing: boolean, tool: ToolType) => void;
   perspectiveRuler?: PerspectiveRuler | null;
   onActiveConstraintAxisChange?: (axis: ConstraintAxis | null) => void;
+  activeSessionId?: string | null;
 }
 
 export function useCanvasDrawing({
   tool,
   brushSettings,
   dimensions,
+  selection = null,
   colorMode = 'color',
   disabled = false,
   viewportRef,
@@ -93,6 +185,7 @@ export function useCanvasDrawing({
   zoom,
   rotation,
   activeLayerId,
+  activeSessionId,
   activeLayerLocked = false,
   activeLayerVisible = true,
   layerCanvasesRef,
@@ -164,6 +257,7 @@ export function useCanvasDrawing({
   const activeLayerLockedRef = useRef(activeLayerLocked);
   const activeLayerVisibleRef = useRef(activeLayerVisible);
   const dimensionsRef = useRef(dimensions);
+  const selectionRef = useRef(selection);
   const isMaskModeRef = useRef(isMaskMode);
   const onUpdateMaskThumbnailRef = useRef(onUpdateMaskThumbnail);
 
@@ -178,6 +272,7 @@ export function useCanvasDrawing({
   activeLayerLockedRef.current = activeLayerLocked;
   activeLayerVisibleRef.current = activeLayerVisible;
   dimensionsRef.current = dimensions;
+  selectionRef.current = selection;
   layersRef.current = layers;
   isMaskModeRef.current = isMaskMode;
   onUpdateMaskThumbnailRef.current = onUpdateMaskThumbnail;
@@ -256,42 +351,43 @@ export function useCanvasDrawing({
   const activeReservoirRef = useRef<PaintReservoir | null>(null);
   const layerPixelSamplerRef = useRef<LayerPixelSampler | null>(null);
   const strokeBackupCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const dedicatedBackupCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const docDraftCanvasRef = useRef<HTMLCanvasElement | null>(null);
-
-  const getDedicatedBackupCanvas = useCallback((width: number, height: number): HTMLCanvasElement => {
-    if (!dedicatedBackupCanvasRef.current) {
-      dedicatedBackupCanvasRef.current = document.createElement('canvas');
-    }
-    const c = dedicatedBackupCanvasRef.current;
-    if (c.width !== width || c.height !== height) {
-      c.width = width;
-      c.height = height;
-    }
-    return c;
-  }, []);
-
-  const getDocDraftCanvas = useCallback((width: number, height: number): HTMLCanvasElement => {
-    if (!docDraftCanvasRef.current) {
-      docDraftCanvasRef.current = document.createElement('canvas');
-    }
-    const c = docDraftCanvasRef.current;
-    if (c.width !== width || c.height !== height) {
-      c.width = width;
-      c.height = height;
-    }
-    return c;
-  }, []);
 
   const isWetColorStrokeRef = useRef<boolean>(false);
   const drewDirectlyOnLayerCanvasRef = useRef<boolean>(false);
+  const liveStrokeIsolationRef = useRef<boolean>(false);
+  const liveAccumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const liveOrigCanvasTilesRef = useRef<Map<number, ImageData>>(new Map());
+  const liveBeforeTileSnapshotRef = useRef<Map<string, { format: TileFormat; data: Uint8Array | null }>>(new Map());
+  const liveNeedsNotifyRef = useRef<boolean>(false);
+  const lastStrokeEndRef = useRef<{ x: number; y: number; pressure: number; width: number; layerId: string } | null>(null);
+  const isShiftLineStrokeRef = useRef<boolean>(false);
+  const historyQueueRef = useRef<Promise<void>>(Promise.resolve());
   const lastPointTimeRef = useRef<number>(0);
   const recentPointsTrailRef = useRef<{ x: number; y: number; t: number; pressure: number; width: number }[]>([]);
   const strokeTotalDistanceRef = useRef<number>(0);
 
   // Dirty bounding box for the active stroke
   const dirtyRectRef = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
+  const touchedTilesRef = useRef<Set<number>>(new Set());
   const lastProcessedPointRef = useRef<{ x: number; y: number } | null>(null);
+
+  const markTouchedTiles = useCallback((minX: number, minY: number, maxX: number, maxY: number) => {
+    const dims = dimensionsRef.current;
+    const clampedMinX = Math.max(0, Math.floor(minX));
+    const clampedMinY = Math.max(0, Math.floor(minY));
+    const clampedMaxX = Math.min(dims.width, Math.ceil(maxX));
+    const clampedMaxY = Math.min(dims.height, Math.ceil(maxY));
+    if (clampedMaxX <= clampedMinX || clampedMaxY <= clampedMinY) return;
+    const minTx = clampedMinX >> 8;
+    const minTy = clampedMinY >> 8;
+    const maxTx = (clampedMaxX - 1) >> 8;
+    const maxTy = (clampedMaxY - 1) >> 8;
+    for (let ty = minTy; ty <= maxTy; ty++) {
+      for (let tx = minTx; tx <= maxTx; tx++) {
+        touchedTilesRef.current.add(ty * 65536 + tx);
+      }
+    }
+  }, []);
 
   // Queue of incoming pointer coordinates to be batched and processed via requestAnimationFrame (rAF)
   const pendingPointsQueueRef = useRef<{ x: number; y: number; pressure: number; pointerType: string; tiltX?: number; tiltY?: number; twist?: number; timestamp?: number }[]>([]);
@@ -326,8 +422,14 @@ export function useCanvasDrawing({
       cachedViewportRectRef.current = null;
     };
     window.addEventListener('resize', handleResize);
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && viewportRef.current) {
+      ro = new ResizeObserver(handleResize);
+      ro.observe(viewportRef.current);
+    }
     return () => {
       window.removeEventListener('resize', handleResize);
+      ro?.disconnect();
       if (clearDraftRafRef.current !== null) {
         cancelAnimationFrame(clearDraftRafRef.current);
       }
@@ -335,7 +437,7 @@ export function useCanvasDrawing({
         cancelAnimationFrame(drawRafIdRef.current);
       }
     };
-  }, []);
+  }, [viewportRef]);
 
   const dispatchPointerStat = useCallback((x: number | null, y: number | null, pressure: number) => {
     pendingStatRef.current = {
@@ -395,11 +497,16 @@ export function useCanvasDrawing({
   const ensureInitialHistory = useCallback(
     (canvas: HTMLCanvasElement, _ctx: CanvasRenderingContext2D) => {
       if (historyRef.current.length === 0) {
-        const initialThumb = createCanvasThumbnail(canvas, activeLayerIdRef.current !== 'layer-bg');
         const now = Date.now();
-
-        const isMono = colorModeRef.current === 'monochrome';
-        globalTileGrid.ingestCanvas(activeLayerIdRef.current, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        const isMono = !isBackgroundLayerId(activeLayerIdRef.current) && colorModeRef.current === 'monochrome';
+        if (!globalTileGrid.isLayerIngested(activeLayerIdRef.current)) {
+          globalTileGrid.ingestCanvas(activeLayerIdRef.current, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        }
+        const isLarge = canvas.width * canvas.height > 1024 * 1024;
+        const targetH = Math.max(38, Math.round((canvas.height / Math.max(1, canvas.width)) * 60));
+        const initialThumb = isLarge
+          ? globalTileGrid.generateThumbnail(activeLayerIdRef.current, 60, targetH, { width: canvas.width, height: canvas.height })
+          : createCanvasThumbnail(canvas, !isBackgroundLayerId(activeLayerIdRef.current));
 
         const initialItem: HistoryItem = {
           id: `hist-init-${now}`,
@@ -433,7 +540,8 @@ export function useCanvasDrawing({
       explicitTileDeltas?: TileDelta[],
       vectorDelta?: { before: VectorStroke[]; after: VectorStroke[] },
       peerId?: string | number,
-      strokeId?: string
+      strokeId?: string,
+      isMaskEdit?: boolean
     ) => {
       const now = Date.now();
       const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
@@ -442,22 +550,32 @@ export function useCanvasDrawing({
 
       const effectiveDirtyRect = dirtyRect || (canvas ? { x: 0, y: 0, width: canvas.width, height: canvas.height } : undefined);
 
-      // Automatically convert ImageData change into minimal SparseTileGrid TileDeltas
-      if (!tileDeltas && effectiveDirtyRect && (beforeData || afterData)) {
+      // Automatically convert ImageData change into minimal SparseTileGrid TileDeltas (skip for mask edits)
+      if (!isMaskEdit && !tileDeltas && effectiveDirtyRect && (beforeData || afterData)) {
         const activeLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-        const isMono = colorModeRef.current === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
+        const isMono = !isBackgroundLayerId(targetLayerId) && (colorModeRef.current === 'monochrome' || activeLayer?.expressionColor === 'monochrome');
         const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+
+        if (beforeData) {
+          const bx = beforeData.width === effectiveDirtyRect.width && beforeData.height === effectiveDirtyRect.height ? effectiveDirtyRect.x : 0;
+          const by = beforeData.width === effectiveDirtyRect.width && beforeData.height === effectiveDirtyRect.height ? effectiveDirtyRect.y : 0;
+          globalTileGrid.writeImageData(targetLayerId, beforeData, bx, by, targetFormat);
+        }
 
         const beforeSnapshot = globalTileGrid.snapshotTilesInRect(targetLayerId, effectiveDirtyRect);
 
         if (afterData) {
-          globalTileGrid.writeImageData(targetLayerId, afterData, effectiveDirtyRect.x, effectiveDirtyRect.y, targetFormat);
+          const ax = afterData.width === effectiveDirtyRect.width && afterData.height === effectiveDirtyRect.height ? effectiveDirtyRect.x : 0;
+          const ay = afterData.width === effectiveDirtyRect.width && afterData.height === effectiveDirtyRect.height ? effectiveDirtyRect.y : 0;
+          globalTileGrid.writeImageData(targetLayerId, afterData, ax, ay, targetFormat);
         } else if (actionType === 'clear') {
           globalTileGrid.clearLayer(targetLayerId);
         }
 
         tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, targetLayerId, effectiveDirtyRect);
       }
+
+      const hasDeltas = Boolean(tileDeltas && tileDeltas.length > 0);
 
       const item: HistoryItem = {
         id: `hist-${now}-${Math.random().toString(36).substring(2, 7)}`,
@@ -468,14 +586,15 @@ export function useCanvasDrawing({
         thumbnailUrl: '',
         layerId: targetLayerId,
         // Memory optimization for 600 DPI manga: eliminate large 35MP ImageData arrays in RAM when tile deltas exist
-        beforeImageData: tileDeltas ? null : beforeData,
-        afterImageData: tileDeltas ? null : afterData,
-        imageData: tileDeltas ? undefined : (afterData || undefined),
+        beforeImageData: hasDeltas ? null : beforeData,
+        afterImageData: hasDeltas ? null : afterData,
+        imageData: hasDeltas ? undefined : (afterData || undefined),
         dirtyRect: effectiveDirtyRect,
-        tileDeltas,
+        tileDeltas: hasDeltas ? tileDeltas : undefined,
         vectorStrokesDelta: vectorDelta,
         peerId,
         strokeId,
+        isMaskEdit,
       };
 
       // Branching: truncate any future redo steps
@@ -489,6 +608,14 @@ export function useCanvasDrawing({
 
       historyRef.current = newHistory;
       historyIndexRef.current = newHistory.length - 1;
+
+      if (canvas) {
+        const isLarge = canvas.width * canvas.height > 1024 * 1024 && globalTileGrid.isLayerIngested(targetLayerId);
+        const targetH = Math.max(38, Math.round((canvas.height / Math.max(1, canvas.width)) * 60));
+        item.thumbnailUrl = isLarge
+          ? globalTileGrid.generateThumbnail(targetLayerId, 60, targetH, { width: canvas.width, height: canvas.height })
+          : createCanvasThumbnail(canvas, !isBackgroundLayerId(targetLayerId));
+      }
       syncHistoryState();
 
       // Seamless LRU disk cache offloading via Tauri v2 Rust IPC
@@ -498,13 +625,11 @@ export function useCanvasDrawing({
         });
       }
 
-      // Defer thumbnail generation so stroke release is 100% instant
-      requestAnimationFrame(() => {
-        if (canvas) {
-          item.thumbnailUrl = createCanvasThumbnail(canvas, targetLayerId !== 'layer-bg');
-          syncHistoryState();
-        }
-      });
+      // Non-blocking WAL journaling for crash recovery
+      if ((tileDeltas && tileDeltas.length > 0) || vectorDelta) {
+        const sessionKey = activeSessionId || recoveryService.getCurrentSessionId() || 'default-session';
+        recoveryService.logStrokeDelta(sessionKey, tileDeltas, vectorDelta, targetLayerId);
+      }
     },
     [getActiveCanvas, layerCanvasesRef, syncHistoryState]
   );
@@ -535,8 +660,19 @@ export function useCanvasDrawing({
   const enqueueHistoryTask = useCallback((task: () => void) => {
     pendingHistoryTasksRef.current.push(task);
     if (idleCallbackIdRef.current === null) {
+      const scheduleRun = () => {
+        if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+          idleCallbackIdRef.current = (window as any).requestIdleCallback(runTasks, { timeout: 250 });
+        } else {
+          idleCallbackIdRef.current = setTimeout(runTasks, 32);
+        }
+      };
       const runTasks = () => {
         idleCallbackIdRef.current = null;
+        if (isDrawingRef.current) {
+          scheduleRun();
+          return;
+        }
         const tasks = pendingHistoryTasksRef.current.splice(0);
         for (const t of tasks) {
           try {
@@ -546,13 +682,181 @@ export function useCanvasDrawing({
           }
         }
       };
-      if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
-        idleCallbackIdRef.current = (window as any).requestIdleCallback(runTasks, { timeout: 120 });
-      } else {
-        idleCallbackIdRef.current = setTimeout(runTasks, 0);
-      }
+      scheduleRun();
     }
   }, []);
+
+  // Helper to restore all live-backed-up tiles back onto a layer canvas
+  const restoreLiveOrigTilesToCanvas = useCallback((canvas: HTMLCanvasElement) => {
+    if (liveOrigCanvasTilesRef.current.size === 0) return;
+    const cCtx = get2DContext(canvas);
+    if (!cCtx) return;
+    for (const [numKey, tileImg] of liveOrigCanvasTilesRef.current) {
+      const ty = Math.floor(numKey / 65536);
+      const tx = numKey % 65536;
+      cCtx.putImageData(tileImg, tx * TILE_SIZE, ty * TILE_SIZE);
+    }
+  }, []);
+
+  // Helper to restore a specific sub-rectangle on `canvasCtx` from `liveOrigCanvasTilesRef`
+  const restoreLiveRectFromOrigTiles = useCallback(
+    (canvasCtx: CanvasRenderingContext2D, rx: number, ry: number, rw: number, rh: number) => {
+      if (rw <= 0 || rh <= 0 || liveOrigCanvasTilesRef.current.size === 0) return;
+      const minTx = rx >> 8;
+      const minTy = ry >> 8;
+      const maxTx = (rx + rw - 1) >> 8;
+      const maxTy = (ry + rh - 1) >> 8;
+      for (let ty = minTy; ty <= maxTy; ty++) {
+        for (let tx = minTx; tx <= maxTx; tx++) {
+          const tileImg = liveOrigCanvasTilesRef.current.get(ty * 65536 + tx);
+          if (!tileImg) continue;
+          const tileOriginX = tx * TILE_SIZE;
+          const tileOriginY = ty * TILE_SIZE;
+          const ix0 = Math.max(rx, tileOriginX);
+          const iy0 = Math.max(ry, tileOriginY);
+          const ix1 = Math.min(rx + rw, tileOriginX + tileImg.width);
+          const iy1 = Math.min(ry + rh, tileOriginY + tileImg.height);
+          if (ix1 > ix0 && iy1 > iy0) {
+            canvasCtx.putImageData(
+              tileImg,
+              tileOriginX,
+              tileOriginY,
+              ix0 - tileOriginX,
+              iy0 - tileOriginY,
+              ix1 - ix0,
+              iy1 - iy0
+            );
+          }
+        }
+      }
+    },
+    []
+  );
+
+  // Lazily snapshot pre-stroke tiles in both SparseTileGrid and canvas ImageData before live mutation
+  const ensureLiveTileSnapshots = useCallback(
+    (
+      canvas: HTMLCanvasElement,
+      canvasCtx: CanvasRenderingContext2D,
+      layerId: string,
+      minX: number,
+      minY: number,
+      maxX: number,
+      maxY: number
+    ) => {
+      const cMinX = Math.max(0, Math.floor(minX));
+      const cMinY = Math.max(0, Math.floor(minY));
+      const cMaxX = Math.min(canvas.width, Math.ceil(maxX));
+      const cMaxY = Math.min(canvas.height, Math.ceil(maxY));
+      if (cMaxX <= cMinX || cMaxY <= cMinY) return;
+
+      const minTx = cMinX >> 8;
+      const minTy = cMinY >> 8;
+      const maxTx = (cMaxX - 1) >> 8;
+      const maxTy = (cMaxY - 1) >> 8;
+
+      for (let ty = minTy; ty <= maxTy; ty++) {
+        for (let tx = minTx; tx <= maxTx; tx++) {
+          const numKey = ty * 65536 + tx;
+          if (!liveOrigCanvasTilesRef.current.has(numKey)) {
+            const ox = tx * TILE_SIZE;
+            const oy = ty * TILE_SIZE;
+            const tw = Math.min(TILE_SIZE, canvas.width - ox);
+            const th = Math.min(TILE_SIZE, canvas.height - oy);
+            if (tw <= 0 || th <= 0) continue;
+            const subSnap = globalTileGrid.snapshotTilesInRect(layerId, {
+              x: ox,
+              y: oy,
+              width: tw,
+              height: th,
+            });
+            for (const [k, v] of subSnap) {
+              if (!liveBeforeTileSnapshotRef.current.has(k)) {
+                liveBeforeTileSnapshotRef.current.set(k, v);
+              }
+            }
+            liveOrigCanvasTilesRef.current.set(numKey, canvasCtx.getImageData(ox, oy, tw, th));
+          }
+        }
+      }
+    },
+    []
+  );
+
+  // Sync a small mutated region of `canvas` into `globalTileGrid` during Live WYSIWYG preview
+  const syncLiveRegionToTiles = useCallback(
+    (
+      canvas: HTMLCanvasElement,
+      canvasCtx: CanvasRenderingContext2D,
+      layerId: string,
+      minX: number,
+      minY: number,
+      maxX: number,
+      maxY: number,
+      isMonochrome: boolean,
+      activeLayer: LayerItem | undefined,
+      bs: BrushSettings,
+      isEraser: boolean,
+      isBgEraser: boolean
+    ) => {
+      const rx = Math.max(0, Math.floor(minX));
+      const ry = Math.max(0, Math.floor(minY));
+      const rw = Math.min(canvas.width, Math.ceil(maxX)) - rx;
+      const rh = Math.min(canvas.height, Math.ceil(maxY)) - ry;
+      if (rw <= 0 || rh <= 0) return;
+
+      ensureLiveTileSnapshots(canvas, canvasCtx, layerId, rx, ry, rx + rw, ry + rh);
+
+      if (liveStrokeIsolationRef.current && liveAccumCanvasRef.current) {
+        restoreLiveRectFromOrigTiles(canvasCtx, rx, ry, rw, rh);
+        canvasCtx.save();
+        canvasCtx.beginPath();
+        canvasCtx.rect(rx, ry, rw, rh);
+        canvasCtx.clip();
+        applySelectionCanvasClip(canvasCtx, selectionRef.current);
+        canvasCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
+        if ((isEraser && !isBgEraser) || bs.isTransparentInk) {
+          canvasCtx.globalCompositeOperation = 'destination-out';
+        } else if (activeLayer?.alphaLocked) {
+          canvasCtx.globalCompositeOperation = 'source-atop';
+        } else {
+          canvasCtx.globalCompositeOperation = 'source-over';
+        }
+        canvasCtx.drawImage(liveAccumCanvasRef.current, rx, ry, rw, rh, rx, ry, rw, rh);
+        canvasCtx.restore();
+      }
+
+      const segData = canvasCtx.getImageData(rx, ry, rw, rh);
+      if (selectionRef.current?.mask) {
+        // Reconstruct before pixels for exact 8-bit selection mask blending
+        restoreLiveRectFromOrigTiles(canvasCtx, rx, ry, rw, rh);
+        const beforeSub = canvasCtx.getImageData(rx, ry, rw, rh);
+        applySelectionMaskToImageData(beforeSub, segData, rx, ry, selectionRef.current);
+        canvasCtx.putImageData(segData, rx, ry);
+      }
+
+      if (isMonochrome) {
+        binarizeImageDataBuffer(
+          segData,
+          activeLayer?.monoThreshold ?? 128,
+          activeLayer?.monoExpressBlack ?? true,
+          activeLayer?.monoExpressWhite ?? true
+        );
+        canvasCtx.putImageData(segData, rx, ry);
+      }
+
+      globalTileGrid.writeImageData(
+        layerId,
+        segData,
+        rx,
+        ry,
+        isMonochrome ? 'monochrome-1bit' : 'color-32bit',
+        true
+      );
+      liveNeedsNotifyRef.current = true;
+    },
+    [ensureLiveTileSnapshots, restoreLiveRectFromOrigTiles]
+  );
 
   // Abort any in-progress stroke session immediately
   const abortActiveStroke = useCallback(() => {
@@ -572,19 +876,31 @@ export function useCanvasDrawing({
         dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
       }
     }
-    if (docDraftCanvasRef.current) {
-      const docCtx = get2DContext(docDraftCanvasRef.current);
-      docCtx?.clearRect(0, 0, docDraftCanvasRef.current.width, docDraftCanvasRef.current.height);
-    }
     clearPredictedCanvas();
-    if (drewDirectlyOnLayerCanvasRef.current && strokeBackupCanvasRef.current) {
+    if (drewDirectlyOnLayerCanvasRef.current) {
       const currentLayerId = activeLayerIdRef.current;
       const canvas = layerCanvasesRef.current.get(currentLayerId) || getActiveCanvas();
-      if (canvas && strokeBackupCanvasRef.current) {
+      if (canvas) {
+        restoreLiveOrigTilesToCanvas(canvas);
         const cCtx = get2DContext(canvas);
         if (cCtx) {
-          cCtx.clearRect(0, 0, canvas.width, canvas.height);
-          cCtx.drawImage(strokeBackupCanvasRef.current, 0, 0);
+          const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+          const isMono =
+            !isBackgroundLayerId(currentLayerId) &&
+            (colorModeRef.current === 'monochrome' || activeLayer?.expressionColor === 'monochrome');
+          for (const [numKey, tileImg] of liveOrigCanvasTilesRef.current) {
+            const ty = Math.floor(numKey / 65536);
+            const tx = numKey % 65536;
+            globalTileGrid.writeImageData(
+              currentLayerId,
+              tileImg,
+              tx * TILE_SIZE,
+              ty * TILE_SIZE,
+              isMono ? 'monochrome-1bit' : 'color-32bit',
+              true
+            );
+          }
+          globalTileGrid.notifyChange(true);
         }
       }
     }
@@ -595,41 +911,57 @@ export function useCanvasDrawing({
     stabilizedPointRef.current = null;
     lastProcessedPointRef.current = null;
     dirtyRectRef.current = null;
+    touchedTilesRef.current.clear();
     pendingPointsQueueRef.current = [];
     drewDirectlyOnLayerCanvasRef.current = false;
+    liveStrokeIsolationRef.current = false;
+    liveOrigCanvasTilesRef.current.clear();
+    liveBeforeTileSnapshotRef.current.clear();
+    liveNeedsNotifyRef.current = false;
+    isShiftLineStrokeRef.current = false;
     isToneStrokeRef.current = false;
     strokeBackupCanvasRef.current = null;
     layerPixelSamplerRef.current = null;
     activeReservoirRef.current = null;
     snapSessionRef.current.endStroke();
     emitConstraintAxisChange(null);
-  }, [clearPredictedCanvas, effectiveDraftCanvasRef, emitConstraintAxisChange, getActiveCanvas, layerCanvasesRef]);
+  }, [clearPredictedCanvas, effectiveDraftCanvasRef, emitConstraintAxisChange, getActiveCanvas, layerCanvasesRef, restoreLiveOrigTilesToCanvas]);
 
-  // Jump directly to any past or future history step
+  // Jump directly to any past or future history step (serialized via historyQueueRef to prevent async race on rapid Ctrl+Z)
   const jumpToHistoryIndex = useCallback(
-    async (targetIndex: number) => {
+    (targetIndex: number): Promise<void> => {
       flushPendingHistoryTasks();
       if (isDrawingRef.current) {
         abortActiveStroke();
       }
-      if (targetIndex < 0 || targetIndex >= historyRef.current.length) return;
-      const currentIndex = historyIndexRef.current;
-      if (targetIndex === currentIndex) return;
+      const nextOp = historyQueueRef.current.then(async () => {
+        if (targetIndex < 0 || targetIndex >= historyRef.current.length) return;
+        const currentIndex = historyIndexRef.current;
+        if (targetIndex === currentIndex) return;
 
-      if (targetIndex < currentIndex) {
-        // Rolling back (undoing) in reverse chronological order
-        for (let i = currentIndex; i > targetIndex; i--) {
-          const item = historyRef.current[i];
-          if (item) {
-            const targetLayerId = item.layerId || activeLayerId;
-            const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
-            const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
-            const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-            const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
-            const deltas = await globalUndoCache.resolveDeltas(item);
+        if (targetIndex < currentIndex) {
+          // Rolling back (undoing) in reverse chronological order
+          for (let i = currentIndex; i > targetIndex; i--) {
+            const item = historyRef.current[i];
+            if (item) {
+              const targetLayerId = item.layerId || activeLayerId;
+              const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
+              const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
+              const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
+              const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
+              const deltas = await globalUndoCache.resolveDeltas(item);
 
-            // Restore vector strokes if vector delta exists
-            if (item.vectorStrokesDelta && targetLayer && canvas) {
+            // Restore mask canvas if mask edit
+            if (item.isMaskEdit && targetLayer?.maskCanvas) {
+              const mCtx = get2DContext(targetLayer.maskCanvas);
+              if (mCtx && item.beforeImageData) {
+                const mx = item.dirtyRect && item.beforeImageData.width === item.dirtyRect.width ? item.dirtyRect.x : 0;
+                const my = item.dirtyRect && item.beforeImageData.height === item.dirtyRect.height ? item.dirtyRect.y : 0;
+                mCtx.putImageData(item.beforeImageData, mx, my);
+                targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
+                onUpdateMaskThumbnailRef.current?.(targetLayerId);
+              }
+            } else if (item.vectorStrokesDelta && targetLayer && canvas) {
               targetLayer.vectorStrokes = item.vectorStrokesDelta.before;
               const cCtx = get2DContext(canvas);
               if (cCtx) {
@@ -667,7 +999,7 @@ export function useCanvasDrawing({
                 } else if (item.beforeImageData) {
                   sCtx.putImageData(item.beforeImageData, 0, 0);
                 } else if (item.type === 'initial') {
-                  if (targetLayerId === 'layer-bg') {
+                  if (isBackgroundLayerId(targetLayerId)) {
                     sCtx.fillStyle = '#ffffff';
                     sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                   } else {
@@ -690,18 +1022,20 @@ export function useCanvasDrawing({
               if (canvas) {
                 const cCtx = get2DContext(canvas);
                 if (cCtx) {
-                  if (item.dirtyRect && item.beforeImageData) {
+                  if (item.dirtyRect && item.beforeImageData && item.beforeImageData.width === item.dirtyRect.width && item.beforeImageData.height === item.dirtyRect.height) {
                     cCtx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
                   } else if (item.beforeImageData) {
                     cCtx.putImageData(item.beforeImageData, 0, 0);
                   } else if (item.type === 'initial') {
-                    if (targetLayerId === 'layer-bg') {
+                    if (isBackgroundLayerId(targetLayerId)) {
                       cCtx.fillStyle = '#ffffff';
                       cCtx.fillRect(0, 0, canvas.width, canvas.height);
                     } else {
                       cCtx.clearRect(0, 0, canvas.width, canvas.height);
                     }
                   }
+                  const isMono = !isBackgroundLayerId(targetLayerId) && (targetLayer?.expressionColor === 'monochrome' || colorModeRef.current === 'monochrome');
+                  globalTileGrid.ingestCanvas(targetLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
                 }
               }
 
@@ -709,12 +1043,12 @@ export function useCanvasDrawing({
               if (sourceCanvas) {
                 const sCtx = get2DContext(sourceCanvas);
                 if (sCtx) {
-                  if (item.dirtyRect && item.beforeImageData) {
+                  if (item.dirtyRect && item.beforeImageData && item.beforeImageData.width === item.dirtyRect.width && item.beforeImageData.height === item.dirtyRect.height) {
                     sCtx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
                   } else if (item.beforeImageData) {
                     sCtx.putImageData(item.beforeImageData, 0, 0);
                   } else if (item.type === 'initial') {
-                    if (targetLayerId === 'layer-bg') {
+                    if (isBackgroundLayerId(targetLayerId)) {
                       sCtx.fillStyle = '#ffffff';
                       sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                     } else {
@@ -737,14 +1071,23 @@ export function useCanvasDrawing({
           const dataToApply = item?.afterImageData || item?.imageData;
           if (item) {
             const targetLayerId = item.layerId || activeLayerId;
-            const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
+            const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
             const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
             const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
             const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
             const deltas = await globalUndoCache.resolveDeltas(item);
 
-            // Restore vector strokes if vector delta exists
-            if (item.vectorStrokesDelta && targetLayer && canvas) {
+            // Restore mask canvas if mask edit
+            if (item.isMaskEdit && targetLayer?.maskCanvas) {
+              const mCtx = get2DContext(targetLayer.maskCanvas);
+              if (mCtx && dataToApply) {
+                const mx = item.dirtyRect && dataToApply.width === item.dirtyRect.width ? item.dirtyRect.x : 0;
+                const my = item.dirtyRect && dataToApply.height === item.dirtyRect.height ? item.dirtyRect.y : 0;
+                mCtx.putImageData(dataToApply, mx, my);
+                targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
+                onUpdateMaskThumbnailRef.current?.(targetLayerId);
+              }
+            } else if (item.vectorStrokesDelta && targetLayer && canvas) {
               targetLayer.vectorStrokes = item.vectorStrokesDelta.after;
               const cCtx = get2DContext(canvas);
               if (cCtx) {
@@ -782,7 +1125,7 @@ export function useCanvasDrawing({
                 } else if (dataToApply) {
                   sCtx.putImageData(dataToApply, 0, 0);
                 } else if (item.type === 'initial') {
-                  if (targetLayerId === 'layer-bg') {
+                  if (isBackgroundLayerId(targetLayerId)) {
                     sCtx.fillStyle = '#ffffff';
                     sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                   } else {
@@ -805,18 +1148,20 @@ export function useCanvasDrawing({
               if (canvas) {
                 const cCtx = get2DContext(canvas);
                 if (cCtx) {
-                  if (item.dirtyRect && dataToApply) {
+                  if (item.dirtyRect && dataToApply && dataToApply.width === item.dirtyRect.width && dataToApply.height === item.dirtyRect.height) {
                     cCtx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
                   } else if (dataToApply) {
                     cCtx.putImageData(dataToApply, 0, 0);
                   } else if (item.type === 'initial') {
-                    if (targetLayerId === 'layer-bg') {
+                    if (isBackgroundLayerId(targetLayerId)) {
                       cCtx.fillStyle = '#ffffff';
                       cCtx.fillRect(0, 0, canvas.width, canvas.height);
                     } else {
                       cCtx.clearRect(0, 0, canvas.width, canvas.height);
                     }
                   }
+                  const isMono = !isBackgroundLayerId(targetLayerId) && (targetLayer?.expressionColor === 'monochrome' || colorModeRef.current === 'monochrome');
+                  globalTileGrid.ingestCanvas(targetLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
                 }
               }
 
@@ -824,12 +1169,12 @@ export function useCanvasDrawing({
               if (sourceCanvas) {
                 const sCtx = get2DContext(sourceCanvas);
                 if (sCtx) {
-                  if (item.dirtyRect && dataToApply) {
+                  if (item.dirtyRect && dataToApply && dataToApply.width === item.dirtyRect.width && dataToApply.height === item.dirtyRect.height) {
                     sCtx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
                   } else if (dataToApply) {
                     sCtx.putImageData(dataToApply, 0, 0);
                   } else if (item.type === 'initial') {
-                    if (targetLayerId === 'layer-bg') {
+                    if (isBackgroundLayerId(targetLayerId)) {
                       sCtx.fillStyle = '#ffffff';
                       sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
                     } else {
@@ -847,11 +1192,16 @@ export function useCanvasDrawing({
         }
       }
 
-      historyIndexRef.current = targetIndex;
-      syncHistoryState();
-      globalTileGrid.notifyChange(true);
+        historyIndexRef.current = targetIndex;
+        syncHistoryState();
+        globalTileGrid.notifyChange(true);
+      });
+      historyQueueRef.current = nextOp.catch((err) => {
+        console.warn('[History] Error during jumpToHistoryIndex:', err);
+      });
+      return historyQueueRef.current;
     },
-    [abortActiveStroke, activeLayerId, flushPendingHistoryTasks, getActiveCanvas, layerCanvasesRef, layerSourceCanvasesRef, onUpdateLayerThumbnail, syncHistoryState]
+    [abortActiveStroke, activeLayerId, flushPendingHistoryTasks, layerCanvasesRef, layerSourceCanvasesRef, onUpdateLayerThumbnail, syncHistoryState]
   );
 
   // Undo action
@@ -964,7 +1314,8 @@ export function useCanvasDrawing({
       vectorDelta = { before: beforeStrokes, after: [] };
     }
 
-    if (activeLayerId === 'layer-bg') {
+    const isBg = isBackgroundLayerId(activeLayerId);
+    if (isBg) {
       ctx.fillStyle = '#ffffff';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
     } else {
@@ -975,7 +1326,7 @@ export function useCanvasDrawing({
     if (sourceCanvas) {
       const sCtx = get2DContext(sourceCanvas);
       if (sCtx) {
-        if (activeLayerId === 'layer-bg') {
+        if (isBg) {
           sCtx.fillStyle = '#ffffff';
           sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
         } else {
@@ -1063,23 +1414,146 @@ export function useCanvasDrawing({
     [getViewportRect]
   );
 
-  // Render a single smooth segment onto the draft overlay context using Catmull-Rom cubic splines
+  const buildLiveTexturedOptions = useCallback(
+    (
+      bs: BrushSettings,
+      strokeFlow: number,
+      strokeSpacing: number,
+      strokeHardness: number,
+      isMonochrome: boolean,
+      canvas: HTMLCanvasElement | null,
+      activeLayer: LayerItem | undefined,
+      isEraser: boolean,
+      isBgEraser: boolean,
+      isolatedPass: boolean = false
+    ): TexturedBrushOptions => ({
+      size: bs.size,
+      minSizeFactor: bs.minSizeFactor,
+      opacity: isolatedPass ? 1.0 : bs.opacity,
+      flow: strokeFlow,
+      adjustDensityByGap: bs.adjustDensityByGap,
+      blendTipsMode: bs.blendTipsMode,
+      spacing: strokeSpacing,
+      thickness: bs.thickness,
+      thicknessVertical: bs.thicknessVertical,
+      flipH: bs.flipH,
+      flipV: bs.flipV,
+      isColorTip: bs.isColorTip,
+      angle: bs.customTipAngle,
+      angleDynamics: bs.customTipAngleDynamics,
+      rotationRandomScale: bs.customTipRotationRandomScale,
+      hardness: strokeHardness,
+      antiAlias: isMonochrome ? 0 : bs.antiAlias,
+      pressureCurve: bs.pressureCurve,
+      velocityCurve: bs.velocityCurve,
+      usePressure: bs.usePressure,
+      useVelocity: bs.useVelocity,
+      useTilt: Boolean(bs.useTilt),
+      sizeSensor: bs.sizeSensor,
+      opacitySensor: bs.opacitySensor,
+      densitySensor: bs.densitySensor,
+      subTips: bs.subTips,
+      subTipOrder: bs.subTipOrder,
+      subTipImages: bs.subTipImages,
+      spray: bs.spray,
+      taper: bs.taper,
+      colorMixing: bs.colorMixing,
+      perceptualMixing: bs.perceptualMixing,
+      amountOfPaint: bs.amountOfPaint,
+      densityOfPaint: bs.densityOfPaint,
+      colorStretch: bs.colorStretch,
+      mixingMode: bs.mixingMode,
+      wetEdge: 0,
+      grain: bs.grain ?? bs.textureDensity,
+      paperTextureMode: bs.paperTextureMode,
+      paperTextureBrightness: bs.paperTextureBrightness,
+      paperTextureContrast: bs.paperTextureContrast,
+      paperTextureInverted: bs.paperTextureInverted,
+      paperTextureImage: bs.paperTextureImage,
+      paperTextureScale: bs.paperTextureScale,
+      paperTextureRotate: bs.paperTextureRotate,
+      dualBrush: bs.dualBrush,
+      dualTipImage: bs.dualTipImage,
+      dualBrushCompositeMode: bs.dualBrushCompositeMode,
+      useGpu: bs.useGpu,
+      underlyingCanvas: canvas || undefined,
+      sampler: layerPixelSamplerRef.current || undefined,
+      reservoir: activeReservoirRef.current || undefined,
+      isEraser: isolatedPass ? false : isEraser && !isBgEraser,
+      isBgEraser: isolatedPass ? false : isBgEraser,
+      alphaLocked: isolatedPass ? false : Boolean(activeLayer?.alphaLocked),
+      isTransparentInk: isolatedPass ? false : Boolean(bs.isTransparentInk),
+      currentStrokeDist: strokeTotalDistanceRef.current,
+      dynamics: bs.dynamics,
+      secondaryColor: bs.secondaryColor,
+    }),
+    []
+  );
+
+  const buildLiveRadialOptions = useCallback(
+    (
+      bs: BrushSettings,
+      isMonochrome: boolean,
+      canvas: HTMLCanvasElement | null,
+      activeLayer: LayerItem | undefined,
+      isolatedPass: boolean = false
+    ): RadialMixingOptions => ({
+      colorMixing: bs.colorMixing,
+      perceptualMixing: bs.perceptualMixing,
+      amountOfPaint: bs.amountOfPaint,
+      densityOfPaint: bs.densityOfPaint,
+      colorStretch: bs.colorStretch,
+      mixingMode: bs.mixingMode,
+      underlyingCanvas: canvas || undefined,
+      sampler: layerPixelSamplerRef.current || undefined,
+      reservoir: activeReservoirRef.current || undefined,
+      alphaLocked: isolatedPass ? false : Boolean(activeLayer?.alphaLocked),
+      isTransparentInk: isolatedPass ? false : Boolean(bs.isTransparentInk),
+      dynamics: bs.dynamics,
+      secondaryColor: bs.secondaryColor,
+      useGpu: bs.useGpu,
+      dualBrush: bs.dualBrush,
+      dualTipImage: bs.dualTipImage,
+      dualBrushCompositeMode: bs.dualBrushCompositeMode,
+      useTilt: Boolean(bs.useTilt),
+      thicknessVertical: bs.thicknessVertical,
+      flipH: bs.flipH,
+      flipV: bs.flipV,
+      antiAlias: isMonochrome ? 0 : bs.antiAlias,
+      angleDynamics: bs.customTipAngleDynamics,
+      rotationRandomScale: bs.customTipRotationRandomScale,
+      adjustDensityByGap: bs.adjustDensityByGap,
+      blendTipsMode: bs.blendTipsMode,
+      grain: bs.grain ?? bs.textureDensity,
+      paperTextureMode: bs.paperTextureMode,
+      paperTextureBrightness: bs.paperTextureBrightness,
+      paperTextureContrast: bs.paperTextureContrast,
+      paperTextureInverted: bs.paperTextureInverted,
+      paperTextureImage: bs.paperTextureImage,
+      paperTextureScale: bs.paperTextureScale,
+      paperTextureRotate: bs.paperTextureRotate,
+      sizeSensor: bs.sizeSensor,
+      opacitySensor: bs.opacitySensor,
+      densitySensor: bs.densitySensor,
+      taper: bs.taper,
+    }),
+    []
+  );
+
+  // Render a single smooth segment onto either Live Direct Layer/Tile preview or the viewport draft overlay
   const renderDraftSegment = useCallback((draftCtx: CanvasRenderingContext2D, point: Point) => {
     const pts = strokePointsRef.current;
 
     const isEraser = toolRef.current === 'eraser';
-    const isBgEraser = isEraser && activeLayerIdRef.current === 'layer-bg';
+    const isBgEraser = isEraser && isBackgroundLayerId(activeLayerIdRef.current);
     const bs = brushSettingsRef.current;
     const mode = colorModeRef.current;
-    const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
+    const isPencil = !isEraser && !bs.customTipImage && (bs.preset?.startsWith('pencil') ?? false);
     const canvas = getActiveCanvas();
     const currentLayerId = activeLayerIdRef.current;
     const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
-    const isToneLayer = Boolean(activeLayer?.toneEnabled);
     const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
     const isMonochrome = mode === 'monochrome' || isMonoLayer;
-    const isTone = isToneStrokeRef.current;
-    const sourceCanvas = isTone ? layerSourceCanvasesRef?.current?.get(currentLayerId) : null;
 
     let strokeColor: string;
     if (isMaskModeRef.current) {
@@ -1099,70 +1573,45 @@ export function useCanvasDrawing({
       strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
     }
     const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
-    const strokeFlow = bs.flow ?? 1.0;
-    const strokeSpacing = bs.spacing ?? 0.08;
+    const baseFlow = isMonochrome ? 1.0 : (bs.flow ?? 1.0);
+    const baseSpacing = bs.spacing ?? 0.08;
+    const curZoom = Math.max(0.05, zoomRef.current || 1.0);
+    const avgW = Math.max(1, ((pts[pts.length - 1]?.width || bs.size || 10) + (point.width || bs.size || 10)) * 0.5);
+    const strokeSpacing = curZoom < 0.75
+      ? Math.max(baseSpacing, Math.min(0.14, (0.45 / curZoom) / avgW))
+      : baseSpacing;
+    const strokeFlow = strokeSpacing > baseSpacing && baseFlow < 0.995
+      ? 1.0 - Math.pow(1.0 - baseFlow, strokeSpacing / Math.max(0.01, baseSpacing))
+      : baseFlow;
 
-    const renderSegmentToContext = (ctx: CanvasRenderingContext2D, sStart: Point, c1Pt: Point, c2Pt: Point, sEnd: Point): number => {
+    const renderSegmentToContext = (
+      ctx: CanvasRenderingContext2D,
+      sStart: Point,
+      c1Pt: Point,
+      c2Pt: Point,
+      sEnd: Point,
+      isolatedPass: boolean = false
+    ): number => {
       if (bs.customTipImage) {
-        const tipOptions: TexturedBrushOptions = {
-          size: bs.size,
-          minSizeFactor: bs.minSizeFactor,
-          opacity: bs.opacity,
-          flow: strokeFlow,
-          spacing: strokeSpacing,
-          thickness: bs.thickness,
-          thicknessVertical: bs.thicknessVertical,
-          angle: bs.customTipAngle,
-          angleDynamics: bs.customTipAngleDynamics,
-          rotationRandomScale: bs.customTipRotationRandomScale,
-          hardness: strokeHardness,
-          antiAlias: isMonochrome ? 0 : bs.antiAlias,
-          pressureCurve: bs.pressureCurve,
-          velocityCurve: bs.velocityCurve,
-          usePressure: bs.usePressure,
-          useVelocity: bs.useVelocity,
-          subTips: bs.subTips,
-          subTipOrder: bs.subTipOrder,
-          subTipImages: bs.subTipImages,
-          spray: bs.spray,
-          taper: bs.taper,
-          colorMixing: bs.colorMixing,
-          perceptualMixing: bs.perceptualMixing,
-          amountOfPaint: bs.amountOfPaint,
-          densityOfPaint: bs.densityOfPaint,
-          colorStretch: bs.colorStretch,
-          mixingMode: bs.mixingMode,
-          wetEdge: bs.wetEdge,
-          wetEdgeRadius: bs.wetEdgeRadius,
-          wetEdgeAlphaPower: bs.wetEdgeAlphaPower,
-          wetEdgeValuePower: bs.wetEdgeValuePower,
-          grain: bs.grain ?? bs.textureDensity,
-          paperTextureImage: bs.paperTextureImage,
-          paperTextureScale: bs.paperTextureScale,
-          paperTextureRotate: bs.paperTextureRotate,
-          dualBrush: bs.dualBrush,
-          dualTipImage: bs.dualTipImage,
-          dualBrushCompositeMode: bs.dualBrushCompositeMode,
-          useGpu: bs.useGpu,
-          underlyingCanvas: canvas || undefined,
-          sampler: layerPixelSamplerRef.current || undefined,
-          reservoir: activeReservoirRef.current || undefined,
-          isEraser: isEraser && !isBgEraser,
+        const tipOptions = buildLiveTexturedOptions(
+          bs,
+          strokeFlow,
+          strokeSpacing,
+          strokeHardness,
+          isMonochrome,
+          canvas,
+          activeLayer,
+          isEraser,
           isBgEraser,
-          alphaLocked: Boolean(activeLayer?.alphaLocked),
-          isTransparentInk: Boolean(bs.isTransparentInk),
-          currentStrokeDist: strokeTotalDistanceRef.current,
-          dynamics: bs.dynamics,
-          secondaryColor: bs.secondaryColor,
-        };
-
+          isolatedPass
+        );
         return drawTexturedCubicBezierSegment(
           ctx,
           sStart,
           c1Pt,
           c2Pt,
           sEnd,
-          strokeColor,
+          isolatedPass && isEraser && !isBgEraser ? '#000000' : strokeColor,
           bs.customTipImage,
           tipOptions,
           stampRemainderDistRef.current
@@ -1177,41 +1626,30 @@ export function useCanvasDrawing({
           sEnd,
           strokeColor,
           grade,
-          bs.flow ?? 0.74,
+          isMonochrome ? 1.0 : (bs.flow ?? 0.74),
           bs.grain ?? 1.0,
-          bs.hardness,
+          strokeHardness,
           stampRemainderDistRef.current,
-          Boolean(activeLayer?.alphaLocked),
-          Boolean(bs.isTransparentInk)
+          isolatedPass ? false : Boolean(activeLayer?.alphaLocked),
+          isolatedPass ? false : Boolean(bs.isTransparentInk),
+          bs.useTilt ?? true
         );
       } else {
-        const radialMixingOptions: RadialMixingOptions = {
-          colorMixing: bs.colorMixing,
-          perceptualMixing: bs.perceptualMixing,
-          amountOfPaint: bs.amountOfPaint,
-          densityOfPaint: bs.densityOfPaint,
-          colorStretch: bs.colorStretch,
-          mixingMode: bs.mixingMode,
-          underlyingCanvas: canvas || undefined,
-          sampler: layerPixelSamplerRef.current || undefined,
-          reservoir: activeReservoirRef.current || undefined,
-          alphaLocked: Boolean(activeLayer?.alphaLocked),
-          isTransparentInk: Boolean(bs.isTransparentInk),
-          dynamics: bs.dynamics,
-          secondaryColor: bs.secondaryColor,
-          useGpu: bs.useGpu,
-          dualBrush: bs.dualBrush,
-          dualTipImage: bs.dualTipImage,
-          dualBrushCompositeMode: bs.dualBrushCompositeMode,
-        };
+        const radialMixingOptions = buildLiveRadialOptions(
+          bs,
+          isMonochrome,
+          canvas,
+          activeLayer,
+          isolatedPass
+        );
         return drawSmoothCubicBezierSegment(
           ctx,
           sStart,
           c1Pt,
           c2Pt,
           sEnd,
-          strokeColor,
-          isEraser && !isBgEraser,
+          isolatedPass && isEraser && !isBgEraser ? '#000000' : strokeColor,
+          isolatedPass ? false : isEraser && !isBgEraser,
           strokeHardness,
           strokeFlow,
           strokeSpacing,
@@ -1251,44 +1689,53 @@ export function useCanvasDrawing({
     const segStart = k1;
     const segEnd = k2;
 
-    if (isEraser) {
-      drewDirectlyOnLayerCanvasRef.current = true;
-      if (canvas) {
-        const cCtx = get2DContext(canvas);
-        if (cCtx) {
-          drawSmoothCubicBezierSegment(
-            cCtx,
-            segStart,
-            c1,
-            c2,
-            segEnd,
-            strokeColor,
-            !isBgEraser,
-            strokeHardness,
-            strokeFlow,
-            strokeSpacing
-          );
-        }
-      }
-      if (isToneLayer && sourceCanvas) {
-        const sCtx = get2DContext(sourceCanvas);
-        if (sCtx) {
-          drawSmoothCubicBezierSegment(
-            sCtx,
-            segStart,
-            c1,
-            c2,
-            segEnd,
-            strokeColor,
-            !isBgEraser,
-            strokeHardness,
-            strokeFlow,
-            strokeSpacing
-          );
-        }
-      }
+    const scatterFactor = Math.max(0, bs.dynamics?.scatter ?? 0);
+    const segPad = Math.ceil(Math.max(segStart.width, segEnd.width, bs.size || 10) * (1.5 + scatterFactor * 2) + 32);
+    const segMinX = Math.min(segStart.x, c1.x, c2.x, segEnd.x) - segPad;
+    const segMinY = Math.min(segStart.y, c1.y, c2.y, segEnd.y) - segPad;
+    const segMaxX = Math.max(segStart.x, c1.x, c2.x, segEnd.x) + segPad;
+    const segMaxY = Math.max(segStart.y, c1.y, c2.y, segEnd.y) + segPad;
+    markTouchedTiles(segMinX, segMinY, segMaxX, segMaxY);
 
-      // Eraser path preview on draft overlay
+    // Live WYSIWYG Direct Layer/Tile Preview (Eraser, Transparent Ink, Alpha Lock, Color Mixing, Translucent, Clipped, Blend, Under-Layer)
+    if (drewDirectlyOnLayerCanvasRef.current && canvas) {
+      const canvasCtx = get2DContext(canvas);
+      if (canvasCtx) {
+        ensureLiveTileSnapshots(canvas, canvasCtx, currentLayerId, segMinX, segMinY, segMaxX, segMaxY);
+        if (liveStrokeIsolationRef.current && liveAccumCanvasRef.current) {
+          const accumCtx = get2DContext(liveAccumCanvasRef.current);
+          if (accumCtx) {
+            accumCtx.save();
+            applySelectionCanvasClip(accumCtx, selectionRef.current);
+            stampRemainderDistRef.current = renderSegmentToContext(accumCtx, segStart, c1, c2, segEnd, true);
+            accumCtx.restore();
+          }
+        } else {
+          canvasCtx.save();
+          applySelectionCanvasClip(canvasCtx, selectionRef.current);
+          stampRemainderDistRef.current = renderSegmentToContext(canvasCtx, segStart, c1, c2, segEnd, false);
+          canvasCtx.restore();
+        }
+        syncLiveRegionToTiles(
+          canvas,
+          canvasCtx,
+          currentLayerId,
+          segMinX,
+          segMinY,
+          segMaxX,
+          segMaxY,
+          isMonochrome,
+          activeLayer,
+          bs,
+          isEraser,
+          isBgEraser
+        );
+        return;
+      }
+    }
+
+    // Fallback wireframe only for Vector / Screentone / Mask Eraser when direct preview is disabled
+    if (isEraser && !isBgEraser) {
       draftCtx.save();
       draftCtx.lineCap = 'round';
       draftCtx.lineJoin = 'round';
@@ -1303,28 +1750,9 @@ export function useCanvasDrawing({
       return;
     }
 
-    // Single-pass document draft rendering + dirty-ROI blit to draft overlay (50% less CPU/GPU work & 100% identical scatter/reservoir state)
-    drewDirectlyOnLayerCanvasRef.current = false;
-    const docDraftCanvas = docDraftCanvasRef.current;
-    const docCtx = docDraftCanvas ? get2DContext(docDraftCanvas) : null;
-    if (docCtx && docDraftCanvas) {
-      stampRemainderDistRef.current = renderSegmentToContext(docCtx, segStart, c1, c2, segEnd);
-      const scatterFactor = Math.max(0, bs.dynamics?.scatter ?? 0);
-      const maxW = Math.max(segStart.width, segEnd.width, bs.size || 10) * (1.5 + scatterFactor * 2) + 24;
-      const sx = Math.max(0, Math.floor(Math.min(segStart.x, c1.x, c2.x, segEnd.x) - maxW));
-      const sy = Math.max(0, Math.floor(Math.min(segStart.y, c1.y, c2.y, segEnd.y) - maxW));
-      const ex = Math.min(docDraftCanvas.width, Math.ceil(Math.max(segStart.x, c1.x, c2.x, segEnd.x) + maxW));
-      const ey = Math.min(docDraftCanvas.height, Math.ceil(Math.max(segStart.y, c1.y, c2.y, segEnd.y) + maxW));
-      const sw = ex - sx;
-      const sh = ey - sy;
-      if (sw > 0 && sh > 0) {
-        draftCtx.clearRect(sx, sy, sw, sh);
-        draftCtx.drawImage(docDraftCanvas, sx, sy, sw, sh, sx, sy, sw, sh);
-      }
-    } else {
-      stampRemainderDistRef.current = renderSegmentToContext(draftCtx, segStart, c1, c2, segEnd);
-    }
-  }, [getActiveCanvas]);
+    // Ultra-fast viewport draft overlay for top-layer opaque strokes
+    stampRemainderDistRef.current = renderSegmentToContext(draftCtx, segStart, c1, c2, segEnd, false);
+  }, [buildLiveRadialOptions, buildLiveTexturedOptions, ensureLiveTileSnapshots, getActiveCanvas, markTouchedTiles, syncLiveRegionToTiles]);
 
   // Stabilize and render point onto draft canvas
   const applyStabilizedPointAndRender = useCallback(
@@ -1354,9 +1782,13 @@ export function useCanvasDrawing({
         velocityScale = Math.max(0.65, Math.min(1.0, 1.0 - Math.max(0, speed - 0.5) * 0.12));
       }
 
+      const hasCustomCurve = Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
       let pt: Point;
       if (stab <= 0) {
-        const mappedP = bs.usePressure ? taperEngineRef.current.mapPressure(rawPressure) : (rawPressure > 0 ? 1.0 : 0);
+        const baseP = bs.usePressure
+          ? (hasCustomCurve ? rawPressure : taperEngineRef.current.mapPressure(rawPressure))
+          : (rawPressure > 0 ? 1.0 : 0);
+        const mappedP = bs.usePressure ? taperEngineRef.current.smoothPressure(baseP) : baseP;
         const width = calculateStrokeWidth(
           bs.size,
           mappedP,
@@ -1371,7 +1803,10 @@ export function useCanvasDrawing({
         stabilizedPointRef.current = pt;
       } else {
         const sample = inputStabilizerRef.current.process(rawX, rawY, rawPressure, now);
-        const mappedP = bs.usePressure ? taperEngineRef.current.mapPressure(sample.pressure) : (rawPressure > 0 ? 1.0 : 0);
+        const baseP = bs.usePressure
+          ? (hasCustomCurve ? sample.pressure : taperEngineRef.current.mapPressure(sample.pressure))
+          : (rawPressure > 0 ? 1.0 : 0);
+        const mappedP = bs.usePressure ? taperEngineRef.current.smoothPressure(baseP) : baseP;
         const smoothWidth = calculateStrokeWidth(
           bs.size,
           mappedP,
@@ -1422,49 +1857,194 @@ export function useCanvasDrawing({
     [renderDraftSegment]
   );
 
-  // Low-latency speculative predicted tip overlay with tangent/distance guard to prevent stray streaks
+  // Zero-gap provisional + predicted tip overlay matching exact brush geometry
   const renderPredictedStroke = useCallback(
     (predEvents: PointerEvent[], vRect: DOMRect) => {
       clearPredictedCanvas();
-      if (!predEvents || predEvents.length === 0 || toolRef.current === 'eraser') return;
+      if (toolRef.current === 'eraser' || drewDirectlyOnLayerCanvasRef.current) return;
+      const pts = strokePointsRef.current;
+      if (pts.length < 2) return;
       const pCanvas = getPredictedCanvas();
-      const lastPt = stabilizedPointRef.current;
-      if (!pCanvas || !lastPt) return;
+      if (!pCanvas) return;
       const pCtx = get2DContext(pCanvas);
       if (!pCtx) return;
 
       const bs = brushSettingsRef.current;
       const dims = dimensionsRef.current;
-      const maxPredDist = Math.min(20, Math.max(4, (bs.size || 10) * 1.15));
+      const mode = colorModeRef.current;
+      const currentLayerId = activeLayerIdRef.current;
+      const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+      const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
+      const isMonochrome = mode === 'monochrome' || isMonoLayer;
+      const isPencil = bs.preset?.startsWith('pencil') ?? false;
 
-      const ev = predEvents[0];
-      const rawPred = screenToCanvas(
-        ev.clientX,
-        ev.clientY,
-        vRect,
+      let strokeColor: string;
+      if (isMaskModeRef.current) {
+        let clean = bs.color.replace('#', '');
+        if (clean.length === 3) clean = clean.split('').map((c) => c + c).join('');
+        const r = parseInt(clean.slice(0, 2), 16) || 0;
+        const g = parseInt(clean.slice(2, 4), 16) || 0;
+        const b = parseInt(clean.slice(4, 6), 16) || 0;
+        const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+        const hexVal = gray.toString(16).padStart(2, '0');
+        strokeColor = `#${hexVal}${hexVal}${hexVal}`;
+      } else {
+        strokeColor = enforceColorMode(bs.color, isMonochrome ? 'monochrome' : mode);
+      }
+
+      const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
+      const strokeFlow = isMonochrome ? 1.0 : (bs.flow ?? 1.0);
+      const strokeSpacing = bs.spacing ?? 0.08;
+
+      const pLast = pts[pts.length - 1];
+      const pPrev = pts[pts.length - 2];
+      const pPrev2 = pts.length >= 3 ? pts[pts.length - 3] : pPrev;
+
+      let predPt: Point | null = null;
+      if (predEvents && predEvents.length > 0) {
+        const maxPredDist = Math.min(20, Math.max(4, (bs.size || 10) * 1.15));
+        const ev = predEvents[0];
+        const rawPred = screenToCanvas(
+          ev.clientX,
+          ev.clientY,
+          vRect,
+          panRef.current,
+          zoomRef.current,
+          rotationRef.current,
+          dims
+        );
+        const dx = rawPred.x - pLast.x;
+        const dy = rawPred.y - pLast.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist >= 0.5 && dist <= maxPredDist * 2.5) {
+          const clampedScale = dist > maxPredDist ? maxPredDist / dist : 1.0;
+          predPt = {
+            x: pLast.x + dx * clampedScale,
+            y: pLast.y + dy * clampedScale,
+            pressure: pLast.pressure * 0.9,
+            width: Math.max(0.5, pLast.width * 0.9),
+            tiltX: pLast.tiltX,
+            tiltY: pLast.tiltY,
+            twist: pLast.twist,
+          };
+        }
+      }
+
+      const scaleX = pCanvas.width / Math.max(1, vRect.width);
+      const scaleY = pCanvas.height / Math.max(1, vRect.height);
+      const matrix = getCanvasToViewportMatrix(
         panRef.current,
         zoomRef.current,
         rotationRef.current,
-        dims
+        dims,
+        scaleX,
+        scaleY
       );
-      const dx = rawPred.x - lastPt.x;
-      const dy = rawPred.y - lastPt.y;
-      const dist = Math.hypot(dx, dy);
-      if (dist < 0.5 || dist > maxPredDist * 2.5) return;
-
-      const clampedScale = dist > maxPredDist ? maxPredDist / dist : 1.0;
-      const targetX = lastPt.x + dx * clampedScale;
-      const targetY = lastPt.y + dy * clampedScale;
 
       pCtx.save();
-      pCtx.globalAlpha = Math.min(0.65, (bs.opacity ?? 1.0) * 0.65);
-      pCtx.strokeStyle = bs.color || '#000000';
-      pCtx.lineCap = 'round';
-      pCtx.lineWidth = Math.max(0.5, lastPt.width * 0.85);
+      pCtx.setTransform(matrix.a, matrix.b, matrix.c, matrix.d, matrix.e, matrix.f);
       pCtx.beginPath();
-      pCtx.moveTo(lastPt.x, lastPt.y);
-      pCtx.lineTo(targetX, targetY);
-      pCtx.stroke();
+      pCtx.rect(0, 0, dims.width, dims.height);
+      pCtx.clip();
+      applySelectionCanvasClip(pCtx, selectionRef.current);
+
+      const drawProvisionalSeg = (s0: Point, c1Pt: Point, c2Pt: Point, s3: Point, rem: number): number => {
+        if (bs.customTipImage) {
+          return drawTexturedCubicBezierSegment(
+            pCtx,
+            s0,
+            c1Pt,
+            c2Pt,
+            s3,
+            strokeColor,
+            bs.customTipImage,
+            {
+              size: bs.size,
+              minSizeFactor: bs.minSizeFactor,
+              opacity: bs.opacity,
+              flow: strokeFlow,
+              spacing: strokeSpacing,
+              thickness: bs.thickness,
+              thicknessVertical: bs.thicknessVertical,
+              angle: bs.customTipAngle,
+              angleDynamics: bs.customTipAngleDynamics,
+              rotationRandomScale: bs.customTipRotationRandomScale,
+              hardness: strokeHardness,
+              antiAlias: isMonochrome ? 0 : bs.antiAlias,
+              pressureCurve: bs.pressureCurve,
+              usePressure: bs.usePressure,
+              subTips: bs.subTips,
+              subTipOrder: bs.subTipOrder,
+              subTipImages: bs.subTipImages,
+              spray: bs.spray,
+              wetEdge: bs.wetEdge,
+              grain: bs.grain ?? bs.textureDensity,
+              dualBrush: bs.dualBrush,
+              dualTipImage: bs.dualTipImage,
+              dualBrushCompositeMode: bs.dualBrushCompositeMode,
+              alphaLocked: Boolean(activeLayer?.alphaLocked),
+              isTransparentInk: Boolean(bs.isTransparentInk),
+              dynamics: bs.dynamics,
+              secondaryColor: bs.secondaryColor,
+            },
+            rem
+          );
+        } else if (isPencil) {
+          const grade = (bs.preset as PencilGrade) || 'pencil-2b';
+          return drawPencilCubicBezierSegment(
+            pCtx,
+            s0,
+            c1Pt,
+            c2Pt,
+            s3,
+            strokeColor,
+            grade,
+            isMonochrome ? 1.0 : (bs.flow ?? 0.74),
+            bs.grain ?? 1.0,
+            strokeHardness,
+            rem,
+            Boolean(activeLayer?.alphaLocked),
+            Boolean(bs.isTransparentInk)
+          );
+        } else {
+          return drawSmoothCubicBezierSegment(
+            pCtx,
+            s0,
+            c1Pt,
+            c2Pt,
+            s3,
+            strokeColor,
+            false,
+            strokeHardness,
+            strokeFlow,
+            strokeSpacing,
+            rem,
+            bs.thickness ?? 1.0,
+            ((bs.customTipAngle ?? 0) * Math.PI) / 180,
+            {
+              alphaLocked: Boolean(activeLayer?.alphaLocked),
+              isTransparentInk: Boolean(bs.isTransparentInk),
+              dynamics: bs.dynamics,
+              secondaryColor: bs.secondaryColor,
+              dualBrush: bs.dualBrush,
+              dualTipImage: bs.dualTipImage,
+              dualBrushCompositeMode: bs.dualBrushCompositeMode,
+            }
+          );
+        }
+      };
+
+      // 1. Provisional unsealed segment (pPrev -> pLast) bridging draftCanvas to current stylus head
+      const provNextKnot = predPt || pLast;
+      const provCtrl = catmullRomToBezier(pPrev2, pPrev, pLast, provNextKnot);
+      const remAfterProv = drawProvisionalSeg(pPrev, provCtrl.c1, provCtrl.c2, pLast, stampRemainderDistRef.current);
+
+      // 2. Speculative lookahead segment (pLast -> predPt) if predicted events exist
+      if (predPt) {
+        const predCtrl = catmullRomToBezier(pPrev, pLast, predPt, predPt);
+        drawProvisionalSeg(pLast, predCtrl.c1, predCtrl.c2, predPt, remAfterProv);
+      }
+
       pCtx.restore();
     },
     [clearPredictedCanvas, getPredictedCanvas]
@@ -1549,6 +2129,11 @@ export function useCanvasDrawing({
       onCollabStrokeChunkRef.current?.(currentStrokeIdRef.current, chunkPts);
     }
 
+    if (liveNeedsNotifyRef.current) {
+      liveNeedsNotifyRef.current = false;
+      globalTileGrid.notifyChange();
+    }
+
     // Update predicted stroke overlay throttled to rAF
     const predData = latestPredictedRef.current;
     latestPredictedRef.current = null;
@@ -1620,26 +2205,26 @@ export function useCanvasDrawing({
       draftCtx.beginPath();
       draftCtx.rect(0, 0, dimensionsRef.current.width, dimensionsRef.current.height);
       draftCtx.clip();
+      applySelectionCanvasClip(draftCtx, selectionRef.current);
 
       clearPredictedCanvas();
 
       const isEraser = toolRef.current === 'eraser';
-      const isBgEraser = isEraser && activeLayerIdRef.current === 'layer-bg';
+      const isBgEraser = isEraser && isBackgroundLayerId(activeLayerIdRef.current);
 
       const currentLayerId = activeLayerIdRef.current;
-      const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
+      const allLayers = layersRef.current || [];
+      const activeIdx = allLayers.findIndex((l) => l.id === currentLayerId);
+      const activeLayer = activeIdx >= 0 ? allLayers[activeIdx] : undefined;
+      const hasVisibleLayersAbove =
+        activeIdx > 0 && allLayers.slice(0, activeIdx).some((l) => l.visible && l.opacity > 0.001);
       const bs = brushSettingsRef.current;
       const mode = colorModeRef.current;
-      const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
+      const isPencil = !isEraser && !bs.customTipImage && (bs.preset?.startsWith('pencil') ?? false);
 
-      const isToneLayer = Boolean(activeLayer?.toneEnabled);
       const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
       const isMonochrome = mode === 'monochrome' || isMonoLayer;
-      const isTone = Boolean(
-        activeLayer?.toneEnabled ||
-        activeLayer?.layerColorEnabled ||
-        (activeLayer?.expressionColor && activeLayer.expressionColor !== 'color')
-      );
+      const isTone = Boolean(activeLayer?.toneEnabled);
       isToneStrokeRef.current = isTone;
 
       let sourceCanvas: HTMLCanvasElement | null = null;
@@ -1671,11 +2256,71 @@ export function useCanvasDrawing({
       const startPoint = snapSessionRef.current.snapPoint(rawStartPoint, rulerRef.current, isAltOverride);
       emitConstraintAxisChange(snapSessionRef.current.getActiveAxis());
 
-      allStrokePointsRef.current = [startPoint];
-      strokePointsRef.current = [startPoint];
       inputStabilizerRef.current.reset();
       inputStabilizerRef.current.setStabilizerLevel(bs.stabilization ?? 0);
+      inputStabilizerRef.current.setZoomScale(zoomRef.current || 1.0);
+      inputStabilizerRef.current.setSharpCorners(bs.sharpCorners !== false);
       taperEngineRef.current.reset();
+
+      const startNow = startPoint.timestamp ?? performance.now();
+      lastPointTimeRef.current = startNow;
+      if ((bs.stabilization ?? 0) > 0) {
+        inputStabilizerRef.current.process(startPoint.x, startPoint.y, startPoint.pressure, startNow);
+      }
+      const hasCustomCurve = Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
+      if (bs.usePressure) {
+        const baseStartP = hasCustomCurve ? startPoint.pressure : taperEngineRef.current.mapPressure(startPoint.pressure);
+        const smoothStartP = taperEngineRef.current.smoothPressure(baseStartP);
+        startPoint.pressure = smoothStartP;
+        startPoint.width = calculateStrokeWidth(
+          bs.size,
+          smoothStartP,
+          bs.minSizeFactor,
+          bs.usePressure,
+          firstEvent.pointerType,
+          bs.pressureCurveGamma ?? 1.0,
+          1.0,
+          bs.pressureCurve
+        );
+      }
+
+      // CSP Shift + Click Straight Line from previous stroke end on the same layer
+      const prevStrokeEnd = lastStrokeEndRef.current;
+      const isShiftLine =
+        Boolean(e.shiftKey) &&
+        !isMaskModeRef.current &&
+        prevStrokeEnd !== null &&
+        prevStrokeEnd.layerId === currentLayerId;
+      isShiftLineStrokeRef.current = isShiftLine;
+
+      if (isShiftLine && prevStrokeEnd) {
+        const pLineStart: Point = {
+          x: prevStrokeEnd.x,
+          y: prevStrokeEnd.y,
+          pressure: startPoint.pressure,
+          width: startPoint.width,
+          tiltX: startPoint.tiltX,
+          tiltY: startPoint.tiltY,
+          twist: startPoint.twist,
+          timestamp: startNow - 16,
+        };
+        const pLineMid: Point = {
+          x: (pLineStart.x + startPoint.x) * 0.5,
+          y: (pLineStart.y + startPoint.y) * 0.5,
+          pressure: startPoint.pressure,
+          width: startPoint.width,
+          tiltX: startPoint.tiltX,
+          tiltY: startPoint.tiltY,
+          twist: startPoint.twist,
+          timestamp: startNow - 8,
+        };
+        allStrokePointsRef.current = [pLineStart, pLineMid, startPoint];
+        strokePointsRef.current = [pLineStart, pLineMid];
+      } else {
+        allStrokePointsRef.current = [startPoint];
+        strokePointsRef.current = [startPoint];
+      }
+
       rawPointsBufferRef.current = [{
         x: startPoint.x,
         y: startPoint.y,
@@ -1696,9 +2341,11 @@ export function useCanvasDrawing({
         pressure: startPoint.pressure,
         width: startPoint.width,
       }];
-      strokeTotalDistanceRef.current = 0;
+      strokeTotalDistanceRef.current = isShiftLine && prevStrokeEnd
+        ? Math.hypot(startPoint.x - prevStrokeEnd.x, startPoint.y - prevStrokeEnd.y)
+        : 0;
 
-      if (events.length > 1) {
+      if (!isShiftLine && events.length > 1) {
         for (let i = 1; i < events.length; i++) {
           const cEv = events[i];
           const rawPt = getCanvasPoint(cEv);
@@ -1726,12 +2373,23 @@ export function useCanvasDrawing({
 
       const blurMargin = (1 - (bs.hardness ?? 1.0)) * (startPoint.width * 1.5);
       const r = Math.max(32, Math.ceil(startPoint.width + blurMargin + 32));
+      const minInitX = isShiftLine && prevStrokeEnd ? Math.min(startPoint.x, prevStrokeEnd.x) : startPoint.x;
+      const minInitY = isShiftLine && prevStrokeEnd ? Math.min(startPoint.y, prevStrokeEnd.y) : startPoint.y;
+      const maxInitX = isShiftLine && prevStrokeEnd ? Math.max(startPoint.x, prevStrokeEnd.x) : startPoint.x;
+      const maxInitY = isShiftLine && prevStrokeEnd ? Math.max(startPoint.y, prevStrokeEnd.y) : startPoint.y;
       dirtyRectRef.current = {
-        minX: Math.max(0, Math.floor(startPoint.x - r)),
-        minY: Math.max(0, Math.floor(startPoint.y - r)),
-        maxX: Math.min(dims.width, Math.ceil(startPoint.x + r)),
-        maxY: Math.min(dims.height, Math.ceil(startPoint.y + r)),
+        minX: Math.max(0, Math.floor(minInitX - r)),
+        minY: Math.max(0, Math.floor(minInitY - r)),
+        maxX: Math.min(dims.width, Math.ceil(maxInitX + r)),
+        maxY: Math.min(dims.height, Math.ceil(maxInitY + r)),
       };
+      touchedTilesRef.current.clear();
+      markTouchedTiles(
+        dirtyRectRef.current.minX,
+        dirtyRectRef.current.minY,
+        dirtyRectRef.current.maxX,
+        dirtyRectRef.current.maxY
+      );
 
       let strokeColor: string;
       if (isMaskModeRef.current) {
@@ -1740,10 +2398,10 @@ export function useCanvasDrawing({
         } else {
           let clean = bs.color.replace('#', '');
           if (clean.length === 3) clean = clean.split('').map((c) => c + c).join('');
-          const r = parseInt(clean.slice(0, 2), 16) || 0;
-          const g = parseInt(clean.slice(2, 4), 16) || 0;
-          const b = parseInt(clean.slice(4, 6), 16) || 0;
-          const gray = Math.round(0.299 * r + 0.587 * g + 0.114 * b);
+          const cr = parseInt(clean.slice(0, 2), 16) || 0;
+          const cg = parseInt(clean.slice(2, 4), 16) || 0;
+          const cb = parseInt(clean.slice(4, 6), 16) || 0;
+          const gray = Math.round(0.299 * cr + 0.587 * cg + 0.114 * cb);
           const hexVal = gray.toString(16).padStart(2, '0');
           strokeColor = `#${hexVal}${hexVal}${hexVal}`;
         }
@@ -1755,222 +2413,182 @@ export function useCanvasDrawing({
 
       const isWetColor = !isEraser && Boolean(bs.colorMixing);
       isWetColorStrokeRef.current = isWetColor;
-      drewDirectlyOnLayerCanvasRef.current = false;
+      liveOrigCanvasTilesRef.current.clear();
+      liveBeforeTileSnapshotRef.current.clear();
+      liveNeedsNotifyRef.current = false;
+      strokeBackupCanvasRef.current = null;
 
-      if (isToneLayer && sourceCanvas) {
-        const backupCanvas = getDedicatedBackupCanvas(sourceCanvas.width, sourceCanvas.height);
-        const backupCtx = get2DContext(backupCanvas);
-        if (backupCtx) {
-          backupCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-          backupCtx.drawImage(sourceCanvas, 0, 0);
-          strokeBackupCanvasRef.current = backupCanvas;
-        }
-        layerPixelSamplerRef.current = null;
-        activeReservoirRef.current = null;
-      } else if (isEraser && canvas) {
-        const backupCanvas = getDedicatedBackupCanvas(canvas.width, canvas.height);
-        const backupCtx = get2DContext(backupCanvas);
-        if (backupCtx) {
-          backupCtx.clearRect(0, 0, canvas.width, canvas.height);
-          backupCtx.drawImage(canvas, 0, 0);
-          strokeBackupCanvasRef.current = backupCanvas;
-        }
-        layerPixelSamplerRef.current = null;
-        activeReservoirRef.current = null;
-      } else {
-        strokeBackupCanvasRef.current = null;
-        if (isWetColor && canvas) {
-          layerPixelSamplerRef.current = new LayerPixelSampler(canvas, activeLayerIdRef.current);
-          activeReservoirRef.current = new PaintReservoir(strokeColor);
+      const useDirectLayerPreview =
+        !isTone &&
+        activeLayer?.type !== 'vector' &&
+        !isMaskModeRef.current &&
+        (isEraser ||
+          Boolean(bs.isTransparentInk) ||
+          Boolean(activeLayer?.alphaLocked) ||
+          isWetColor ||
+          Boolean(activeLayer?.clipped) ||
+          Boolean(activeLayer?.maskEnabled) ||
+          Boolean(selectionRef.current?.mask) ||
+          (activeLayer?.blendMode !== undefined &&
+            activeLayer.blendMode !== 'normal' &&
+            activeLayer.blendMode !== 'pass-through') ||
+          hasVisibleLayersAbove ||
+          (bs.opacity ?? 1.0) < 0.999 ||
+          bs.blendTipsMode === 'compare');
+
+      drewDirectlyOnLayerCanvasRef.current = useDirectLayerPreview;
+      const needsIsolation = useDirectLayerPreview && (bs.opacity ?? 1.0) < 0.999 && !isWetColor;
+      liveStrokeIsolationRef.current = needsIsolation;
+      if (needsIsolation) {
+        if (
+          !liveAccumCanvasRef.current ||
+          liveAccumCanvasRef.current.width !== canvas.width ||
+          liveAccumCanvasRef.current.height !== canvas.height
+        ) {
+          liveAccumCanvasRef.current = document.createElement('canvas');
+          liveAccumCanvasRef.current.width = canvas.width;
+          liveAccumCanvasRef.current.height = canvas.height;
         } else {
-          layerPixelSamplerRef.current = null;
-          activeReservoirRef.current = null;
+          const accCtx = get2DContext(liveAccumCanvasRef.current);
+          accCtx?.clearRect(0, 0, canvas.width, canvas.height);
         }
+      }
+
+      if (isWetColor && canvas) {
+        layerPixelSamplerRef.current = new LayerPixelSampler(canvas, activeLayerIdRef.current);
+        activeReservoirRef.current = new PaintReservoir(strokeColor);
+      } else {
+        layerPixelSamplerRef.current = null;
+        activeReservoirRef.current = null;
       }
 
       const strokeId = `stroke-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
       currentStrokeIdRef.current = strokeId;
       onCollabStrokeStartRef.current?.(strokeId, activeLayerIdRef.current, bs, toolRef.current, startPoint);
 
-      stampRemainderDistRef.current = Math.max(0.2, startPoint.width * (bs.spacing ?? 0.08));
+      stampRemainderDistRef.current = Math.max(0.12, startPoint.width * (bs.spacing ?? 0.08));
 
-      if (isEraser) {
-        drewDirectlyOnLayerCanvasRef.current = true;
-        if (canvas) {
-          const cCtx = get2DContext(canvas);
-          if (cCtx) {
-            drawDot(cCtx, startPoint, strokeColor, !isBgEraser, strokeHardness, strokeFlow);
-          }
-        }
-        if (isToneLayer && sourceCanvas) {
-          const sCtx = get2DContext(sourceCanvas);
-          if (sCtx) {
-            drawDot(sCtx, startPoint, strokeColor, !isBgEraser, strokeHardness, strokeFlow);
-          }
-        }
-        draftCtx.save();
-        draftCtx.strokeStyle = 'rgba(255, 80, 80, 0.75)';
-        draftCtx.setLineDash([3, 3]);
-        draftCtx.lineWidth = 1.5;
-        draftCtx.beginPath();
-        draftCtx.arc(startPoint.x, startPoint.y, Math.max(1, startPoint.width / 2), 0, Math.PI * 2);
-        draftCtx.stroke();
-        draftCtx.restore();
-      } else {
-        drewDirectlyOnLayerCanvasRef.current = false;
-        const docDraft = canvas ? getDocDraftCanvas(canvas.width, canvas.height) : null;
-        const docCtx = docDraft ? get2DContext(docDraft) : null;
-        if (docCtx && canvas) {
-          docCtx.clearRect(0, 0, canvas.width, canvas.height);
-        }
+      const firstDotPoint = allStrokePointsRef.current[0];
 
-        const primaryTargetCtx = docCtx || draftCtx;
+      const drawInitialDotToCtx = (targetCtx: CanvasRenderingContext2D, isolatedPass: boolean) => {
         if (bs.customTipImage) {
-          const tipOptions: TexturedBrushOptions = {
-            size: bs.size,
-            minSizeFactor: bs.minSizeFactor,
-            opacity: bs.opacity,
-            flow: bs.flow ?? 0.85,
-            spacing: bs.spacing ?? 0.08,
-            thickness: bs.thickness,
-            thicknessVertical: bs.thicknessVertical,
-            angle: bs.customTipAngle,
-            angleDynamics: bs.customTipAngleDynamics,
-            rotationRandomScale: bs.customTipRotationRandomScale,
-            hardness: strokeHardness,
-            antiAlias: isMonochrome ? 0 : bs.antiAlias,
-            pressureCurve: bs.pressureCurve,
-            velocityCurve: bs.velocityCurve,
-            useVelocity: bs.useVelocity,
-            subTips: bs.subTips,
-            subTipOrder: bs.subTipOrder,
-            subTipImages: bs.subTipImages,
-            spray: bs.spray,
-            taper: bs.taper,
-            colorMixing: bs.colorMixing,
-            perceptualMixing: bs.perceptualMixing,
-            amountOfPaint: bs.amountOfPaint,
-            densityOfPaint: bs.densityOfPaint,
-            colorStretch: bs.colorStretch,
-            mixingMode: bs.mixingMode,
-            wetEdge: bs.wetEdge,
-            wetEdgeRadius: bs.wetEdgeRadius,
-            wetEdgeAlphaPower: bs.wetEdgeAlphaPower,
-            wetEdgeValuePower: bs.wetEdgeValuePower,
-            grain: bs.grain ?? bs.textureDensity,
-            paperTextureImage: bs.paperTextureImage,
-            paperTextureScale: bs.paperTextureScale,
-            paperTextureRotate: bs.paperTextureRotate,
-            dualBrush: bs.dualBrush,
-            dualTipImage: bs.dualTipImage,
-            dualBrushCompositeMode: bs.dualBrushCompositeMode,
-            useGpu: bs.useGpu,
-            underlyingCanvas: canvas || undefined,
-            sampler: layerPixelSamplerRef.current || undefined,
-            reservoir: activeReservoirRef.current || undefined,
-            isEraser: false,
-            isBgEraser: false,
-            alphaLocked: Boolean(activeLayer?.alphaLocked),
-            isTransparentInk: Boolean(bs.isTransparentInk),
-            dynamics: bs.dynamics,
-            secondaryColor: bs.secondaryColor,
-          };
-          drawTexturedDot(primaryTargetCtx, startPoint, strokeColor, bs.customTipImage, tipOptions);
+          const tipOptions = buildLiveTexturedOptions(
+            bs,
+            bs.flow ?? 0.85,
+            bs.spacing ?? 0.08,
+            strokeHardness,
+            isMonochrome,
+            canvas,
+            activeLayer,
+            isEraser,
+            isBgEraser,
+            isolatedPass
+          );
+          drawTexturedDot(
+            targetCtx,
+            firstDotPoint,
+            isolatedPass && isEraser && !isBgEraser ? '#000000' : strokeColor,
+            bs.customTipImage,
+            tipOptions
+          );
         } else if (isPencil) {
           const grade = (bs.preset as PencilGrade) || 'pencil-2b';
           drawPencilDot(
-            primaryTargetCtx,
-            startPoint,
+            targetCtx,
+            firstDotPoint,
             strokeColor,
             grade,
-            bs.flow ?? 0.74,
+            isMonochrome ? 1.0 : (bs.flow ?? 0.74),
             bs.grain ?? 1.0,
-            bs.hardness,
-            Boolean(activeLayer?.alphaLocked),
-            Boolean(bs.isTransparentInk)
+            strokeHardness,
+            isolatedPass ? false : Boolean(activeLayer?.alphaLocked),
+            isolatedPass ? false : Boolean(bs.isTransparentInk)
           );
         } else {
-          const radialMixingOptions: RadialMixingOptions = {
-            colorMixing: bs.colorMixing,
-            perceptualMixing: bs.perceptualMixing,
-            amountOfPaint: bs.amountOfPaint,
-            densityOfPaint: bs.densityOfPaint,
-            colorStretch: bs.colorStretch,
-            mixingMode: bs.mixingMode,
-            underlyingCanvas: canvas || undefined,
-            sampler: layerPixelSamplerRef.current || undefined,
-            reservoir: activeReservoirRef.current || undefined,
-            alphaLocked: Boolean(activeLayer?.alphaLocked),
-            isTransparentInk: Boolean(bs.isTransparentInk),
-            dynamics: bs.dynamics,
-            secondaryColor: bs.secondaryColor,
-            useGpu: bs.useGpu,
-            dualBrush: bs.dualBrush,
-            dualTipImage: bs.dualTipImage,
-            dualBrushCompositeMode: bs.dualBrushCompositeMode,
-          };
+          const radialMixingOptions = buildLiveRadialOptions(
+            bs,
+            isMonochrome,
+            canvas,
+            activeLayer,
+            isolatedPass
+          );
           drawDot(
-            primaryTargetCtx,
-            startPoint,
-            strokeColor,
-            false,
+            targetCtx,
+            firstDotPoint,
+            isolatedPass && isEraser && !isBgEraser ? '#000000' : strokeColor,
+            isolatedPass ? false : isEraser && !isBgEraser,
             strokeHardness,
-            bs.flow ?? 1.0,
-            radialMixingOptions
+            isMonochrome ? 1.0 : strokeFlow,
+            radialMixingOptions,
+            bs.thickness ?? 1.0,
+            ((bs.customTipAngle ?? 0) * Math.PI) / 180
           );
         }
+      };
 
-        if (docCtx && docDraft) {
-          const scatterFactor = Math.max(0, bs.dynamics?.scatter ?? 0);
-          const pad = Math.max(startPoint.width, bs.size || 10) * (1.5 + scatterFactor * 2) + 24;
-          const sx = Math.max(0, Math.floor(startPoint.x - pad));
-          const sy = Math.max(0, Math.floor(startPoint.y - pad));
-          const ex = Math.min(docDraft.width, Math.ceil(startPoint.x + pad));
-          const ey = Math.min(docDraft.height, Math.ceil(startPoint.y + pad));
-          const sw = ex - sx;
-          const sh = ey - sy;
-          if (sw > 0 && sh > 0) {
-            draftCtx.drawImage(docDraft, sx, sy, sw, sh, sx, sy, sw, sh);
+      if (useDirectLayerPreview) {
+        const cCtx = get2DContext(canvas);
+        if (cCtx) {
+          const d = dirtyRectRef.current;
+          ensureLiveTileSnapshots(canvas, cCtx, currentLayerId, d.minX, d.minY, d.maxX, d.maxY);
+          if (needsIsolation && liveAccumCanvasRef.current) {
+            const accCtx = get2DContext(liveAccumCanvasRef.current);
+            if (accCtx) {
+              accCtx.save();
+              applySelectionCanvasClip(accCtx, selectionRef.current);
+              drawInitialDotToCtx(accCtx, true);
+              accCtx.restore();
+            }
+          } else {
+            cCtx.save();
+            applySelectionCanvasClip(cCtx, selectionRef.current);
+            drawInitialDotToCtx(cCtx, false);
+            cCtx.restore();
           }
+          syncLiveRegionToTiles(
+            canvas,
+            cCtx,
+            currentLayerId,
+            firstDotPoint.x - r,
+            firstDotPoint.y - r,
+            firstDotPoint.x + r,
+            firstDotPoint.y + r,
+            isMonochrome,
+            activeLayer,
+            bs,
+            isEraser,
+            isBgEraser
+          );
+          if (isShiftLine) {
+            renderDraftSegment(draftCtx, startPoint);
+          }
+          globalTileGrid.notifyChange();
+          liveNeedsNotifyRef.current = false;
+        }
+      } else if (isEraser && !isBgEraser) {
+        draftCtx.save();
+        draftCtx.strokeStyle = 'rgba(255, 80, 80, 0.75)';
+        draftCtx.setLineDash([3, 3]);
+        draftCtx.lineWidth = Math.max(1, 1.5 / Math.max(0.05, zoomRef.current));
+        draftCtx.beginPath();
+        draftCtx.arc(firstDotPoint.x, firstDotPoint.y, Math.max(1, firstDotPoint.width / 2), 0, Math.PI * 2);
+        draftCtx.stroke();
+        draftCtx.restore();
+        if (isShiftLine) {
+          renderDraftSegment(draftCtx, startPoint);
+        }
+      } else {
+        drawInitialDotToCtx(draftCtx, false);
+        if (isShiftLine) {
+          renderDraftSegment(draftCtx, startPoint);
         }
       }
 
-      if (isEraser && isMonochrome && canvas && dirtyRectRef.current) {
-        const dotDirty = dirtyRectRef.current;
-        const dw = dotDirty.maxX - dotDirty.minX;
-        const dh = dotDirty.maxY - dotDirty.minY;
-        if (dw > 0 && dh > 0) {
-          binarizeCanvasRect(
-            get2DContext(canvas)!,
-            { x: dotDirty.minX, y: dotDirty.minY, width: dw, height: dh },
-            activeLayer?.monoThreshold ?? 128,
-            activeLayer?.monoExpressBlack ?? true,
-            activeLayer?.monoExpressWhite ?? true
-          );
-          if (sourceCanvas) {
-            const sCtx = get2DContext(sourceCanvas);
-            sCtx?.drawImage(canvas, dotDirty.minX, dotDirty.minY, dw, dh, dotDirty.minX, dotDirty.minY, dw, dh);
-          }
-        }
-      } else if (isEraser && isToneLayer && sourceCanvas && canvas && activeLayer) {
-        applyLayerEffects(
-          sourceCanvas,
-          canvas,
-          activeLayer,
-          dims.dpi ?? 600,
-          {
-            x: dirtyRectRef.current.minX,
-            y: dirtyRectRef.current.minY,
-            width: dirtyRectRef.current.maxX - dirtyRectRef.current.minX,
-            height: dirtyRectRef.current.maxY - dirtyRectRef.current.minY,
-          }
-        );
-      }
       if (pendingPointsQueueRef.current.length > 0 && drawRafIdRef.current === null) {
         drawRafIdRef.current = requestAnimationFrame(flushPendingPoints);
       }
     },
-    [clearPredictedCanvas, disabled, dispatchPointerStat, effectiveDraftCanvasRef, emitConstraintAxisChange, flushPendingHistoryTasks, flushPendingPoints, getActiveCanvas, getCanvasPoint, getDocDraftCanvas, getPredictedCanvas, getViewportRect, viewportRef]
+    [buildLiveRadialOptions, buildLiveTexturedOptions, clearPredictedCanvas, disabled, dispatchPointerStat, effectiveDraftCanvasRef, emitConstraintAxisChange, ensureLiveTileSnapshots, flushPendingHistoryTasks, flushPendingPoints, getActiveCanvas, getCanvasPoint, getViewportRect, markTouchedTiles, renderDraftSegment, syncLiveRegionToTiles, viewportRef]
   );
 
   // Pointer Move handler: throttled & batched coordinate ingestion via rAF with coalesced and predicted events
@@ -1980,11 +2598,10 @@ export function useCanvasDrawing({
       coalescedEvents?: PointerEvent[],
       _predictedEvents?: PointerEvent[]
     ) => {
-      const point = getCanvasPoint(e);
-      dispatchPointerStat(point.x, point.y, point.pressure);
-      onCollabCursorMoveRef.current?.(point.x, point.y, isDrawingRef.current, toolRef.current);
-
       if (!isDrawingRef.current || e.pointerId !== activePointerIdRef.current) {
+        const point = getCanvasPoint(e);
+        dispatchPointerStat(point.x, point.y, point.pressure);
+        onCollabCursorMoveRef.current?.(point.x, point.y, false, toolRef.current);
         return;
       }
 
@@ -2001,8 +2618,11 @@ export function useCanvasDrawing({
       const events: PointerEvent[] =
         rawCoalesced && rawCoalesced.length > 0 ? Array.from(rawCoalesced) : [e.nativeEvent];
 
-      const draftCanvas = effectiveDraftCanvasRef?.current;
-      const draftCtx = draftCanvas ? get2DContext(draftCanvas) : null;
+      const minStepDoc = Math.min(0.25, 0.25 / Math.max(0.05, zoomRef.current));
+      let lastQueuedX = 0;
+      let lastQueuedY = 0;
+      let lastQueuedPressure = 0.5;
+      let hasQueued = false;
 
       for (let i = 0; i < events.length; i++) {
         const cEvent = events[i];
@@ -2018,18 +2638,27 @@ export function useCanvasDrawing({
 
         const isAltOverride = e.altKey;
         const snapRes = snapSessionRef.current.processPoint(rawCoords, rulerRef.current, isAltOverride);
-        const cx = snapRes.x;
-        const cy = snapRes.y;
+        let cx = snapRes.x;
+        let cy = snapRes.y;
         if (snapRes.axis) {
           emitConstraintAxisChange(snapRes.axis);
+        } else if (
+          !isShiftLineStrokeRef.current &&
+          e.shiftKey &&
+          !rulerRef.current?.enabled &&
+          allStrokePointsRef.current.length > 0
+        ) {
+          const originPt = allStrokePointsRef.current[0];
+          const dx = cx - originPt.x;
+          const dy = cy - originPt.y;
+          const dist = Math.hypot(dx, dy);
+          if (dist > 0.5) {
+            const snapAngle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+            cx = originPt.x + Math.cos(snapAngle) * dist;
+            cy = originPt.y + Math.sin(snapAngle) * dist;
+          }
         }
 
-        const last = lastProcessedPointRef.current;
-        if (last && Math.hypot(cx - last.x, cy - last.y) < 0.25) {
-          continue;
-        }
-
-        lastProcessedPointRef.current = { x: cx, y: cy };
         let cPressure = 0;
         if (cEvent.pointerType === 'mouse') {
           cPressure = (cEvent.buttons & 1) ? 0.5 : 0;
@@ -2037,23 +2666,49 @@ export function useCanvasDrawing({
           cPressure = cEvent.pressure !== undefined ? Math.max(0, Math.min(1.0, cEvent.pressure)) : 0;
         }
 
-        // Render segment immediately on draft canvas for zero-latency stylus tracking (CSP style)
-        if (draftCtx) {
-          applyStabilizedPointAndRender(
-            draftCtx,
-            cx,
-            cy,
-            cPressure,
-            cEvent.pointerType,
-            cEvent.tiltX ?? 0,
-            cEvent.tiltY ?? 0,
-            cEvent.twist ?? 0,
-            cEvent.timeStamp
-          );
+        const last = lastProcessedPointRef.current;
+        if (
+          last &&
+          Math.hypot(cx - last.x, cy - last.y) < minStepDoc &&
+          Math.abs(cPressure - lastQueuedPressure) <= 0.04
+        ) {
+          continue;
         }
+
+        lastProcessedPointRef.current = { x: cx, y: cy };
+
+        pendingPointsQueueRef.current.push({
+          x: cx,
+          y: cy,
+          pressure: cPressure,
+          pointerType: cEvent.pointerType,
+          tiltX: cEvent.tiltX ?? 0,
+          tiltY: cEvent.tiltY ?? 0,
+          twist: cEvent.twist ?? 0,
+          timestamp: cEvent.timeStamp,
+        });
+        lastQueuedX = cx;
+        lastQueuedY = cy;
+        lastQueuedPressure = cPressure;
+        hasQueued = true;
+      }
+
+      if (_predictedEvents && _predictedEvents.length > 0) {
+        latestPredictedRef.current = { predEvents: _predictedEvents, vRect };
+      } else {
+        latestPredictedRef.current = null;
+      }
+
+      if (hasQueued) {
+        dispatchPointerStat(lastQueuedX, lastQueuedY, lastQueuedPressure);
+        onCollabCursorMoveRef.current?.(lastQueuedX, lastQueuedY, true, toolRef.current);
+      }
+
+      if (pendingPointsQueueRef.current.length > 0 && drawRafIdRef.current === null) {
+        drawRafIdRef.current = requestAnimationFrame(flushPendingPoints);
       }
     },
-    [applyStabilizedPointAndRender, dispatchPointerStat, effectiveDraftCanvasRef, emitConstraintAxisChange, getCanvasPoint, getViewportRect]
+    [dispatchPointerStat, emitConstraintAxisChange, flushPendingPoints, getCanvasPoint, getViewportRect]
   );
 
   // Pointer Up / Cancel handler: composite and bake stroke into high-res canvas at dirty rect
@@ -2084,15 +2739,19 @@ export function useCanvasDrawing({
       const draftCanvas = effectiveDraftCanvasRef?.current;
       const draftCtx = draftCanvas ? get2DContext(draftCanvas) : null;
       const canvas = getActiveCanvas();
+      if (canvas) {
+        (canvas as any).__isBlank = false;
+        (canvas as any).__isSolidWhite = false;
+      }
 
       // Finalize tail segment on draft canvas using Catmull-Rom cubic Bézier
       const pts = strokePointsRef.current;
       const currentTool = toolRef.current;
       const currentLayerId = activeLayerIdRef.current;
       const isEraser = currentTool === 'eraser';
-      const isBgEraser = isEraser && currentLayerId === 'layer-bg';
+      const isBgEraser = isEraser && isBackgroundLayerId(currentLayerId);
       const mode = colorModeRef.current;
-      const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
+      const isPencil = !isEraser && !bs.customTipImage && (bs.preset?.startsWith('pencil') ?? false);
 
       const isTone = isToneStrokeRef.current;
       const activeLayer = layersRef.current?.find((l) => l.id === currentLayerId);
@@ -2100,9 +2759,7 @@ export function useCanvasDrawing({
       const isMonoLayer = activeLayer?.expressionColor === 'monochrome';
       const isMonochrome = mode === 'monochrome' || isMonoLayer;
       const sourceCanvas = isTone ? layerSourceCanvasesRef?.current?.get(currentLayerId) : null;
-      const targetTailCtx = isToneLayer && sourceCanvas
-        ? get2DContext(sourceCanvas)
-        : (drewDirectlyOnLayerCanvasRef.current && canvas ? get2DContext(canvas) : draftCtx);
+      const targetTailCtx = draftCtx;
 
       let strokeColor: string;
       if (isMaskModeRef.current) {
@@ -2123,68 +2780,43 @@ export function useCanvasDrawing({
       }
       const strokeHardness = isMonochrome ? 1.0 : (bs.hardness ?? 1.0);
 
-      if (targetTailCtx && pts.length >= 2) {
+      if (pts.length >= 2 && bs.usePressure && e.pointerType === 'pen') {
+        const pLast = pts[pts.length - 1];
+        pLast.pressure = 0;
+        pLast.width = Math.max(0.1, bs.size * (bs.minSizeFactor ?? 0));
+      }
+
+      if (targetTailCtx && !drewDirectlyOnLayerCanvasRef.current && pts.length >= 2) {
         const pLast = pts[pts.length - 1];
         const pPrev = pts[pts.length - 2];
         const pPrev2 = pts.length >= 3 ? pts[pts.length - 3] : pPrev;
-
-        // If stylus pen is lifted, naturally taper pressure to 0 at release point
-        if (bs.usePressure && e.pointerType === 'pen') {
-          pLast.pressure = 0;
-          pLast.width = Math.max(0.1, bs.size * (bs.minSizeFactor ?? 0));
-        }
-
         const { c1, c2 } = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
-        const docCtx = (!isEraser && docDraftCanvasRef.current) ? get2DContext(docDraftCanvasRef.current) : null;
 
-        if (bs.customTipImage) {
-          const tipOptions: TexturedBrushOptions = {
-            size: bs.size,
-            minSizeFactor: bs.minSizeFactor,
-            opacity: bs.opacity,
-            flow: bs.flow ?? 0.85,
-            spacing: bs.spacing ?? 0.08,
-            thickness: bs.thickness,
-            thicknessVertical: bs.thicknessVertical,
-            angle: bs.customTipAngle,
-            angleDynamics: bs.customTipAngleDynamics,
-            rotationRandomScale: bs.customTipRotationRandomScale,
-            hardness: strokeHardness,
-            antiAlias: isMonochrome ? 0 : bs.antiAlias,
-            pressureCurve: bs.pressureCurve,
-            velocityCurve: bs.velocityCurve,
-            usePressure: bs.usePressure,
-            useVelocity: bs.useVelocity,
-            subTips: bs.subTips,
-            subTipOrder: bs.subTipOrder,
-            subTipImages: bs.subTipImages,
-            spray: bs.spray,
-            taper: bs.taper,
-            colorMixing: bs.colorMixing,
-            amountOfPaint: bs.amountOfPaint,
-            densityOfPaint: bs.densityOfPaint,
-            colorStretch: bs.colorStretch,
-            mixingMode: bs.mixingMode,
-            wetEdge: bs.wetEdge,
-            wetEdgeRadius: bs.wetEdgeRadius,
-            wetEdgeAlphaPower: bs.wetEdgeAlphaPower,
-            wetEdgeValuePower: bs.wetEdgeValuePower,
-            grain: bs.grain ?? bs.textureDensity,
-            paperTextureImage: bs.paperTextureImage,
-            paperTextureScale: bs.paperTextureScale,
-            paperTextureRotate: bs.paperTextureRotate,
-            useGpu: bs.useGpu,
-            underlyingCanvas: canvas || undefined,
-            sampler: layerPixelSamplerRef.current || undefined,
-            reservoir: activeReservoirRef.current || undefined,
-            isEraser: isEraser && !isBgEraser,
+        if (isEraser && !isBgEraser) {
+          targetTailCtx.save();
+          targetTailCtx.lineCap = 'round';
+          targetTailCtx.lineJoin = 'round';
+          targetTailCtx.setLineDash([4, 4]);
+          targetTailCtx.strokeStyle = 'rgba(255, 80, 80, 0.75)';
+          targetTailCtx.lineWidth = Math.max(1, (pPrev.width + pLast.width) / 2);
+          targetTailCtx.beginPath();
+          targetTailCtx.moveTo(pPrev.x, pPrev.y);
+          targetTailCtx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, pLast.x, pLast.y);
+          targetTailCtx.stroke();
+          targetTailCtx.restore();
+        } else if (bs.customTipImage) {
+          const tipOptions = buildLiveTexturedOptions(
+            bs,
+            bs.flow ?? 0.85,
+            bs.spacing ?? 0.08,
+            strokeHardness,
+            isMonochrome,
+            canvas,
+            activeLayer,
+            isEraser,
             isBgEraser,
-            alphaLocked: Boolean(activeLayer?.alphaLocked),
-            isTransparentInk: Boolean(bs.isTransparentInk),
-            currentStrokeDist: strokeTotalDistanceRef.current,
-            dynamics: bs.dynamics,
-            secondaryColor: bs.secondaryColor,
-          };
+            false
+          );
           drawTexturedCubicBezierSegment(
             targetTailCtx,
             pPrev,
@@ -2196,19 +2828,6 @@ export function useCanvasDrawing({
             tipOptions,
             stampRemainderDistRef.current
           );
-          if (docCtx) {
-            drawTexturedCubicBezierSegment(
-              docCtx,
-              pPrev,
-              c1,
-              c2,
-              pLast,
-              strokeColor,
-              bs.customTipImage,
-              tipOptions,
-              stampRemainderDistRef.current
-            );
-          }
         } else if (isPencil) {
           const grade = (bs.preset as PencilGrade) || 'pencil-2b';
           drawPencilCubicBezierSegment(
@@ -2219,45 +2838,22 @@ export function useCanvasDrawing({
             pLast,
             strokeColor,
             grade,
-            bs.flow ?? 0.74,
+            isMonochrome ? 1.0 : (bs.flow ?? 0.74),
             bs.grain ?? 1.0,
-            bs.hardness,
+            strokeHardness,
             stampRemainderDistRef.current,
             Boolean(activeLayer?.alphaLocked),
-            Boolean(bs.isTransparentInk)
+            Boolean(bs.isTransparentInk),
+            bs.useTilt ?? true
           );
-          if (docCtx) {
-            drawPencilCubicBezierSegment(
-              docCtx,
-              pPrev,
-              c1,
-              c2,
-              pLast,
-              strokeColor,
-              grade,
-              bs.flow ?? 0.74,
-              bs.grain ?? 1.0,
-              bs.hardness,
-              stampRemainderDistRef.current,
-              Boolean(activeLayer?.alphaLocked),
-              Boolean(bs.isTransparentInk)
-            );
-          }
         } else {
-          const radialMixingOptions: RadialMixingOptions = {
-            colorMixing: bs.colorMixing,
-            amountOfPaint: bs.amountOfPaint,
-            densityOfPaint: bs.densityOfPaint,
-            colorStretch: bs.colorStretch,
-            mixingMode: bs.mixingMode,
-            underlyingCanvas: canvas || undefined,
-            sampler: layerPixelSamplerRef.current || undefined,
-            reservoir: activeReservoirRef.current || undefined,
-            alphaLocked: Boolean(activeLayer?.alphaLocked),
-            isTransparentInk: Boolean(bs.isTransparentInk),
-            dynamics: bs.dynamics,
-            secondaryColor: bs.secondaryColor,
-          };
+          const radialMixingOptions = buildLiveRadialOptions(
+            bs,
+            isMonochrome,
+            canvas,
+            activeLayer,
+            false
+          );
           drawSmoothCubicBezierSegment(
             targetTailCtx,
             pPrev,
@@ -2267,45 +2863,13 @@ export function useCanvasDrawing({
             strokeColor,
             isEraser && !isBgEraser,
             strokeHardness,
-            bs.flow ?? 1.0,
+            isMonochrome ? 1.0 : (bs.flow ?? 1.0),
             bs.spacing ?? 0.06,
             stampRemainderDistRef.current,
             bs.thickness ?? 1.0,
             ((bs.customTipAngle ?? 0) * Math.PI) / 180,
             radialMixingOptions
           );
-          if (docCtx) {
-            drawSmoothCubicBezierSegment(
-              docCtx,
-              pPrev,
-              c1,
-              c2,
-              pLast,
-              strokeColor,
-              false,
-              strokeHardness,
-              bs.flow ?? 1.0,
-              bs.spacing ?? 0.06,
-              stampRemainderDistRef.current,
-              bs.thickness ?? 1.0,
-              ((bs.customTipAngle ?? 0) * Math.PI) / 180,
-              radialMixingOptions
-            );
-          }
-        }
-
-        if (isEraser && draftCtx) {
-          draftCtx.save();
-          draftCtx.lineCap = 'round';
-          draftCtx.lineJoin = 'round';
-          draftCtx.setLineDash([4, 4]);
-          draftCtx.strokeStyle = 'rgba(255, 80, 80, 0.75)';
-          draftCtx.lineWidth = Math.max(1, (pPrev.width + pLast.width) / 2);
-          draftCtx.beginPath();
-          draftCtx.moveTo(pPrev.x, pPrev.y);
-          draftCtx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, pLast.x, pLast.y);
-          draftCtx.stroke();
-          draftCtx.restore();
         }
       }
 
@@ -2324,65 +2888,75 @@ export function useCanvasDrawing({
           dirtyRectRef.current.maxX = Math.max(dirtyRectRef.current.maxX, tMaxX);
           dirtyRectRef.current.maxY = Math.max(dirtyRectRef.current.maxY, tMaxY);
         }
-
-        if (isEraser && isMonochrome && canvas && dirtyRectRef.current) {
-          const eDirty = dirtyRectRef.current;
-          const eMinX = Math.max(0, Math.floor(eDirty.minX));
-          const eMinY = Math.max(0, Math.floor(eDirty.minY));
-          const eMaxX = Math.min(canvas.width, Math.ceil(eDirty.maxX));
-          const eMaxY = Math.min(canvas.height, Math.ceil(eDirty.maxY));
-          const eW = eMaxX - eMinX;
-          const eH = eMaxY - eMinY;
-          if (eW > 0 && eH > 0) {
-            const cCtx = get2DContext(canvas);
-            if (cCtx) {
-              binarizeCanvasRect(
-                cCtx,
-                { x: eMinX, y: eMinY, width: eW, height: eH },
-                activeLayer?.monoThreshold ?? 128,
-                activeLayer?.monoExpressBlack ?? true,
-                activeLayer?.monoExpressWhite ?? true
-              );
-            }
-            if (sourceCanvas) {
-              const sCtx = get2DContext(sourceCanvas);
-              sCtx?.drawImage(canvas, eMinX, eMinY, eW, eH, eMinX, eMinY, eW, eH);
-            }
-          }
-        }
+        markTouchedTiles(tMinX, tMinY, tMaxX, tMaxY);
       }
 
       // BAKE STROKE INTO HIGH-RESOLUTION BASE CANVAS (Dirty Rect only)
       const dirty = dirtyRectRef.current;
-
-      if (isEraser && isToneLayer && sourceCanvas && canvas) {
-        if (activeLayer) {
-          const freq = activeLayer?.toneFrequency ?? 60;
-          const cellSize = Math.max(3.5, (dimensionsRef.current.dpi ?? 600) / freq);
-          const cellMargin = Math.ceil(cellSize * 2 + 32);
-          applyLayerEffects(
-            sourceCanvas,
-            canvas,
-            activeLayer,
-            dimensionsRef.current.dpi ?? 600,
-            dirty ? {
-              x: Math.max(0, Math.floor(dirty.minX - cellMargin)),
-              y: Math.max(0, Math.floor(dirty.minY - cellMargin)),
-              width: Math.min(canvas.width, Math.ceil(dirty.maxX + cellMargin)) - Math.max(0, Math.floor(dirty.minX - cellMargin)),
-              height: Math.min(canvas.height, Math.ceil(dirty.maxY + cellMargin)) - Math.max(0, Math.floor(dirty.minY - cellMargin)),
-            } : undefined
-          );
-        }
-      }
       let exitSpeed = 0;
+      let exitVx = 0;
+      let exitVy = 0;
       if (recentPointsTrailRef.current.length >= 2) {
         const trail = recentPointsTrailRef.current;
         const sampleIdx = Math.max(0, trail.length - 4);
         const pA = trail[sampleIdx];
         const pB = trail[trail.length - 1];
-        const dt = Math.max(1, pB.t - pA.t);
-        const dist = Math.hypot(pB.x - pA.x, pB.y - pA.y);
+        const dwellMs = Math.max(0, performance.now() - pB.t);
+        const dt = Math.max(1, (pB.t - pA.t) + dwellMs);
+        const dx = pB.x - pA.x;
+        const dy = pB.y - pA.y;
+        const dist = Math.hypot(dx, dy);
         exitSpeed = dist / dt;
+        exitVx = dx / dt;
+        exitVy = dy / dt;
+      }
+
+      // Synthesize ballistic flick tail (Iri-Nuki) when lifting stylus at high velocity
+      if (!isEraser && exitSpeed >= 0.7 && allStrokePointsRef.current.length >= 3) {
+        const lastKnot = allStrokePointsRef.current[allStrokePointsRef.current.length - 1];
+        const prevKnot = allStrokePointsRef.current[allStrokePointsRef.current.length - 2];
+        const refWidth = Math.max(lastKnot.width, prevKnot.width);
+        const refPressure = Math.max(lastKnot.pressure, prevKnot.pressure);
+        const flick = taperEngineRef.current.computeFlickTaper(
+          lastKnot.x,
+          lastKnot.y,
+          refWidth,
+          refPressure,
+          exitVx,
+          exitVy,
+          performance.now()
+        );
+        if (flick.count > 0) {
+          const docW = canvas ? canvas.width : dimensionsRef.current.width;
+          const docH = canvas ? canvas.height : dimensionsRef.current.height;
+          for (let i = 0; i < flick.count; i++) {
+            const fp = flick.points[i];
+            const fx = Math.max(0, Math.min(docW, fp.x));
+            const fy = Math.max(0, Math.min(docH, fp.y));
+            allStrokePointsRef.current.push({
+              x: fx,
+              y: fy,
+              pressure: fp.pressure,
+              width: fp.width,
+              tiltX: lastKnot.tiltX,
+              tiltY: lastKnot.tiltY,
+              twist: lastKnot.twist,
+              timestamp: fp.timestamp,
+            });
+            const fMargin = Math.ceil(fp.width * 1.5 + 24);
+            const fMinX = Math.max(0, Math.floor(fx - fMargin));
+            const fMinY = Math.max(0, Math.floor(fy - fMargin));
+            const fMaxX = Math.min(docW, Math.ceil(fx + fMargin));
+            const fMaxY = Math.min(docH, Math.ceil(fy + fMargin));
+            if (dirty) {
+              dirty.minX = Math.min(dirty.minX, fMinX);
+              dirty.minY = Math.min(dirty.minY, fMinY);
+              dirty.maxX = Math.max(dirty.maxX, fMaxX);
+              dirty.maxY = Math.max(dirty.maxY, fMaxY);
+            }
+            markTouchedTiles(fMinX, fMinY, fMaxX, fMaxY);
+          }
+        }
       }
 
       const shouldTaperOut = (bs.usePressure && e.pointerType === 'pen') || exitSpeed > 0.5 || Boolean(bs.taper?.useOut) || Boolean(bs.velocityDynamics);
@@ -2397,6 +2971,18 @@ export function useCanvasDrawing({
 
       const allPoints = allStrokePointsRef.current;
       let createdVectorStroke: VectorStroke | undefined;
+
+      // Track final stroke point for Shift + Click straight line continuation
+      if (allPoints.length > 0 && !isMaskModeRef.current) {
+        const finalPt = allPoints[allPoints.length - 1];
+        lastStrokeEndRef.current = {
+          x: finalPt.x,
+          y: finalPt.y,
+          pressure: finalPt.pressure,
+          width: finalPt.width,
+          layerId: currentLayerId,
+        };
+      }
 
       if (activeLayer?.type === 'vector' && canvas && allPoints.length > 0) {
         const knots: VectorKnot[] = allPoints.map((pt, idx) => ({
@@ -2515,7 +3101,8 @@ export function useCanvasDrawing({
           );
         }
       } else if (canvas && dirty && allPoints.length > 0) {
-        const pad = Math.ceil(Math.max(32, (bs.size || 10) * 1.5));
+        const wetMargin = (bs.wetEdge ?? 0) > 0.01 ? Math.ceil((bs.wetEdgeRadius ?? 3.0) * 2 + 8) : 0;
+        const pad = Math.ceil(Math.max(32, (bs.size || 10) * 1.5)) + wetMargin;
         const sx = Math.max(0, Math.floor(dirty.minX - pad));
         const sy = Math.max(0, Math.floor(dirty.minY - pad));
         const maxX = Math.min(canvas.width, Math.ceil(dirty.maxX + pad));
@@ -2524,6 +3111,11 @@ export function useCanvasDrawing({
         const dh = maxY - sy;
 
         if (dw > 0 && dh > 0) {
+          // If Live Direct Layer Preview mutated `canvas`, restore pre-stroke pixels first so final bake is 100% clean
+          if (drewDirectlyOnLayerCanvasRef.current) {
+            restoreLiveOrigTilesToCanvas(canvas);
+          }
+
           const ctx = get2DContext(canvas);
           if (ctx) {
             let label = 'Brush Stroke';
@@ -2545,60 +3137,108 @@ export function useCanvasDrawing({
               label = isMonochrome ? 'Monochrome Pen' : 'Round Brush';
             }
 
-            const docDraft = docDraftCanvasRef.current;
             const dirtyRect = { x: sx, y: sy, width: dw, height: dh };
             const toolForHistory = currentTool === 'eraser' ? 'eraser' : (isPencil ? 'pencil' : 'brush');
+            const targetFormat = isMonochrome ? 'monochrome-1bit' : 'color-32bit';
+            const effectiveMode: CanvasColorMode = isMonochrome ? 'monochrome' : mode;
+            const activeSelection = selectionRef.current;
 
-            if (isEraser && strokeBackupCanvasRef.current) {
-              // Synchronize dirty bounding box to sourceCanvas so tone can be toggled without losing edits
-              if (layerSourceCanvasesRef?.current?.has(currentLayerId)) {
-                const existingSource = layerSourceCanvasesRef.current.get(currentLayerId);
-                if (existingSource) {
-                  const sCtx = get2DContext(existingSource);
-                  if (sCtx) {
-                    sCtx.clearRect(sx, sy, dw, dh);
-                    sCtx.drawImage(canvas, sx, sy, dw, dh, sx, sy, dw, dh);
-                  }
+            if (isMaskModeRef.current) {
+              const beforeMaskData = ctx.getImageData(sx, sy, dw, dh);
+              const maskBs: BrushSettings = {
+                ...bs,
+                color: strokeColor,
+                isTransparentInk: false,
+                colorMixing: false,
+              };
+              const maskTool: ToolType = isEraser ? 'brush' : currentTool;
+
+              ctx.save();
+              ctx.beginPath();
+              ctx.rect(sx, sy, dw, dh);
+              ctx.clip();
+              applySelectionCanvasClip(ctx, activeSelection);
+
+              if ((bs.opacity ?? 1.0) >= 0.999) {
+                renderCompleteStroke(ctx, allPoints, maskBs, maskTool, 'grayscale', false, canvas, false);
+              } else {
+                ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
+                ctx.globalCompositeOperation = 'source-over';
+                const bakeCanvas = getReusableBakeCanvas(dw, dh);
+                const bCtx = bakeCanvas.getContext('2d', { alpha: true });
+                if (bCtx) {
+                  bCtx.clearRect(0, 0, dw, dh);
+                  bCtx.save();
+                  bCtx.translate(-sx, -sy);
+                  renderCompleteStroke(bCtx, allPoints, { ...maskBs, opacity: 1.0 }, maskTool, 'grayscale', false, canvas, false);
+                  bCtx.restore();
+                  ctx.drawImage(bakeCanvas, 0, 0, dw, dh, sx, sy, dw, dh);
                 }
               }
+              ctx.restore();
 
-              // Synchronously snapshot and write committed tiles to globalTileGrid
-              const targetFormat = isMonochrome ? 'monochrome-1bit' : 'color-32bit';
-              const beforeSnapshot = globalTileGrid.snapshotTilesInRect(currentLayerId, dirtyRect);
-              const afterData = ctx.getImageData(sx, sy, dw, dh);
-              globalTileGrid.writeImageData(currentLayerId, afterData, sx, sy, targetFormat);
-
-              // Offload history step and tile delta generation to background task
+              const afterMaskData = ctx.getImageData(sx, sy, dw, dh);
+              if (activeSelection?.mask) {
+                applySelectionMaskToImageData(beforeMaskData, afterMaskData, sx, sy, activeSelection);
+                ctx.putImageData(afterMaskData, sx, sy);
+              }
+              if (activeLayer) {
+                activeLayer.maskVersion = (activeLayer.maskVersion || 0) + 1;
+              }
               enqueueHistoryTask(() => {
-                const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId, dirtyRect);
-                pushHistoryStep('eraser', label, null, null, currentLayerId, dirtyRect, tileDeltas);
+                pushHistoryStep(
+                  toolForHistory,
+                  'Layer Mask Stroke',
+                  beforeMaskData,
+                  afterMaskData,
+                  currentLayerId,
+                  dirtyRect,
+                  undefined,
+                  undefined,
+                  undefined,
+                  undefined,
+                  true
+                );
               });
             } else if (isToneLayer && sourceCanvas) {
               const sCtx = get2DContext(sourceCanvas);
+              const beforeSelectionData =
+                activeSelection?.mask && sCtx ? sCtx.getImageData(sx, sy, dw, dh) : null;
               if (sCtx) {
                 sCtx.save();
                 sCtx.beginPath();
                 sCtx.rect(sx, sy, dw, dh);
                 sCtx.clip();
-                sCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
-                if (bs.isTransparentInk) {
-                  sCtx.globalCompositeOperation = 'destination-out';
-                } else if (activeLayer?.alphaLocked) {
-                  sCtx.globalCompositeOperation = 'source-atop';
-                } else {
-                  sCtx.globalCompositeOperation = 'source-over';
-                }
+                applySelectionCanvasClip(sCtx, activeSelection);
 
-                if (docDraft) {
-                  sCtx.drawImage(docDraft, sx, sy, dw, dh, sx, sy, dw, dh);
+                const needsIsolatedBake = (bs.opacity ?? 1.0) < 0.999;
+                if (!needsIsolatedBake) {
+                  renderCompleteStroke(sCtx, allPoints, bs, currentTool, effectiveMode, isBgEraser, sourceCanvas, Boolean(activeLayer?.alphaLocked));
                 } else {
+                  sCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
+                  if ((isEraser && !isBgEraser) || bs.isTransparentInk) {
+                    sCtx.globalCompositeOperation = 'destination-out';
+                  } else if (activeLayer?.alphaLocked) {
+                    sCtx.globalCompositeOperation = 'source-atop';
+                  } else {
+                    sCtx.globalCompositeOperation = 'source-over';
+                  }
                   const bakeCanvas = getReusableBakeCanvas(dw, dh);
                   const bCtxBake = bakeCanvas.getContext('2d', { alpha: true });
                   if (bCtxBake) {
-                    bCtxBake.clearRect(0, 0, bakeCanvas.width, bakeCanvas.height);
+                    bCtxBake.clearRect(0, 0, dw, dh);
                     bCtxBake.save();
                     bCtxBake.translate(-sx, -sy);
-                    renderCompleteStroke(bCtxBake, allPoints, bs, currentTool, mode, isBgEraser, sourceCanvas, Boolean(activeLayer?.alphaLocked));
+                    renderCompleteStroke(
+                      bCtxBake,
+                      allPoints,
+                      { ...bs, opacity: 1.0, isTransparentInk: false, color: isEraser && !isBgEraser ? '#000000' : bs.color },
+                      isEraser && !isBgEraser ? 'brush' : currentTool,
+                      effectiveMode,
+                      isBgEraser,
+                      sourceCanvas,
+                      false
+                    );
                     bCtxBake.restore();
                     sCtx.drawImage(bakeCanvas, 0, 0, dw, dh, sx, sy, dw, dh);
                   }
@@ -2606,127 +3246,253 @@ export function useCanvasDrawing({
                 sCtx.restore();
               }
 
+              const beforeSnapshot = globalTileGrid.snapshotTilesInRect(currentLayerId, dirtyRect);
+              const afterData = sCtx ? sCtx.getImageData(sx, sy, dw, dh) : null;
+              if (afterData && beforeSelectionData && activeSelection?.mask && sCtx) {
+                applySelectionMaskToImageData(beforeSelectionData, afterData, sx, sy, activeSelection);
+                sCtx.putImageData(afterData, sx, sy);
+              }
+
               if (activeLayer) {
+                const freq = activeLayer?.toneFrequency ?? 60;
+                const cellSize = Math.max(3.5, (dimensionsRef.current.dpi ?? 600) / freq);
+                const cellMargin = isEraser ? Math.ceil(cellSize * 2 + 32) : 0;
+                const fxX = Math.max(0, sx - cellMargin);
+                const fxY = Math.max(0, sy - cellMargin);
+                const fxW = Math.min(canvas.width, sx + dw + cellMargin) - fxX;
+                const fxH = Math.min(canvas.height, sy + dh + cellMargin) - fxY;
                 applyLayerEffects(
                   sourceCanvas,
                   canvas,
                   activeLayer,
                   dimensionsRef.current.dpi ?? 600,
-                  { x: sx, y: sy, width: dw, height: dh }
+                  { x: fxX, y: fxY, width: fxW, height: fxH }
                 );
               }
 
-              if (docDraft) {
-                const dCtx = get2DContext(docDraft);
-                dCtx?.clearRect(sx, sy, dw, dh);
-              }
-
-              // Synchronously snapshot and write committed tiles to globalTileGrid
-              const targetFormat = isMonochrome ? 'monochrome-1bit' : 'color-32bit';
-              const beforeSnapshot = globalTileGrid.snapshotTilesInRect(currentLayerId, dirtyRect);
-              const afterData = sCtx ? sCtx.getImageData(sx, sy, dw, dh) : null;
               if (afterData) {
                 globalTileGrid.writeImageData(currentLayerId, afterData, sx, sy, targetFormat);
               }
+              const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId, dirtyRect);
 
               enqueueHistoryTask(() => {
-                const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId, dirtyRect);
                 pushHistoryStep(toolForHistory, label, null, null, currentLayerId, dirtyRect, tileDeltas);
               });
             } else {
-              // Direct zero-stall GPU blit from docDraft to layer canvas (<0.2 ms)
+              const beforeSelectionData =
+                activeSelection?.mask ? ctx.getImageData(sx, sy, dw, dh) : null;
+
               ctx.save();
               ctx.beginPath();
               ctx.rect(sx, sy, dw, dh);
               ctx.clip();
+              applySelectionCanvasClip(ctx, activeSelection);
 
-              ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
-              if (bs.isTransparentInk) {
-                ctx.globalCompositeOperation = 'destination-out';
-              } else if (activeLayer?.alphaLocked) {
-                ctx.globalCompositeOperation = 'source-atop';
-              } else {
-                ctx.globalCompositeOperation = 'source-over';
-              }
+              const hasWetEdge =
+                !isMonochrome &&
+                !isEraser &&
+                !bs.isTransparentInk &&
+                (bs.wetEdge ?? 0) > 0.01;
+              const needsIsolatedBake = (bs.opacity ?? 1.0) < 0.999 || hasWetEdge;
 
-              if (docDraft) {
-                ctx.drawImage(docDraft, sx, sy, dw, dh, sx, sy, dw, dh);
+              if (!needsIsolatedBake) {
+                renderCompleteStroke(ctx, allPoints, bs, currentTool, effectiveMode, isBgEraser, canvas, Boolean(activeLayer?.alphaLocked));
               } else {
+                ctx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
+                if ((isEraser && !isBgEraser) || bs.isTransparentInk) {
+                  ctx.globalCompositeOperation = 'destination-out';
+                } else if (activeLayer?.alphaLocked) {
+                  ctx.globalCompositeOperation = 'source-atop';
+                } else {
+                  ctx.globalCompositeOperation = 'source-over';
+                }
                 const bakeCanvas = getReusableBakeCanvas(dw, dh);
-                const bCtx = bakeCanvas.getContext('2d', { alpha: true });
+                const bCtx = bakeCanvas.getContext('2d', { alpha: true, willReadFrequently: hasWetEdge });
                 if (bCtx) {
-                  bCtx.clearRect(0, 0, bakeCanvas.width, bakeCanvas.height);
+                  bCtx.clearRect(0, 0, dw, dh);
                   bCtx.save();
                   bCtx.translate(-sx, -sy);
-                  renderCompleteStroke(bCtx, allPoints, bs, currentTool, mode, isBgEraser, canvas, Boolean(activeLayer?.alphaLocked));
+                  renderCompleteStroke(
+                    bCtx,
+                    allPoints,
+                    {
+                      ...bs,
+                      opacity: 1.0,
+                      isTransparentInk: false,
+                      wetEdge: 0,
+                      color: isEraser && !isBgEraser ? '#000000' : bs.color,
+                    },
+                    isEraser && !isBgEraser ? 'brush' : currentTool,
+                    effectiveMode,
+                    isBgEraser,
+                    canvas,
+                    false
+                  );
                   bCtx.restore();
+
+                  if (hasWetEdge) {
+                    const bakeImg = bCtx.getImageData(0, 0, dw, dh);
+                    applyCspWatercolorEdge(
+                      bakeImg,
+                      bs.wetEdge ?? 0,
+                      bs.wetEdgeRadius ?? 3.0,
+                      bs.wetEdgeAlphaPower ?? 25,
+                      bs.wetEdgeValuePower ?? 15
+                    );
+                    bCtx.putImageData(bakeImg, 0, 0);
+                  }
+
                   ctx.drawImage(bakeCanvas, 0, 0, dw, dh, sx, sy, dw, dh);
                 }
               }
 
               ctx.restore();
 
-              // Single-pass snapshot: read pixel buffer once, binarize in-place if monochrome, then write
-              const targetFormat = isMonochrome ? 'monochrome-1bit' : 'color-32bit';
-              const beforeSnapshot = globalTileGrid.snapshotTilesInRect(currentLayerId, dirtyRect);
-              const afterData = ctx.getImageData(sx, sy, dw, dh);
-              if (isMonochrome) {
-                binarizeImageDataBuffer(
-                  afterData,
-                  activeLayer?.monoThreshold ?? 128,
-                  activeLayer?.monoExpressBlack ?? true,
-                  activeLayer?.monoExpressWhite ?? true
-                );
-                ctx.putImageData(afterData, sx, sy);
+              if (beforeSelectionData && activeSelection?.mask) {
+                const fullAfter = ctx.getImageData(sx, sy, dw, dh);
+                applySelectionMaskToImageData(beforeSelectionData, fullAfter, sx, sy, activeSelection);
+                ctx.putImageData(fullAfter, sx, sy);
               }
 
-              if (layerSourceCanvasesRef?.current?.has(currentLayerId)) {
-                const existingSource = layerSourceCanvasesRef.current.get(currentLayerId);
-                if (existingSource) {
-                  const sCtx = get2DContext(existingSource);
-                  if (sCtx) {
-                    sCtx.clearRect(sx, sy, dw, dh);
-                    sCtx.drawImage(canvas, sx, sy, dw, dh, sx, sy, dw, dh);
+              const useSparseTileSpans = dw * dh > 512 * 512 && touchedTilesRef.current.size > 0;
+              if (useSparseTileSpans) {
+                const rows = new Map<number, number[]>();
+                for (const key of touchedTilesRef.current) {
+                  const ty = Math.floor(key / 65536);
+                  const tx = key % 65536;
+                  let list = rows.get(ty);
+                  if (!list) {
+                    list = [];
+                    rows.set(ty, list);
+                  }
+                  list.push(tx);
+                }
+
+                const spans: Array<{ x: number; y: number; width: number; height: number }> = [];
+                for (const [ty, txList] of rows) {
+                  txList.sort((a, b) => a - b);
+                  let spanStart = txList[0];
+                  let spanEnd = txList[0];
+                  for (let i = 1; i < txList.length; i++) {
+                    if (txList[i] <= spanEnd + 1) {
+                      spanEnd = txList[i];
+                    } else {
+                      const rx = Math.max(0, spanStart * TILE_SIZE);
+                      const ry = Math.max(0, ty * TILE_SIZE);
+                      const rw = Math.min(canvas.width, (spanEnd + 1) * TILE_SIZE) - rx;
+                      const rh = Math.min(canvas.height, (ty + 1) * TILE_SIZE) - ry;
+                      if (rw > 0 && rh > 0) spans.push({ x: rx, y: ry, width: rw, height: rh });
+                      spanStart = txList[i];
+                      spanEnd = txList[i];
+                    }
+                  }
+                  const rx = Math.max(0, spanStart * TILE_SIZE);
+                  const ry = Math.max(0, ty * TILE_SIZE);
+                  const rw = Math.min(canvas.width, (spanEnd + 1) * TILE_SIZE) - rx;
+                  const rh = Math.min(canvas.height, (ty + 1) * TILE_SIZE) - ry;
+                  if (rw > 0 && rh > 0) spans.push({ x: rx, y: ry, width: rw, height: rh });
+                }
+
+                const beforeSnapshot = new Map<string, { format: TileFormat; data: Uint8Array | null }>(
+                  liveBeforeTileSnapshotRef.current
+                );
+                for (let i = 0; i < spans.length; i++) {
+                  const sp = spans[i];
+                  const subSnap = globalTileGrid.snapshotTilesInRect(currentLayerId, sp);
+                  for (const [k, v] of subSnap) {
+                    if (!beforeSnapshot.has(k)) beforeSnapshot.set(k, v);
+                  }
+                  const spanData = ctx.getImageData(sp.x, sp.y, sp.width, sp.height);
+                  if (isMonochrome) {
+                    binarizeImageDataBuffer(
+                      spanData,
+                      activeLayer?.monoThreshold ?? 128,
+                      activeLayer?.monoExpressBlack ?? true,
+                      activeLayer?.monoExpressWhite ?? true
+                    );
+                    ctx.putImageData(spanData, sp.x, sp.y);
+                  }
+                  globalTileGrid.writeImageData(currentLayerId, spanData, sp.x, sp.y, targetFormat, true);
+                }
+
+                if (layerSourceCanvasesRef?.current?.has(currentLayerId)) {
+                  const existingSource = layerSourceCanvasesRef.current.get(currentLayerId);
+                  if (existingSource) {
+                    const sCtx = get2DContext(existingSource);
+                    if (sCtx) {
+                      for (let i = 0; i < spans.length; i++) {
+                        const sp = spans[i];
+                        sCtx.clearRect(sp.x, sp.y, sp.width, sp.height);
+                        sCtx.drawImage(canvas, sp.x, sp.y, sp.width, sp.height, sp.x, sp.y, sp.width, sp.height);
+                      }
+                    }
                   }
                 }
-              }
 
-              if (docDraft) {
-                const dCtx = get2DContext(docDraft);
-                dCtx?.clearRect(sx, sy, dw, dh);
-              }
+                const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId);
+                enqueueHistoryTask(() => {
+                  pushHistoryStep(toolForHistory, label, null, null, currentLayerId, dirtyRect, tileDeltas);
+                });
+              } else {
+                const beforeSnapshot = new Map<string, { format: TileFormat; data: Uint8Array | null }>(
+                  liveBeforeTileSnapshotRef.current
+                );
+                const subSnap = globalTileGrid.snapshotTilesInRect(currentLayerId, dirtyRect);
+                for (const [k, v] of subSnap) {
+                  if (!beforeSnapshot.has(k)) beforeSnapshot.set(k, v);
+                }
 
-              globalTileGrid.writeImageData(currentLayerId, afterData, sx, sy, targetFormat);
+                const afterData = ctx.getImageData(sx, sy, dw, dh);
+                if (isMonochrome) {
+                  binarizeImageDataBuffer(
+                    afterData,
+                    activeLayer?.monoThreshold ?? 128,
+                    activeLayer?.monoExpressBlack ?? true,
+                    activeLayer?.monoExpressWhite ?? true
+                  );
+                  ctx.putImageData(afterData, sx, sy);
+                }
 
-              enqueueHistoryTask(() => {
+                if (layerSourceCanvasesRef?.current?.has(currentLayerId)) {
+                  const existingSource = layerSourceCanvasesRef.current.get(currentLayerId);
+                  if (existingSource) {
+                    const sCtx = get2DContext(existingSource);
+                    if (sCtx) {
+                      sCtx.clearRect(sx, sy, dw, dh);
+                      sCtx.drawImage(canvas, sx, sy, dw, dh, sx, sy, dw, dh);
+                    }
+                  }
+                }
+
+                globalTileGrid.writeImageData(currentLayerId, afterData, sx, sy, targetFormat);
                 const tileDeltas = globalTileGrid.computeDeltasFromSnapshot(beforeSnapshot, currentLayerId, dirtyRect);
-                pushHistoryStep(toolForHistory, label, null, null, currentLayerId, dirtyRect, tileDeltas);
-              });
+
+                enqueueHistoryTask(() => {
+                  pushHistoryStep(toolForHistory, label, null, null, currentLayerId, dirtyRect, tileDeltas);
+                });
+              }
             }
           }
         }
       }
 
-      // Synchronously notify tile grid compositor
+      // Synchronously notify tile grid compositor AND synchronously clear draft overlay in the same frame (zero double-alpha flash!)
       globalTileGrid.notifyChange(true);
 
-      // Atomic Zero-Flicker handoff: wait 1 frame for WebGL compositor to present its swap chain, then clear draft overlay
       if (clearDraftRafRef.current !== null) {
         cancelAnimationFrame(clearDraftRafRef.current);
-      }
-      clearDraftRafRef.current = requestAnimationFrame(() => {
         clearDraftRafRef.current = null;
-        if (draftCanvas) {
-          const dCtx = get2DContext(draftCanvas);
-          if (dCtx) {
-            try {
-              dCtx.restore(); // Restore artboard clip
-            } catch (_) {}
-            dCtx.resetTransform();
-            dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
-          }
+      }
+      if (draftCanvas) {
+        const dCtx = get2DContext(draftCanvas);
+        if (dCtx) {
+          try {
+            dCtx.restore();
+          } catch (_) {}
+          dCtx.resetTransform();
+          dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
         }
-      });
+      }
       clearPredictedCanvas();
 
       if (currentStrokeIdRef.current) {
@@ -2752,8 +3518,14 @@ export function useCanvasDrawing({
       stabilizedPointRef.current = null;
       lastProcessedPointRef.current = null;
       dirtyRectRef.current = null;
+      touchedTilesRef.current.clear();
       pendingPointsQueueRef.current = [];
       drewDirectlyOnLayerCanvasRef.current = false;
+      liveStrokeIsolationRef.current = false;
+      liveOrigCanvasTilesRef.current.clear();
+      liveBeforeTileSnapshotRef.current.clear();
+      liveNeedsNotifyRef.current = false;
+      isShiftLineStrokeRef.current = false;
       isToneStrokeRef.current = false;
       strokeBackupCanvasRef.current = null;
       layerPixelSamplerRef.current = null;
@@ -2771,7 +3543,8 @@ export function useCanvasDrawing({
       }
     },
     [
-      applyStabilizedPointAndRender,
+      buildLiveRadialOptions,
+      buildLiveTexturedOptions,
       clearPredictedCanvas,
       effectiveDraftCanvasRef,
       emitConstraintAxisChange,
@@ -2779,12 +3552,13 @@ export function useCanvasDrawing({
       flushPendingPoints,
       getActiveCanvas,
       getCanvasPoint,
+      layerSourceCanvasesRef,
+      markTouchedTiles,
       onUpdateLayerThumbnail,
       pushHistoryStep,
-      renderDraftSegment,
+      restoreLiveOrigTilesToCanvas,
     ]
   );
-
 
   const handlePointerEnter = useCallback(() => {
     if (viewportRef.current) {
@@ -2799,46 +3573,22 @@ export function useCanvasDrawing({
     }
   }, [dispatchPointerStat]);
 
-  // Keyboard shortcut listener (Ctrl+Z for undo, Ctrl+Y / Ctrl+Shift+Z for redo)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Ignore if typing in text inputs or textareas
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement).tagName)) {
-        return;
-      }
-
-      const key = e.key.toLowerCase();
-      const isZ = key === 'z' || e.code === 'KeyZ';
-
-      if ((e.ctrlKey || e.metaKey) && isZ) {
-        e.preventDefault();
-        e.stopPropagation();
-        if (e.shiftKey) {
-          redo();
-        } else {
-          undo();
-        }
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown, true);
-    return () => window.removeEventListener('keydown', handleKeyDown, true);
-  }, [undo, redo]);
-
   const resetHistory = useCallback(() => {
     historyRef.current = [];
     historyIndexRef.current = -1;
+    lastStrokeEndRef.current = null;
     setHistoryList([]);
     setHistoryIndex(-1);
     setCanUndo(false);
     setCanRedo(false);
+    globalUndoCache.clearCache().catch(() => {});
 
     // Re-seed initial history state after DOM canvas updates without heavy getImageData readback
     setTimeout(() => {
       const canvas = layerCanvasesRef.current.get(activeLayerId) || layerCanvasesRef.current.values().next().value;
       if (!canvas) return;
 
-      const thumbnail = createCanvasThumbnail(canvas, activeLayerId !== 'layer-bg');
+      const thumbnail = createCanvasThumbnail(canvas, !isBackgroundLayerId(activeLayerId));
       const now = Date.now();
 
       const initialItem: HistoryItem = {
@@ -2862,6 +3612,7 @@ export function useCanvasDrawing({
 
   return {
     interactionRef,
+    isDrawingRef,
     getActiveCanvas,
     pushHistoryStep,
     handlePointerDown,

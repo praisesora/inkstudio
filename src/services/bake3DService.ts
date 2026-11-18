@@ -60,13 +60,21 @@ export function disposeThreeResources(
       }
 
       const line = obj as THREE.Line;
-      if (line.isLine && line.geometry) {
-        line.geometry.dispose();
+      if (line.isLine) {
+        if (line.geometry) line.geometry.dispose();
+        if (line.material) {
+          if (Array.isArray(line.material)) line.material.forEach((m) => disposeMaterialTextures(m));
+          else disposeMaterialTextures(line.material);
+        }
       }
 
       const points = obj as THREE.Points;
-      if (points.isPoints && points.geometry) {
-        points.geometry.dispose();
+      if (points.isPoints) {
+        if (points.geometry) points.geometry.dispose();
+        if (points.material) {
+          if (Array.isArray(points.material)) points.material.forEach((m) => disposeMaterialTextures(m));
+          else disposeMaterialTextures(points.material);
+        }
       }
     });
 
@@ -76,6 +84,11 @@ export function disposeThreeResources(
   }
 
   if (renderer) {
+    try {
+      if (typeof renderer.forceContextLoss === 'function') {
+        renderer.forceContextLoss();
+      }
+    } catch {}
     renderer.dispose();
   }
 
@@ -669,7 +682,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
       const pIdx = i * 4;
       const alpha = diffData[pIdx + 3];
       // Skip background pixels and lineart contours
-      if (alpha === 0 || (lineData32[i] & 0xff000000) !== 0) continue;
+      if (alpha === 0 || (lineData32[i] & SOLID_BLACK_U32) !== 0) continue;
 
       const r = diffData[pIdx];
       const g = diffData[pIdx + 1];
@@ -753,6 +766,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   };
 
   // 8. Immediate Cleanup of Offscreen WebGL Resources
+  normalMat.dispose();
   quadGeo.dispose();
   sobelMaterial.dispose();
   displayMaterial.dispose();
@@ -770,6 +784,11 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
       disposeThreeResources(null, activeRenderer);
     }
   } else {
+    try {
+      if (typeof offscreenRenderer.forceContextLoss === 'function') {
+        offscreenRenderer.forceContextLoss();
+      }
+    } catch {}
     offscreenRenderer.dispose();
   }
 
@@ -794,11 +813,11 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   if (onBroadcastLayer) {
     onBroadcastLayer(folderLayer, '');
     onBroadcastLayer(lineLayer, lineDataUrl);
-    toneLayers.forEach((l, i) => onBroadcastLayer(l, toneCanvases[i].toDataURL('image/png')));
+    toneLayersStackOrder.forEach((l, i) => onBroadcastLayer(l, toneCanvasesStackOrder[i].toDataURL('image/png')));
   } else if (multiplayerService.isConnected()) {
     multiplayerService.sendLayerAdd(folderLayer);
     multiplayerService.sendLayerAdd(lineLayer, lineDataUrl);
-    toneLayers.forEach((l, i) => multiplayerService.sendLayerAdd(l, toneCanvases[i].toDataURL('image/png')));
+    toneLayersStackOrder.forEach((l, i) => multiplayerService.sendLayerAdd(l, toneCanvasesStackOrder[i].toDataURL('image/png')));
   }
 
   return {

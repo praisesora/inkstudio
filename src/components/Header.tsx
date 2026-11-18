@@ -1,14 +1,21 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Undo2,
   Redo2,
-  ZoomIn,
-  ZoomOut,
-  RotateCcw,
-  RotateCw,
+  Minus,
+  Plus,
+  X,
   Users,
+  Settings,
+  RotateCcw,
 } from 'lucide-react';
-import { ToolType, CanvasDimensions, MenuSection, CanvasColorMode, BrushPresetId, SoftProofSettings } from '../types/editor';
+import {
+  CanvasDimensions,
+  MenuSection,
+  CanvasColorMode,
+  SoftProofSettings,
+  DocumentTab,
+} from '../types/editor';
 import { ThemePreset } from '../types/settings';
 import { formatZoomPercent } from '../hooks/useCanvasNavigation';
 import { formatRotationDegrees } from '../utils/canvasUtils';
@@ -16,17 +23,10 @@ import { MenuBar } from './MenuBar';
 import { WindowControls } from './WindowControls';
 
 interface HeaderProps {
-  tool?: ToolType;
-  preset?: BrushPresetId;
-  brushName?: string;
-  brushSize?: number;
-  onBrushSizeChange?: (size: number) => void;
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
-  onClear?: () => void;
-  onExport?: () => void;
   zoom: number;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -37,22 +37,23 @@ interface HeaderProps {
   colorMode?: CanvasColorMode;
   menuSections?: MenuSection[];
   hasOpenDocument?: boolean;
+  documents?: DocumentTab[];
+  activeDocumentId?: string | null;
+  onSelectDocument?: (id: string) => void;
+  onCloseDocument?: (id: string) => void;
+  onNewDocument?: () => void;
+  onRenameDocument?: (id: string, newName: string) => void;
   isCollabConnected?: boolean;
   collabPeerCount?: number;
   onOpenCollabModal?: () => void;
+  onOpenSettings?: () => void;
   themePreset?: ThemePreset;
-  activeDocumentTitle?: string;
   softProofSettings?: SoftProofSettings;
   appView?: 'home' | 'workspace';
   onSelectAppView?: (view: 'home' | 'workspace') => void;
 }
 
 export const Header: React.FC<HeaderProps> = React.memo(({
-  tool: _tool,
-  preset: _preset,
-  brushName: _brushName,
-  brushSize: _brushSize,
-  onBrushSizeChange: _onBrushSizeChange,
   canUndo,
   canRedo,
   onUndo,
@@ -63,427 +64,273 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   onResetZoom,
   rotation,
   onResetRotation,
-  dimensions = { width: 1440, height: 900 },
   colorMode = 'color',
   menuSections,
   hasOpenDocument = true,
+  documents = [],
+  activeDocumentId = null,
+  onSelectDocument,
+  onCloseDocument,
+  onNewDocument,
+  onRenameDocument,
   isCollabConnected = false,
   collabPeerCount = 1,
   onOpenCollabModal,
-  themePreset = 'vintage-manga',
-  activeDocumentTitle,
+  onOpenSettings,
+  themePreset,
   softProofSettings,
   appView = 'workspace',
   onSelectAppView,
 }) => {
-  if (themePreset === 'modern') {
-    return (
-      <header
-        data-tauri-drag-region
-        className="h-10 px-3 flex items-center justify-between text-xs select-none z-30 shrink-0 cursor-default bg-[#18191d] border-b border-white/[0.08] text-white/90"
-      >
-        {/* Brand, Menus, Home/Workspace Pills & Document Info */}
-        <div className="flex items-center space-x-3 min-w-0">
-          <div className="flex items-center space-x-2" title="Ink Studio">
-            <div className="w-5 h-5 flex items-center justify-center">
-              <img
-                src="/app-icon.png"
-                alt="Studio Logo"
-                className="w-4 h-4 object-contain select-none pointer-events-none drop-shadow-xs"
-              />
-            </div>
-            <span className="font-semibold text-xs text-white tracking-tight hidden sm:inline">Ink Studio</span>
-          </div>
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editingName, setEditingName] = useState<string>('');
 
-          <span className="text-white/15">|</span>
+  const handleStartRename = (e: React.MouseEvent, doc: DocumentTab) => {
+    e.stopPropagation();
+    setEditingId(doc.id);
+    setEditingName(doc.name);
+  };
 
-          {/* Menu Bar Sections: File, Edit, Layer, View, Help */}
-          <MenuBar sections={menuSections} />
+  const handleFinishRename = (id: string) => {
+    if (editingName.trim() && onRenameDocument) {
+      onRenameDocument(id, editingName.trim());
+    }
+    setEditingId(null);
+  };
 
-          {/* Home / Workspace Navigation Pills matching Reference 1 & 3 */}
-          <div className="flex items-center space-x-0.5 bg-white/[0.04] p-0.5 rounded-lg border border-white/[0.08]">
-            <button
-              onClick={() => onSelectAppView?.('home')}
-              className={`px-3 py-1 rounded-md text-xs transition-colors cursor-pointer ${
-                appView === 'home'
-                  ? 'bg-white/[0.14] text-white font-medium border border-white/10 shadow-xs'
-                  : 'text-white/60 hover:text-white hover:bg-white/[0.06] border border-transparent'
-              }`}
-            >
-              Home
-            </button>
-            <button
-              onClick={() => onSelectAppView?.('workspace')}
-              className={`px-3 py-1 rounded-md text-xs transition-colors cursor-pointer ${
-                appView === 'workspace'
-                  ? 'bg-white/[0.14] text-white font-medium border border-white/10 shadow-xs'
-                  : 'text-white/60 hover:text-white hover:bg-white/[0.06] border border-transparent'
-              }`}
-            >
-              Workspace
-            </button>
-          </div>
-
-          {hasOpenDocument && (
-            <>
-              <span className="text-white/15">|</span>
-
-              <div className="flex items-center space-x-2 truncate">
-                <span
-                  className="text-white/90 font-medium text-xs truncate max-w-[280px]"
-                  title={`${activeDocumentTitle || 'New canvas*'} (${dimensions.width}×${dimensions.height}px ${dimensions.dpi ? `${dimensions.dpi}dpi ` : ''}${formatZoomPercent(zoom)})`}
-                >
-                  {activeDocumentTitle || 'New canvas*'}
-                </span>
-                <span className="text-[10px] text-white/40 font-mono hidden md:inline">
-                  {dimensions.width}×{dimensions.height}px
-                </span>
-
-                <span
-                  className={`text-[9px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider ${
-                    colorMode === 'monochrome'
-                      ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
-                      : colorMode === 'grayscale'
-                      ? 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
-                      : 'bg-[var(--modern-accent-subtle)] text-[var(--modern-accent)] border border-[var(--modern-accent-border)]'
-                  }`}
-                  title={`Active Canvas Color Mode: ${colorMode}`}
-                >
-                  {colorMode === 'monochrome' ? 'Manga' : colorMode}
-                </span>
-
-                {softProofSettings?.enabled && (
-                  <span
-                    className="text-[9px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider bg-cyan-500/15 text-cyan-300 border border-cyan-500/30"
-                    title={`CMYK Soft Proofing Active (${softProofSettings.standard})`}
-                  >
-                    CMYK Proof
-                  </span>
-                )}
-
-                {softProofSettings?.gamutWarning && (
-                  <span
-                    className="text-[9px] px-1.5 py-0.5 rounded-full font-mono uppercase tracking-wider bg-amber-500/15 text-amber-300 border border-amber-500/30"
-                    title="Gamut Warning Overlay Active"
-                  >
-                    Gamut Warning
-                  </span>
-                )}
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Action Tools & Zoom */}
-        <div className="flex items-center space-x-2">
-          {/* Undo / Redo */}
-          <div className="flex items-center rounded-lg p-0.5 space-x-0.5 bg-white/[0.04] border border-white/[0.08]">
-            <button
-              onClick={onUndo}
-              disabled={!canUndo}
-              title="Undo (Ctrl+Z)"
-              className={`p-1 rounded-md transition-colors ${
-                canUndo
-                  ? 'text-white/80 hover:text-white hover:bg-white/10 cursor-pointer'
-                  : 'text-white/20 cursor-not-allowed'
-              }`}
-            >
-              <Undo2 className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={onRedo}
-              disabled={!canRedo}
-              title="Redo (Ctrl+Y)"
-              className={`p-1 rounded-md transition-colors ${
-                canRedo
-                  ? 'text-white/80 hover:text-white hover:bg-white/10 cursor-pointer'
-                  : 'text-white/20 cursor-not-allowed'
-              }`}
-            >
-              <Redo2 className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {/* Zoom Controls */}
-          <div
-            className={`flex items-center space-x-0.5 rounded-lg px-1 py-0.5 bg-white/[0.04] border border-white/[0.08] ${
-              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
-            }`}
-          >
-            <button
-              onClick={onZoomOut}
-              title="Zoom Out (Ctrl + Minus)"
-              className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={onResetZoom}
-              title="Reset Zoom & Center (Ctrl + 0)"
-              className="font-mono text-xs px-1.5 text-white/90 hover:text-white hover:bg-white/10 rounded-md transition-colors cursor-pointer"
-            >
-              {formatZoomPercent(zoom)}
-            </button>
-            <button
-              onClick={onZoomIn}
-              title="Zoom In (Ctrl + Plus)"
-              className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
-            </button>
-            <button
-              onClick={onResetZoom}
-              title="Reset to 100% & Center (Ctrl + 0)"
-              className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
-            >
-              <RotateCcw className="w-3 h-3" />
-            </button>
-          </div>
-
-          {/* Rotation Controls */}
-          <div
-            className={`flex items-center space-x-0.5 rounded-lg px-1 py-0.5 bg-white/[0.04] border border-white/[0.08] ${
-              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
-            }`}
-          >
-            <RotateCw className="w-3.5 h-3.5 text-white/40 ml-0.5" />
-            <button
-              onClick={onResetRotation}
-              onDoubleClick={onResetRotation}
-              title="Canvas Rotation (Double-click or Ctrl+Alt+0 to Reset 0°)"
-              className="font-mono text-xs px-1.5 text-white/90 hover:text-white hover:bg-white/10 rounded-md transition-colors cursor-pointer"
-            >
-              {formatRotationDegrees(rotation)}
-            </button>
-            {Math.abs(rotation % 360) > 0.05 && (
-              <button
-                onClick={onResetRotation}
-                title="Reset Rotation to 0° (Ctrl+Alt+0)"
-                className="p-1 hover:text-white hover:bg-white/10 rounded-md text-white/60 transition-colors cursor-pointer"
-              >
-                <RotateCcw className="w-3 h-3" />
-              </button>
-            )}
-          </div>
-
-          <span className="text-white/15">|</span>
-
-          {/* Multiplayer Host / Connection Indicator */}
-          <button
-            onClick={onOpenCollabModal}
-            className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all cursor-pointer ${
-              isCollabConnected
-                ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 shadow-xs'
-                : 'bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-white/80 hover:text-white'
-            }`}
-            title={isCollabConnected ? `Collaborative Room (${collabPeerCount} online)` : 'Start Collaborative Session (Host)'}
-          >
-            {isCollabConnected ? (
-              <>
-                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                <span>{collabPeerCount} online</span>
-              </>
-            ) : (
-              <>
-                <Users className="w-3.5 h-3.5 text-white/60" />
-                <span>Collab</span>
-              </>
-            )}
-          </button>
-
-          {/* Desktop Native Window Controls (Minimize, Maximize, Close) */}
-          <WindowControls themePreset={themePreset} />
-        </div>
-      </header>
-    );
-  }
+  const isRotated = Math.abs(rotation % 360) > 0.05;
 
   return (
     <header
       data-tauri-drag-region
-      className="h-10 px-3 flex items-center justify-between text-xs select-none z-30 shrink-0 cursor-default transition-colors bg-gradient-to-b from-[#505053] to-[#3e3e40] border-b border-[#242426] text-[#e0e0e3] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]"
+      className="h-[36px] px-2 flex items-center justify-between gap-2 bg-[#202020] text-[#e5e5e5] select-none z-40 shrink-0"
     >
-      {/* Brand, Menus & Document Info */}
-      <div className="flex items-center space-x-2.5 min-w-0">
-        <div className="flex items-center" title="Old Studio">
-          <div className="w-5 h-5 flex items-center justify-center">
-            <img
-              src="/app-icon.png"
-              alt="Studio Logo"
-              className="w-5 h-5 object-contain select-none pointer-events-none drop-shadow-xs"
-            />
-          </div>
-        </div>
+      {/* Left: App Icon (Home Toggle) + Menu Bar */}
+      <div
+        className="flex items-center gap-1 shrink-0"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
+        <button
+          type="button"
+          onClick={() => onSelectAppView?.(appView === 'home' ? 'workspace' : 'home')}
+          title={appView === 'home' ? 'Return to Workspace' : 'Home & Recent Documents'}
+          className={`w-6 h-6 rounded flex items-center justify-center transition-colors cursor-pointer ${
+            appView === 'home'
+              ? 'bg-[#2c2c2c] text-[var(--accent)]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+          }`}
+        >
+          <img
+            src="/app-icon.png"
+            alt="Ink Studio"
+            className="w-3.5 h-3.5 object-contain pointer-events-none opacity-90"
+          />
+        </button>
 
-        <span className="text-[#3a3a3a]">|</span>
-
-        {/* Menu Bar Sections: File, Edit, Layer, View, Help */}
         <MenuBar sections={menuSections} />
+      </div>
 
-        {hasOpenDocument && (
-          <>
-            <span className="text-[#3a3a3a]">|</span>
-
-            <div className="flex items-center space-x-2 truncate">
-              <span className="text-[#f0f0f4] font-medium text-xs truncate max-w-[280px]" title={`${activeDocumentTitle || 'New canvas*'} (${dimensions.width}×${dimensions.height}px ${dimensions.dpi ? `${dimensions.dpi}dpi ` : ''}${formatZoomPercent(zoom)})`}>
-                {activeDocumentTitle || 'New canvas*'} ({dimensions.width}×${dimensions.height}px {dimensions.dpi ? `${dimensions.dpi}dpi ` : ''}{formatZoomPercent(zoom)})
-              </span>
-
-              <span
-                className={`text-[9px] px-1.5 py-0.5 rounded font-mono uppercase tracking-wider ${
-                  colorMode === 'monochrome'
-                    ? 'bg-amber-500/15 text-amber-300 border border-amber-500/30'
-                    : colorMode === 'grayscale'
-                    ? 'bg-slate-500/15 text-slate-300 border border-slate-500/30'
-                    : 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/30'
-                }`}
-                title={`Active Canvas Color Mode: ${colorMode}`}
-              >
-                {colorMode === 'monochrome' ? 'Manga B&W' : colorMode}
-              </span>
-
-              {softProofSettings?.enabled && (
+      {/* Center: Consolidated Compact Document Tabs */}
+      <div
+        className="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto no-scrollbar px-1"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
+        {documents.map((doc) => {
+          const isActive = doc.id === activeDocumentId && appView === 'workspace';
+          return (
+            <div
+              key={doc.id}
+              onClick={() => onSelectDocument?.(doc.id)}
+              onDoubleClick={(e) => handleStartRename(e, doc)}
+              title={`${doc.name} (${doc.dimensions.width}×${doc.dimensions.height}px)`}
+              className={`group relative h-6 flex items-center gap-1.5 pl-2.5 pr-1.5 rounded text-[11px] cursor-pointer shrink-0 transition-colors ${
+                isActive
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+              }`}
+            >
+              {isActive && (
                 <span
-                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase tracking-wider bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
-                  title={`CMYK Soft Proofing Active (${softProofSettings.standard})`}
-                >
-                  CMYK Proof
-                </span>
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{ backgroundColor: 'var(--accent)' }}
+                />
               )}
 
-              {softProofSettings?.gamutWarning && (
-                <span
-                  className="text-[9px] px-1.5 py-0.5 rounded font-mono uppercase tracking-wider bg-amber-500/20 text-amber-300 border border-amber-500/30"
-                  title="Gamut Warning Overlay Active"
+              {editingId === doc.id ? (
+                <input
+                  type="text"
+                  value={editingName}
+                  onChange={(e) => setEditingName(e.target.value)}
+                  onBlur={() => handleFinishRename(doc.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') handleFinishRename(doc.id);
+                    if (e.key === 'Escape') setEditingId(null);
+                  }}
+                  autoFocus
+                  onClick={(e) => e.stopPropagation()}
+                  className="bg-[#161616] text-[#e5e5e5] text-[11px] px-1 py-0.5 rounded w-24"
+                />
+              ) : (
+                <span className="truncate max-w-[130px]">{doc.name}</span>
+              )}
+
+              {onCloseDocument && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCloseDocument(doc.id);
+                  }}
+                  title="Close tab"
+                  className={`w-4 h-4 rounded flex items-center justify-center transition-colors cursor-pointer ${
+                    isActive
+                      ? 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#161616]/50'
+                      : 'opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-[#e5e5e5]'
+                  }`}
                 >
-                  Gamut Warning
-                </span>
+                  <X className="w-2.5 h-2.5" />
+                </button>
               )}
             </div>
-          </>
+          );
+        })}
+
+        {onNewDocument && (
+          <button
+            type="button"
+            onClick={onNewDocument}
+            title="New Canvas (Ctrl+N)"
+            className="w-6 h-6 rounded flex items-center justify-center shrink-0 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
+          >
+            <Plus className="w-3.5 h-3.5" />
+          </button>
         )}
       </div>
 
-      {/* Action Tools & Zoom */}
-      <div className="flex items-center space-x-2">
-        {/* Undo / Redo */}
-        <div className="flex items-center rounded-[2px] p-0.5 space-x-1 bg-[#2c2c2f] border border-[#202022] shadow-[inset_0_1px_2px_rgba(0,0,0,0.5),0_1px_0_rgba(255,255,255,0.08)]">
+      {/* Right: Mode Badges, Undo/Redo, Zoom Level, Settings & Window Controls */}
+      <div
+        className="flex items-center gap-1.5 shrink-0"
+        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+      >
+        {hasOpenDocument && colorMode !== 'color' && (
+          <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#161616] text-[#8a8a8a]">
+            {colorMode === 'monochrome' ? '1-bit' : 'Gray'}
+          </span>
+        )}
+
+        {hasOpenDocument && softProofSettings?.enabled && (
+          <span className="text-[10px] font-mono uppercase px-1.5 py-0.5 rounded bg-[#161616] text-[var(--accent)]">
+            CMYK
+          </span>
+        )}
+
+        {hasOpenDocument && isRotated && (
           <button
+            type="button"
+            onClick={onResetRotation}
+            title="Reset Canvas Rotation (Ctrl+Alt+0)"
+            className="h-6 px-1.5 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] font-mono text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center gap-1 transition-colors cursor-pointer"
+          >
+            <RotateCcw className="w-3 h-3" />
+            <span>{formatRotationDegrees(rotation)}</span>
+          </button>
+        )}
+
+        {/* Undo / Redo */}
+        <div className="flex items-center gap-0.5">
+          <button
+            type="button"
             onClick={onUndo}
             disabled={!canUndo}
             title="Undo (Ctrl+Z)"
-            className={`p-1 rounded-[2px] transition-colors ${
+            className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${
               canUndo
-                ? 'text-[#d8d8dc] hover:text-white bg-gradient-to-b from-[#56565a] to-[#404043] hover:from-[#626266] hover:to-[#4a4a4d] border border-[#262628] shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_1px_1px_rgba(0,0,0,0.3)] active:brightness-90 cursor-pointer'
-                : 'text-[#444444] cursor-not-allowed opacity-50'
+                ? 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
+                : 'text-[#8a8a8a]/25 cursor-not-allowed'
             }`}
           >
             <Undo2 className="w-3.5 h-3.5" />
           </button>
           <button
+            type="button"
             onClick={onRedo}
             disabled={!canRedo}
             title="Redo (Ctrl+Y)"
-            className={`p-1 rounded-[2px] transition-colors ${
+            className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${
               canRedo
-                ? 'text-[#d8d8dc] hover:text-white bg-gradient-to-b from-[#56565a] to-[#404043] hover:from-[#626266] hover:to-[#4a4a4d] border border-[#262628] shadow-[inset_0_1px_0_rgba(255,255,255,0.22),0_1px_1px_rgba(0,0,0,0.3)] active:brightness-90 cursor-pointer'
-                : 'text-[#444444] cursor-not-allowed opacity-50'
+                ? 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
+                : 'text-[#8a8a8a]/25 cursor-not-allowed'
             }`}
           >
             <Redo2 className="w-3.5 h-3.5" />
           </button>
         </div>
 
-        {/* Zoom Controls */}
-        <div className={`flex items-center space-x-1 rounded-[2px] px-1.5 py-0.5 bg-[#2c2c2f] border border-[#202022] shadow-[inset_0_1px_2px_rgba(0,0,0,0.5),0_1px_0_rgba(255,255,255,0.08)] ${
-          !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
-        }`}>
+        {/* Compact Zoom Control */}
+        <div
+          className={`h-6 flex items-center bg-[#161616] rounded px-0.5 ${
+            !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
+          }`}
+        >
           <button
+            type="button"
             onClick={onZoomOut}
-            title="Zoom Out (Ctrl + Minus)"
-            className="p-1 hover:text-white hover:bg-[#404044] rounded-[2px] text-[#888888] transition-colors cursor-pointer"
+            title="Zoom Out (Ctrl+-)"
+            className="w-5 h-5 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
-            <ZoomOut className="w-3.5 h-3.5" />
+            <Minus className="w-3 h-3" />
           </button>
           <button
-            onClick={onResetZoom}
-            title="Reset Zoom & Center (Ctrl + 0)"
-            className="font-mono text-xs px-1.5 text-[#cccccc] hover:text-white hover:bg-[#404044] rounded-[2px] transition-colors cursor-pointer"
+            type="button"
+            onClick={() => onResetZoom()}
+            title="Reset Zoom & Center (Ctrl+0)"
+            className="h-5 px-1.5 rounded font-mono text-[11px] text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer min-w-[42px] text-center"
           >
             {formatZoomPercent(zoom)}
           </button>
           <button
+            type="button"
             onClick={onZoomIn}
-            title="Zoom In (Ctrl + Plus)"
-            className="p-1 hover:text-white hover:bg-[#404044] rounded-[2px] text-[#888888] transition-colors cursor-pointer"
+            title="Zoom In (Ctrl++)"
+            className="w-5 h-5 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
-            <ZoomIn className="w-3.5 h-3.5" />
-          </button>
-          <button
-            onClick={onResetZoom}
-            title="Reset to 100% & Center (Ctrl + 0)"
-            className="p-1 hover:text-white hover:bg-[#404044] rounded-[2px] text-[#888888] transition-colors ml-0.5 cursor-pointer"
-          >
-            <RotateCcw className="w-3 h-3" />
+            <Plus className="w-3 h-3" />
           </button>
         </div>
 
-        {/* Rotation Controls */}
-        <div className={`flex items-center space-x-1 rounded-[2px] px-1.5 py-0.5 bg-[#2c2c2f] border border-[#202022] shadow-[inset_0_1px_2px_rgba(0,0,0,0.5),0_1px_0_rgba(255,255,255,0.08)] ${
-          !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
-        }`}>
-          <RotateCw className="w-3.5 h-3.5 text-[#888888] ml-0.5" />
+        {/* Collab Session Button */}
+        {onOpenCollabModal && (
           <button
-            onClick={onResetRotation}
-            onDoubleClick={onResetRotation}
-            title="Canvas Rotation (Double-click or Ctrl+Alt+0 to Reset 0°)"
-            className="font-mono text-xs px-1.5 text-[#cccccc] hover:text-white hover:bg-[#404044] rounded-[2px] transition-colors cursor-pointer"
+            type="button"
+            onClick={onOpenCollabModal}
+            title={isCollabConnected ? `Collab (${collabPeerCount} online)` : 'Collaborative Session'}
+            className={`h-6 px-1.5 rounded flex items-center gap-1 text-[11px] transition-colors cursor-pointer ${
+              isCollabConnected
+                ? 'bg-[#2c2c2c] text-[var(--accent)]'
+                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+            }`}
           >
-            {formatRotationDegrees(rotation)}
+            <Users className="w-3.5 h-3.5" />
+            {isCollabConnected && <span className="font-mono text-[10px]">{collabPeerCount}</span>}
           </button>
-          {Math.abs(rotation % 360) > 0.05 && (
-            <button
-              onClick={onResetRotation}
-              title="Reset Rotation to 0° (Ctrl+Alt+0)"
-              className="p-1 hover:text-white hover:bg-[#404044] rounded-[2px] text-[#888888] transition-colors ml-0.5 cursor-pointer"
-            >
-              <RotateCcw className="w-3 h-3" />
-            </button>
-          )}
-        </div>
+        )}
 
-        <span className="text-[#3a3a3a]">|</span>
+        {/* Settings Button */}
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            title="Preferences (Ctrl+,)"
+            className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
+          >
+            <Settings className="w-3.5 h-3.5" />
+          </button>
+        )}
 
-        {/* Multiplayer Host / Connection Indicator */}
-        <button
-          onClick={onOpenCollabModal}
-          className={`flex items-center space-x-1.5 px-2.5 py-1 rounded-[3px] text-xs font-medium transition-colors cursor-pointer ${
-            isCollabConnected
-              ? 'bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/30 shadow-xs'
-              : 'bg-gradient-to-b from-[#525255] to-[#404043] border border-[#28282a] text-[#cccccc] hover:text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]'
-          }`}
-          title={isCollabConnected ? `Collaborative Room (${collabPeerCount} online)` : 'Start Collaborative Session (Host)'}
-        >
-          {isCollabConnected ? (
-            <>
-              <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span>{collabPeerCount} online</span>
-            </>
-          ) : (
-            <>
-              <Users className="w-3.5 h-3.5 text-[#888888]" />
-              <span>Collab</span>
-            </>
-          )}
-        </button>
-
-        {/* Desktop Native Window Controls (Minimize, Maximize, Close) */}
         <WindowControls themePreset={themePreset} />
       </div>
     </header>
-
   );
 });
 
 Header.displayName = 'Header';
-

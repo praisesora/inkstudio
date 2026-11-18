@@ -828,16 +828,17 @@ export function liftSelectionToFloating(
       const mCtx = maskCanvas.getContext('2d');
       if (mCtx) {
         const mImg = mCtx.createImageData(targetCanvas.width, targetCanvas.height);
+        const fillRgb = isBackground ? 255 : 0;
         for (let i = 0; i < selection.mask.length; i++) {
-          mImg.data[i * 4] = 0;
-          mImg.data[i * 4 + 1] = 0;
-          mImg.data[i * 4 + 2] = 0;
+          mImg.data[i * 4] = fillRgb;
+          mImg.data[i * 4 + 1] = fillRgb;
+          mImg.data[i * 4 + 2] = fillRgb;
           mImg.data[i * 4 + 3] = selection.mask[i];
         }
         mCtx.putImageData(mImg, 0, 0);
         if (isBackground) {
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(b.x, b.y, b.width, b.height);
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.drawImage(maskCanvas, 0, 0);
         } else {
           ctx.globalCompositeOperation = 'destination-out';
           ctx.drawImage(maskCanvas, 0, 0);

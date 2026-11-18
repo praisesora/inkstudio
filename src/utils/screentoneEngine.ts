@@ -186,10 +186,6 @@ export function applyScreentoneCPU(
     targetCanvas.width = width;
     targetCanvas.height = height;
   }
-  if (sourceCanvas.width !== width || sourceCanvas.height !== height) {
-    sourceCanvas.width = width;
-    sourceCanvas.height = height;
-  }
 
   const srcCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
   const dstCtx = targetCanvas.getContext('2d');
@@ -588,10 +584,6 @@ class WebGLHalftonePipeline {
     if (targetCanvas.width !== width || targetCanvas.height !== height) {
       targetCanvas.width = width;
       targetCanvas.height = height;
-    }
-    if (sourceCanvas.width !== width || sourceCanvas.height !== height) {
-      sourceCanvas.width = width;
-      sourceCanvas.height = height;
     }
 
     const dstCtx = targetCanvas.getContext('2d');

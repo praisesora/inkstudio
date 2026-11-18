@@ -1,9 +1,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   DEFAULT_APP_SETTINGS,
+  DEFAULT_ACCENT_HEX,
   loadAppSettings,
   saveAppSettings,
   resolveModernAccentColor,
+  getAccentContrastColor,
   hexToRgb,
   MODERN_ACCENTS,
 } from '../../types/settings';
@@ -25,11 +27,12 @@ describe('settings theme & accent system', () => {
     };
   });
 
-  it('loads default settings when storage is empty', () => {
+  it('loads minimalist default settings with neutral #e5e5e5 accent when storage is empty', () => {
     const settings = loadAppSettings();
-    expect(settings.themePreset).toBe('vintage-manga');
-    expect(settings.modernAccent).toBe('blue');
-    expect(settings.modernCustomColor).toBe('#3b82f6');
+    expect(settings.themePreset).toBe('modern');
+    expect(settings.modernAccent).toBe('neutral');
+    expect(settings.modernCustomColor).toBe('#e5e5e5');
+    expect(resolveModernAccentColor(settings.modernAccent)).toBe(DEFAULT_ACCENT_HEX);
   });
 
   it('correctly loads and persists modern theme with presets', () => {
@@ -45,6 +48,7 @@ describe('settings theme & accent system', () => {
   });
 
   it('correctly resolves preset accent hex codes', () => {
+    expect(resolveModernAccentColor('neutral')).toBe(MODERN_ACCENTS.neutral.hex);
     expect(resolveModernAccentColor('blue')).toBe(MODERN_ACCENTS.blue.hex);
     expect(resolveModernAccentColor('burgundy')).toBe(MODERN_ACCENTS.burgundy.hex);
     expect(resolveModernAccentColor('green')).toBe(MODERN_ACCENTS.green.hex);
@@ -52,12 +56,18 @@ describe('settings theme & accent system', () => {
     expect(resolveModernAccentColor('orange')).toBe(MODERN_ACCENTS.orange.hex);
   });
 
-  it('handles custom accent color with validation fallback', () => {
+  it('handles custom accent color with validation fallback to #e5e5e5', () => {
     expect(resolveModernAccentColor('custom', '#123456')).toBe('#123456');
-    expect(resolveModernAccentColor('custom', 'invalid-hex')).toBe('#3b82f6');
+    expect(resolveModernAccentColor('custom', 'invalid-hex')).toBe('#e5e5e5');
+  });
+
+  it('computes high-contrast foreground text color for light and dark accents', () => {
+    expect(getAccentContrastColor('#e5e5e5')).toBe('#161616');
+    expect(getAccentContrastColor('#3b82f6')).toBe('#e5e5e5');
   });
 
   it('converts hex strings to valid RGB objects', () => {
+    expect(hexToRgb('#e5e5e5')).toEqual({ r: 229, g: 229, b: 229 });
     expect(hexToRgb('#3b82f6')).toEqual({ r: 59, g: 130, b: 246 });
     expect(hexToRgb('#fff')).toEqual({ r: 255, g: 255, b: 255 });
     expect(hexToRgb('invalid')).toBeNull();
@@ -74,6 +84,6 @@ describe('settings theme & accent system', () => {
       ...DEFAULT_APP_SETTINGS,
       uiTone: 'invalid-tone' as any,
     });
-    expect(loadAppSettings().uiTone).toBe('slate');
+    expect(loadAppSettings().uiTone).toBe('charcoal');
   });
 });

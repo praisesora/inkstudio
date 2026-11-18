@@ -193,13 +193,14 @@ export function createProceduralMannequin(): {
   const geometries: THREE.BufferGeometry[] = [];
 
   const addPart = (
-    geom: THREE.BufferGeometry,
+    rawGeom: THREE.BufferGeometry,
     boneIndex: number,
     offset: THREE.Vector3,
     rot?: THREE.Euler,
     scale?: THREE.Vector3
   ) => {
-    geom = geom.clone();
+    const geom = rawGeom.clone();
+    rawGeom.dispose();
     if (scale) geom.scale(scale.x, scale.y, scale.z);
     if (rot) geom.applyQuaternion(new THREE.Quaternion().setFromEuler(rot));
     geom.translate(offset.x, offset.y, offset.z);
@@ -273,6 +274,9 @@ export function createProceduralMannequin(): {
   addPart(new THREE.BoxGeometry(0.08, 0.06, 0.18), 18, new THREE.Vector3(-0.12, 0.05, 0.04));
 
   const mergedGeometry = BufferGeometryUtils.mergeGeometries(geometries);
+  for (const g of geometries) {
+    g.dispose();
+  }
   mergedGeometry.computeVertexNormals();
 
   // CSP Mannequin Clay Material
@@ -470,12 +474,15 @@ export function createIKHandles(): {
  * Applies studio pose presets to humanoid mannequin bones.
  */
 export function applyPosePreset(bones: HumanoidBones, preset: PosePresetName): void {
-  // Reset all bones to identity rotation first
+  // Reset all bones to identity rotation and restore default hip height first
   for (const key of Object.keys(bones)) {
     const b = bones[key];
     if (b) {
       b.quaternion.identity();
     }
+  }
+  if (bones.hips) {
+    bones.hips.position.set(0, 0.95, 0);
   }
 
   const rad = (deg: number) => (deg * Math.PI) / 180;

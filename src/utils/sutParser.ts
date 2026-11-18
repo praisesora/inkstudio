@@ -1,6 +1,20 @@
 import initSqlJs from 'sql.js';
-import { inflateSync } from 'fflate';
-import { CspBrush, CspSubTip, CspSpraySettings, CspTaperSettings } from '../types/editor';
+import { unzlibSync, inflateSync } from 'fflate';
+import {
+  CspAngleDynamicsMode,
+  CspBlendTipsMode,
+  CspBrush,
+  CspPaperTextureMode,
+  CspSensorConfig,
+  CspSpraySettings,
+  CspSubTip,
+  CspTaperSettings,
+  CspTipFlipMode,
+} from '../types/editor';
+import { evaluateFastSpline } from '../engine/CspBrushEngine';
+
+const MAX_DECOMPRESSED_BLOB_BYTES = 64 * 1024 * 1024;
+const MAX_COMPRESSED_BLOB_BYTES = 16 * 1024 * 1024;
 
 let sqlJsPromise: Promise<any> | null = null;
 
@@ -8,6 +22,9 @@ async function getSql() {
   if (!sqlJsPromise) {
     sqlJsPromise = initSqlJs({
       locateFile: () => '/sql-wasm.wasm',
+    }).catch((err) => {
+      sqlJsPromise = null;
+      throw err;
     });
   }
   return await sqlJsPromise;
@@ -40,7 +57,7 @@ function indexOfSequence(haystack: Uint8Array, needle: number[], startOffset: nu
 export function extractSqliteFromBuffer(buffer: Uint8Array): Uint8Array | null {
   const sqliteSig = [
     0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x20, 0x66, 0x6f, 0x72, 0x6d, 0x61, 0x74, 0x20, 0x33, 0x00,
-  ]; // 'SQLite format 3\0'
+  ];
 
   // 1. Direct SQLite 3 file
   if (buffer.length >= 16) {
@@ -56,20 +73,20 @@ export function extractSqliteFromBuffer(buffer: Uint8Array): Uint8Array | null {
 
   // 2. CSFCHUNK container (Clip Studio Format Chunk)
   if (buffer.length >= 24) {
-    const magic = new TextDecoder('ascii').decode(buffer.slice(0, 8));
+    const magic = new TextDecoder('ascii').decode(buffer.subarray(0, 8));
     if (magic === 'CSFCHUNK') {
       let offset = 24;
       const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
 
       while (offset + 16 <= buffer.length) {
-        const chunkTag = new TextDecoder('ascii').decode(buffer.slice(offset, offset + 4));
+        const chunkTag = new TextDecoder('ascii').decode(buffer.subarray(offset, offset + 4));
         if (chunkTag !== 'CHNK') break;
 
-        const chunkName = new TextDecoder('ascii').decode(buffer.slice(offset + 4, offset + 8));
-        const chunkSize = view.getUint32(offset + 12, false); // big-endian
+        const chunkName = new TextDecoder('ascii').decode(buffer.subarray(offset + 4, offset + 8));
+        const chunkSize = view.getUint32(offset + 12, false);
         const dataStart = offset + 16;
         const dataEnd = dataStart + chunkSize;
-        if (dataEnd > buffer.length) break;
+        if (dataEnd > buffer.length || chunkSize > buffer.length) break;
 
         if (chunkName === 'SQLi') {
           const sqliData = buffer.slice(dataStart, dataEnd);
@@ -92,6 +109,31 @@ export function extractSqliteFromBuffer(buffer: Uint8Array): Uint8Array | null {
 }
 
 /**
+ * Walks PNG chunk headers starting after the 8-byte PNG signature to find the exact byte end
+ * (avoiding false-positive 'IEND' byte sequences inside compressed IDAT payloads).
+ */
+function findExactPngEnd(buf: Uint8Array, startIdx: number): number {
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  let offset = startIdx + 8;
+  while (offset + 12 <= buf.length) {
+    const chunkLen = view.getUint32(offset, false);
+    if (chunkLen > 0x7fffffff || offset + 12 + chunkLen > buf.length) {
+      return -1;
+    }
+    const c0 = buf[offset + 4];
+    const c1 = buf[offset + 5];
+    const c2 = buf[offset + 6];
+    const c3 = buf[offset + 7];
+    offset += 12 + chunkLen;
+    // 'IEND' = 0x49 0x45 0x4e 0x44
+    if (c0 === 0x49 && c1 === 0x45 && c2 === 0x4e && c3 === 0x44) {
+      return offset;
+    }
+  }
+  return -1;
+}
+
+/**
  * Extracts PNG byte arrays from binary BLOB (handling raw PNG, tar archives, or zlib compression).
  */
 export function extractPngImagesFromBlob(data: Uint8Array): Uint8Array[] {
@@ -99,41 +141,45 @@ export function extractPngImagesFromBlob(data: Uint8Array): Uint8Array[] {
   if (!data || data.length < 16) return pngs;
 
   const pngMagic = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-  const iendTag = [0x49, 0x45, 0x4e, 0x44]; // 'IEND'
 
   const tryScan = (buf: Uint8Array) => {
     let pos = 0;
-    while (pos < buf.length - 8) {
+    while (pos < buf.length - 16) {
       const startIdx = indexOfSequence(buf, pngMagic, pos);
       if (startIdx === -1) break;
 
-      const iendIdx = indexOfSequence(buf, iendTag, startIdx + 8);
-      if (iendIdx === -1) {
-        pos = startIdx + 8;
-        continue;
-      }
-
-      // IEND is: 4 bytes length + 4 bytes 'IEND' + 4 bytes CRC = +8 past iendIdx
-      const endIdx = iendIdx + 8;
-      if (endIdx <= buf.length) {
-        pngs.push(buf.slice(startIdx, endIdx));
-        pos = endIdx;
+      const exactEnd = findExactPngEnd(buf, startIdx);
+      if (exactEnd > startIdx) {
+        pngs.push(buf.slice(startIdx, exactEnd));
+        pos = exactEnd;
       } else {
         pos = startIdx + 8;
       }
     }
   };
 
-  // Direct scan
   tryScan(data);
 
-  // If none found and looks like zlib compressed (first byte 0x78), try decompressing
-  if (pngs.length === 0 && data.length > 2 && data[0] === 0x78) {
+  if (
+    pngs.length === 0 &&
+    data.length > 2 &&
+    data.length <= MAX_COMPRESSED_BLOB_BYTES &&
+    data[0] === 0x78
+  ) {
     try {
-      const decompressed = inflateSync(data);
-      tryScan(decompressed);
+      const decompressed = unzlibSync(data);
+      if (decompressed.byteLength <= MAX_DECOMPRESSED_BLOB_BYTES) {
+        tryScan(decompressed);
+      }
     } catch {
-      // Ignore decompression error
+      try {
+        const decompressed = inflateSync(data.subarray(2));
+        if (decompressed.byteLength <= MAX_DECOMPRESSED_BLOB_BYTES) {
+          tryScan(decompressed);
+        }
+      } catch {
+        // Ignore decompression error
+      }
     }
   }
 
@@ -201,9 +247,6 @@ export function isPng(buf: Uint8Array): boolean {
 
 /**
  * Extracts the primary raster image from a Clip Studio Paint MaterialFile BLOB.
- * MaterialFile.FileData is an uncompressed USTAR archive.
- * The authentic brush tip or paper texture is stored in 'thumbnail/thumbnail.png'.
- * (data/material_0.layer is a C2F file containing empty 0-alpha layer canvas tiles).
  */
 export function extractMaterialPng(fileData: Uint8Array): Uint8Array | null {
   if (!fileData || fileData.length < 16) return null;
@@ -211,12 +254,10 @@ export function extractMaterialPng(fileData: Uint8Array): Uint8Array | null {
   try {
     const tarEntries = extractTarEntries(fileData);
     if (tarEntries.length > 0) {
-      // 1. Prioritize thumbnail/thumbnail.png (authentic rendered tip or paper texture)
       const thumb = tarEntries.find((e) => e.name.toLowerCase().endsWith('thumbnail.png'));
       if (thumb && isPng(thumb.data)) {
         return thumb.data;
       }
-      // 2. Any other valid PNG in the archive
       const anyPng = tarEntries.find((e) => e.name.toLowerCase().endsWith('.png') && isPng(e.data));
       if (anyPng) {
         return anyPng.data;
@@ -226,7 +267,6 @@ export function extractMaterialPng(fileData: Uint8Array): Uint8Array | null {
     // Fall back to direct scan
   }
 
-  // 3. Fallback: direct scan for PNG chunks (sort descending by size to ignore 4KB 0-alpha layer dummies)
   const pngs = extractPngImagesFromBlob(fileData);
   if (pngs.length > 0) {
     pngs.sort((a, b) => b.length - a.length);
@@ -237,21 +277,18 @@ export function extractMaterialPng(fileData: Uint8Array): Uint8Array | null {
 }
 
 /**
- * Converts a Uint8Array of image bytes to a Base64 data URL.
+ * Converts a Uint8Array of image bytes to a Base64 data URL in 8KB chunks (O(N) zero quadratic alloc).
  */
 export function bytesToDataUrl(bytes: Uint8Array, mime: string = 'image/png'): string {
-  let binary = '';
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const CHUNK_SIZE = 8192;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.byteLength; i += CHUNK_SIZE) {
+    const slice = bytes.subarray(i, Math.min(bytes.byteLength, i + CHUNK_SIZE));
+    parts.push(String.fromCharCode.apply(null, slice as unknown as number[]));
   }
-  return `data:${mime};base64,${btoa(binary)}`;
+  return `data:${mime};base64,${btoa(parts.join(''))}`;
 }
 
-/**
- * Decodes strings from a binary buffer (handles UTF-16LE, UTF-16BE, and ASCII).
- * Extracts Clip Studio Paint catalog identifiers: e.g. ".:36:98:acedf7c35d-144c-1ab1-39df-ec7fb2dbe4"
- */
 function extractCatalogIdsFromBlob(blob: Uint8Array | null | undefined): string[] {
   if (!blob || blob.length === 0) return [];
   const results: string[] = [];
@@ -264,7 +301,6 @@ function extractCatalogIdsFromBlob(blob: Uint8Array | null | undefined): string[
         results.push(match[0]);
       }
     }
-    // Also UUIDs directly
     const uuidRe = /[a-f0-9]{10}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{10}/gi;
     while ((match = uuidRe.exec(text)) !== null) {
       if (!results.includes(match[0])) {
@@ -274,41 +310,33 @@ function extractCatalogIdsFromBlob(blob: Uint8Array | null | undefined): string[
   };
 
   try {
-    const le = new TextDecoder('utf-16le', { fatal: false }).decode(blob);
-    addMatches(le);
+    addMatches(new TextDecoder('utf-16le', { fatal: false }).decode(blob));
   } catch {
-    // Ignore decoding errors
+    // Ignore
   }
-
   try {
-    const be = new TextDecoder('utf-16be', { fatal: false }).decode(blob);
-    addMatches(be);
+    addMatches(new TextDecoder('utf-16be', { fatal: false }).decode(blob));
   } catch {
-    // Ignore decoding errors
+    // Ignore
   }
-
   try {
-    const latin = new TextDecoder('latin1', { fatal: false }).decode(blob);
-    addMatches(latin);
+    addMatches(new TextDecoder('latin1', { fatal: false }).decode(blob));
   } catch {
-    // Ignore decoding errors
+    // Ignore
   }
 
   return results;
 }
 
-/**
- * Decodes Clip Studio Paint *Effector binary blobs.
- * Contains stylus pressure, tilt, and velocity dynamics curves.
- */
 export interface DecodedEffector {
   usePressure: boolean;
   useTilt: boolean;
   useVelocity: boolean;
   useRandom: boolean;
-  minValue: number; // 0.0 to 1.0
-  maxValue: number; // 0.0 to 1.0
+  minValue: number;
+  maxValue: number;
   pressureCurve?: [number, number][];
+  tiltCurve?: [number, number][];
   velocityCurve?: [number, number][];
 }
 
@@ -316,7 +344,7 @@ export function parseCspEffector(blob: Uint8Array | null | undefined): DecodedEf
   if (!blob || blob.length < 44) return null;
   const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
 
-  const sourceFlags = view.getUint32(8, false); // big-endian
+  const sourceFlags = view.getUint32(8, false);
   const usePressure = Boolean(sourceFlags & 0x10);
   const useTilt = Boolean(sourceFlags & 0x20);
   const useVelocity = Boolean(sourceFlags & 0x80);
@@ -335,7 +363,7 @@ export function parseCspEffector(blob: Uint8Array | null | undefined): DecodedEf
     const numPts = view.getUint32(offset + 4, false);
     const ptSize = view.getUint32(offset + 8, false);
 
-    if (magic !== 12 || ptSize !== 16 || offset + 12 + numPts * 16 > blob.length) {
+    if (magic !== 12 || ptSize !== 16 || numPts > 256 || offset + 12 + numPts * 16 > blob.length) {
       break;
     }
 
@@ -352,18 +380,19 @@ export function parseCspEffector(blob: Uint8Array | null | undefined): DecodedEf
     }
   }
 
+  let curveIdx = 0;
   let pressureCurve: [number, number][] | undefined = undefined;
+  let tiltCurve: [number, number][] | undefined = undefined;
   let velocityCurve: [number, number][] | undefined = undefined;
 
-  if (curves.length > 0) {
-    if (usePressure) {
-      pressureCurve = curves[0];
-      if (useVelocity && curves.length > 1) {
-        velocityCurve = curves[1];
-      }
-    } else if (useVelocity) {
-      velocityCurve = curves[0];
-    }
+  if (usePressure && curveIdx < curves.length) {
+    pressureCurve = curves[curveIdx++];
+  }
+  if (useTilt && curveIdx < curves.length) {
+    tiltCurve = curves[curveIdx++];
+  }
+  if (useVelocity && curveIdx < curves.length) {
+    velocityCurve = curves[curveIdx++];
   }
 
   return {
@@ -374,67 +403,35 @@ export function parseCspEffector(blob: Uint8Array | null | undefined): DecodedEf
     minValue,
     maxValue,
     pressureCurve,
+    tiltCurve,
     velocityCurve,
   };
 }
 
-/**
- * Evaluates a value through a Clip Studio Paint cubic Hermite spline curve (PCHIP).
- * Monotonic without overshoot, guaranteeing 100% authentic pen response.
- */
-export function evaluateCspSpline(x: number, pts?: [number, number][]): number {
-  if (!pts || pts.length === 0) return x;
-  if (pts.length === 1) return pts[0][1];
-  if (x <= pts[0][0]) return pts[0][1];
-  if (x >= pts[pts.length - 1][0]) return pts[pts.length - 1][1];
-
-  const n = pts.length;
-  // Calculate secant slopes
-  const deltas: number[] = new Array(n - 1);
-  for (let k = 0; k < n - 1; k++) {
-    const dx = pts[k + 1][0] - pts[k][0];
-    deltas[k] = dx === 0 ? 0 : (pts[k + 1][1] - pts[k][1]) / dx;
-  }
-
-  // Calculate tangents
-  const m: number[] = new Array(n).fill(0);
-  m[0] = deltas[0];
-  m[n - 1] = deltas[n - 2];
-  for (let k = 1; k < n - 1; k++) {
-    if (deltas[k - 1] * deltas[k] <= 0) {
-      m[k] = 0;
-    } else {
-      const dxPrev = pts[k][0] - pts[k - 1][0];
-      const dxNext = pts[k + 1][0] - pts[k][0];
-      m[k] =
-        (3 * (dxPrev + dxNext)) /
-        ((2 * dxNext + dxPrev) / deltas[k - 1] + (dxNext + 2 * dxPrev) / deltas[k]);
-    }
-  }
-
-  // Interpolate segment
-  for (let k = 0; k < n - 1; k++) {
-    if (pts[k][0] <= x && x <= pts[k + 1][0]) {
-      const h = pts[k + 1][0] - pts[k][0];
-      if (h === 0) return pts[k][1];
-      const t = (x - pts[k][0]) / h;
-      const t2 = t * t;
-      const t3 = t2 * t;
-      const h00 = 2 * t3 - 3 * t2 + 1;
-      const h10 = t3 - 2 * t2 + t;
-      const h01 = -2 * t3 + 3 * t2;
-      const h11 = t3 - t2;
-      return h00 * pts[k][1] + h10 * h * m[k] + h01 * pts[k + 1][1] + h11 * h * m[k + 1];
-    }
-  }
-
-  return pts[pts.length - 1][1];
+function effectorToSensorConfig(eff: DecodedEffector): CspSensorConfig {
+  return {
+    usePressure: eff.usePressure,
+    pressureMin: eff.minValue,
+    pressureCurve: eff.pressureCurve,
+    useTilt: eff.useTilt,
+    tiltMin: eff.minValue,
+    useVelocity: eff.useVelocity,
+    velocityMin: eff.minValue,
+    useRandom: eff.useRandom,
+    randomMin: eff.minValue,
+  };
 }
 
 /**
- * Normalizes brush tip alpha and transparency:
- * If the image is opaque (black ink on white canvas), it converts luminance to alpha.
- * Detects chromatic multi-colored stamps and preserves color channels.
+ * Evaluates a value through a Clip Studio Paint cubic Hermite spline curve (PCHIP)
+ * using the O(1) precompiled Float32Array(256) LUT in CspBrushEngine.
+ */
+export function evaluateCspSpline(x: number, pts?: [number, number][]): number {
+  return evaluateFastSpline(x, pts);
+}
+
+/**
+ * Normalizes brush tip alpha and transparency.
  */
 export async function processBrushTipImage(
   dataUrl: string,
@@ -474,7 +471,6 @@ export async function processBrushTipImage(
       const imgData = ctx.getImageData(0, 0, w, h);
       const data = imgData.data;
 
-      // Check transparency, chromatic color variance, and max alpha
       let hasAlpha = false;
       let hasColor = false;
       let maxAlpha = 0;
@@ -497,7 +493,6 @@ export async function processBrushTipImage(
         }
       }
 
-      // If the image is completely empty / 0-alpha (dummy layer tile or corrupt blob)
       if (maxAlpha === 0 || nonZeroCount === 0) {
         const proc = generateProceduralTip(
           fallbackProcedural?.hardness ?? 1.0,
@@ -508,14 +503,9 @@ export async function processBrushTipImage(
         return;
       }
 
-      // If opaque (white background with dark markings), map luminance to alpha
       if (!hasAlpha) {
         for (let i = 0; i < data.length; i += 4) {
-          const r = data[i];
-          const g = data[i + 1];
-          const b = data[i + 2];
-          // Invert: 255 (white) => 0 alpha, 0 (black) => 255 alpha
-          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+          const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
           const alpha = Math.max(0, Math.min(255, Math.round(255 - lum)));
           data[i] = 255;
           data[i + 1] = 255;
@@ -525,7 +515,6 @@ export async function processBrushTipImage(
         ctx.putImageData(imgData, 0, 0);
         resolve({ dataUrl: canvas.toDataURL('image/png'), width: w, height: h, isColor: false });
       } else if (!hasColor) {
-        // Ensure monochrome color channels are white so tinting via 'source-in' & shaders works accurately
         for (let i = 0; i < data.length; i += 4) {
           data[i] = 255;
           data[i + 1] = 255;
@@ -534,7 +523,6 @@ export async function processBrushTipImage(
         ctx.putImageData(imgData, 0, 0);
         resolve({ dataUrl: canvas.toDataURL('image/png'), width: w, height: h, isColor: false });
       } else {
-        // Multi-color pattern brush: retain original colors and alpha
         resolve({ dataUrl, width: w, height: h, isColor: true });
       }
     };
@@ -557,13 +545,12 @@ export async function processBrushTipImage(
 }
 
 /**
- * Generates an authentic Clip Studio Paint procedural tip (e.g. for Turnip Pen, G-Pen, Textured Pen).
- * Accurately models hardness falloff, elliptical thickness squeeze, and anti-aliasing.
+ * Generates an authentic Clip Studio Paint procedural tip.
  */
 export function generateProceduralTip(
-  hardness: number = 1.0, // 0.05 to 1.0
-  thickness: number = 1.0, // 0.05 to 1.0
-  antiAlias: number = 2 // 0: none/binary, 1: low, 2: mid, 3: high
+  hardness: number = 1.0,
+  thickness: number = 1.0,
+  antiAlias: number = 2
 ): { dataUrl: string; width: number; height: number } {
   const size = 128;
   const canvas = document.createElement('canvas');
@@ -592,7 +579,6 @@ export function generateProceduralTip(
         let alpha = 1.0;
         if (dist > hNorm) {
           alpha = 1.0 - (dist - hNorm) / (1.0 - hNorm);
-          // Hermite smoothstep
           alpha = alpha * alpha * (3 - 2 * alpha);
         }
         if (isBinary) {
@@ -617,9 +603,25 @@ export function generateProceduralTip(
   };
 }
 
+function mapFlipMode(val: unknown): CspTipFlipMode {
+  const n = Number(val);
+  if (n === 1 || n === 2) return 'alternate';
+  if (n === 3) return 'random';
+  return 'none';
+}
+
+function mapTextureMode(val: unknown): CspPaperTextureMode {
+  const n = Number(val);
+  if (n === 1) return 'subtract';
+  if (n === 2) return 'multiply';
+  if (n === 3) return 'compare';
+  if (n === 4) return 'overlay';
+  if (n === 5) return 'outline';
+  return 'subtract';
+}
+
 /**
  * Parses a Clip Studio Paint .sut (Sub Tool) brush file.
- * Returns a fully configured CspBrush object ready for painting and saving.
  */
 export async function parseSutFile(
   fileBuffer: ArrayBuffer | Uint8Array,
@@ -638,7 +640,6 @@ export async function parseSutFile(
   try {
     db = new SQL.Database(sqliteData);
 
-    // 1. Get Tables List
     const tablesQuery = db.exec("SELECT name FROM sqlite_master WHERE type='table'");
     const tables: string[] = [];
     if (tablesQuery.length > 0 && tablesQuery[0].values) {
@@ -647,7 +648,6 @@ export async function parseSutFile(
       }
     }
 
-    // 2. Brush Name & Target Variant ID from Node table
     let brushName = fileName.replace(/\.sut$/i, '').trim();
     let variantId: number | null = null;
 
@@ -659,8 +659,8 @@ export async function parseSutFile(
           if (row[0] && typeof row[0] === 'string' && row[0].trim().length > 0) {
             brushName = row[0].trim();
           }
-          if (row[1] !== null && row[1] !== undefined) {
-            variantId = Number(row[1]);
+          if (row[1] !== null && row[1] !== undefined && Number.isFinite(Number(row[1]))) {
+            variantId = Math.trunc(Number(row[1]));
           }
         }
       } catch {
@@ -668,29 +668,38 @@ export async function parseSutFile(
       }
     }
 
-    // 3. Variant Parameters from Variant table
     let brushSize = 16;
     let minSizeFactor = 0.2;
     let opacity = 1.0;
     let flow = 0.85;
+    let adjustDensityByGap = false;
+    let blendTipsMode: CspBlendTipsMode = 'darken';
     let spacing = 0.08;
     let hardness = 1.0;
     let thickness = 1.0;
     let thicknessVertical = false;
+    let flipH: CspTipFlipMode = 'none';
+    let flipV: CspTipFlipMode = 'none';
     let angle = 0;
-    let angleDynamics: 'none' | 'direction' | 'random' = 'none';
+    let angleDynamics: CspAngleDynamicsMode = 'none';
     let rotationRandomScale = 0;
     let antiAlias = 2;
     let stabilization = 0;
+    let postCorrection = 0;
+    let sharpCorners = true;
     let usePressure = true;
     let useVelocity = false;
+    let useTilt = false;
     let pressureCurve: [number, number][] | undefined = undefined;
     let velocityCurve: [number, number][] | undefined = undefined;
+    let sizeSensor: CspSensorConfig | undefined = undefined;
+    let opacitySensor: CspSensorConfig | undefined = undefined;
+    let densitySensor: CspSensorConfig | undefined = undefined;
     let colorMixing = false;
     let amountOfPaint = 0.7;
     let densityOfPaint = 0.8;
     let colorStretch = 0.6;
-    let mixingMode: 'blend' | 'running_color' = 'blend';
+    let mixingMode: 'blend' | 'running_color' | 'smear' = 'blend';
     let wetEdge = 0;
     let wetEdgeRadius = 3.0;
     let wetEdgeAlphaPower = 20;
@@ -698,6 +707,10 @@ export async function parseSutFile(
     let textureDensity = 0;
     let paperTextureScale = 1.0;
     let paperTextureRotate = 0;
+    let paperTextureMode: CspPaperTextureMode = 'subtract';
+    let paperTextureBrightness = 0;
+    let paperTextureContrast = 0;
+    let paperTextureInverted = false;
     let spray: CspSpraySettings | undefined = undefined;
     let taper: CspTaperSettings | undefined = undefined;
     let isRibbon = false;
@@ -722,12 +735,11 @@ export async function parseSutFile(
           colMap.set(c.toLowerCase(), c);
         }
 
-        const sql =
+        const varRes =
           variantId !== null
-            ? `SELECT * FROM Variant WHERE _PW_ID = ${variantId} LIMIT 1`
-            : 'SELECT * FROM Variant LIMIT 1';
+            ? db.exec('SELECT * FROM Variant WHERE _PW_ID = ? LIMIT 1', [variantId])
+            : db.exec('SELECT * FROM Variant LIMIT 1');
 
-        const varRes = db.exec(sql);
         if (varRes.length > 0 && varRes[0].values && varRes[0].values.length > 0) {
           const row = varRes[0].values[0];
           const getVal = (aliases: string[]): any => {
@@ -747,76 +759,110 @@ export async function parseSutFile(
           const rawSize = getVal(['BrushSize', 'Size', 'PenSize', 'BrushSizeVal', 'LineWidth']);
           if (typeof rawSize === 'number' && rawSize > 0) {
             if (rawSize > 500) {
-              brushSize = Math.max(2, Math.min(300, rawSize / 100));
+              brushSize = Math.max(1, Math.min(500, rawSize / 100));
             } else if (rawSize > 250) {
-              brushSize = Math.max(2, Math.min(300, rawSize / 10));
+              brushSize = Math.max(1, Math.min(500, rawSize / 10));
             } else {
-              brushSize = Math.max(1, Math.min(300, rawSize));
+              brushSize = Math.max(0.5, Math.min(500, rawSize));
             }
           }
 
-          // Size Dynamics Effector (Pressure, Velocity, MinSize, Spline curve)
+          // Size Dynamics Effector
           const sizeEffBlob = getVal(['BrushSizeEffector', 'SizeEffector']);
           if (sizeEffBlob instanceof Uint8Array) {
             const eff = parseCspEffector(sizeEffBlob);
             if (eff) {
               usePressure = eff.usePressure;
               useVelocity = eff.useVelocity;
+              useTilt = eff.useTilt;
               minSizeFactor = eff.minValue;
               pressureCurve = eff.pressureCurve;
               velocityCurve = eff.velocityCurve;
+              sizeSensor = effectorToSensorConfig(eff);
             }
+          }
+
+          // Opacity & Density Effectors
+          const opacityEffBlob = getVal(['OpacityEffector', 'BrushOpacityEffector']);
+          if (opacityEffBlob instanceof Uint8Array) {
+            const eff = parseCspEffector(opacityEffBlob);
+            if (eff) opacitySensor = effectorToSensorConfig(eff);
+          }
+
+          const densityEffBlob = getVal(['BrushDensityEffector', 'BrushFlowEffector', 'DensityEffector']);
+          if (densityEffBlob instanceof Uint8Array) {
+            const eff = parseCspEffector(densityEffBlob);
+            if (eff) densitySensor = effectorToSensorConfig(eff);
           }
 
           // Spacing / Interval
           const rawSpacing = getVal(['BrushInterval', 'Interval', 'Spacing', 'BrushSpacing']);
           if (typeof rawSpacing === 'number' && rawSpacing > 0) {
-            spacing = rawSpacing > 1.0 ? Math.max(0.01, Math.min(1.0, rawSpacing / 100)) : Math.max(0.01, Math.min(1.0, rawSpacing));
+            spacing =
+              rawSpacing > 1.0
+                ? Math.max(0.01, Math.min(1.0, rawSpacing / 100))
+                : Math.max(0.01, Math.min(1.0, rawSpacing));
           }
 
-          // Opacity
-          const rawOpacity = getVal(['Opacity', 'BrushOpacity', 'BrushDensity', 'Density']);
+          // Opacity (strictly stroke ceiling opacity, distinct from BrushDensity!)
+          const rawOpacity = getVal(['Opacity', 'BrushOpacity']);
           if (typeof rawOpacity === 'number' && rawOpacity > 0) {
             opacity = rawOpacity > 1.0 ? Math.min(1.0, rawOpacity / 100) : rawOpacity;
           }
 
-          // Flow
-          const rawFlow = getVal(['BrushFlow', 'Flow', 'PaintAmount', 'InkAmount']);
+          // Brush Density / Flow (per-dab alpha)
+          const rawFlow = getVal(['BrushDensity', 'Density', 'BrushFlow', 'Flow', 'InkAmount']);
           if (typeof rawFlow === 'number' && rawFlow > 0) {
             flow = rawFlow > 1.0 ? Math.min(1.0, rawFlow / 100) : rawFlow;
+          }
+
+          const rawAdjustGap = getVal(['BrushAdjustDensityByGap', 'AdjustDensityByGap']);
+          if (rawAdjustGap !== null) {
+            adjustDensityByGap = Boolean(rawAdjustGap);
+          }
+
+          const rawBlendTips = getVal(['BlendBrushTips', 'BrushCombineMode', 'BrushBlendMode']);
+          if (rawBlendTips !== null && Number(rawBlendTips) === 1) {
+            blendTipsMode = 'compare';
           }
 
           // Hardness
           const rawHardness = getVal(['BrushHardness', 'Hardness']);
           if (typeof rawHardness === 'number' && rawHardness > 0) {
-            if (rawHardness <= 5) {
-              hardness = Math.max(0.05, Math.min(1.0, rawHardness / 5));
-            } else {
-              hardness = Math.max(0.05, Math.min(1.0, rawHardness / 100));
-            }
+            hardness =
+              rawHardness <= 5
+                ? Math.max(0.05, Math.min(1.0, rawHardness / 5))
+                : Math.max(0.05, Math.min(1.0, rawHardness / 100));
           }
 
-          // Thickness (Elliptical squeeze)
+          // Thickness & Flip
           const rawThickness = getVal(['BrushThickness', 'Thickness']);
           if (typeof rawThickness === 'number' && rawThickness > 0) {
             thickness = Math.max(0.05, Math.min(1.0, rawThickness / 100));
           }
-          const rawVertThick = getVal(['BrushVerticalThicknes', 'VerticalThickness']);
+          const rawVertThick = getVal(['BrushVerticalThicknes', 'BrushVerticalThickness', 'VerticalThickness']);
           if (rawVertThick !== null) {
             thicknessVertical = Boolean(rawVertThick);
           }
 
+          const rawFlipH = getVal(['BrushFlipX', 'FlipHorizontal']);
+          if (rawFlipH !== null) flipH = mapFlipMode(rawFlipH);
+          const rawFlipV = getVal(['BrushFlipY', 'FlipVertical']);
+          if (rawFlipV !== null) flipV = mapFlipMode(rawFlipV);
+
           // Rotation & Rotation Dynamics
           const rawAngle = getVal(['BrushRotation', 'Rotation', 'BrushAngle', 'Angle']);
           if (typeof rawAngle === 'number') {
-            angle = (rawAngle % 360 + 360) % 360;
+            angle = ((rawAngle % 360) + 360) % 360;
           }
 
           const rawRotEff = getVal(['BrushRotationEffector', 'RotationEffector', 'AngleDynamics']);
           if (typeof rawRotEff === 'number') {
-            // In CSP: bit 7 (128) or bit 1/2 indicate direction / line direction
             if (rawRotEff & 0x80 || rawRotEff === 3 || rawRotEff === 67 || rawRotEff === 131) {
               angleDynamics = 'direction';
+            } else if (rawRotEff & 0x20) {
+              angleDynamics = 'tilt';
+              useTilt = true;
             }
           }
 
@@ -834,10 +880,18 @@ export async function parseSutFile(
             antiAlias = Math.max(0, Math.min(3, Math.round(rawAA)));
           }
 
-          // Stabilization
+          // Stabilization & Post-Correction
           const rawRev = getVal(['BrushRevision', 'Revision', 'FlickerReduction', 'BrushStabilization']);
           if (typeof rawRev === 'number' && rawRev >= 0) {
             stabilization = Math.min(50, Math.max(0, Math.round(rawRev)));
+          }
+          const rawPostCorr = getVal(['BrushPostCorrection', 'PostCorrection']);
+          if (typeof rawPostCorr === 'number' && rawPostCorr >= 0) {
+            postCorrection = Math.min(5, Math.max(0, Math.round(rawPostCorr)));
+          }
+          const rawSharp = getVal(['BrushSharpAngles', 'SharpAngles']);
+          if (rawSharp !== null) {
+            sharpCorners = Boolean(rawSharp);
           }
 
           // Ribbon Mode
@@ -847,12 +901,22 @@ export async function parseSutFile(
           }
 
           // Color Mixing & Smear
-          const rawMixing = getVal(['BrushUseWaterColor', 'BrushUseWaterColor2', 'ColorMixing', 'EnableColorMixing']);
+          const rawMixing = getVal([
+            'BrushUseWaterColor',
+            'BrushUseWaterColor2',
+            'ColorMixing',
+            'EnableColorMixing',
+          ]);
           if (rawMixing !== null) {
             colorMixing = Boolean(rawMixing);
           }
 
-          const rawMixColor = getVal(['BrushMixColor', 'AmountOfPaint', 'PaintAmount', 'ColorMixAmount']);
+          const rawMixColor = getVal([
+            'BrushMixColor',
+            'AmountOfPaint',
+            'PaintAmount',
+            'ColorMixAmount',
+          ]);
           if (typeof rawMixColor === 'number' && rawMixColor >= 0) {
             amountOfPaint = rawMixColor > 1.0 ? Math.min(1.0, rawMixColor / 100) : rawMixColor;
           }
@@ -869,10 +933,11 @@ export async function parseSutFile(
 
           const rawMixMode = getVal(['BrushColorMixingMode', 'MixingMode']);
           if (rawMixMode !== null) {
-            mixingMode = Number(rawMixMode) === 1 ? 'running_color' : 'blend';
+            const m = Number(rawMixMode);
+            mixingMode = m === 2 ? 'smear' : m === 1 ? 'running_color' : 'blend';
           }
 
-          // Wet Edge (Water Edge)
+          // Wet Edge
           const rawWetEdge = getVal(['BrushUseWaterEdge', 'UseWaterEdge']);
           if (rawWetEdge !== null) {
             wetEdge = Boolean(rawWetEdge) ? 0.75 : 0;
@@ -894,7 +959,8 @@ export async function parseSutFile(
           // Paper Grain / Texture
           const rawTexDensity = getVal(['TextureDensity', 'Grain', 'BrushTextureDensity']);
           if (typeof rawTexDensity === 'number' && rawTexDensity > 0) {
-            textureDensity = rawTexDensity > 1.0 ? Math.min(1.0, rawTexDensity / 100) : rawTexDensity;
+            textureDensity =
+              rawTexDensity > 1.0 ? Math.min(1.0, rawTexDensity / 100) : rawTexDensity;
           }
           const rawTexScale = getVal(['TextureScale2', 'TextureScale']);
           if (typeof rawTexScale === 'number' && rawTexScale > 0) {
@@ -903,6 +969,22 @@ export async function parseSutFile(
           const rawTexRotate = getVal(['TextureRotate']);
           if (typeof rawTexRotate === 'number') {
             paperTextureRotate = rawTexRotate;
+          }
+          const rawTexMode = getVal(['TextureMode', 'BrushTextureMode']);
+          if (rawTexMode !== null) {
+            paperTextureMode = mapTextureMode(rawTexMode);
+          }
+          const rawTexInvert = getVal(['TextureInvert', 'BrushTextureInvert']);
+          if (rawTexInvert !== null) {
+            paperTextureInverted = Boolean(rawTexInvert);
+          }
+          const rawTexBright = getVal(['TextureBrightness']);
+          if (typeof rawTexBright === 'number') {
+            paperTextureBrightness = Math.max(-1, Math.min(1, rawTexBright / 100));
+          }
+          const rawTexContrast = getVal(['TextureContrast']);
+          if (typeof rawTexContrast === 'number') {
+            paperTextureContrast = Math.max(-1, Math.min(1, rawTexContrast / 100));
           }
 
           // Spray / Airbrush
@@ -914,8 +996,14 @@ export async function parseSutFile(
             spray = {
               enabled: true,
               size: typeof rawSpraySize === 'number' ? Math.max(1, rawSpraySize) : 2.0,
-              density: typeof rawSprayDensity === 'number' ? Math.max(1, Math.min(50, rawSprayDensity)) : 5,
-              bias: typeof rawSprayBias === 'number' ? Math.max(-1, Math.min(1, rawSprayBias / 100)) : 0,
+              density:
+                typeof rawSprayDensity === 'number'
+                  ? Math.max(1, Math.min(50, rawSprayDensity))
+                  : 5,
+              bias:
+                typeof rawSprayBias === 'number'
+                  ? Math.max(-1, Math.min(1, rawSprayBias / 100))
+                  : 0,
             };
           }
 
@@ -949,8 +1037,15 @@ export async function parseSutFile(
           if (Boolean(rawDual)) {
             dualBrush = true;
           }
+          const rawDualMode = getVal(['DualBrushMode', 'DualCompositeMode']);
+          if (rawDualMode !== null) {
+            const dm = Number(rawDualMode);
+            if (dm === 1) dualBrushCompositeMode = 'subtract';
+            else if (dm === 2) dualBrushCompositeMode = 'darken';
+            else if (dm === 3) dualBrushCompositeMode = 'lighten';
+            else if (dm === 4) dualBrushCompositeMode = 'screen';
+          }
 
-          // Blobs for image arrays
           rawPatternArrayBlob = getVal(['BrushPatternImageArray']);
           rawTextureImageBlob = getVal(['TextureImage']);
           rawDualPatternBlob = getVal(['DualPatternImageArray']);
@@ -960,7 +1055,7 @@ export async function parseSutFile(
       }
     }
 
-    // 4. MaterialFile extraction and mapping
+    // 4. MaterialFile extraction
     const materialMap = new Map<string, { mainPng: Uint8Array; width: number; height: number }>();
     const allMaterialsList: { mainPng: Uint8Array; catalogPath: string; width: number; height: number }[] = [];
 
@@ -988,8 +1083,9 @@ export async function parseSutFile(
                 if (catPath) materialMap.set(catPath, entry);
                 materialMap.set(pwId, entry);
 
-                // Index by UUID
-                const uuidMatch = catPath.match(/[a-f0-9]{10}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{10}/i);
+                const uuidMatch = catPath.match(
+                  /[a-f0-9]{10}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{10}/i
+                );
                 if (uuidMatch) {
                   materialMap.set(uuidMatch[0], entry);
                 }
@@ -1004,7 +1100,7 @@ export async function parseSutFile(
       }
     }
 
-    // 5. Match Paper Texture from TextureImage
+    // 5. Match Paper Texture
     let paperTexture: string | undefined = undefined;
     let paperTextureEntry: { mainPng: Uint8Array } | null = null;
 
@@ -1019,7 +1115,7 @@ export async function parseSutFile(
       }
     }
 
-    // 6. Match Brush Tip(s) from BrushPatternImageArray
+    // 6. Match Brush Tip(s)
     const tipPngEntries: { mainPng: Uint8Array; width: number; height: number }[] = [];
 
     if (rawPatternArrayBlob) {
@@ -1034,7 +1130,6 @@ export async function parseSutFile(
       }
     }
 
-    // If no pattern array match, but materials exist, assign non-texture materials as tips
     if (tipPngEntries.length === 0 && allMaterialsList.length > 0) {
       for (const m of allMaterialsList) {
         if (m !== paperTextureEntry && !tipPngEntries.some((e) => e.mainPng === m.mainPng)) {
@@ -1043,23 +1138,23 @@ export async function parseSutFile(
       }
     }
 
-    // 7. Process extracted tips or generate authentic procedural tip
+    // 7. Process extracted tips or generate procedural tip
     let tipDataUrl: string | undefined = undefined;
     let tipWidth: number | undefined = undefined;
     let tipHeight: number | undefined = undefined;
+    let isColorTip = false;
     const subTips: CspSubTip[] = [];
     const fallbackProc = { hardness, thickness, antiAlias };
 
     if (tipPngEntries.length > 0) {
-      // Primary Tip
       const primaryEntry = tipPngEntries[0];
       const rawUrl = bytesToDataUrl(primaryEntry.mainPng, 'image/png');
       const processed = await processBrushTipImage(rawUrl, fallbackProc);
       tipDataUrl = processed.dataUrl;
       tipWidth = processed.width;
       tipHeight = processed.height;
+      isColorTip = processed.isColor;
 
-      // All sub-tips
       for (const entry of tipPngEntries) {
         const u = bytesToDataUrl(entry.mainPng, 'image/png');
         const p = await processBrushTipImage(u, fallbackProc);
@@ -1071,14 +1166,12 @@ export async function parseSutFile(
         });
       }
     } else {
-      // Authentic CSP Procedural Pen Tip (Turnip pen, G-pen, Textured pen, Calligraphy oval)
       const proc = generateProceduralTip(hardness, thickness, antiAlias);
       tipDataUrl = proc.dataUrl;
       tipWidth = proc.width;
       tipHeight = proc.height;
     }
 
-    // Secondary Tip for Dual Brush
     let secondaryTipDataUrl: string | undefined = undefined;
     let secondaryTipWidth: number | undefined = undefined;
     let secondaryTipHeight: number | undefined = undefined;
@@ -1108,6 +1201,7 @@ export async function parseSutFile(
       tipDataUrl,
       tipWidth,
       tipHeight,
+      isColorTip,
       secondaryTipDataUrl,
       secondaryTipWidth,
       secondaryTipHeight,
@@ -1116,18 +1210,28 @@ export async function parseSutFile(
       minSizeFactor,
       opacity,
       flow,
+      adjustDensityByGap,
+      blendTipsMode,
       spacing,
       hardness,
       thickness,
       thicknessVertical,
+      flipH,
+      flipV,
       angle,
       angleDynamics,
       rotationRandomScale,
       antiAlias,
       usePressure,
       useVelocity,
+      useTilt,
+      sizeSensor,
+      opacitySensor,
+      densitySensor,
       smoothing: true,
       stabilization,
+      postCorrection,
+      sharpCorners,
       pressureCurve,
       velocityCurve,
       colorMixing,
@@ -1143,6 +1247,10 @@ export async function parseSutFile(
       textureDensity,
       paperTextureScale,
       paperTextureRotate,
+      paperTextureMode,
+      paperTextureBrightness,
+      paperTextureContrast,
+      paperTextureInverted,
       dualBrush,
       dualBrushCompositeMode,
       spray,

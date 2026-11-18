@@ -184,15 +184,28 @@ export function bisectComicFrame(
   }
   poly2.push({ ...hitA.point });
 
-  // 4. Inset both polygons by halfGutter along normal
-  // Offset poly1 along +normal and poly2 along -normal
+  // 4. Inset both polygons by halfGutter away from the cut line
+  let c1x = 0;
+  let c1y = 0;
+  for (const p of poly1) {
+    c1x += p.x;
+    c1y += p.y;
+  }
+  c1x /= Math.max(1, poly1.length);
+  c1y /= Math.max(1, poly1.length);
+  const midCutX = (hitA.point.x + hitB.point.x) * 0.5;
+  const midCutY = (hitA.point.y + hitB.point.y) * 0.5;
+  const dotSide = (c1x - midCutX) * normal.x + (c1y - midCutY) * normal.y;
+  const sign = dotSide >= 0 ? 1 : -1;
+  const nX = normal.x * sign;
+  const nY = normal.y * sign;
+
   const insetPoly1 = poly1.map((p) => {
-    // Only offset cut seam vertices (hitA, hitB)
     const isSeam =
       Math.hypot(p.x - hitA.point.x, p.y - hitA.point.y) < 1e-3 ||
       Math.hypot(p.x - hitB.point.x, p.y - hitB.point.y) < 1e-3;
     if (isSeam) {
-      return { x: p.x + normal.x * halfGutter, y: p.y + normal.y * halfGutter };
+      return { x: p.x + nX * halfGutter, y: p.y + nY * halfGutter };
     }
     return p;
   });
@@ -202,7 +215,7 @@ export function bisectComicFrame(
       Math.hypot(p.x - hitA.point.x, p.y - hitA.point.y) < 1e-3 ||
       Math.hypot(p.x - hitB.point.x, p.y - hitB.point.y) < 1e-3;
     if (isSeam) {
-      return { x: p.x - normal.x * halfGutter, y: p.y - normal.y * halfGutter };
+      return { x: p.x - nX * halfGutter, y: p.y - nY * halfGutter };
     }
     return p;
   });

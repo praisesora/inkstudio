@@ -22,6 +22,7 @@ export interface MangaTextOptions {
   lineHeightRatio?: number;
   maxWidth?: number;
   maxHeight?: number;
+  anchorTopLeft?: boolean;
 }
 
 export interface PositionedGlyph {
@@ -78,17 +79,28 @@ export function computeMangaTextLayout(
     // Standard horizontal-tb layout
     const glyphs: PositionedGlyph[] = [];
     const charWidth = fontSize * 0.6; // estimated fallback
+    const linesChars = rawLines.map((line) => Array.from(line));
     let maxLineWidth = 0;
+    for (const chars of linesChars) {
+      const w = chars.length * charWidth;
+      if (w > maxLineWidth) maxLineWidth = w;
+    }
+    const boxWidth = Math.max(fontSize, maxLineWidth);
 
-    rawLines.forEach((line, lineIdx) => {
+    linesChars.forEach((chars, lineIdx) => {
       const lineY = lineIdx * lineSpacing + fontSize * 0.5;
-      const lineWidth = line.length * charWidth;
-      if (lineWidth > maxLineWidth) maxLineWidth = lineWidth;
+      const lineWidth = chars.length * charWidth;
+      let startX = 0;
+      if (options.align === 'center') {
+        startX = (boxWidth - lineWidth) * 0.5;
+      } else if (options.align === 'right') {
+        startX = boxWidth - lineWidth;
+      }
 
-      for (let cIdx = 0; cIdx < line.length; cIdx++) {
+      for (let cIdx = 0; cIdx < chars.length; cIdx++) {
         glyphs.push({
-          char: line[cIdx],
-          x: cIdx * charWidth + charWidth * 0.5,
+          char: chars[cIdx],
+          x: startX + cIdx * charWidth + charWidth * 0.5,
           y: lineY,
           rotateDeg: 0,
         });
@@ -98,7 +110,7 @@ export function computeMangaTextLayout(
     const totalHeight = rawLines.length * lineSpacing;
     return {
       glyphs,
-      width: Math.max(fontSize, maxLineWidth),
+      width: boxWidth,
       height: Math.max(fontSize, totalHeight),
     };
   }
@@ -110,12 +122,13 @@ export function computeMangaTextLayout(
   const glyphs: PositionedGlyph[] = [];
 
   rawLines.forEach((line, colIndex) => {
+    const chars = Array.from(line);
     // In vertical-rl, col 0 is at rightmost position (x = (numColumns - 1 - colIndex) * lineSpacing)
     const colX = (numColumns - 1 - colIndex) * lineSpacing + lineSpacing * 0.5;
     let currentY = fontSize * 0.6;
 
-    for (let cIdx = 0; cIdx < line.length; cIdx++) {
-      const char = line[cIdx];
+    for (let cIdx = 0; cIdx < chars.length; cIdx++) {
+      const char = chars[cIdx];
       let rotateDeg = 0;
       let dx = 0;
       let dy = 0;
@@ -177,7 +190,10 @@ export function renderMangaTextToCanvas(
   let offsetX = originX - layout.width * 0.5;
   let offsetY = originY - layout.height * 0.5;
 
-  if (options.align === 'left') {
+  if (options.anchorTopLeft) {
+    offsetX = originX + 6;
+    offsetY = originY + 6;
+  } else if (options.align === 'left') {
     offsetX = originX;
   } else if (options.align === 'right') {
     offsetX = originX - layout.width;

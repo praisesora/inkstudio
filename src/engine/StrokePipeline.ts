@@ -177,9 +177,9 @@ export class StrokePipeline {
     this.ingestPointerEvent(e, view);
     this.flush();
 
-    // Evaluate exit flick taper
+    // Evaluate exit flick taper using cached velocity from last processed sample (do not re-process knotP2)
     if (this.knotCount >= 2 && this.scratchCtx) {
-      const exitSample = this.stabilizer.process(this.knotP2.x, this.knotP2.y, this.knotP2.pressure, e.timeStamp);
+      const exitSample = this.stabilizer.getLastSample();
       const flick = this.taperEngine.computeFlickTaper(
         this.knotP2.x,
         this.knotP2.y,
@@ -195,6 +195,15 @@ export class StrokePipeline {
           const pt = flick.points[i];
           this.processStabilizedPoint(pt.x, pt.y, pt.pressure, pt.width, exitSample.vx, exitSample.vy, false);
         }
+      } else {
+        // Seal the final segment knotP1 -> knotP2 onto scratchCtx
+        const finalSeg = this.splineGen.generateCatmullRomSegment(
+          this.knotP0,
+          this.knotP1,
+          this.knotP2,
+          this.knotP2
+        );
+        this.renderSegment(this.scratchCtx, finalSeg, false);
       }
     }
 
@@ -317,7 +326,8 @@ export class StrokePipeline {
 
     if (isCorner && this.knotCount >= 1) {
       const cornerPt: SplinePoint = { x, y, pressure, width };
-      const cornerSeg = this.splineGen.generateCornerSegment(this.knotP1, cornerPt);
+      const prevKnot = this.knotCount >= 2 ? this.knotP2 : this.knotP1;
+      const cornerSeg = this.splineGen.generateCornerSegment(prevKnot, cornerPt);
       this.renderSegment(this.scratchCtx, cornerSeg, false);
       this.splineGen.commitCornerKnot(cornerPt);
 
@@ -359,7 +369,8 @@ export class StrokePipeline {
       this.knotP2.width = width;
 
       const seg = this.splineGen.generateProvisionalSegment(this.knotP1, this.knotP2, vx, vy);
-      this.renderSegment(this.scratchCtx, seg, true);
+      const provTarget = this.predictedCtx || this.scratchCtx;
+      this.renderSegment(provTarget, seg, true);
       this.knotCount = 2;
       return;
     }
@@ -378,8 +389,10 @@ export class StrokePipeline {
     );
     this.renderSegment(this.scratchCtx, sealedSeg, false);
 
-    const nextProvSeg = this.splineGen.generateProvisionalSegment(this.knotP2, this.knotP3, vx, vy);
-    this.renderSegment(this.scratchCtx, nextProvSeg, true);
+    if (this.predictedCtx) {
+      const nextProvSeg = this.splineGen.generateProvisionalSegment(this.knotP2, this.knotP3, vx, vy);
+      this.renderSegment(this.predictedCtx, nextProvSeg, true);
+    }
 
     // Shift window
     this.knotP0.x = this.knotP1.x;
@@ -431,8 +444,8 @@ export class StrokePipeline {
         prevPt = curPt;
       }
     } else {
-      // Hermite extrapolation forward along velocity vector
-      const sample = this.stabilizer.process(this.knotP2.x, this.knotP2.y, this.knotP2.pressure, e.timeStamp);
+      // Hermite extrapolation forward along velocity vector without mutating stabilizer filter state
+      const sample = this.stabilizer.getLastSample();
       if (sample.speed > 0.05) {
         const dt = 12.0; // ms forward
         const predPt: SplinePoint = {
@@ -469,9 +482,11 @@ export class StrokePipeline {
       ctx.stroke();
     }
 
-    this.expandDirtyRect(seg.p0.x, seg.p0.y, seg.p0.width);
-    this.expandDirtyRect(seg.c1.x, seg.c1.y, seg.c1.width);
-    this.expandDirtyRect(seg.c2.x, seg.c2.y, seg.c2.width);
-    this.expandDirtyRect(seg.p3.x, seg.p3.y, seg.p3.width);
+    if (ctx === this.scratchCtx) {
+      this.expandDirtyRect(seg.p0.x, seg.p0.y, seg.p0.width);
+      this.expandDirtyRect(seg.c1.x, seg.c1.y, seg.c1.width);
+      this.expandDirtyRect(seg.c2.x, seg.c2.y, seg.c2.width);
+      this.expandDirtyRect(seg.p3.x, seg.p3.y, seg.p3.width);
+    }
   }
 }

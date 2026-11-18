@@ -1,5 +1,5 @@
 import initSqlJs, { Database } from 'sql.js';
-import { inflateSync } from 'fflate';
+import { unzlibSync, inflateSync } from 'fflate';
 import { BlendMode, LayerItem, LoadedDocument } from '../types/editor';
 import { createCanvasThumbnail } from './canvasUtils';
 
@@ -193,8 +193,13 @@ function renderCspBitmapToCanvas(
     for (let i = 0; i < blockData.length - 8; i++) {
       if (blockData[i] === 0x78 && (blockData[i + 1] === 0x9c || blockData[i + 1] === 0x01 || blockData[i + 1] === 0xda)) {
         try {
-          const slice = blockData.slice(i);
-          const decompressed = inflateSync(slice);
+          const sub = blockData.subarray(i);
+          let decompressed: Uint8Array;
+          try {
+            decompressed = unzlibSync(sub);
+          } catch {
+            decompressed = inflateSync(sub.subarray(2));
+          }
 
           // Expected: 256*256 bytes alpha + 256*256*4 bytes BGRX = 327680 bytes
           if (decompressed.length >= BLOCK_SIZE * BLOCK_SIZE * 5) {
