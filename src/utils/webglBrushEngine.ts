@@ -386,7 +386,6 @@ export class WebGlBrushEngine {
 
   private canvas: HTMLCanvasElement | null = null;
   private gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
-  private isWebGl2 = false;
   private program: WebGLProgram | null = null;
   private ribbonProgram: WebGLProgram | null = null;
   private isGpuAvailable = false;
@@ -460,7 +459,6 @@ export class WebGlBrushEngine {
     drawArraysInstanced: (mode: number, first: number, count: number, instanceCount: number) => void;
     vertexAttribDivisor: (index: number, divisor: number) => void;
   } | null = null;
-  private extMinMax: { MAX_EXT: number } | null = null;
   private instanceBuffer: WebGLBuffer | null = null;
   private instanceArray: Float32Array = new Float32Array(4096 * 14);
 
@@ -524,7 +522,6 @@ export class WebGlBrushEngine {
       }
 
       this.gl = gl;
-      this.isWebGl2 = Boolean(gl2 && 'MAX' in gl2);
 
       let renderer = 'Generic WebGL GPU';
       let vendor = 'Generic';
@@ -533,9 +530,6 @@ export class WebGlBrushEngine {
         if (ext) {
           renderer = gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || renderer;
           vendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || vendor;
-        }
-        if (!this.isWebGl2) {
-          this.extMinMax = gl.getExtension('EXT_blend_minmax') as any;
         }
       }
       const glVersion = (typeof gl.getParameter === 'function' && gl.getParameter(gl.VERSION)) || 'WebGL';
@@ -757,6 +751,7 @@ export class WebGlBrushEngine {
     const tex = gl.createTexture();
     if (!tex) return null;
 
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
@@ -780,6 +775,7 @@ export class WebGlBrushEngine {
     const tex = this.canvasLayerTexture;
     if (!tex) return null;
 
+    gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
@@ -1063,16 +1059,8 @@ export class WebGlBrushEngine {
 
     gl.useProgram(this.program);
 
-    // Configure Blend Equation (Compare Density / Darken tips uses MAX alpha so washes never over-darken!)
-    const useCompareTips = settings.blendTipsMode === 'compare' || settings.blendTipsMode === 'darken';
-    if (useCompareTips && (this.isWebGl2 || this.extMinMax)) {
-      const maxEnum = this.isWebGl2 ? (gl as WebGL2RenderingContext).MAX : this.extMinMax!.MAX_EXT;
-      gl.blendEquationSeparate(gl.FUNC_ADD, maxEnum);
-      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE);
-    } else {
-      gl.blendEquation(gl.FUNC_ADD);
-      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-    }
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
     if (this.uDocResolutionLoc) {
       const docW = underlyingCanvas ? underlyingCanvas.width : Math.max(1, _canvasWidth);
@@ -1330,11 +1318,6 @@ export class WebGlBrushEngine {
       gl.disableVertexAttribArray(this.aAlphaLoc);
       gl.disableVertexAttribArray(this.aPressureLoc);
       gl.disableVertexAttribArray(this.aStrokeDistLoc);
-    }
-
-    if (useCompareTips) {
-      gl.blendEquation(gl.FUNC_ADD);
-      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     }
 
     return true;

@@ -227,24 +227,28 @@ export class LayerPixelSampler {
   private layerId: string | null = null;
   private useLazyTiles: boolean = false;
   private lazyTiles: Map<number, Uint8ClampedArray> = new Map();
+  private origTilesMap: Map<number, ImageData> | null = null;
   private tilesX: number = 1;
 
   constructor(
     sourceCanvas: HTMLCanvasElement,
     layerId?: string,
-    tileGrid: SparseTileGrid = globalTileGrid
+    tileGrid: SparseTileGrid = globalTileGrid,
+    origTilesMap?: Map<number, ImageData>
   ) {
     this.width = sourceCanvas.width;
     this.height = sourceCanvas.height;
     this.tilesX = Math.max(1, Math.ceil(this.width / TILE_SIZE));
+    this.origTilesMap = origTilesMap ?? null;
     this.sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
 
     // If a SparseTileGrid has tiles for this layer, or if the canvas is large (> 512x512),
+    // or if an origTilesMap is provided for clean live sampling,
     // use zero-stall on-demand 256x256 tile caching instead of a synchronous full-document getImageData!
     const hasGridTiles = Boolean(layerId && tileGrid && tileGrid.getLayerTiles(layerId).length > 0);
     const isLargeCanvas = this.width * this.height > 512 * 512;
 
-    if (hasGridTiles || isLargeCanvas) {
+    if (hasGridTiles || isLargeCanvas || Boolean(origTilesMap)) {
       this.useLazyTiles = true;
       this.layerId = layerId ?? null;
       this.tileGrid = hasGridTiles ? tileGrid : null;
@@ -273,6 +277,24 @@ export class LayerPixelSampler {
     const key = ty * this.tilesX + tx;
     let buf = this.lazyTiles.get(key);
     if (buf) return buf;
+
+    if (this.origTilesMap) {
+      const origImg = this.origTilesMap.get(ty * 65536 + tx);
+      if (origImg) {
+        buf = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+        if (origImg.width === TILE_SIZE && origImg.height === TILE_SIZE) {
+          buf.set(origImg.data);
+        } else {
+          for (let row = 0; row < origImg.height; row++) {
+            const srcOff = row * origImg.width * 4;
+            const dstOff = row * TILE_SIZE * 4;
+            buf.set(origImg.data.subarray(srcOff, srcOff + origImg.width * 4), dstOff);
+          }
+        }
+        this.lazyTiles.set(key, buf);
+        return buf;
+      }
+    }
 
     if (this.tileGrid && this.layerId) {
       const tile = this.tileGrid.getTile(this.layerId, tx, ty);

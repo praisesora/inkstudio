@@ -1,9 +1,19 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   SparseTileGrid,
+  TILE_SIZE,
 } from '../tileEngine';
 import { binarizeCanvasRect } from '../colorUtils';
 import { TaperEngine } from '../../engine/TaperEngine';
+import { COMPOSITOR_FRAGMENT_SHADER } from '../compositor';
+import { LayerPixelSampler } from '../colorMixingEngine';
+import {
+  drawRadialDot,
+  drawRadialCubicBezierSegment,
+  renderCompleteRadialStroke,
+  centripetalCatmullRomToBezier,
+  RadialMixingOptions,
+} from '../stampEngine';
 
 describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
   let grid: SparseTileGrid;
@@ -190,5 +200,120 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
     const idxStroke2 = (106 * 256 + 106) * 4;
     expect(rgbaAfterSecond[idxStroke1 + 3]).toBe(255);
     expect(rgbaAfterSecond[idxStroke2 + 3]).toBe(255);
+  });
+
+  it('prevents double-premultiplication dark gray edge artifacts in COMPOSITOR_FRAGMENT_SHADER', () => {
+    expect(COMPOSITOR_FRAGMENT_SHADER).toContain('vec4 rawTex = texture(u_tileTexture, v_texCoord);');
+    expect(COMPOSITOR_FRAGMENT_SHADER).toContain('clamp(rawTex.rgb / rawTex.a, 0.0, 1.0)');
+  });
+
+  it('guarantees 100% live-vs-committed dab parity without opacity drop for darken/compare blendTipsMode', () => {
+    const pts = [
+      { x: 20, y: 20, pressure: 0.7, width: 12 },
+      { x: 45, y: 25, pressure: 0.8, width: 14 },
+      { x: 70, y: 30, pressure: 0.75, width: 13 },
+    ];
+    const mixingOpts: RadialMixingOptions = {
+      blendTipsMode: 'darken',
+      adjustDensityByGap: true,
+      grain: 0.35,
+      useTilt: false,
+    };
+
+    const liveStamps: Array<{ x: number; y: number; w: number; h: number; alpha: number; op: string }> = [];
+    const completeStamps: Array<{ x: number; y: number; w: number; h: number; alpha: number; op: string }> = [];
+
+    const makeMockCtx = (log: typeof liveStamps) => {
+      const state = { globalAlpha: 1, globalCompositeOperation: 'source-over', imageSmoothingEnabled: true };
+      return {
+        canvas: { width: 200, height: 200 },
+        get globalAlpha() { return state.globalAlpha; },
+        set globalAlpha(v: number) { state.globalAlpha = v; },
+        get globalCompositeOperation() { return state.globalCompositeOperation; },
+        set globalCompositeOperation(v: string) { state.globalCompositeOperation = v; },
+        get imageSmoothingEnabled() { return state.imageSmoothingEnabled; },
+        set imageSmoothingEnabled(v: boolean) { state.imageSmoothingEnabled = v; },
+        save: () => {},
+        restore: () => {},
+        translate: () => {},
+        rotate: () => {},
+        scale: () => {},
+        clearRect: () => {},
+        fillRect: () => {},
+        createImageData: (w: number, h: number) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+        getImageData: (_x: number, _y: number, w: number, h: number) => ({ width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }),
+        putImageData: () => {},
+        drawImage: (_img: unknown, x: number, y: number, w: number, h: number) => {
+          log.push({ x, y, w, h, alpha: state.globalAlpha, op: state.globalCompositeOperation });
+        },
+      } as unknown as CanvasRenderingContext2D;
+    };
+
+    if (typeof (globalThis as any).document === 'undefined') {
+      (globalThis as any).document = {
+        createElement: () => {
+          const dummyLog: typeof liveStamps = [];
+          const ctx = makeMockCtx(dummyLog);
+          return { width: 200, height: 200, getContext: () => ctx };
+        },
+      };
+    }
+
+    const liveCtx = makeMockCtx(liveStamps);
+    const completeCtx = makeMockCtx(completeStamps);
+    const flow = 0.62;
+    const spacing = 0.05;
+    const hardness = 0.55;
+
+    // 1. Live incremental rendering (initial dot + segment 0->1 + tail segment 1->2)
+    drawRadialDot(liveCtx, pts[0], '#e03030', hardness, flow, false, false, mixingOpts, 1.0, 0);
+    let rem = Math.max(0.12, pts[0].width * spacing);
+    const seg1 = centripetalCatmullRomToBezier(pts[0], pts[0], pts[1], pts[2]);
+    rem = drawRadialCubicBezierSegment(liveCtx, pts[0], seg1.c1, seg1.c2, pts[1], '#e03030', hardness, flow, spacing, false, false, rem, 1.0, 0, mixingOpts);
+    const seg2 = centripetalCatmullRomToBezier(pts[0], pts[1], pts[2], pts[2]);
+    drawRadialCubicBezierSegment(liveCtx, pts[1], seg2.c1, seg2.c2, pts[2], '#e03030', hardness, flow, spacing, false, false, rem, 1.0, 0, mixingOpts);
+
+    // 2. Complete stroke rendering
+    renderCompleteRadialStroke(completeCtx, pts, '#e03030', hardness, flow, spacing, false, false, 1.0, 0, mixingOpts);
+
+    expect(liveStamps.length).toBeGreaterThan(5);
+    expect(liveStamps.length).toBe(completeStamps.length);
+    for (let i = 0; i < liveStamps.length; i++) {
+      expect(liveStamps[i].op).toBe('source-over');
+      expect(completeStamps[i].op).toBe('source-over');
+      expect(liveStamps[i].alpha).toBeCloseTo(completeStamps[i].alpha, 6);
+      expect(liveStamps[i].w).toBeCloseTo(completeStamps[i].w, 6);
+    }
+  });
+
+  it('LayerPixelSampler reads clean pre-stroke origTilesMap instead of dirty live tileGrid', () => {
+    const layerId = 'wet-layer';
+    const dirtyBuf = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+    for (let i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
+      dirtyBuf[i * 4] = 255; // Live red stroke written to tileGrid
+      dirtyBuf[i * 4 + 3] = 255;
+    }
+    grid.writeImageData(layerId, { data: dirtyBuf, width: TILE_SIZE, height: TILE_SIZE }, 0, 0, 'color-32bit');
+
+    // Clean pre-stroke tile was pure green
+    const cleanBuf = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+    for (let i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
+      cleanBuf[i * 4 + 1] = 200;
+      cleanBuf[i * 4 + 3] = 255;
+    }
+    const origMap = new Map<number, ImageData>();
+    origMap.set(0, { data: cleanBuf, width: TILE_SIZE, height: TILE_SIZE } as ImageData);
+
+    const mockCanvas = {
+      width: 512,
+      height: 512,
+      getContext: () => null,
+    } as unknown as HTMLCanvasElement;
+
+    const sampler = new LayerPixelSampler(mockCanvas, layerId, grid, origMap);
+    const sampled = sampler.sampleColor(32, 32, 4);
+    expect(sampled.r).toBe(0);
+    expect(sampled.g).toBe(200);
+    expect(sampled.a).toBeCloseTo(1.0, 2);
   });
 });

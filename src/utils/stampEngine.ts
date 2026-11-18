@@ -18,7 +18,7 @@ import {
   rgbToHex,
 } from './colorMixingEngine';
 import { getPaperGrain } from './pencilEngine';
-import { WebGlBrushEngine, GpuDab } from './webglBrushEngine';
+import { GpuDab } from './webglBrushEngine';
 import {
   evaluateFastSpline,
   dabHashFloat,
@@ -462,7 +462,7 @@ export function drawSingleStamp(
   flipX: number = 1,
   flipY: number = 1,
   antiAlias: number = 2,
-  blendTipsMode?: CspBlendTipsMode
+  _blendTipsMode?: CspBlendTipsMode
 ) {
   if (width < 0.08 || height < 0.08 || alpha <= 0.002) return;
 
@@ -479,8 +479,6 @@ export function drawSingleStamp(
     ? 'destination-out'
     : alphaLocked
     ? 'source-atop'
-    : blendTipsMode === 'darken'
-    ? 'darken'
     : 'source-over';
 
   const prevSmooth = ctx.imageSmoothingEnabled;
@@ -1474,13 +1472,7 @@ export function renderCompleteTexturedStroke(
   options.totalLength = totalLen;
   options.currentStrokeDist = 0;
 
-  const gpuEngine = WebGlBrushEngine.getInstance();
-  const canUseGpu =
-    Boolean(options.useGpu) &&
-    gpuEngine.isAvailable() &&
-    (!options.subTipImages || options.subTipImages.length <= 1) &&
-    Boolean(ctx.canvas && ctx.canvas.width > 0 && ctx.canvas.height > 0);
-  const batchGpuDabs: GpuDab[] | undefined = canUseGpu ? [] : undefined;
+  const batchGpuDabs: GpuDab[] | undefined = undefined;
 
   const dabCounter = { count: 0 };
   let accDist = Math.max(0.15, points[0].width * (options.spacing ?? 0.07));
@@ -1510,45 +1502,6 @@ export function renderCompleteTexturedStroke(
     const pLast = points[n - 1];
     const last = centripetalCatmullRomToBezier(pPrev2, pPrev, pLast, pLast);
     drawTexturedCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, color, tipImage, options, accDist, dabCounter, batchGpuDabs);
-  }
-
-  if (batchGpuDabs && batchGpuDabs.length > 0) {
-    const isEraser = options.isEraser ?? false;
-    gpuEngine.renderDabsToContext(
-      ctx,
-      batchGpuDabs,
-      {
-        size: options.size,
-        opacity: options.opacity ?? 1.0,
-        flow: options.flow ?? 0.85,
-        brushDensity: options.brushDensity,
-        blendTipsMode: options.blendTipsMode,
-        hardness: options.hardness ?? 1.0,
-        antiAlias: options.antiAlias ?? 2,
-        wetEdge: options.wetEdge ?? 0,
-        grain: options.grain,
-        textureDensity: options.textureDensity,
-        paperTextureMode: options.paperTextureMode,
-        paperTextureBrightness: options.paperTextureBrightness,
-        paperTextureContrast: options.paperTextureContrast,
-        paperTextureInverted: options.paperTextureInverted,
-        paperTextureImage: options.paperTextureImage,
-        paperTextureScale: options.paperTextureScale,
-        paperTextureRotate: options.paperTextureRotate,
-        customTipImage: tipImage,
-        isColorTip: Boolean(options.isColorTip || (options.subTips && options.subTips[0]?.isColor)),
-        dualBrush: options.dualBrush,
-        dualTipImage: options.dualTipImage,
-        dualBrushCompositeMode: options.dualBrushCompositeMode,
-        colorMixing: false,
-        perceptualMixing: options.perceptualMixing,
-        alphaLocked: options.alphaLocked,
-        isTransparentInk: options.isTransparentInk,
-      } as any,
-      isEraser ? 'eraser' : 'brush',
-      ctx.canvas.width,
-      ctx.canvas.height
-    );
   }
 }
 
@@ -1682,12 +1635,48 @@ export function drawRadialDot(
 ) {
   const isColorMixing = Boolean(mixingOptions?.colorMixing) && !isEraser && !isBgEraser;
   let dabColor = isBgEraser ? '#ffffff' : color;
-  let dabFlow = flow;
-  const w = Math.max(0.4, point.width);
+  let dabFlow = computeGapAdjustedAlpha(flow, 0.08, mixingOptions?.adjustDensityByGap);
+  let w = Math.max(0.4, point.width);
   const aaMode = mixingOptions?.antiAlias ?? 2;
   const isVert = Boolean(mixingOptions?.thicknessVertical);
   // Default useTilt to true ONLY when mixingOptions is undefined (legacy unit test compatibility) or explicitly true
   const useTilt = mixingOptions === undefined ? true : Boolean(mixingOptions.useTilt);
+  const tiltX = useTilt ? (point.tiltX ?? 0) : 0;
+  const tiltY = useTilt ? (point.tiltY ?? 0) : 0;
+  const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
+  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180) * (mixingOptions?.tiltScale ?? 1.0);
+
+  if (mixingOptions?.sizeSensor) {
+    w = Math.max(
+      0.15,
+      w *
+        evaluateCspSensor(
+          mixingOptions.sizeSensor,
+          point.pressure ?? 1.0,
+          tiltMagnitude,
+          0,
+          dabHashFloat(point.x, point.y, 0, 50)
+        )
+    );
+  }
+  if (mixingOptions?.opacitySensor) {
+    dabFlow *= evaluateCspSensor(
+      mixingOptions.opacitySensor,
+      point.pressure ?? 1.0,
+      tiltMagnitude,
+      0,
+      dabHashFloat(point.x, point.y, 0, 51)
+    );
+  }
+  if (mixingOptions?.densitySensor) {
+    dabFlow *= evaluateCspSensor(
+      mixingOptions.densitySensor,
+      point.pressure ?? 1.0,
+      tiltMagnitude,
+      0,
+      dabHashFloat(point.x, point.y, 0, 52)
+    );
+  }
 
   if (isColorMixing) {
     if (!mixingOptions!.reservoir) {
@@ -1712,7 +1701,7 @@ export function drawRadialDot(
       mixingOptions!.colorStretch ?? 0.75,
       mixingOptions!.mixingMode ?? 'blend',
       point.pressure ?? 1.0,
-      flow,
+      dabFlow,
       0,
       mixingOptions!.perceptualMixing !== false
     );
@@ -1732,11 +1721,6 @@ export function drawRadialDot(
       );
     }
   }
-
-  const tiltX = useTilt ? (point.tiltX ?? 0) : 0;
-  const tiltY = useTilt ? (point.tiltY ?? 0) : 0;
-  const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180) * (mixingOptions?.tiltScale ?? 1.0);
 
   let dotW = w;
   let dotAngle = angleRad;
@@ -2205,12 +2189,7 @@ export function renderCompleteRadialStroke(
   drawRadialDot(ctx, points[0], color, hardness, flow, isEraser, isBgEraser, mixingOptions, thickness, angleRad);
   if (points.length === 1) return;
 
-  const gpuEngine = WebGlBrushEngine.getInstance();
-  const canUseGpu =
-    Boolean(mixingOptions?.useGpu) &&
-    gpuEngine.isAvailable() &&
-    Boolean(ctx.canvas && ctx.canvas.width > 0 && ctx.canvas.height > 0);
-  const batchGpuDabs: GpuDab[] | undefined = canUseGpu ? [] : undefined;
+  const batchGpuDabs: GpuDab[] | undefined = undefined;
 
   const firstWidth = Math.max(0.2, points[0].width);
   let accDist = Math.max(0.12, firstWidth * spacing);
@@ -2238,39 +2217,5 @@ export function renderCompleteRadialStroke(
     const pLast = points[n - 1];
     const last = centripetalCatmullRomToBezier(pPrev2, pPrev, pLast, pLast);
     drawRadialCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, color, hardness, flow, spacing, isEraser, isBgEraser, accDist, thickness, angleRad, mixingOptions, batchGpuDabs);
-  }
-
-  if (batchGpuDabs && batchGpuDabs.length > 0) {
-    gpuEngine.renderDabsToContext(
-      ctx,
-      batchGpuDabs,
-      {
-        size: points[0].width || 10,
-        opacity: 1.0,
-        flow,
-        blendTipsMode: mixingOptions?.blendTipsMode,
-        hardness,
-        antiAlias: mixingOptions?.antiAlias ?? 2,
-        wetEdge: 0,
-        grain: mixingOptions?.grain,
-        paperTextureMode: mixingOptions?.paperTextureMode,
-        paperTextureBrightness: mixingOptions?.paperTextureBrightness,
-        paperTextureContrast: mixingOptions?.paperTextureContrast,
-        paperTextureInverted: mixingOptions?.paperTextureInverted,
-        paperTextureImage: mixingOptions?.paperTextureImage,
-        paperTextureScale: mixingOptions?.paperTextureScale,
-        paperTextureRotate: mixingOptions?.paperTextureRotate,
-        dualBrush: mixingOptions?.dualBrush,
-        dualTipImage: mixingOptions?.dualTipImage,
-        dualBrushCompositeMode: mixingOptions?.dualBrushCompositeMode,
-        colorMixing: false,
-        perceptualMixing: mixingOptions?.perceptualMixing,
-        alphaLocked: mixingOptions?.alphaLocked,
-        isTransparentInk: mixingOptions?.isTransparentInk,
-      } as any,
-      isEraser ? 'eraser' : 'brush',
-      ctx.canvas.width,
-      ctx.canvas.height
-    );
   }
 }

@@ -396,12 +396,13 @@ void main() {
     return;
   }
 
-  vec4 texColor = texture(u_tileTexture, v_texCoord);
+  vec4 rawTex = texture(u_tileTexture, v_texCoord);
 
-  if (texColor.a < 0.002) {
+  if (rawTex.a < 0.002) {
     discard;
   }
 
+  vec4 texColor = vec4(clamp(rawTex.rgb / rawTex.a, 0.0, 1.0), rawTex.a);
   vec4 finalColor = texColor;
 
   if (u_expressionMode == 1) {
@@ -1116,6 +1117,7 @@ export class ViewportCompositor {
   private lastDraftVersion: number = -1;
   private currentOptions: CompositorOptions | null = null;
   private currentZoom: number = 1.0;
+  private premulScratch: Uint8Array = new Uint8Array(TILE_SIZE * TILE_SIZE * 4);
 
   // Adjustment program & uniforms
   private adjProgram: WebGLProgram | null = null;
@@ -1631,10 +1633,31 @@ export class ViewportCompositor {
       gl.bindTexture(gl.TEXTURE_2D, slot.texture);
 
       const rgbaData = grid.getTileAsRGBA(tile);
-      const uploadBytes =
+      const srcBytes =
         rgbaData instanceof Uint8Array
           ? rgbaData
           : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
+      const uploadBytes = this.premulScratch;
+      const len = Math.min(srcBytes.length, uploadBytes.length);
+      for (let i = 0; i < len; i += 4) {
+        const a = srcBytes[i + 3];
+        if (a === 255) {
+          uploadBytes[i] = srcBytes[i];
+          uploadBytes[i + 1] = srcBytes[i + 1];
+          uploadBytes[i + 2] = srcBytes[i + 2];
+          uploadBytes[i + 3] = 255;
+        } else if (a === 0) {
+          uploadBytes[i] = 0;
+          uploadBytes[i + 1] = 0;
+          uploadBytes[i + 2] = 0;
+          uploadBytes[i + 3] = 0;
+        } else {
+          uploadBytes[i] = (srcBytes[i] * a + 127) / 255;
+          uploadBytes[i + 1] = (srcBytes[i + 1] * a + 127) / 255;
+          uploadBytes[i + 2] = (srcBytes[i + 2] * a + 127) / 255;
+          uploadBytes[i + 3] = a;
+        }
+      }
 
       if (slot.hasStorage && typeof gl.texSubImage2D === 'function') {
         gl.texSubImage2D(
@@ -2413,7 +2436,9 @@ export class ViewportCompositor {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       this.draftTexWidth = draftCanvas.width;
       this.draftTexHeight = draftCanvas.height;
       this.lastDraftVersion = ver;
