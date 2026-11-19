@@ -157,6 +157,203 @@ export interface RecoveryReplayData {
   wal_entries: WalEntryData[];
 }
 
+const _recoveryEncoder = new TextEncoder();
+const _recoveryDecoder = new TextDecoder();
+
+function toExactUint8Array(u8: Uint8Array): Uint8Array {
+  return u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength ? u8 : u8.slice();
+}
+
+/**
+ * Packs a checkpoint payload into a raw binary frame:
+ * `[manifestLen:u32][snapshotLen:u32][thumbLen:u32][manifestUtf8][baseSnapshot][thumbnailPng]` (LE)
+ */
+export function packRecoveryCheckpointPayload(
+  manifestJson: string,
+  baseSnapshot: Uint8Array,
+  thumbnailPng: Uint8Array
+): Uint8Array {
+  const manifestBytes = _recoveryEncoder.encode(manifestJson);
+  const total = 12 + manifestBytes.byteLength + baseSnapshot.byteLength + thumbnailPng.byteLength;
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+
+  view.setUint32(0, manifestBytes.byteLength, true);
+  view.setUint32(4, baseSnapshot.byteLength, true);
+  view.setUint32(8, thumbnailPng.byteLength, true);
+
+  let offset = 12;
+  out.set(manifestBytes, offset);
+  offset += manifestBytes.byteLength;
+  out.set(baseSnapshot, offset);
+  offset += baseSnapshot.byteLength;
+  out.set(thumbnailPng, offset);
+
+  return out;
+}
+
+/**
+ * Unpacks a binary checkpoint frame back into its components.
+ */
+export function unpackRecoveryCheckpointPayload(buffer: ArrayBuffer | Uint8Array): {
+  manifestJson: string;
+  baseSnapshot: Uint8Array;
+  thumbnailPng: Uint8Array;
+} {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  if (bytes.byteLength < 12) {
+    throw new Error('Truncated recovery checkpoint header');
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const manifestLen = view.getUint32(0, true);
+  const snapshotLen = view.getUint32(4, true);
+  const thumbLen = view.getUint32(8, true);
+
+  if (12 + manifestLen + snapshotLen + thumbLen !== bytes.byteLength) {
+    throw new Error('Recovery checkpoint payload size mismatch');
+  }
+
+  let offset = 12;
+  const manifestJson = _recoveryDecoder.decode(bytes.subarray(offset, offset + manifestLen));
+  offset += manifestLen;
+  const baseSnapshot = bytes.slice(offset, offset + snapshotLen);
+  offset += snapshotLen;
+  const thumbnailPng = bytes.slice(offset, offset + thumbLen);
+
+  return { manifestJson, baseSnapshot, thumbnailPng };
+}
+
+/**
+ * Encodes `RecoveryReplayData` into the binary `INKR` frame matching Rust `recovery::encode_replay_data`.
+ */
+export function encodeRecoveryReplayData(data: RecoveryReplayData): Uint8Array {
+  const sidBytes = _recoveryEncoder.encode(data.session_id);
+  const manifestBytes = _recoveryEncoder.encode(data.manifest_json);
+  const hasSnapshot = data.base_snapshot !== null && data.base_snapshot !== undefined;
+  const snapBytes = hasSnapshot
+    ? data.base_snapshot instanceof Uint8Array
+      ? data.base_snapshot
+      : new Uint8Array(data.base_snapshot!)
+    : new Uint8Array(0);
+  const walPayloads = data.wal_entries.map((e) =>
+    e.payload instanceof Uint8Array ? e.payload : new Uint8Array(e.payload)
+  );
+
+  let total = 4 + 4 + sidBytes.byteLength + 4 + manifestBytes.byteLength + 1 + 4 + snapBytes.byteLength + 4;
+  for (const p of walPayloads) {
+    total += 5 + p.byteLength;
+  }
+
+  const out = new Uint8Array(total);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  // Magic 'INKR'
+  out[0] = 0x49;
+  out[1] = 0x4e;
+  out[2] = 0x4b;
+  out[3] = 0x52;
+
+  let offset = 4;
+  view.setUint32(offset, sidBytes.byteLength, true);
+  offset += 4;
+  out.set(sidBytes, offset);
+  offset += sidBytes.byteLength;
+
+  view.setUint32(offset, manifestBytes.byteLength, true);
+  offset += 4;
+  out.set(manifestBytes, offset);
+  offset += manifestBytes.byteLength;
+
+  out[offset++] = hasSnapshot ? 1 : 0;
+  view.setUint32(offset, snapBytes.byteLength, true);
+  offset += 4;
+  if (snapBytes.byteLength > 0) {
+    out.set(snapBytes, offset);
+    offset += snapBytes.byteLength;
+  }
+
+  view.setUint32(offset, data.wal_entries.length, true);
+  offset += 4;
+  for (let i = 0; i < data.wal_entries.length; i++) {
+    out[offset++] = data.wal_entries[i].entry_type & 0xff;
+    const p = walPayloads[i];
+    view.setUint32(offset, p.byteLength, true);
+    offset += 4;
+    out.set(p, offset);
+    offset += p.byteLength;
+  }
+
+  return out;
+}
+
+/**
+ * Decodes a binary `INKR` response returned by `recovery_load_session_data`.
+ */
+export function decodeRecoveryReplayData(buffer: ArrayBuffer | Uint8Array): RecoveryReplayData {
+  const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+  if (
+    bytes.byteLength < 17 ||
+    bytes[0] !== 0x49 ||
+    bytes[1] !== 0x4e ||
+    bytes[2] !== 0x4b ||
+    bytes[3] !== 0x52
+  ) {
+    throw new Error('Invalid recovery replay binary frame');
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 4;
+
+  const readU32 = (): number => {
+    if (offset + 4 > bytes.byteLength) throw new Error('Truncated recovery replay frame');
+    const v = view.getUint32(offset, true);
+    offset += 4;
+    return v;
+  };
+
+  const sidLen = readU32();
+  if (offset + sidLen > bytes.byteLength) throw new Error('Truncated replay session_id');
+  const session_id = _recoveryDecoder.decode(bytes.subarray(offset, offset + sidLen));
+  offset += sidLen;
+
+  const manifestLen = readU32();
+  if (offset + manifestLen > bytes.byteLength) throw new Error('Truncated replay manifest');
+  const manifest_json = _recoveryDecoder.decode(bytes.subarray(offset, offset + manifestLen));
+  offset += manifestLen;
+
+  if (offset >= bytes.byteLength) throw new Error('Truncated replay snapshot flag');
+  const hasSnapshot = bytes[offset++] !== 0;
+
+  const snapLen = readU32();
+  if (offset + snapLen > bytes.byteLength) throw new Error('Truncated replay snapshot');
+  const base_snapshot = hasSnapshot ? bytes.subarray(offset, offset + snapLen) : null;
+  offset += snapLen;
+
+  const walCount = readU32();
+  if (walCount > Math.floor((bytes.byteLength - offset) / 5)) {
+    throw new Error('Truncated replay WAL entries');
+  }
+  const wal_entries: WalEntryData[] = new Array(walCount);
+  for (let i = 0; i < walCount; i++) {
+    if (offset >= bytes.byteLength) throw new Error('Truncated WAL entry type');
+    const entry_type = bytes[offset++];
+    const payloadLen = readU32();
+    if (offset + payloadLen > bytes.byteLength) throw new Error('Truncated WAL entry payload');
+    const payload = bytes.subarray(offset, offset + payloadLen);
+    offset += payloadLen;
+    wal_entries[i] = { entry_type, payload };
+  }
+
+  if (offset !== bytes.byteLength) {
+    throw new Error('Unexpected trailing bytes in recovery replay frame');
+  }
+
+  return {
+    session_id,
+    manifest_json,
+    base_snapshot,
+    wal_entries,
+  };
+}
+
 export function isTauriEnvironment(): boolean {
   if (typeof window === 'undefined') return false;
   return Boolean(
@@ -235,6 +432,26 @@ class RecoveryService {
     }
   }
 
+  private dispatchWalEntry(
+    sessionId: string,
+    entryType: number,
+    compressed: Uint8Array,
+    label: string
+  ): void {
+    if (!isTauriEnvironment()) return;
+    const payload = toExactUint8Array(compressed);
+    import('@tauri-apps/api/core').then(({ invoke }) => {
+      void invoke('recovery_append_wal_entry', payload, {
+        headers: {
+          'x-session-id': encodeURIComponent(sessionId),
+          'x-entry-type': String(entryType),
+        },
+      }).catch((err) => {
+        console.warn(`[RecoveryService] Non-blocking WAL ${label} append error:`, err);
+      });
+    });
+  }
+
   /**
    * Asynchronously appends a completed stroke's tile deltas or vector deltas to journal.wal without blocking UI.
    */
@@ -252,18 +469,7 @@ class RecoveryService {
       try {
         const serialized = serializeTileDeltas(tileDeltas);
         const compressed = deflateSync(serialized, { level: 1 }); // Ultra-fast compression (<0.3ms)
-
-        if (isTauriEnvironment()) {
-          import('@tauri-apps/api/core').then(({ invoke }) => {
-            void invoke('recovery_append_wal_entry', {
-              sessionId: activeId,
-              entryType: WAL_ENTRY_STROKE_TILE_DELTA,
-              payload: compressed,
-            }).catch((err) => {
-              console.warn('[RecoveryService] Non-blocking WAL tile append error:', err);
-            });
-          });
-        }
+        this.dispatchWalEntry(activeId, WAL_ENTRY_STROKE_TILE_DELTA, compressed, 'tile');
       } catch (err) {
         console.warn('[RecoveryService] Error serializing stroke tile delta:', err);
       }
@@ -276,20 +482,9 @@ class RecoveryService {
           layerId,
           strokes: vectorDelta.after,
         };
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(payloadData));
+        const jsonBytes = _recoveryEncoder.encode(JSON.stringify(payloadData));
         const compressed = deflateSync(jsonBytes, { level: 1 });
-
-        if (isTauriEnvironment()) {
-          import('@tauri-apps/api/core').then(({ invoke }) => {
-            void invoke('recovery_append_wal_entry', {
-              sessionId: activeId,
-              entryType: WAL_ENTRY_VECTOR_STROKE,
-              payload: compressed,
-            }).catch((err) => {
-              console.warn('[RecoveryService] Non-blocking WAL vector append error:', err);
-            });
-          });
-        }
+        this.dispatchWalEntry(activeId, WAL_ENTRY_VECTOR_STROKE, compressed, 'vector');
       } catch (err) {
         console.warn('[RecoveryService] Error serializing vector stroke delta:', err);
       }
@@ -320,20 +515,9 @@ class RecoveryService {
           activeLayerId,
           timestamp: Date.now(),
         };
-        const jsonBytes = new TextEncoder().encode(JSON.stringify(payloadData));
+        const jsonBytes = _recoveryEncoder.encode(JSON.stringify(payloadData));
         const compressed = deflateSync(jsonBytes, { level: 1 });
-
-        if (isTauriEnvironment()) {
-          import('@tauri-apps/api/core').then(({ invoke }) => {
-            void invoke('recovery_append_wal_entry', {
-              sessionId: activeId,
-              entryType: WAL_ENTRY_LAYER_MUTATION,
-              payload: compressed,
-            }).catch((err) => {
-              console.warn('[RecoveryService] Non-blocking WAL layer mutation append error:', err);
-            });
-          });
-        }
+        this.dispatchWalEntry(activeId, WAL_ENTRY_LAYER_MUTATION, compressed, 'layer mutation');
       } catch (err) {
         console.warn('[RecoveryService] Error logging layer mutation:', err);
       }
@@ -419,11 +603,15 @@ class RecoveryService {
 
       if (isTauriEnvironment()) {
         const { invoke } = await import('@tauri-apps/api/core');
-        await invoke('recovery_checkpoint', {
-          sessionId: activeId,
-          baseSnapshot: compressedSnapshot,
+        const checkpointBody = packRecoveryCheckpointPayload(
           manifestJson,
-          thumbnailPng,
+          compressedSnapshot,
+          thumbnailPng
+        );
+        await invoke('recovery_checkpoint', checkpointBody, {
+          headers: {
+            'x-session-id': encodeURIComponent(activeId),
+          },
         });
       }
 
@@ -504,7 +692,19 @@ class RecoveryService {
       throw new Error('Recovery requires Tauri environment');
     }
     const { invoke } = await import('@tauri-apps/api/core');
-    return await invoke<RecoveryReplayData>('recovery_load_session_data', { sessionId });
+    const raw = await invoke<ArrayBuffer | Uint8Array | RecoveryReplayData>(
+      'recovery_load_session_data',
+      undefined,
+      {
+        headers: {
+          'x-session-id': encodeURIComponent(sessionId),
+        },
+      }
+    );
+    if (raw instanceof ArrayBuffer || raw instanceof Uint8Array) {
+      return decodeRecoveryReplayData(raw);
+    }
+    return raw;
   }
 
   /**

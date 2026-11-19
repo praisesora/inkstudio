@@ -5,6 +5,7 @@ import {
   FilterType,
 } from '../types/editor';
 import { TonalCorrectionType } from './tonalEngine';
+import { safeLocalStorageSetItem } from './safeStorage';
 
 export type AutoActionCommandType =
   | 'create-layer'
@@ -342,13 +343,7 @@ export function loadAutoActionSets(): AutoActionSet[] {
 }
 
 export function saveAutoActionSets(sets: AutoActionSet[]): void {
-  try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(AUTO_ACTIONS_STORAGE_KEY, JSON.stringify(sets));
-    }
-  } catch {
-    // Ignore storage quota errors
-  }
+  safeLocalStorageSetItem(AUTO_ACTIONS_STORAGE_KEY, JSON.stringify(sets), 'Auto Actions');
 }
 
 export function exportAutoActionSetsJson(sets: AutoActionSet[]): string {

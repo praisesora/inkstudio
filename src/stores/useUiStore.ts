@@ -1,6 +1,7 @@
 import { AppSettings, loadAppSettings, saveAppSettings } from '../types/settings';
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType, ProcessingBounds } from '../utils/tonalEngine';
+import { safeLocalStorageSetItem, setStorageQuotaNotifier } from '../utils/safeStorage';
 import { createStore } from './createStore';
 
 export interface TonalModalState {
@@ -118,24 +119,12 @@ export const uiStoreActions = {
 
   setLeftPanelWidth(w: number): void {
     useUiStore.setState({ leftPanelWidth: w });
-    try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem('ink_left_panel_width_v3', String(w));
-      }
-    } catch {
-      // Ignore storage errors
-    }
+    safeLocalStorageSetItem('ink_left_panel_width_v3', String(w), 'panel width');
   },
 
   setRightSidebarWidth(w: number): void {
     useUiStore.setState({ rightSidebarWidth: w });
-    try {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem('ink_right_sidebar_width_v3', String(w));
-      }
-    } catch {
-      // Ignore storage errors
-    }
+    safeLocalStorageSetItem('ink_right_sidebar_width_v3', String(w), 'sidebar width');
   },
 
   setLeftPanelHidden(hidden: boolean): void {
@@ -264,6 +253,8 @@ export const uiStoreActions = {
     useUiStore.setState({ toastMessage: null });
   },
 };
+
+setStorageQuotaNotifier((msg) => uiStoreActions.showToast(msg));
 
 export function selectIsAnyModalOpen(state: UiStoreState, isHostModalOpen = false): boolean {
   return (

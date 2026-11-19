@@ -1,7 +1,27 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 const MAX_TIMELAPSE_FRAME_BYTES: usize = 8 * 1024 * 1024; // 8 MB ceiling per keyframe
+const MAX_TIMELAPSE_EXPORT_FRAMES: usize = 100_000;
+
+/// Unpacks a raw little-endian u32 array of frame indices.
+pub fn unpack_frame_indices(bytes: &[u8]) -> Result<Vec<u32>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err("Invalid frame_indices byte length (must be multiple of 4)".to_string());
+    }
+    let count = bytes.len() / 4;
+    if count > MAX_TIMELAPSE_EXPORT_FRAMES {
+        return Err("Timelapse export frame count exceeds safety ceiling".to_string());
+    }
+    let mut indices = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(4) {
+        indices.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    Ok(indices)
+}
 
 fn sanitize_session_id(raw: &str) -> String {
     let s: String = raw
@@ -36,11 +56,19 @@ fn session_dir(session_id: &str) -> PathBuf {
         .join(sanitize_session_id(session_id))
 }
 
+/// Normalize Windows separators (`\` -> `/`) and escape single quotes (`'` -> `'\''`)
+/// per FFmpeg concat demuxer single-quoted token syntax.
+fn escape_ffmpeg_concat_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace('\'', "'\\''")
+}
+
 pub async fn write_frame(
     session_id: &str,
     frame_index: u32,
     ext: &str,
-    data: Vec<u8>,
+    data: &[u8],
 ) -> Result<(), String> {
     if data.len() > MAX_TIMELAPSE_FRAME_BYTES {
         return Err("Timelapse frame exceeds 8 MB safety limit".to_string());
@@ -72,9 +100,11 @@ pub async fn clear_session(session_id: &str) -> Result<(), String> {
 }
 
 pub async fn check_ffmpeg() -> bool {
-    Command::new("ffmpeg")
-        .arg("-version")
-        .output()
+    let mut cmd = Command::new("ffmpeg");
+    cmd.arg("-version");
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -104,7 +134,7 @@ pub async fn export_ffmpeg(
     for idx in &frame_indices {
         let fpath = dir.join(format!("frame_{:06}.{}", idx, safe_ext));
         if fpath.exists() {
-            let escaped = fpath.to_string_lossy().replace('\'', "'\\''");
+            let escaped = escape_ffmpeg_concat_path(&fpath);
             manifest.push_str(&format!("file '{}'\nduration {:.6}\n", escaped, frame_dur));
         }
     }
@@ -121,27 +151,31 @@ pub async fn export_ffmpeg(
         safe_w, safe_h, safe_w, safe_h
     );
 
-    let output = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            list_path.to_string_lossy().as_ref(),
-            "-vf",
-            &vf,
-            "-r",
-            &safe_fps.to_string(),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            out_path.to_string_lossy().as_ref(),
-        ])
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        list_path.to_string_lossy().as_ref(),
+        "-vf",
+        &vf,
+        "-r",
+        &safe_fps.to_string(),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        out_path.to_string_lossy().as_ref(),
+    ]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd
         .output()
         .await
         .map_err(|e| format!("Failed to launch ffmpeg: {}", e))?;
@@ -157,4 +191,28 @@ pub async fn export_ffmpeg(
     let _ = tokio::fs::remove_file(&list_path).await;
     let _ = tokio::fs::remove_file(&out_path).await;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_ffmpeg_concat_path_windows_and_quotes() {
+        let p = Path::new(r"C:\Users\O'Brien\AppData\Local\Temp\inkstudio_timelapse\s1\frame_000001.png");
+        assert_eq!(
+            escape_ffmpeg_concat_path(p),
+            "C:/Users/O'\\''Brien/AppData/Local/Temp/inkstudio_timelapse/s1/frame_000001.png"
+        );
+    }
+
+    #[test]
+    fn test_unpack_frame_indices() {
+        let mut raw = Vec::new();
+        for idx in [0u32, 1, 42, 99999] {
+            raw.extend_from_slice(&idx.to_le_bytes());
+        }
+        assert_eq!(unpack_frame_indices(&raw).unwrap(), vec![0, 1, 42, 99999]);
+        assert!(unpack_frame_indices(&[1, 2, 3]).is_err());
+    }
 }

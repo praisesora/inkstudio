@@ -154,10 +154,15 @@ export class UndoCacheManager {
     if (isTauriEnvironment()) {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        await invoke('save_undo_tile_cache', {
-          sessionId: this.sessionId,
-          stateId: item.id,
-          data: compressed,
+        const payload =
+          compressed.byteOffset === 0 && compressed.byteLength === compressed.buffer.byteLength
+            ? compressed
+            : compressed.slice();
+        await invoke('save_undo_tile_cache', payload, {
+          headers: {
+            'x-session-id': encodeURIComponent(this.sessionId),
+            'x-state-id': encodeURIComponent(item.id),
+          },
         });
         this.diskCachedIds.add(item.id);
         this.ramItems.delete(item.id);
@@ -193,9 +198,11 @@ export class UndoCacheManager {
     if (this.diskCachedIds.has(item.id) && isTauriEnvironment()) {
       try {
         const { invoke } = await import('@tauri-apps/api/core');
-        const rawData = await invoke<number[] | Uint8Array | ArrayBuffer>('load_undo_tile_cache', {
-          sessionId: this.sessionId,
-          stateId: item.id,
+        const rawData = await invoke<ArrayBuffer | Uint8Array | number[]>('load_undo_tile_cache', undefined, {
+          headers: {
+            'x-session-id': encodeURIComponent(this.sessionId),
+            'x-state-id': encodeURIComponent(item.id),
+          },
         });
         if (rawData) {
           const u8 =

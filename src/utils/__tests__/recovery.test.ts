@@ -8,6 +8,10 @@ import {
   WAL_ENTRY_LAYER_MUTATION,
   recoveryService,
   RecoveryReplayData,
+  packRecoveryCheckpointPayload,
+  unpackRecoveryCheckpointPayload,
+  encodeRecoveryReplayData,
+  decodeRecoveryReplayData,
 } from '../../services/recoveryService';
 import {
   SparseTileGrid,
@@ -416,6 +420,57 @@ describe('Crash Recovery & WAL Architecture Engine', () => {
       const restoredInk = restoredGrid.getTile('layer-ink', 0, 0);
       const originalInk = originalGrid.getTile('layer-ink', 0, 0);
       expect(restoredInk?.data).toEqual(originalInk?.data);
+    });
+  });
+
+  describe('Binary IPC Framing for Checkpoints and Session Replay', () => {
+    it('packs and unpacks checkpoint binary frames losslessly', () => {
+      const manifest = JSON.stringify({ documentName: 'Page 1', width: 2480 });
+      const snapshot = new Uint8Array([1, 2, 3, 250, 255]);
+      const thumb = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+
+      const packed = packRecoveryCheckpointPayload(manifest, snapshot, thumb);
+      const unpacked = unpackRecoveryCheckpointPayload(packed);
+
+      expect(unpacked.manifestJson).toBe(manifest);
+      expect(Array.from(unpacked.baseSnapshot)).toEqual([1, 2, 3, 250, 255]);
+      expect(Array.from(unpacked.thumbnailPng)).toEqual([0x89, 0x50, 0x4e, 0x47]);
+      expect(() => unpackRecoveryCheckpointPayload(packed.subarray(0, packed.length - 1))).toThrow();
+    });
+
+    it('encodes and decodes INKR binary replay responses without JSON byte arrays', () => {
+      const replay: RecoveryReplayData = {
+        session_id: 'sess-bin-1',
+        manifest_json: '{"width":1024}',
+        base_snapshot: new Uint8Array([10, 20, 30]),
+        wal_entries: [
+          { entry_type: WAL_ENTRY_STROKE_TILE_DELTA, payload: new Uint8Array([1, 2, 3, 4]) },
+          { entry_type: WAL_ENTRY_LAYER_MUTATION, payload: new Uint8Array([99]) },
+        ],
+      };
+
+      const encoded = encodeRecoveryReplayData(replay);
+      const decoded = decodeRecoveryReplayData(encoded.buffer as ArrayBuffer);
+
+      expect(decoded.session_id).toBe('sess-bin-1');
+      expect(decoded.manifest_json).toBe('{"width":1024}');
+      expect(decoded.base_snapshot).toBeInstanceOf(Uint8Array);
+      expect(Array.from(decoded.base_snapshot as Uint8Array)).toEqual([10, 20, 30]);
+      expect(decoded.wal_entries).toHaveLength(2);
+      expect(decoded.wal_entries[0].entry_type).toBe(WAL_ENTRY_STROKE_TILE_DELTA);
+      expect(Array.from(decoded.wal_entries[0].payload as Uint8Array)).toEqual([1, 2, 3, 4]);
+      expect(decoded.wal_entries[1].entry_type).toBe(WAL_ENTRY_LAYER_MUTATION);
+      expect(Array.from(decoded.wal_entries[1].payload as Uint8Array)).toEqual([99]);
+
+      const emptySnapEncoded = encodeRecoveryReplayData({
+        session_id: 'sess-empty',
+        manifest_json: '{}',
+        base_snapshot: null,
+        wal_entries: [],
+      });
+      const emptySnapDecoded = decodeRecoveryReplayData(emptySnapEncoded);
+      expect(emptySnapDecoded.base_snapshot).toBeNull();
+      expect(emptySnapDecoded.wal_entries).toEqual([]);
     });
   });
 });

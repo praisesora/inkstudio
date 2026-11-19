@@ -66,6 +66,35 @@ async function invokeTauri<T>(cmd: string, args: Record<string, unknown>): Promi
   return invoke<T>(cmd, args);
 }
 
+async function invokeTauriRaw<T>(
+  cmd: string,
+  body: Uint8Array | ArrayBuffer | undefined,
+  headers: Record<string, string>
+): Promise<T> {
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<T>(cmd, body, { headers });
+}
+
+function packFrameIndices(indices: number[]): Uint8Array {
+  const out = new Uint8Array(indices.length * 4);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  for (let i = 0; i < indices.length; i++) {
+    view.setUint32(i * 4, indices[i] >>> 0, true);
+  }
+  return out;
+}
+
+function toArrayBuffer(raw: ArrayBuffer | Uint8Array | number[]): ArrayBuffer {
+  if (raw instanceof ArrayBuffer) return raw;
+  if (raw instanceof Uint8Array) {
+    if (raw.buffer instanceof ArrayBuffer && raw.byteOffset === 0 && raw.byteLength === raw.buffer.byteLength) {
+      return raw.buffer;
+    }
+    return raw.slice().buffer;
+  }
+  return new Uint8Array(raw).buffer;
+}
+
 /**
  * Computes even-dimension output video size for the chosen aspect ratio & resolution preset.
  */
@@ -335,12 +364,11 @@ export class TimelapseRecorderManager {
       // Offload to Tauri scratch disk when available to keep RAM usage near zero
       if (isTauriRuntime()) {
         try {
-          const buf = new Uint8Array(await blob.arrayBuffer());
-          await invokeTauri('timelapse_write_frame', {
-            sessionId: documentId,
-            frameIndex: idx,
-            ext: mimeType === 'image/webp' ? 'webp' : 'jpg',
-            data: Array.from(buf),
+          const buf = await blob.arrayBuffer();
+          await invokeTauriRaw('timelapse_write_frame', buf, {
+            'x-session-id': encodeURIComponent(documentId),
+            'x-frame-index': String(idx),
+            'x-ext': mimeType === 'image/webp' ? 'webp' : 'jpg',
           });
           entry.offloadedToDisk = true;
           entry.blob = undefined;
@@ -386,12 +414,16 @@ export class TimelapseRecorderManager {
     if (frame.blob) return frame.blob;
     if (frame.offloadedToDisk && isTauriRuntime()) {
       try {
-        const bytes = await invokeTauri<number[]>('timelapse_read_frame', {
-          sessionId: documentId,
-          frameIndex: frame.index,
-          ext: frame.mimeType === 'image/webp' ? 'webp' : 'jpg',
-        });
-        return new Blob([new Uint8Array(bytes)], { type: frame.mimeType });
+        const raw = await invokeTauriRaw<ArrayBuffer | Uint8Array | number[]>(
+          'timelapse_read_frame',
+          undefined,
+          {
+            'x-session-id': encodeURIComponent(documentId),
+            'x-frame-index': String(frame.index),
+            'x-ext': frame.mimeType === 'image/webp' ? 'webp' : 'jpg',
+          }
+        );
+        return new Blob([toArrayBuffer(raw)], { type: frame.mimeType });
       } catch {
         return null;
       }
@@ -445,17 +477,23 @@ export class TimelapseRecorderManager {
       const hasFfmpeg = await this.checkFfmpegAvailable();
       if (hasFfmpeg) {
         onProgress?.(0.2);
-        const mp4Bytes = await invokeTauri<number[]>('timelapse_export_ffmpeg', {
-          sessionId: documentId,
-          frameIndices: sampledIndices.map((idx) => sess.frames[idx].index),
-          ext: firstFrame.mimeType === 'image/webp' ? 'webp' : 'jpg',
-          fps,
-          width: targetDims.width,
-          height: targetDims.height,
-        });
+        const packedIndices = packFrameIndices(
+          sampledIndices.map((idx) => sess.frames[idx].index)
+        );
+        const mp4Raw = await invokeTauriRaw<ArrayBuffer | Uint8Array | number[]>(
+          'timelapse_export_ffmpeg',
+          packedIndices,
+          {
+            'x-session-id': encodeURIComponent(documentId),
+            'x-ext': firstFrame.mimeType === 'image/webp' ? 'webp' : 'jpg',
+            'x-fps': String(fps),
+            'x-width': String(targetDims.width),
+            'x-height': String(targetDims.height),
+          }
+        );
         onProgress?.(1);
         return {
-          blob: new Blob([new Uint8Array(mp4Bytes)], { type: 'video/mp4' }),
+          blob: new Blob([toArrayBuffer(mp4Raw)], { type: 'video/mp4' }),
           mimeType: 'video/mp4',
           extension: '.mp4',
           frameCount: sampledIndices.length,

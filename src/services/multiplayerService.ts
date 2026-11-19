@@ -104,13 +104,30 @@ class MultiplayerService {
     return this.currentPeer;
   }
 
-  public connect(url: string, peer: CollabPeer): Promise<void> {
+  public connect(url: string, peer: CollabPeer, token?: string): Promise<void> {
     return new Promise((resolve, reject) => {
       this.disconnect();
       this.currentPeer = peer;
 
+      let connectUrl = url;
+      let displayUrl = url;
       try {
-        const ws = new WebSocket(url);
+        const parsed = new URL(url);
+        if (token && !parsed.searchParams.has('token')) {
+          parsed.searchParams.set('token', token);
+        }
+        connectUrl = parsed.toString();
+        parsed.searchParams.delete('token');
+        displayUrl = parsed.toString();
+      } catch {
+        if (token && !/[?&]token=/.test(url)) {
+          const sep = url.includes('?') ? '&' : '?';
+          connectUrl = `${url}${sep}token=${encodeURIComponent(token)}`;
+        }
+      }
+
+      try {
+        const ws = new WebSocket(connectUrl);
         ws.binaryType = 'arraybuffer';
         this.ws = ws;
 
@@ -155,10 +172,10 @@ class MultiplayerService {
 
         ws.onerror = (err) => {
           this.errorHandlers.forEach((h) => h(err));
-          reject(new Error(`Failed to connect to socket server (${url})`));
+          reject(new Error(`Failed to connect to socket server (${displayUrl})`));
         };
       } catch (err: any) {
-        reject(new Error(err?.message || `WebSocket initialization error (${url})`));
+        reject(new Error(err?.message || `WebSocket initialization error (${displayUrl})`));
       }
     });
   }

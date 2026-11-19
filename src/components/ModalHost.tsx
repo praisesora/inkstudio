@@ -35,6 +35,7 @@ export interface InviteLinkPayload {
   host: string;
   port: number;
   url: string;
+  token?: string;
 }
 
 export interface ModalHostProps {
@@ -85,7 +86,7 @@ export interface ModalHostProps {
   setClipboardInvite: (invite: InviteLinkPayload | null) => void;
   webLandingInvite: InviteLinkPayload | null;
   setWebLandingInvite: (invite: InviteLinkPayload | null) => void;
-  joinRoom: (host: string, port: number, roomName: string, name: string) => void;
+  joinRoom: (host: string, port: number, roomName: string, name: string, token?: string) => void;
   onCaptureTimelapseNow?: () => void;
   showToast: (msg: string) => void;
 }
@@ -261,15 +262,15 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
 
         <ClipboardInviteToast
           invite={clipboardInvite}
-          onJoin={(h, p, r) => joinRoom(h, p, r, collabMyPeer.name)}
+          onJoin={(h, p, r, t) => joinRoom(h, p, r, collabMyPeer.name, t)}
           onDismiss={() => setClipboardInvite(null)}
         />
 
         <WebLandingModal
           invite={webLandingInvite}
-          onJoinInBrowser={(name, h, p, r) => {
+          onJoinInBrowser={(name, h, p, r, t) => {
             updateMyName(name);
-            joinRoom(h, p, r, name);
+            joinRoom(h, p, r, name, t);
           }}
           onDismiss={() => setWebLandingInvite(null)}
         />

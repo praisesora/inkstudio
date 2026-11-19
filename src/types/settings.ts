@@ -1,4 +1,5 @@
 import { CanvasColorMode } from './editor';
+import { safeLocalStorageSetItem } from '../utils/safeStorage';
 
 export type AnchorPosition =
   | 'center'
@@ -441,12 +442,5 @@ export function loadAppSettings(): AppSettings {
 }
 
 export function saveAppSettings(settings: AppSettings): void {
-  try {
-    if (typeof localStorage === 'undefined' || typeof localStorage.setItem !== 'function') {
-      return;
-    }
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-  } catch (err) {
-    console.warn('Failed to save settings to localStorage:', err);
-  }
+  safeLocalStorageSetItem(SETTINGS_KEY, JSON.stringify(settings), 'app settings');
 }

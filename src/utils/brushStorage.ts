@@ -1,9 +1,14 @@
 import { CspBrush, BrushSettings } from '../types/editor';
+import {
+  handleIndexedDbError,
+  safeLocalStorageGetItem,
+  safeLocalStorageSetItem,
+} from './safeStorage';
 
 const DB_NAME = 'SoraPaintBrushesDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'csp_brushes';
-const LS_KEY = 'sora_paint_custom_brushes';
+export const BRUSH_INDEX_LS_KEY = 'sora_paint_custom_brushes';
 
 export const CUSTOM_BRUSHES_CHANGED_EVENT = 'ink-custom-brushes-changed';
 
@@ -19,6 +24,29 @@ function emitCustomBrushesChanged(): void {
   if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
     window.dispatchEvent(new CustomEvent(CUSTOM_BRUSHES_CHANGED_EVENT));
   }
+}
+
+function hasHeavyBrushAssets(brush: CspBrush): boolean {
+  return Boolean(
+    brush.tipDataUrl ||
+    brush.secondaryTipDataUrl ||
+    brush.paperTexture ||
+    (brush.subTips && brush.subTips.length > 0)
+  );
+}
+
+/**
+ * Strips heavy base64 data URLs so only lightweight settings/IDs ever touch localStorage.
+ */
+function stripHeavyBrushAssets(brush: CspBrush): CspBrush {
+  const {
+    tipDataUrl: _tip,
+    secondaryTipDataUrl: _sec,
+    subTips: _subs,
+    paperTexture: _tex,
+    ...lightweight
+  } = brush;
+  return lightweight;
 }
 
 function preloadAllBrushAssets(brush: CspBrush): void {
@@ -43,13 +71,25 @@ function preloadAllBrushAssets(brush: CspBrush): void {
  */
 export function getCachedCustomBrushes(): CspBrush[] {
   if (!_hasLoadedCustomBrushes) {
-    const fallback = loadFromLocalStorageFallback();
+    const fallback = loadLightweightIndexFromLocalStorage();
     if (fallback.length > 0) {
       _cachedCustomBrushes = fallback;
       _hasLoadedCustomBrushes = true;
     }
   }
   return _cachedCustomBrushes;
+}
+
+/**
+ * Resets in-memory brush cache (intended for unit tests).
+ */
+export function resetBrushStorageCache(): void {
+  for (const timer of _debouncedBrushSaves.values()) {
+    clearTimeout(timer);
+  }
+  _debouncedBrushSaves.clear();
+  _cachedCustomBrushes = [];
+  _hasLoadedCustomBrushes = false;
 }
 
 /**
@@ -89,12 +129,18 @@ export function getPreloadedTipImage(dataUrl?: string): HTMLImageElement | null 
  */
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    if (typeof window === 'undefined' || !window.indexedDB) {
+    const idb =
+      typeof indexedDB !== 'undefined'
+        ? indexedDB
+        : typeof window !== 'undefined'
+          ? window.indexedDB
+          : undefined;
+    if (!idb) {
       reject(new Error('IndexedDB is not supported in this environment.'));
       return;
     }
 
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    const request = idb.open(DB_NAME, DB_VERSION);
 
     request.onupgradeneeded = (e: IDBVersionChangeEvent) => {
       const db = (e.target as IDBOpenDBRequest).result;
@@ -110,34 +156,73 @@ function openDB(): Promise<IDBDatabase> {
 
 /**
  * Loads all imported Clip Studio Paint brushes from persistent IndexedDB storage.
+ * Automatically migrates any legacy heavy brush payloads out of localStorage into IndexedDB.
  */
 export async function loadCustomBrushes(): Promise<CspBrush[]> {
+  const rawLegacy = loadRawFromLocalStorage();
+  const hasLegacyHeavy = rawLegacy.some(hasHeavyBrushAssets);
+
   try {
     const db = await openDB();
-    return new Promise((resolve) => {
+    const idbBrushes = await new Promise<CspBrush[]>((resolve, reject) => {
       const transaction = db.transaction([STORE_NAME], 'readonly');
       const store = transaction.objectStore(STORE_NAME);
       const request = store.getAll();
-
-      request.onsuccess = () => {
-        const brushes: CspBrush[] = request.result || [];
-        _cachedCustomBrushes = brushes;
-        _hasLoadedCustomBrushes = true;
-        for (const b of brushes) {
-          preloadAllBrushAssets(b);
-        }
-        resolve(brushes);
-      };
-
-      request.onerror = () => {
-        const fallback = loadFromLocalStorageFallback();
-        _cachedCustomBrushes = fallback;
-        _hasLoadedCustomBrushes = true;
-        resolve(fallback);
-      };
+      request.onsuccess = () => resolve((request.result as CspBrush[]) || []);
+      request.onerror = () => reject(request.error);
     });
+
+    const byId = new Map<string, CspBrush>();
+    for (const b of idbBrushes) {
+      byId.set(b.id, b);
+    }
+
+    // Migrate any legacy brushes that still exist only in localStorage into IndexedDB
+    const toMigrate: CspBrush[] = [];
+    for (const legacy of rawLegacy) {
+      if (!byId.has(legacy.id)) {
+        byId.set(legacy.id, legacy);
+        toMigrate.push(legacy);
+      }
+    }
+
+    if (toMigrate.length > 0) {
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction([STORE_NAME], 'readwrite');
+          const store = tx.objectStore(STORE_NAME);
+          for (const b of toMigrate) {
+            store.put(b);
+          }
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      } catch (err) {
+        handleIndexedDbError(err, 'custom brush migration');
+      }
+    }
+
+    const brushes = Array.from(byId.values());
+    if (hasLegacyHeavy || toMigrate.length > 0) {
+      writeLightweightIndexToLocalStorage(brushes);
+    }
+
+    _cachedCustomBrushes = brushes;
+    _hasLoadedCustomBrushes = true;
+    for (const b of brushes) {
+      preloadAllBrushAssets(b);
+    }
+    return brushes;
   } catch {
-    const fallback = loadFromLocalStorageFallback();
+    // Strip heavy data URLs from localStorage even if IDB is unavailable
+    if (hasLegacyHeavy) {
+      writeLightweightIndexToLocalStorage(rawLegacy);
+    }
+    if (_cachedCustomBrushes.length > 0) {
+      _hasLoadedCustomBrushes = true;
+      return _cachedCustomBrushes;
+    }
+    const fallback = rawLegacy.map(stripHeavyBrushAssets);
     _cachedCustomBrushes = fallback;
     _hasLoadedCustomBrushes = true;
     return fallback;
@@ -146,6 +231,7 @@ export async function loadCustomBrushes(): Promise<CspBrush[]> {
 
 /**
  * Saves or updates a Clip Studio Paint brush in persistent IndexedDB storage.
+ * Only lightweight metadata/IDs are mirrored to localStorage (never tip/texture data URLs).
  */
 export async function saveCustomBrush(brush: CspBrush): Promise<void> {
   preloadAllBrushAssets(brush);
@@ -167,16 +253,15 @@ export async function saveCustomBrush(brush: CspBrush): Promise<void> {
       const transaction = db.transaction([STORE_NAME], 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
       const request = store.put(brush);
-
-      request.onsuccess = () => {
-        syncToLocalStorageFallback(brush);
-        resolve();
-      };
+      request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
+      transaction.onerror = () => reject(transaction.error);
     });
-  } catch {
-    syncToLocalStorageFallback(brush);
+  } catch (err) {
+    handleIndexedDbError(err, `custom brush "${brush.name}"`);
   }
+
+  syncLightweightIndexToLocalStorage(brush);
   emitCustomBrushesChanged();
 }
 
@@ -219,48 +304,45 @@ export async function deleteCustomBrush(brushId: string): Promise<void> {
       const transaction = db.transaction([STORE_NAME], 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
       const request = store.delete(brushId);
-
-      request.onsuccess = () => {
-        removeFromLocalStorageFallback(brushId);
-        resolve();
-      };
+      request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
     });
   } catch {
-    removeFromLocalStorageFallback(brushId);
+    // Ignore IDB failure during delete
   }
+  removeFromLightweightIndex(brushId);
   emitCustomBrushesChanged();
 }
 
-function loadFromLocalStorageFallback(): CspBrush[] {
+function loadRawFromLocalStorage(): CspBrush[] {
   try {
-    if (typeof localStorage === 'undefined') return [];
-    const data = localStorage.getItem(LS_KEY);
-    return data ? JSON.parse(data) : [];
+    const data = safeLocalStorageGetItem(BRUSH_INDEX_LS_KEY);
+    if (!data) return [];
+    const parsed = JSON.parse(data);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
 }
 
-function syncToLocalStorageFallback(brush: CspBrush) {
-  try {
-    if (typeof localStorage === 'undefined') return;
-    const current = loadFromLocalStorageFallback().filter((b) => b.id !== brush.id);
-    current.push(brush);
-    localStorage.setItem(LS_KEY, JSON.stringify(current));
-  } catch {
-    // LocalStorage quota may be exceeded with large base64 tips; IndexedDB remains authoritative
-  }
+function loadLightweightIndexFromLocalStorage(): CspBrush[] {
+  return loadRawFromLocalStorage().map(stripHeavyBrushAssets);
 }
 
-function removeFromLocalStorageFallback(brushId: string) {
-  try {
-    if (typeof localStorage === 'undefined') return;
-    const current = loadFromLocalStorageFallback().filter((b) => b.id !== brushId);
-    localStorage.setItem(LS_KEY, JSON.stringify(current));
-  } catch {
-    // Ignore
-  }
+function writeLightweightIndexToLocalStorage(brushes: CspBrush[]): void {
+  const lightweight = brushes.map(stripHeavyBrushAssets);
+  safeLocalStorageSetItem(BRUSH_INDEX_LS_KEY, JSON.stringify(lightweight), 'custom brush list');
+}
+
+function syncLightweightIndexToLocalStorage(brush: CspBrush): void {
+  const current = loadLightweightIndexFromLocalStorage().filter((b) => b.id !== brush.id);
+  current.push(stripHeavyBrushAssets(brush));
+  safeLocalStorageSetItem(BRUSH_INDEX_LS_KEY, JSON.stringify(current), 'custom brush list');
+}
+
+function removeFromLightweightIndex(brushId: string): void {
+  const current = loadLightweightIndexFromLocalStorage().filter((b) => b.id !== brushId);
+  safeLocalStorageSetItem(BRUSH_INDEX_LS_KEY, JSON.stringify(current), 'custom brush list');
 }
 
 /**

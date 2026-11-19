@@ -1,4 +1,9 @@
 // Recent & Starred Documents Manager with IndexedDB persistence and disk removal
+import {
+  handleIndexedDbError,
+  safeLocalStorageGetItem,
+  safeLocalStorageSetItem,
+} from './safeStorage';
 
 export interface RecentDocument {
   id: string;
@@ -15,7 +20,7 @@ export interface RecentDocument {
 const DB_NAME = 'InkStudioRecentDocsDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'recent_documents';
-const LS_BACKUP_KEY = 'inkstudio_recent_docs_backup';
+export const RECENT_DOCS_LS_KEY = 'inkstudio_recent_docs_backup';
 
 export function isActualSavedDocument(doc: RecentDocument): boolean {
   if (!doc) return false;
@@ -33,13 +38,28 @@ export function isActualSavedDocument(doc: RecentDocument): boolean {
   return true;
 }
 
+/**
+ * Strips heavy coverUrl thumbnails so localStorage only ever stores lightweight metadata/IDs.
+ */
+function stripRecentDocThumbnail(doc: RecentDocument): RecentDocument {
+  if (!doc.coverUrl) return doc;
+  const { coverUrl: _omit, ...lightweight } = doc;
+  return lightweight;
+}
+
 function openDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    if (typeof window === 'undefined' || !window.indexedDB) {
+    const idb =
+      typeof indexedDB !== 'undefined'
+        ? indexedDB
+        : typeof window !== 'undefined'
+          ? window.indexedDB
+          : undefined;
+    if (!idb) {
       reject(new Error('IndexedDB not available'));
       return;
     }
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    const req = idb.open(DB_NAME, DB_VERSION);
     req.onupgradeneeded = (e) => {
       const db = (e.target as IDBOpenDBRequest).result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
@@ -53,24 +73,41 @@ function openDB(): Promise<IDBDatabase> {
   });
 }
 
-export async function loadRecentDocuments(): Promise<RecentDocument[]> {
-  // Purge unsaved and legacy sample docs from localStorage
+function writeFallbackDocs(docs: RecentDocument[]): void {
+  const stripped = docs.filter(isActualSavedDocument).map(stripRecentDocThumbnail);
+  safeLocalStorageSetItem(RECENT_DOCS_LS_KEY, JSON.stringify(stripped), 'recent documents');
+}
+
+function getRawFallbackDocs(): RecentDocument[] {
   try {
-    const raw = localStorage.getItem(LS_BACKUP_KEY);
+    const raw = safeLocalStorageGetItem(RECENT_DOCS_LS_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
-        const cleaned = parsed.filter(isActualSavedDocument);
-        localStorage.setItem(LS_BACKUP_KEY, JSON.stringify(cleaned));
+        return parsed.filter(isActualSavedDocument);
       }
     }
   } catch {
     // ignore
   }
+  return [];
+}
+
+function getFallbackDocs(): RecentDocument[] {
+  return getRawFallbackDocs().map(stripRecentDocThumbnail);
+}
+
+export async function loadRecentDocuments(): Promise<RecentDocument[]> {
+  // Read any legacy localStorage records (and purge unsaved/thumbnails from localStorage)
+  const rawLegacy = getRawFallbackDocs();
+  const hasLegacyThumbnails = rawLegacy.some((d) => Boolean(d.coverUrl));
+  if (rawLegacy.length > 0 || safeLocalStorageGetItem(RECENT_DOCS_LS_KEY)) {
+    writeFallbackDocs(rawLegacy);
+  }
 
   try {
     const db = await openDB();
-    return new Promise((resolve) => {
+    return await new Promise((resolve) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
       const req = store.getAll();
@@ -84,6 +121,19 @@ export async function loadRecentDocuments(): Promise<RecentDocument[]> {
           }
           docs = docs.filter((d) => isActualSavedDocument(d));
         }
+
+        // Migrate any legacy localStorage docs (including thumbnails) into IDB if missing
+        const existingIds = new Set(docs.map((d) => d.id));
+        if (hasLegacyThumbnails || rawLegacy.some((d) => !existingIds.has(d.id))) {
+          for (const legacy of rawLegacy) {
+            if (!existingIds.has(legacy.id)) {
+              store.put(legacy);
+              docs.push(legacy);
+              existingIds.add(legacy.id);
+            }
+          }
+        }
+
         docs.sort((a, b) => b.lastOpened - a.lastOpened);
         resolve(docs);
       };
@@ -94,21 +144,6 @@ export async function loadRecentDocuments(): Promise<RecentDocument[]> {
   } catch {
     return getFallbackDocs();
   }
-}
-
-function getFallbackDocs(): RecentDocument[] {
-  try {
-    const raw = localStorage.getItem(LS_BACKUP_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        return parsed.filter(isActualSavedDocument);
-      }
-    }
-  } catch {
-    // ignore
-  }
-  return [];
 }
 
 export async function saveRecentDocument(
@@ -127,19 +162,25 @@ export async function saveRecentDocument(
 
   try {
     const db = await openDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(fullDoc);
-  } catch {
-    // fallback to localStorage
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const req = tx.objectStore(STORE_NAME).put(fullDoc);
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    handleIndexedDbError(err, 'recent document thumbnail');
+    // Fallback to localStorage without heavy thumbnail payloads
     const current = getFallbackDocs().filter((d) => d.id !== fullDoc.id);
-    localStorage.setItem(LS_BACKUP_KEY, JSON.stringify([fullDoc, ...current]));
+    writeFallbackDocs([stripRecentDocThumbnail(fullDoc), ...current]);
   }
 }
 
 export async function toggleStarDocument(id: string): Promise<boolean> {
   try {
     const db = await openDB();
-    return new Promise((resolve) => {
+    return await new Promise((resolve) => {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       const store = tx.objectStore(STORE_NAME);
       const req = store.get(id);
@@ -160,7 +201,7 @@ export async function toggleStarDocument(id: string): Promise<boolean> {
     const target = current.find((d) => d.id === id);
     if (target) {
       target.isStarred = !target.isStarred;
-      localStorage.setItem(LS_BACKUP_KEY, JSON.stringify(current));
+      writeFallbackDocs(current);
       return target.isStarred;
     }
     return false;
@@ -170,13 +211,17 @@ export async function toggleStarDocument(id: string): Promise<boolean> {
 export async function removeRecentDocument(id: string): Promise<void> {
   try {
     const db = await openDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).delete(id);
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
   } catch {
     // ignore
   }
   const current = getFallbackDocs().filter((d) => d.id !== id);
-  localStorage.setItem(LS_BACKUP_KEY, JSON.stringify(current));
+  writeFallbackDocs(current);
 }
 
 export async function permanentlyDeleteDocument(

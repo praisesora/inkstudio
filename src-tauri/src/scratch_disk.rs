@@ -38,6 +38,114 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 const MAX_UNCOMPRESSED_TILE_BYTES: usize = 4 * 1024 * 1024; // 4 MB max per 256x256 tile
 const MAX_COMPRESSED_TILE_BYTES: u32 = 8 * 1024 * 1024;     // 8 MB max compressed payload
+const MAX_TILES_PER_BATCH: usize = 4096;
+const MIN_TILE_RECORD_BYTES: usize = 2 + 4 + 4 + 4; // layerIdLen(u16) + tx(i32) + ty(i32) + dataLen(u32)
+
+/// Packs a batch of tiles into the compact binary frame:
+/// `[count:u32][layerIdLen:u16, layerId(utf8), tx:i32, ty:i32, dataLen:u32, data]...` (all LE)
+#[allow(dead_code)]
+pub fn pack_tile_batch(tiles: &[TileWritePayload]) -> Result<Vec<u8>, String> {
+    if tiles.len() > MAX_TILES_PER_BATCH {
+        return Err("Tile batch exceeds maximum allowed tile count".to_string());
+    }
+    let mut total_size: usize = 4;
+    for tile in tiles {
+        let lid_len = tile.layer_id.len();
+        if lid_len > u16::MAX as usize {
+            return Err("Layer ID exceeds u16 length limit".to_string());
+        }
+        if tile.data.len() > MAX_UNCOMPRESSED_TILE_BYTES {
+            return Err("Tile uncompressed payload exceeds 4 MB safety ceiling".to_string());
+        }
+        total_size = total_size
+            .checked_add(MIN_TILE_RECORD_BYTES)
+            .and_then(|n| n.checked_add(lid_len))
+            .and_then(|n| n.checked_add(tile.data.len()))
+            .ok_or_else(|| "Tile batch size overflow".to_string())?;
+    }
+
+    let mut out = Vec::with_capacity(total_size);
+    out.extend_from_slice(&(tiles.len() as u32).to_le_bytes());
+    for tile in tiles {
+        let lid_bytes = tile.layer_id.as_bytes();
+        out.extend_from_slice(&(lid_bytes.len() as u16).to_le_bytes());
+        out.extend_from_slice(lid_bytes);
+        out.extend_from_slice(&tile.tile_x.to_le_bytes());
+        out.extend_from_slice(&tile.tile_y.to_le_bytes());
+        out.extend_from_slice(&(tile.data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&tile.data);
+    }
+    Ok(out)
+}
+
+/// Unpacks a compact binary tile batch frame:
+/// `[count:u32][layerIdLen:u16, layerId(utf8), tx:i32, ty:i32, dataLen:u32, data]...` (all LE)
+pub fn unpack_tile_batch(bytes: &[u8]) -> Result<Vec<TileWritePayload>, String> {
+    if bytes.len() < 4 {
+        return Err("Truncated tile batch header".to_string());
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if count > MAX_TILES_PER_BATCH {
+        return Err("Tile batch count exceeds safety ceiling".to_string());
+    }
+    if count > (bytes.len() - 4) / MIN_TILE_RECORD_BYTES {
+        return Err("Truncated tile batch payload".to_string());
+    }
+
+    let mut offset = 4usize;
+    let mut tiles = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let lid_len_end = offset
+            .checked_add(2)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| "Truncated tile record layerIdLen".to_string())?;
+        let layer_id_len = u16::from_le_bytes(bytes[offset..lid_len_end].try_into().unwrap()) as usize;
+        offset = lid_len_end;
+
+        let lid_end = offset
+            .checked_add(layer_id_len)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| "Truncated tile record layerId".to_string())?;
+        let layer_id = std::str::from_utf8(&bytes[offset..lid_end])
+            .map_err(|_| "Invalid UTF-8 in tile record layerId".to_string())?
+            .to_string();
+        offset = lid_end;
+
+        let meta_end = offset
+            .checked_add(12)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| "Truncated tile record metadata".to_string())?;
+        let tile_x = i32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let tile_y = i32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        let data_len = u32::from_le_bytes(bytes[offset + 8..offset + 12].try_into().unwrap()) as usize;
+        offset = meta_end;
+
+        if data_len > MAX_UNCOMPRESSED_TILE_BYTES {
+            return Err("Tile uncompressed payload exceeds 4 MB safety ceiling".to_string());
+        }
+
+        let data_end = offset
+            .checked_add(data_len)
+            .filter(|&end| end <= bytes.len())
+            .ok_or_else(|| "Truncated tile record data".to_string())?;
+        let data = bytes[offset..data_end].to_vec();
+        offset = data_end;
+
+        tiles.push(TileWritePayload {
+            layer_id,
+            tile_x,
+            tile_y,
+            data,
+        });
+    }
+
+    if offset != bytes.len() {
+        return Err("Unexpected trailing bytes in tile batch payload".to_string());
+    }
+
+    Ok(tiles)
+}
 
 pub fn get_scratch_root(session_id: &str) -> PathBuf {
     let safe_session = sanitize_layer_id(session_id);
@@ -431,5 +539,81 @@ mod tests {
         // Clear scratch disk
         clear_scratch_disk(&session_id).await.expect("clear failed");
         assert!(!get_scratch_root(&session_id).exists());
+    }
+
+    #[test]
+    fn test_tile_batch_pack_unpack_roundtrip() {
+        let tiles = vec![
+            TileWritePayload {
+                layer_id: "layer_alpha".to_string(),
+                tile_x: -5,
+                tile_y: 12,
+                data: vec![0, 1, 2, 255, 128],
+            },
+            TileWritePayload {
+                layer_id: "レイヤー_2".to_string(),
+                tile_x: 0,
+                tile_y: -999,
+                data: vec![42u8; 8192],
+            },
+            TileWritePayload {
+                layer_id: "empty_tile".to_string(),
+                tile_x: 3,
+                tile_y: 4,
+                data: Vec::new(),
+            },
+        ];
+
+        let packed = pack_tile_batch(&tiles).expect("pack failed");
+        let unpacked = unpack_tile_batch(&packed).expect("unpack failed");
+
+        assert_eq!(unpacked.len(), tiles.len());
+        for (a, b) in tiles.iter().zip(unpacked.iter()) {
+            assert_eq!(a.layer_id, b.layer_id);
+            assert_eq!(a.tile_x, b.tile_x);
+            assert_eq!(a.tile_y, b.tile_y);
+            assert_eq!(a.data, b.data);
+        }
+
+        // Empty batch roundtrip
+        let empty = pack_tile_batch(&[]).expect("pack empty failed");
+        assert_eq!(empty, 0u32.to_le_bytes());
+        assert!(unpack_tile_batch(&empty).expect("unpack empty failed").is_empty());
+    }
+
+    #[test]
+    fn test_tile_batch_unpack_rejects_malformed_frames() {
+        // Too short header
+        assert!(unpack_tile_batch(&[1, 0]).is_err());
+
+        // Bogus huge count (OOM guard)
+        let mut bogus = Vec::new();
+        bogus.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(unpack_tile_batch(&bogus).is_err());
+
+        // Truncated data and trailing bytes
+        let valid = pack_tile_batch(&[TileWritePayload {
+            layer_id: "l1".to_string(),
+            tile_x: 1,
+            tile_y: 2,
+            data: vec![10, 20, 30],
+        }])
+        .unwrap();
+
+        assert!(unpack_tile_batch(&valid[..valid.len() - 1]).is_err());
+
+        let mut with_trailing = valid.clone();
+        with_trailing.push(0xAA);
+        assert!(unpack_tile_batch(&with_trailing).is_err());
+
+        // Oversized tile dataLen (> 4 MB)
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(&1u32.to_le_bytes());
+        oversized.extend_from_slice(&2u16.to_le_bytes());
+        oversized.extend_from_slice(b"l1");
+        oversized.extend_from_slice(&0i32.to_le_bytes());
+        oversized.extend_from_slice(&0i32.to_le_bytes());
+        oversized.extend_from_slice(&((MAX_UNCOMPRESSED_TILE_BYTES + 1) as u32).to_le_bytes());
+        assert!(unpack_tile_batch(&oversized).is_err());
     }
 }

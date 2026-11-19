@@ -13,6 +13,7 @@ import {
 } from '../types/editor';
 import { getBuiltinBrushConfig } from './presetBrushes';
 import { getPreloadedTipImage, getCachedCustomBrushes } from './brushStorage';
+import { safeLocalStorageSetItem } from './safeStorage';
 
 export const BRUSH_SIZE_PRESETS: number[] = [
   0.5, 0.7, 1, 1.5, 2, 2.5, 3,
@@ -219,9 +220,9 @@ export function loadAllSavedBrushSettings(): Record<string, BrushPersistentSetti
           }
         }
         if (mutated) {
-          localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(parsed));
+          safeLocalStorageSetItem(STORAGE_KEY_SETTINGS, JSON.stringify(parsed), 'brush settings');
         }
-        localStorage.setItem(STORAGE_KEY_PRESET_SCHEMA, String(BUILTIN_PRESET_SCHEMA_VERSION));
+        safeLocalStorageSetItem(STORAGE_KEY_PRESET_SCHEMA, String(BUILTIN_PRESET_SCHEMA_VERSION), 'brush settings');
       }
     }
     _memorySettingsCache = parsed;
@@ -310,13 +311,7 @@ function mergeIntoMemoryCache(presetId: string, settings: Partial<BrushSettings>
 
 function flushMemoryCacheToStorage(): void {
   if (!_memorySettingsCache) return;
-  try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(_memorySettingsCache));
-    }
-  } catch (err) {
-    console.warn('Failed to persist brush settings to localStorage:', err);
-  }
+  safeLocalStorageSetItem(STORAGE_KEY_SETTINGS, JSON.stringify(_memorySettingsCache), 'brush settings');
 }
 
 export function saveBrushSettingsImmediately(
@@ -384,13 +379,7 @@ export function getActivePresetId(): string {
 }
 
 export function saveActivePresetId(presetId: string): void {
-  try {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEY_ACTIVE_PRESET, presetId);
-    }
-  } catch {
-    // ignore
-  }
+  safeLocalStorageSetItem(STORAGE_KEY_ACTIVE_PRESET, presetId, 'active brush preset');
 }
 
 export function getEffectiveBrushSettings(

@@ -190,6 +190,7 @@ export interface SessionHostInfo {
   port: number;
   localIp: string;
   roomName: string;
+  roomToken?: string;
   inviteUrl: string;
   peerCount: number;
   isGlobal?: boolean;

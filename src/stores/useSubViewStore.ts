@@ -1,8 +1,14 @@
 import { createStore } from './createStore';
+import {
+  handleIndexedDbError,
+  safeLocalStorageGetItem,
+  safeLocalStorageSetItem,
+} from '../utils/safeStorage';
 
 export const SUB_VIEW_STORAGE_KEY = 'ink_studio_subview_v1';
-const MAX_PERSISTED_SRC_CHARS = 380_000;
-const MAX_TOTAL_PERSISTED_CHARS = 1_500_000;
+const SUB_VIEW_DB_NAME = 'InkStudioSubViewDB';
+const SUB_VIEW_DB_VERSION = 1;
+const SUB_VIEW_IMAGE_STORE = 'subview_images';
 
 export interface SubViewTransform {
   zoom: number;
@@ -14,7 +20,7 @@ export interface SubViewTransform {
 export interface SubViewImageItem {
   id: string;
   name: string;
-  src: string; // data: URL or safe same-origin URL (may be empty if evicted from storage on reload)
+  src: string; // data: URL stored in IndexedDB (empty until hydrated or if evicted)
   width: number;
   height: number;
   zoom: number;
@@ -41,7 +47,6 @@ interface PersistedSubViewPayload {
   items: Array<{
     id: string;
     name: string;
-    src?: string;
     width: number;
     height: number;
     zoom: number;
@@ -50,6 +55,11 @@ interface PersistedSubViewPayload {
     flipX: boolean;
     needsInitialFit?: boolean;
   }>;
+}
+
+interface SubViewImageRecord {
+  id: string;
+  src: string;
 }
 
 export const SUB_VIEW_MIN_ZOOM = 0.05;
@@ -62,11 +72,99 @@ function clampZoom(z: number): number {
 
 function isSafeImageSrc(src: unknown): src is string {
   if (typeof src !== 'string' || !src) return false;
-  // Allow data:image/* (never data:image/svg+xml script vectors when loading raw strings unless standard)
-  // and safe local/blob/https URLs
   if (src.startsWith('data:image/')) return true;
-  if (src.startsWith('blob:')) return false; // blob URLs do not survive reload
+  if (src.startsWith('blob:')) return false;
   return false;
+}
+
+function openSubViewDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const idb =
+      typeof indexedDB !== 'undefined'
+        ? indexedDB
+        : typeof window !== 'undefined'
+          ? window.indexedDB
+          : undefined;
+    if (!idb) {
+      reject(new Error('IndexedDB is not available'));
+      return;
+    }
+    const req = idb.open(SUB_VIEW_DB_NAME, SUB_VIEW_DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = (e.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(SUB_VIEW_IMAGE_STORE)) {
+        db.createObjectStore(SUB_VIEW_IMAGE_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+export async function saveSubViewImageToIdb(id: string, src: string): Promise<void> {
+  if (!id || !isSafeImageSrc(src)) return;
+  try {
+    const db = await openSubViewDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SUB_VIEW_IMAGE_STORE, 'readwrite');
+      const req = tx.objectStore(SUB_VIEW_IMAGE_STORE).put({ id, src } satisfies SubViewImageRecord);
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    handleIndexedDbError(err, 'Sub View reference image');
+  }
+}
+
+export async function deleteSubViewImageFromIdb(id: string): Promise<void> {
+  if (!id) return;
+  try {
+    const db = await openSubViewDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SUB_VIEW_IMAGE_STORE, 'readwrite');
+      tx.objectStore(SUB_VIEW_IMAGE_STORE).delete(id);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // Ignore delete failures when IDB is unavailable
+  }
+}
+
+export async function clearSubViewImagesFromIdb(): Promise<void> {
+  try {
+    const db = await openSubViewDB();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(SUB_VIEW_IMAGE_STORE, 'readwrite');
+      tx.objectStore(SUB_VIEW_IMAGE_STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // Ignore clear failures when IDB is unavailable
+  }
+}
+
+export async function loadSubViewImagesFromIdb(): Promise<Map<string, string>> {
+  const map = new Map<string, string>();
+  try {
+    const db = await openSubViewDB();
+    const records = await new Promise<SubViewImageRecord[]>((resolve, reject) => {
+      const tx = db.transaction(SUB_VIEW_IMAGE_STORE, 'readonly');
+      const req = tx.objectStore(SUB_VIEW_IMAGE_STORE).getAll();
+      req.onsuccess = () => resolve((req.result as SubViewImageRecord[]) || []);
+      req.onerror = () => reject(req.error);
+    });
+    for (const rec of records) {
+      if (rec && typeof rec.id === 'string' && isSafeImageSrc(rec.src)) {
+        map.set(rec.id, rec.src);
+      }
+    }
+  } catch {
+    // IDB unavailable
+  }
+  return map;
 }
 
 export function loadSubViewState(): SubViewStoreState {
@@ -79,14 +177,14 @@ export function loadSubViewState(): SubViewStoreState {
   };
 
   try {
-    if (typeof localStorage === 'undefined') return fallback;
-    const raw = localStorage.getItem(SUB_VIEW_STORAGE_KEY);
+    const raw = safeLocalStorageGetItem(SUB_VIEW_STORAGE_KEY);
     if (!raw) return fallback;
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object') return fallback;
 
     const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
     const items: SubViewImageItem[] = [];
+    const legacyInlineImages: Array<{ id: string; src: string }> = [];
     const seen = new Set<string>();
 
     for (const entry of rawItems) {
@@ -97,7 +195,10 @@ export function loadSubViewState(): SubViewStoreState {
       seen.add(id);
 
       const name = typeof r.name === 'string' && r.name.trim() ? r.name.slice(0, 120) : 'Reference';
-      const src = isSafeImageSrc(r.src) ? r.src : '';
+      const legacySrc = isSafeImageSrc(r.src) ? r.src : '';
+      if (legacySrc) {
+        legacyInlineImages.push({ id, src: legacySrc });
+      }
       const width = typeof r.width === 'number' && Number.isFinite(r.width) && r.width > 0 ? Math.round(r.width) : 0;
       const height = typeof r.height === 'number' && Number.isFinite(r.height) && r.height > 0 ? Math.round(r.height) : 0;
       const zoom = clampZoom(typeof r.zoom === 'number' ? r.zoom : 1);
@@ -110,7 +211,7 @@ export function loadSubViewState(): SubViewStoreState {
       items.push({
         id,
         name,
-        src,
+        src: legacySrc,
         width,
         height,
         zoom,
@@ -126,71 +227,78 @@ export function loadSubViewState(): SubViewStoreState {
         ? parsed.activeId
         : items[0]?.id ?? null;
 
-    return {
+    const state: SubViewStoreState = {
       items,
       activeId,
       autoEyedropper: typeof parsed.autoEyedropper === 'boolean' ? parsed.autoEyedropper : true,
       manualEyedropper: false,
       showList: typeof parsed.showList === 'boolean' ? parsed.showList : false,
     };
+
+    // Migrate any legacy inline data URLs out of localStorage into IndexedDB immediately
+    if (legacyInlineImages.length > 0) {
+      saveSubViewState(state);
+      for (const img of legacyInlineImages) {
+        void saveSubViewImageToIdb(img.id, img.src);
+      }
+    }
+
+    return state;
   } catch {
     return fallback;
   }
 }
 
+/**
+ * Persists only lightweight Sub View metadata and IDs to localStorage.
+ * Image data URLs live exclusively in IndexedDB.
+ */
 export function saveSubViewState(state: SubViewStoreState): void {
-  try {
-    if (typeof localStorage === 'undefined') return;
+  const payload: PersistedSubViewPayload = {
+    version: 1,
+    activeId: state.activeId,
+    autoEyedropper: state.autoEyedropper,
+    showList: state.showList,
+    items: state.items.map((item) => ({
+      id: item.id,
+      name: item.name,
+      width: item.width,
+      height: item.height,
+      zoom: item.zoom,
+      pan: item.pan,
+      rotation: item.rotation,
+      flipX: item.flipX,
+      needsInitialFit: item.needsInitialFit,
+    })),
+  };
 
-    let budget = MAX_TOTAL_PERSISTED_CHARS;
-    const serializedItems = state.items.map((item) => {
-      let persistedSrc: string | undefined;
-      if (
-        item.src.startsWith('data:image/') &&
-        item.src.length <= MAX_PERSISTED_SRC_CHARS &&
-        item.src.length <= budget
-      ) {
-        persistedSrc = item.src;
-        budget -= item.src.length;
-      }
-      return {
-        id: item.id,
-        name: item.name,
-        ...(persistedSrc ? { src: persistedSrc } : {}),
-        width: item.width,
-        height: item.height,
-        zoom: item.zoom,
-        pan: item.pan,
-        rotation: item.rotation,
-        flipX: item.flipX,
-        needsInitialFit: item.needsInitialFit,
-      };
-    });
-
-    const payload: PersistedSubViewPayload = {
-      version: 1,
-      activeId: state.activeId,
-      autoEyedropper: state.autoEyedropper,
-      showList: state.showList,
-      items: serializedItems,
-    };
-
-    try {
-      localStorage.setItem(SUB_VIEW_STORAGE_KEY, JSON.stringify(payload));
-    } catch {
-      // QuotaExceeded fallback: persist metadata without inline image payloads
-      const metadataOnly: PersistedSubViewPayload = {
-        ...payload,
-        items: payload.items.map(({ src: _omit, ...rest }) => rest),
-      };
-      localStorage.setItem(SUB_VIEW_STORAGE_KEY, JSON.stringify(metadataOnly));
-    }
-  } catch {
-    // Ignore storage access errors
-  }
+  safeLocalStorageSetItem(SUB_VIEW_STORAGE_KEY, JSON.stringify(payload), 'Sub View layout');
 }
 
 export const useSubViewStore = createStore<SubViewStoreState>(loadSubViewState);
+
+/**
+ * Hydrates Sub View item image payloads from IndexedDB into the store.
+ */
+export async function hydrateSubViewImages(): Promise<void> {
+  const imageMap = await loadSubViewImagesFromIdb();
+  if (imageMap.size === 0) return;
+
+  useSubViewStore.setState((prev) => {
+    let changed = false;
+    const nextItems = prev.items.map((item) => {
+      if (!item.src) {
+        const stored = imageMap.get(item.id);
+        if (stored) {
+          changed = true;
+          return { ...item, src: stored };
+        }
+      }
+      return item;
+    });
+    return changed ? { items: nextItems } : prev;
+  });
+}
 
 let subViewIdSeq = 1;
 export function createSubViewItemId(): string {
@@ -223,6 +331,9 @@ export const subViewStoreActions = {
       activeId: prepared[prepared.length - 1].id,
     }));
     persist();
+    for (const item of prepared) {
+      void saveSubViewImageToIdb(item.id, item.src);
+    }
   },
 
   removeImage(id: string): void {
@@ -238,11 +349,13 @@ export const subViewStoreActions = {
       return { items: nextItems, activeId: nextActive };
     });
     persist();
+    void deleteSubViewImageFromIdb(id);
   },
 
   clearAll(): void {
     useSubViewStore.setState({ items: [], activeId: null });
     persist();
+    void clearSubViewImagesFromIdb();
   },
 
   selectImage(id: string): void {
@@ -300,6 +413,7 @@ export const subViewStoreActions = {
       ),
     }));
     persist();
+    void saveSubViewImageToIdb(id, src);
   },
 
   setAutoEyedropper(enabled: boolean): void {

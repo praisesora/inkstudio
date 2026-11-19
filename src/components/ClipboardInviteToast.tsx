@@ -7,8 +7,9 @@ interface ClipboardInviteToastProps {
     host: string;
     port: number;
     url: string;
+    token?: string;
   } | null;
-  onJoin: (host: string, port: number, roomName: string) => void;
+  onJoin: (host: string, port: number, roomName: string, token?: string) => void;
   onDismiss: () => void;
 }
 
@@ -40,7 +41,7 @@ export const ClipboardInviteToast: React.FC<ClipboardInviteToastProps> = ({
 
         <div className="flex items-center space-x-2 pl-2">
           <button
-            onClick={() => onJoin(invite.host, invite.port, invite.roomName)}
+            onClick={() => onJoin(invite.host, invite.port, invite.roomName, invite.token)}
             className="flex items-center space-x-1.5 rounded-md bg-rose-600 hover:bg-rose-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors shadow-sm cursor-pointer"
           >
             <span>Connect</span>

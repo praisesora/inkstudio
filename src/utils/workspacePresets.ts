@@ -1,3 +1,4 @@
+import { safeLocalStorageSetItem } from './safeStorage';
 import {
   ALL_DOCK_PANEL_IDS,
   COMMAND_CATALOG,
@@ -776,10 +777,5 @@ export function loadWorkspaceState(): PersistedWorkspaceState {
 }
 
 export function saveWorkspaceState(state: PersistedWorkspaceState): void {
-  try {
-    if (typeof localStorage === 'undefined') return;
-    localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    // Ignore storage quota/access errors
-  }
+  safeLocalStorageSetItem(WORKSPACE_STORAGE_KEY, JSON.stringify(state), 'workspace layout');
 }

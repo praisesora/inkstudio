@@ -4,6 +4,7 @@ use tauri::Manager;
 use tokio::io::AsyncWriteExt;
 
 pub const WAL_MAGIC: &[u8; 4] = b"INKW";
+pub const REPLAY_MAGIC: &[u8; 4] = b"INKR";
 #[allow(dead_code)]
 pub const WAL_ENTRY_STROKE_TILE_DELTA: u8 = 1;
 #[allow(dead_code)]
@@ -12,6 +13,9 @@ pub const WAL_ENTRY_VECTOR_STROKE: u8 = 2;
 pub const WAL_ENTRY_LAYER_MUTATION: u8 = 3;
 
 const MAX_WAL_FRAME_PAYLOAD_BYTES: usize = 64 * 1024 * 1024; // 64 MB per WAL frame ceiling
+const MAX_CHECKPOINT_MANIFEST_BYTES: usize = 32 * 1024 * 1024; // 32 MB manifest ceiling
+const MAX_CHECKPOINT_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024; // 256 MB snapshot ceiling
+const MAX_CHECKPOINT_THUMBNAIL_BYTES: usize = 16 * 1024 * 1024; // 16 MB thumbnail ceiling
 
 static WAL_IO_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
@@ -457,6 +461,194 @@ pub async fn load_session_data(
     })
 }
 
+/// Unpacks a binary checkpoint frame:
+/// `[manifestLen:u32][snapshotLen:u32][thumbLen:u32][manifestUtf8][baseSnapshot][thumbnailPng]` (LE)
+pub fn unpack_checkpoint_payload(bytes: &[u8]) -> Result<(&str, &[u8], &[u8]), String> {
+    if bytes.len() < 12 {
+        return Err("Truncated checkpoint header".to_string());
+    }
+    let manifest_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    let snapshot_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+    let thumb_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+
+    if manifest_len > MAX_CHECKPOINT_MANIFEST_BYTES {
+        return Err("Checkpoint manifest exceeds safety ceiling".to_string());
+    }
+    if snapshot_len > MAX_CHECKPOINT_SNAPSHOT_BYTES {
+        return Err("Checkpoint snapshot exceeds safety ceiling".to_string());
+    }
+    if thumb_len > MAX_CHECKPOINT_THUMBNAIL_BYTES {
+        return Err("Checkpoint thumbnail exceeds safety ceiling".to_string());
+    }
+
+    let manifest_end = 12usize
+        .checked_add(manifest_len)
+        .ok_or_else(|| "Checkpoint length overflow".to_string())?;
+    let snapshot_end = manifest_end
+        .checked_add(snapshot_len)
+        .ok_or_else(|| "Checkpoint length overflow".to_string())?;
+    let thumb_end = snapshot_end
+        .checked_add(thumb_len)
+        .ok_or_else(|| "Checkpoint length overflow".to_string())?;
+
+    if thumb_end != bytes.len() {
+        return Err("Checkpoint payload size mismatch".to_string());
+    }
+
+    let manifest_json = std::str::from_utf8(&bytes[12..manifest_end])
+        .map_err(|_| "Checkpoint manifest is not valid UTF-8".to_string())?;
+    let base_snapshot = &bytes[manifest_end..snapshot_end];
+    let thumbnail_png = &bytes[snapshot_end..thumb_end];
+
+    Ok((manifest_json, base_snapshot, thumbnail_png))
+}
+
+#[allow(dead_code)]
+pub fn pack_checkpoint_payload(
+    manifest_json: &str,
+    base_snapshot: &[u8],
+    thumbnail_png: &[u8],
+) -> Result<Vec<u8>, String> {
+    let manifest_bytes = manifest_json.as_bytes();
+    let total = 12usize
+        .checked_add(manifest_bytes.len())
+        .and_then(|n| n.checked_add(base_snapshot.len()))
+        .and_then(|n| n.checked_add(thumbnail_png.len()))
+        .ok_or_else(|| "Checkpoint payload overflow".to_string())?;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(base_snapshot.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(thumbnail_png.len() as u32).to_le_bytes());
+    out.extend_from_slice(manifest_bytes);
+    out.extend_from_slice(base_snapshot);
+    out.extend_from_slice(thumbnail_png);
+    Ok(out)
+}
+
+/// Encodes `RecoveryReplayData` into a compact binary frame for `tauri::ipc::Response`:
+/// `[magic:"INKR"][sessionIdLen:u32][sessionId][manifestLen:u32][manifest][hasSnapshot:u8][snapshotLen:u32][snapshot][walCount:u32]([entryType:u8][payloadLen:u32][payload])*`
+pub fn encode_replay_data(data: &RecoveryReplayData) -> Result<Vec<u8>, String> {
+    let session_bytes = data.session_id.as_bytes();
+    let manifest_bytes = data.manifest_json.as_bytes();
+    let snapshot_bytes = data.base_snapshot.as_deref().unwrap_or(&[]);
+    let has_snapshot: u8 = if data.base_snapshot.is_some() { 1 } else { 0 };
+
+    let mut total: usize = 4 + 4 + session_bytes.len() + 4 + manifest_bytes.len() + 1 + 4 + snapshot_bytes.len() + 4;
+    for entry in &data.wal_entries {
+        total = total
+            .checked_add(5)
+            .and_then(|n| n.checked_add(entry.payload.len()))
+            .ok_or_else(|| "Replay payload size overflow".to_string())?;
+    }
+
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(REPLAY_MAGIC);
+    out.extend_from_slice(&(session_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(session_bytes);
+    out.extend_from_slice(&(manifest_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(manifest_bytes);
+    out.push(has_snapshot);
+    out.extend_from_slice(&(snapshot_bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(snapshot_bytes);
+    out.extend_from_slice(&(data.wal_entries.len() as u32).to_le_bytes());
+    for entry in &data.wal_entries {
+        out.push(entry.entry_type);
+        out.extend_from_slice(&(entry.payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&entry.payload);
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+pub fn decode_replay_data(bytes: &[u8]) -> Result<RecoveryReplayData, String> {
+    if bytes.len() < 4 || &bytes[0..4] != REPLAY_MAGIC {
+        return Err("Invalid recovery replay magic".to_string());
+    }
+    let mut offset = 4usize;
+
+    let read_u32 = |buf: &[u8], off: &mut usize| -> Result<usize, String> {
+        let end = off
+            .checked_add(4)
+            .filter(|&e| e <= buf.len())
+            .ok_or_else(|| "Truncated replay u32".to_string())?;
+        let v = u32::from_le_bytes(buf[*off..end].try_into().unwrap()) as usize;
+        *off = end;
+        Ok(v)
+    };
+
+    let sid_len = read_u32(bytes, &mut offset)?;
+    let sid_end = offset
+        .checked_add(sid_len)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| "Truncated replay session_id".to_string())?;
+    let session_id = std::str::from_utf8(&bytes[offset..sid_end])
+        .map_err(|_| "Invalid UTF-8 session_id".to_string())?
+        .to_string();
+    offset = sid_end;
+
+    let manifest_len = read_u32(bytes, &mut offset)?;
+    let manifest_end = offset
+        .checked_add(manifest_len)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| "Truncated replay manifest".to_string())?;
+    let manifest_json = std::str::from_utf8(&bytes[offset..manifest_end])
+        .map_err(|_| "Invalid UTF-8 manifest".to_string())?
+        .to_string();
+    offset = manifest_end;
+
+    if offset >= bytes.len() {
+        return Err("Truncated replay snapshot flag".to_string());
+    }
+    let has_snapshot = bytes[offset];
+    offset += 1;
+
+    let snap_len = read_u32(bytes, &mut offset)?;
+    let snap_end = offset
+        .checked_add(snap_len)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| "Truncated replay snapshot".to_string())?;
+    let base_snapshot = if has_snapshot != 0 {
+        Some(bytes[offset..snap_end].to_vec())
+    } else {
+        None
+    };
+    offset = snap_end;
+
+    let wal_count = read_u32(bytes, &mut offset)?;
+    if wal_count > (bytes.len() - offset) / 5 {
+        return Err("Truncated replay WAL entries".to_string());
+    }
+    let mut wal_entries = Vec::with_capacity(wal_count);
+    for _ in 0..wal_count {
+        if offset >= bytes.len() {
+            return Err("Truncated WAL entry type".to_string());
+        }
+        let entry_type = bytes[offset];
+        offset += 1;
+        let payload_len = read_u32(bytes, &mut offset)?;
+        let payload_end = offset
+            .checked_add(payload_len)
+            .filter(|&e| e <= bytes.len())
+            .ok_or_else(|| "Truncated WAL entry payload".to_string())?;
+        wal_entries.push(WalEntryData {
+            entry_type,
+            payload: bytes[offset..payload_end].to_vec(),
+        });
+        offset = payload_end;
+    }
+
+    if offset != bytes.len() {
+        return Err("Unexpected trailing bytes in replay payload".to_string());
+    }
+
+    Ok(RecoveryReplayData {
+        session_id,
+        manifest_json,
+        base_snapshot,
+        wal_entries,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +722,64 @@ mod tests {
 
         assert_eq!(valid_entries.len(), 1);
         assert_eq!(valid_entries[0].1, payload1);
+    }
+
+    #[test]
+    fn test_checkpoint_payload_pack_unpack_roundtrip() {
+        let manifest = r#"{"documentName":"Ch1","width":3000}"#;
+        let snap = vec![1u8, 2, 3, 4, 255];
+        let thumb = vec![0x89, 0x50, 0x4E, 0x47];
+        let packed = pack_checkpoint_payload(manifest, &snap, &thumb).unwrap();
+        let (m, s, t) = unpack_checkpoint_payload(&packed).unwrap();
+        assert_eq!(m, manifest);
+        assert_eq!(s, snap.as_slice());
+        assert_eq!(t, thumb.as_slice());
+
+        // Truncated rejected
+        assert!(unpack_checkpoint_payload(&packed[..packed.len() - 1]).is_err());
+        // Short header rejected
+        assert!(unpack_checkpoint_payload(&[0u8; 8]).is_err());
+    }
+
+    #[test]
+    fn test_replay_data_binary_roundtrip() {
+        let replay = RecoveryReplayData {
+            session_id: "sess-1".to_string(),
+            manifest_json: r#"{"width":1024}"#.to_string(),
+            base_snapshot: Some(vec![10, 20, 30]),
+            wal_entries: vec![
+                WalEntryData {
+                    entry_type: WAL_ENTRY_STROKE_TILE_DELTA,
+                    payload: vec![1, 2, 3, 4],
+                },
+                WalEntryData {
+                    entry_type: WAL_ENTRY_LAYER_MUTATION,
+                    payload: vec![99],
+                },
+            ],
+        };
+        let encoded = encode_replay_data(&replay).unwrap();
+        let decoded = decode_replay_data(&encoded).unwrap();
+        assert_eq!(decoded.session_id, replay.session_id);
+        assert_eq!(decoded.manifest_json, replay.manifest_json);
+        assert_eq!(decoded.base_snapshot, replay.base_snapshot);
+        assert_eq!(decoded.wal_entries.len(), 2);
+        assert_eq!(decoded.wal_entries[0].entry_type, WAL_ENTRY_STROKE_TILE_DELTA);
+        assert_eq!(decoded.wal_entries[0].payload, vec![1, 2, 3, 4]);
+        assert_eq!(decoded.wal_entries[1].entry_type, WAL_ENTRY_LAYER_MUTATION);
+        assert_eq!(decoded.wal_entries[1].payload, vec![99]);
+
+        // None snapshot case
+        let no_snap = RecoveryReplayData {
+            session_id: "sess-2".to_string(),
+            manifest_json: "{}".to_string(),
+            base_snapshot: None,
+            wal_entries: vec![],
+        };
+        let encoded2 = encode_replay_data(&no_snap).unwrap();
+        let decoded2 = decode_replay_data(&encoded2).unwrap();
+        assert!(decoded2.base_snapshot.is_none());
+        assert!(decoded2.wal_entries.is_empty());
     }
 }
 

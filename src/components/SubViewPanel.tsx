@@ -23,6 +23,7 @@ import {
   SUB_VIEW_MIN_ZOOM,
   SubViewImageItem,
   SubViewTransform,
+  hydrateSubViewImages,
   subViewStoreActions,
   useSubViewStore,
 } from '../stores/useSubViewStore';
@@ -211,6 +212,11 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
 
     const stageSizeRef = useRef(stageSize);
     stageSizeRef.current = stageSize;
+
+    // Hydrate Sub View image data URLs from IndexedDB on mount
+    useEffect(() => {
+      void hydrateSubViewImages();
+    }, []);
 
     // Sync live transform ref whenever active item changes
     useEffect(() => {

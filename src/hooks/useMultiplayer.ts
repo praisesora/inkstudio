@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { safeLocalStorageSetItem } from '../utils/safeStorage';
 import {
   CollabPeer,
   SessionHostInfo,
@@ -92,6 +93,7 @@ export function useMultiplayer({
     host: string;
     port: number;
     url: string;
+    token?: string;
   } | null>(null);
   const lastProcessedClipboardUrlRef = useRef<string | null>(null);
 
@@ -101,6 +103,7 @@ export function useMultiplayer({
     host: string;
     port: number;
     url: string;
+    token?: string;
   } | null>(null);
 
   // Synchronous refs for event handlers
@@ -422,22 +425,36 @@ export function useMultiplayer({
         const text = await navigator.clipboard.readText();
         if (!text || text === lastProcessedClipboardUrlRef.current) return;
 
-        const httpMatch = text.match(/https?:\/\/([^:/]+)(?::([0-9]+))?\/?[?&]room=([^&]+)/i);
-        const protocolMatch = text.match(/forsora:\/\/join\?host=([^&]+)&port=([0-9]+)(?:&room=([^&]+))?/i);
+        const trimmed = text.trim();
+        let parsedUrl: URL | null = null;
+        try {
+          parsedUrl = new URL(trimmed);
+        } catch {
+          parsedUrl = null;
+        }
 
-        if (httpMatch) {
-          const host = httpMatch[1];
-          const isHttps = text.startsWith('https://');
-          const port = httpMatch[2] ? parseInt(httpMatch[2], 10) : (isHttps ? 443 : 80);
-          const roomName = decodeURIComponent(httpMatch[3]);
-          lastProcessedClipboardUrlRef.current = text;
-          setClipboardInvite({ roomName, host, port, url: text });
-        } else if (protocolMatch) {
-          const host = protocolMatch[1];
-          const port = parseInt(protocolMatch[2], 10);
-          const roomName = protocolMatch[3] ? decodeURIComponent(protocolMatch[3]) : 'Studio';
-          lastProcessedClipboardUrlRef.current = text;
-          setClipboardInvite({ roomName, host, port, url: text });
+        if (parsedUrl && (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:')) {
+          const roomParam = parsedUrl.searchParams.get('room');
+          if (roomParam) {
+            const host = parsedUrl.hostname;
+            const isHttps = parsedUrl.protocol === 'https:';
+            const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : (isHttps ? 443 : 80);
+            const token = parsedUrl.searchParams.get('token') || undefined;
+            lastProcessedClipboardUrlRef.current = text;
+            setClipboardInvite({ roomName: roomParam, host, port, url: trimmed, token });
+          }
+        } else if (parsedUrl && parsedUrl.protocol === 'forsora:') {
+          const host = parsedUrl.searchParams.get('host');
+          const portParam = parsedUrl.searchParams.get('port');
+          if (host && portParam) {
+            const port = parseInt(portParam, 10);
+            const roomName = parsedUrl.searchParams.get('room') || 'Studio';
+            const token = parsedUrl.searchParams.get('token') || undefined;
+            if (Number.isFinite(port)) {
+              lastProcessedClipboardUrlRef.current = text;
+              setClipboardInvite({ roomName, host, port, url: trimmed, token });
+            }
+          }
         }
       } catch {
         // Clipboard read permission might be denied or window not focused, ignore silently
@@ -458,11 +475,13 @@ export function useMultiplayer({
       const host = window.location.hostname || '127.0.0.1';
       const isHttps = window.location.protocol === 'https:';
       const port = window.location.port ? parseInt(window.location.port, 10) : (isHttps ? 443 : 80);
+      const token = params.get('token') || undefined;
       setWebLandingInvite({
-        roomName: decodeURIComponent(room),
+        roomName: room,
         host,
         port,
         url: window.location.href,
+        token,
       });
     }
   }, []);
@@ -479,9 +498,7 @@ export function useMultiplayer({
         let currentName = myPeer.name;
         if (hostNickname && hostNickname.trim()) {
           currentName = hostNickname.trim();
-          if (typeof window !== 'undefined') {
-            localStorage.setItem('sora_paint_nickname', currentName);
-          }
+          safeLocalStorageSetItem('sora_paint_nickname', currentName, 'artist name');
         }
 
         let serverInfo: SessionHostInfo;
@@ -509,10 +526,12 @@ export function useMultiplayer({
         const resolvedPort = serverInfo.port || port;
         const resolvedIp = serverInfo.localIp || (serverInfo as any).local_ip || '127.0.0.1';
         const resolvedRoomName = serverInfo.roomName || (serverInfo as any).room_name || roomName;
+        const resolvedRoomToken = serverInfo.roomToken || (serverInfo as any).room_token || '';
+        const tokenQuery = resolvedRoomToken ? `&token=${encodeURIComponent(resolvedRoomToken)}` : '';
         const resolvedInviteUrl =
           serverInfo.inviteUrl ||
           (serverInfo as any).invite_url ||
-          `http://${resolvedIp}:${resolvedPort}/?room=${encodeURIComponent(resolvedRoomName)}`;
+          `http://${resolvedIp}:${resolvedPort}/?room=${encodeURIComponent(resolvedRoomName)}${tokenQuery}`;
         const isGlobalServer = Boolean(serverInfo.isGlobal ?? (serverInfo as any).is_global);
         const localInviteUrl = serverInfo.localInviteUrl || (serverInfo as any).local_invite_url;
 
@@ -521,6 +540,7 @@ export function useMultiplayer({
           port: resolvedPort,
           localIp: resolvedIp,
           roomName: resolvedRoomName,
+          roomToken: resolvedRoomToken || undefined,
           inviteUrl: resolvedInviteUrl,
           peerCount: serverInfo.peerCount || 1,
           isGlobal: isGlobalServer,
@@ -538,9 +558,9 @@ export function useMultiplayer({
         setMyPeer(hostPeer);
         myPeerRef.current = hostPeer;
 
-        // Host connects locally via 127.0.0.1
+        // Host connects locally via 127.0.0.1 with the room token
         const wsUrl = `ws://127.0.0.1:${resolvedPort}/ws`;
-        await multiplayerService.connect(wsUrl, hostPeer);
+        await multiplayerService.connect(wsUrl, hostPeer, resolvedRoomToken || undefined);
         setIsConnected(true);
 
         // Auto-copy invite link
@@ -587,14 +607,12 @@ export function useMultiplayer({
 
   // JOIN ROOM
   const joinRoom = useCallback(
-    async (host: string, port: number, roomName: string, guestNickname?: string) => {
+    async (host: string, port: number, roomName: string, guestNickname?: string, token?: string) => {
       try {
         let currentName = myPeer.name;
         if (guestNickname && guestNickname.trim()) {
           currentName = guestNickname.trim();
-          if (typeof window !== 'undefined') {
-            localStorage.setItem('sora_paint_nickname', currentName);
-          }
+          safeLocalStorageSetItem('sora_paint_nickname', currentName, 'artist name');
         }
 
         const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
@@ -611,16 +629,18 @@ export function useMultiplayer({
         setMyPeer(guestPeer);
         myPeerRef.current = guestPeer;
 
-        await multiplayerService.connect(wsUrl, guestPeer);
+        await multiplayerService.connect(wsUrl, guestPeer, token);
         setIsConnected(true);
         setIsHost(false);
         const inviteProto = isSecure ? 'https' : 'http';
+        const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : '';
         setHostInfo({
           isRunning: true,
           port,
           localIp: host,
           roomName,
-          inviteUrl: `${inviteProto}://${host}${portPart}/?room=${encodeURIComponent(roomName)}`,
+          roomToken: token,
+          inviteUrl: `${inviteProto}://${host}${portPart}/?room=${encodeURIComponent(roomName)}${tokenQuery}`,
           peerCount: 1,
           isGlobal: isSecure,
         });
@@ -646,9 +666,7 @@ export function useMultiplayer({
 
   const updateMyName = useCallback((name: string) => {
     const trimmed = name.trim() || 'Artist';
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('sora_paint_nickname', trimmed);
-    }
+    safeLocalStorageSetItem('sora_paint_nickname', trimmed, 'artist name');
     setMyPeer((prev) => ({ ...prev, name: trimmed }));
   }, []);
 

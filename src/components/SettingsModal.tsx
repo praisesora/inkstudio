@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { safeLocalStorageSetItem } from '../utils/safeStorage';
 import {
   X,
   Palette,
@@ -509,11 +510,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onChange={(e) => {
                       const val = e.target.value;
                       handleChange('userName', val);
-                      try {
-                        localStorage.setItem('sora_paint_nickname', val);
-                      } catch {
-                        // ignore
-                      }
+                      safeLocalStorageSetItem('sora_paint_nickname', val, 'artist name');
                     }}
                     placeholder="Artist"
                     className="w-full bg-[#161616] px-3 py-1.5 rounded text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"

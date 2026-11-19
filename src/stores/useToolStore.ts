@@ -20,6 +20,7 @@ import {
   DEFAULT_BRUSH_PRESET_ID,
 } from '../utils/brushPresetManager';
 import { enforceColorMode } from '../utils/colorUtils';
+import { safeLocalStorageSetItem } from '../utils/safeStorage';
 import { createStore } from './createStore';
 import { useDocumentStore } from './useDocumentStore';
 
@@ -413,13 +414,7 @@ export const toolStoreActions = {
   updateLiquifySettings(patch: Partial<LiquifySettings>): void {
     useToolStore.setState((prev) => {
       const next = { ...prev.liquifySettings, ...patch };
-      try {
-        if (typeof localStorage !== 'undefined') {
-          localStorage.setItem('sora_paint_liquify_settings', JSON.stringify(next));
-        }
-      } catch {
-        // Ignore storage errors
-      }
+      safeLocalStorageSetItem('sora_paint_liquify_settings', JSON.stringify(next), 'liquify settings');
       return { liquifySettings: next };
     });
   },

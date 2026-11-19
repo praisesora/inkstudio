@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Users, Globe, Monitor, ArrowRight, X } from 'lucide-react';
 import { isTauriEnvironment } from '../hooks/useMultiplayer';
+import { safeLocalStorageSetItem } from '../utils/safeStorage';
 
 interface WebLandingModalProps {
   invite: {
@@ -8,8 +9,9 @@ interface WebLandingModalProps {
     host: string;
     port: number;
     url: string;
+    token?: string;
   } | null;
-  onJoinInBrowser: (name: string, host: string, port: number, roomName: string) => void;
+  onJoinInBrowser: (name: string, host: string, port: number, roomName: string, token?: string) => void;
   onDismiss: () => void;
 }
 
@@ -28,16 +30,15 @@ export const WebLandingModal: React.FC<WebLandingModalProps> = ({
 
   const handleOpenInApp = () => {
     // Attempt deep link protocol
-    const deepLink = `forsora://join?host=${encodeURIComponent(invite.host)}&port=${invite.port}&room=${encodeURIComponent(invite.roomName)}`;
+    const tokenPart = invite.token ? `&token=${encodeURIComponent(invite.token)}` : '';
+    const deepLink = `forsora://join?host=${encodeURIComponent(invite.host)}&port=${invite.port}&room=${encodeURIComponent(invite.roomName)}${tokenPart}`;
     window.location.href = deepLink;
   };
 
   const handleJoinBrowser = () => {
     const finalName = userName.trim() || 'Guest';
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('sora_paint_nickname', finalName);
-    }
-    onJoinInBrowser(finalName, invite.host, invite.port, invite.roomName);
+    safeLocalStorageSetItem('sora_paint_nickname', finalName, 'artist name');
+    onJoinInBrowser(finalName, invite.host, invite.port, invite.roomName, invite.token);
   };
 
   return (

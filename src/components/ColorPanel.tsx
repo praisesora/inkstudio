@@ -4,6 +4,7 @@ import { ColorWheel } from './ColorWheel';
 import { ColorSlider } from './ColorSlider';
 import { ToolType, CanvasColorMode } from '../types/editor';
 import { isValidHex, enforceColorMode } from '../utils/colorUtils';
+import { safeLocalStorageSetItem } from '../utils/safeStorage';
 
 export interface ColorPanelProps {
   primaryColor: string;
@@ -48,11 +49,7 @@ export const ColorPanel: React.FC<ColorPanelProps> = ({
   const toggleTab = () => {
     const next = activeTab === 'wheel' ? 'slider' : 'wheel';
     setActiveTab(next);
-    try {
-      localStorage.setItem('ink_color_tab', next);
-    } catch {
-      // ignore
-    }
+    safeLocalStorageSetItem('ink_color_tab', next, 'color panel preference');
   };
 
   const handleHexChange = (raw: string) => {

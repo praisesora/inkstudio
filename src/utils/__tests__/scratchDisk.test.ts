@@ -9,6 +9,9 @@ import {
   setPixel1Bit,
   getPixel1Bit,
   InMemoryScratchDiskDriver,
+  packTileWriteBatch,
+  unpackTileWriteBatch,
+  TauriScratchDiskDriver,
 } from '../tileEngine';
 
 describe('Production-Grade Virtual Memory & SSD Scratch Disk Engine', () => {
@@ -455,6 +458,139 @@ describe('Production-Grade Virtual Memory & SSD Scratch Disk Engine', () => {
       const endX0 = Math.floor(frustum.maxX / lodDocSize0);
       expect(startX0).toBe(3);
       expect(endX0).toBe(11);
+    });
+  });
+
+  // ==========================================================================
+  // Pillar 5: Binary IPC Tile Batch Packing / Unpacking
+  // ==========================================================================
+  describe('Pillar 5: Binary IPC Tile Batch Packing and Unpacking', () => {
+    it('packs and unpacks exact binary wire layout [count:u32][layerIdLen:u16, layerId, tx:i32, ty:i32, dataLen:u32, data]', () => {
+      const backing = new Uint8Array([99, 10, 20, 30, 40, 88]);
+      const subarrayData = backing.subarray(1, 5); // [10, 20, 30, 40] with non-zero byteOffset
+
+      const batch = [
+        {
+          layerId: 'layer-ink',
+          tileX: -3,
+          tileY: 17,
+          data: subarrayData,
+        },
+        {
+          layerId: 'レイヤー_2',
+          tileX: 0,
+          tileY: -512,
+          data: new Uint8Array([0, 127, 255]),
+        },
+        {
+          layerId: 'empty-tile',
+          tileX: 4,
+          tileY: 8,
+          data: new Uint8Array(0),
+        },
+      ];
+
+      const packed = packTileWriteBatch(batch);
+
+      // Verify wire header and first record layout byte-for-byte
+      const view = new DataView(packed.buffer, packed.byteOffset, packed.byteLength);
+      expect(view.getUint32(0, true)).toBe(3);
+      expect(view.getUint16(4, true)).toBe(9); // 'layer-ink'.length
+      expect(new TextDecoder().decode(packed.subarray(6, 15))).toBe('layer-ink');
+      expect(view.getInt32(15, true)).toBe(-3);
+      expect(view.getInt32(19, true)).toBe(17);
+      expect(view.getUint32(23, true)).toBe(4);
+      expect(Array.from(packed.subarray(27, 31))).toEqual([10, 20, 30, 40]);
+
+      // Full roundtrip from Uint8Array and from ArrayBuffer
+      const unpacked = unpackTileWriteBatch(packed);
+      expect(unpacked).toHaveLength(3);
+      expect(unpacked[0].layerId).toBe('layer-ink');
+      expect(unpacked[0].tileX).toBe(-3);
+      expect(unpacked[0].tileY).toBe(17);
+      expect(Array.from(unpacked[0].data)).toEqual([10, 20, 30, 40]);
+
+      expect(unpacked[1].layerId).toBe('レイヤー_2');
+      expect(unpacked[1].tileX).toBe(0);
+      expect(unpacked[1].tileY).toBe(-512);
+      expect(Array.from(unpacked[1].data)).toEqual([0, 127, 255]);
+
+      expect(unpacked[2].layerId).toBe('empty-tile');
+      expect(unpacked[2].data.byteLength).toBe(0);
+
+      const fromArrayBuf = unpackTileWriteBatch(packed.buffer as ArrayBuffer);
+      expect(fromArrayBuf).toHaveLength(3);
+      expect(Array.from(fromArrayBuf[0].data)).toEqual([10, 20, 30, 40]);
+    });
+
+    it('handles empty tile batches and rejects truncated or trailing frames', () => {
+      const empty = packTileWriteBatch([]);
+      expect(empty.byteLength).toBe(4);
+      expect(unpackTileWriteBatch(empty)).toEqual([]);
+
+      expect(() => unpackTileWriteBatch(new Uint8Array([1, 0]))).toThrow();
+
+      const valid = packTileWriteBatch([
+        { layerId: 'l1', tileX: 1, tileY: 2, data: new Uint8Array([5, 6, 7]) },
+      ]);
+      expect(() => unpackTileWriteBatch(valid.subarray(0, valid.byteLength - 1))).toThrow();
+
+      const withTrailing = new Uint8Array(valid.byteLength + 1);
+      withTrailing.set(valid, 0);
+      withTrailing[valid.byteLength] = 0xff;
+      expect(() => unpackTileWriteBatch(withTrailing)).toThrow();
+    });
+
+    it('TauriScratchDiskDriver sends raw Uint8Array + IPC headers and decodes ArrayBuffer response', async () => {
+      const calls: Array<{ cmd: string; args: unknown; options: unknown }> = [];
+      const responsePayload = new Uint8Array([7, 8, 9, 10]);
+
+      const prevWindow = (globalThis as Record<string, unknown>).window;
+      (globalThis as Record<string, unknown>).window = {
+        __TAURI_INTERNALS__: {
+          invoke: async (cmd: string, args: unknown, options: unknown) => {
+            calls.push({ cmd, args, options });
+            if (cmd === 'scratch_disk_write_tiles') return 1;
+            if (cmd === 'scratch_disk_read_tile') return responsePayload.buffer.slice(0);
+            return undefined;
+          },
+        },
+      };
+
+      try {
+        const tauriDriver = new TauriScratchDiskDriver();
+        const written = await tauriDriver.writeTiles('sess/1', [
+          { layerId: 'layer_a', tileX: -1, tileY: 2, data: new Uint8Array([1, 2, 3]) },
+        ]);
+        expect(written).toBe(1);
+        expect(calls[0].cmd).toBe('scratch_disk_write_tiles');
+        expect(calls[0].args).toBeInstanceOf(Uint8Array);
+        expect((calls[0].options as { headers: Record<string, string> }).headers).toEqual({
+          'x-session-id': 'sess%2F1',
+        });
+
+        const unpackedSent = unpackTileWriteBatch(calls[0].args as Uint8Array);
+        expect(unpackedSent).toHaveLength(1);
+        expect(unpackedSent[0].layerId).toBe('layer_a');
+        expect(Array.from(unpackedSent[0].data)).toEqual([1, 2, 3]);
+
+        const read = await tauriDriver.readTile('sess/1', 'layer_a', -1, 2);
+        expect(read).toBeInstanceOf(Uint8Array);
+        expect(Array.from(read)).toEqual([7, 8, 9, 10]);
+        expect(calls[1].cmd).toBe('scratch_disk_read_tile');
+        expect((calls[1].options as { headers: Record<string, string> }).headers).toEqual({
+          'x-session-id': 'sess%2F1',
+          'x-layer-id': 'layer_a',
+          'x-tile-x': '-1',
+          'x-tile-y': '2',
+        });
+      } finally {
+        if (prevWindow === undefined) {
+          delete (globalThis as Record<string, unknown>).window;
+        } else {
+          (globalThis as Record<string, unknown>).window = prevWindow;
+        }
+      }
     });
   });
 });

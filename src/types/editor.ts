@@ -1,4 +1,5 @@
 import { PerspectiveRuler } from './perspective';
+import type { SparseTileGrid } from '../utils/tileEngine';
 
 export type ToolType =
   | 'brush'
@@ -865,6 +866,7 @@ export interface LoadedDocument {
   colorMode: CanvasColorMode;
   layers: LayerItem[];
   layerCanvases?: Map<string, HTMLCanvasElement>;
+  tileGrid?: SparseTileGrid;
 }
 
 export type CmykStandard = 'japan-color-2001' | 'us-web-coated-swop' | 'iso-coated-v2';

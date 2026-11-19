@@ -2222,7 +2222,12 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       }
 
       if (!skipIngest) {
-        grid.clearAll();
+        if (doc.tileGrid && doc.tileGrid !== grid) {
+          grid.restoreFromSnapshot(doc.tileGrid.getAllTiles(), doc.tileGrid.getAllLayerFormats());
+          doc.tileGrid.clearAll();
+        } else if (!doc.tileGrid) {
+          grid.clearAll();
+        }
       }
       pendingCanvasCopiesRef.current.clear();
       pendingInitialDataRef.current.clear();
