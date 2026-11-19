@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { SpeechBalloon } from '../types/editor';
 import {
   MessageSquare,
@@ -8,7 +8,7 @@ import {
   Check,
   Trash2,
 } from 'lucide-react';
-import { getBalloonHandles, BalloonHandle } from '../utils/balloonEngine';
+import { getBalloonHandles, BalloonHandle, renderSpeechBalloon } from '../utils/balloonEngine';
 
 interface SpeechBalloonOverlayProps {
   balloon: SpeechBalloon | null;
@@ -48,6 +48,59 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
   });
 
   const [activeTab, setActiveTab] = useState<'shape' | 'text'>('shape');
+  const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  const pad = 120;
+  const minX = Math.floor(
+    Math.min(
+      balloon.bounds.x,
+      balloon.tail.start.x,
+      balloon.tail.control1.x,
+      balloon.tail.control2.x,
+      balloon.tail.tip.x
+    ) - pad
+  );
+  const minY = Math.floor(
+    Math.min(
+      balloon.bounds.y,
+      balloon.tail.start.y,
+      balloon.tail.control1.y,
+      balloon.tail.control2.y,
+      balloon.tail.tip.y
+    ) - pad
+  );
+  const maxX = Math.ceil(
+    Math.max(
+      balloon.bounds.x + balloon.bounds.width,
+      balloon.tail.start.x,
+      balloon.tail.control1.x,
+      balloon.tail.control2.x,
+      balloon.tail.tip.x
+    ) + pad
+  );
+  const maxY = Math.ceil(
+    Math.max(
+      balloon.bounds.y + balloon.bounds.height,
+      balloon.tail.start.y,
+      balloon.tail.control1.y,
+      balloon.tail.control2.y,
+      balloon.tail.tip.y
+    ) + pad
+  );
+  const previewW = Math.max(64, maxX - minX);
+  const previewH = Math.max(64, maxY - minY);
+
+  useEffect(() => {
+    const canvas = previewCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(-minX, -minY);
+    renderSpeechBalloon(ctx, balloon);
+    ctx.restore();
+  }, [balloon, minX, minY, previewW, previewH]);
 
   const handles: BalloonHandle[] = getBalloonHandles(balloon);
 
@@ -181,6 +234,20 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
 
   return (
     <div className="absolute inset-0 pointer-events-none z-35">
+      {/* Live WYSIWYG Balloon Canvas Preview */}
+      <canvas
+        ref={previewCanvasRef}
+        width={previewW}
+        height={previewH}
+        className="absolute pointer-events-none"
+        style={{
+          left: `${minX}px`,
+          top: `${minY}px`,
+          width: `${previewW}px`,
+          height: `${previewH}px`,
+        }}
+      />
+
       {/* SVG overlay rendering handles and tail control skeleton */}
       <svg className="w-full h-full overflow-visible pointer-events-none">
         {/* Bounding box guide */}

@@ -19,6 +19,9 @@ import {
   Link2,
   SlidersHorizontal,
   Sparkles,
+  Frame,
+  Type,
+  MessageSquare,
 } from 'lucide-react';
 import {
   HistoryItemMeta,
@@ -27,6 +30,7 @@ import {
   ToolType,
   CanvasColorMode,
   ExpressionColor,
+  isFolderLikeLayer,
 } from '../types/editor';
 import { BLEND_MODES } from '../utils/canvasUtils';
 import { ColorPanel } from './ColorPanel';
@@ -143,6 +147,8 @@ export interface RightSidebarProps {
     initialType?: 'curves' | 'gradient-map' | 'levels' | 'color-balance'
   ) => void;
   onOpenLayerStylesModal?: (layerId: string) => void;
+  onEditVectorLayer?: (layer: LayerItem) => void;
+  onRasterizeLayer?: (layerId: string) => void;
   onReorderLayers?: (draggedId: string, targetId: string, position: 'above' | 'below' | 'inside') => void;
   onToggleReferenceLayer?: (id: string) => void;
   onToggleTone?: (id: string) => void;
@@ -232,6 +238,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onToggleMaskLinked,
   onOpenAdjustmentModal,
   onOpenLayerStylesModal,
+  onEditVectorLayer,
+  onRasterizeLayer,
   onToggleReferenceLayer,
   onToggleTone,
   onSetToneFrequency,
@@ -424,7 +432,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
       let isDescendant = false;
       for (const dId of draggedIds) {
         const draggedItem = layers.find((l) => l.id === dId);
-        if (draggedItem?.type === 'folder') {
+        if (isFolderLikeLayer(draggedItem)) {
           let curr: LayerItem | undefined = targetLayer;
           while (curr) {
             if (curr.id === dId) {
@@ -441,7 +449,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
       const rect = row.getBoundingClientRect();
       const yRatio = (moveEvt.clientY - rect.top) / rect.height;
       let position: 'above' | 'below' | 'inside';
-      if (targetLayer.type === 'folder') {
+      if (isFolderLikeLayer(targetLayer)) {
         position = yRatio > 0.25 && yRatio < 0.75 ? 'inside' : yRatio <= 0.25 ? 'above' : 'below';
       } else {
         position = yRatio <= 0.5 ? 'above' : 'below';
@@ -805,7 +813,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
 
                     const isActive = layer.id === activeLayerId;
                     const isSelected = selectedLayerIds ? selectedLayerIds.includes(layer.id) : isActive;
-                    const isFolder = layer.type === 'folder';
+                    const isFolder = isFolderLikeLayer(layer);
+                    const isFrameFolder = layer.type === 'frame-folder';
                     const isInsideFolder = Boolean(layer.parentId);
                     const isTarget = dropIndicator?.id === layer.id;
                     const isDropInside = isTarget && dropIndicator.position === 'inside';
@@ -842,6 +851,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                         onDoubleClick={() => {
                           if (layer.type === 'adjustment') {
                             onOpenAdjustmentModal?.(layer.id, layer.adjustmentData?.type);
+                          } else if ((layer.type === 'text' || layer.type === 'balloon') && onEditVectorLayer) {
+                            onEditVectorLayer(layer);
                           } else {
                             startRename(layer);
                           }
@@ -920,7 +931,9 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                             ) : (
                               <ChevronDown className="w-3 h-3" />
                             )}
-                            {layer.collapsed ? (
+                            {isFrameFolder ? (
+                              <Frame className="w-3.5 h-3.5 text-cyan-400" />
+                            ) : layer.collapsed ? (
                               <Folder className="w-3.5 h-3.5" />
                             ) : (
                               <FolderOpen className="w-3.5 h-3.5" />
@@ -938,6 +951,38 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                                 className="w-6 h-5 rounded-xs bg-[#161616] flex items-center justify-center shrink-0"
                               >
                                 <SlidersHorizontal className="w-3 h-3 text-[var(--accent)]" />
+                              </div>
+                            ) : layer.type === 'text' ? (
+                              <div
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onSelectLayer(layer.id);
+                                  onSelectEditTarget?.('layer');
+                                }}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  onEditVectorLayer?.(layer);
+                                }}
+                                title="Non-destructive Text Layer (Double-click to edit)"
+                                className="w-6 h-5 rounded-xs bg-[#161616] border border-cyan-500/30 flex items-center justify-center shrink-0"
+                              >
+                                <Type className="w-3 h-3 text-cyan-300" />
+                              </div>
+                            ) : layer.type === 'balloon' ? (
+                              <div
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onSelectLayer(layer.id);
+                                  onSelectEditTarget?.('layer');
+                                }}
+                                onDoubleClick={(e) => {
+                                  e.stopPropagation();
+                                  onEditVectorLayer?.(layer);
+                                }}
+                                title="Non-destructive Speech Balloon (Double-click to edit)"
+                                className="w-6 h-5 rounded-xs bg-[#161616] border border-amber-500/30 flex items-center justify-center shrink-0"
+                              >
+                                <MessageSquare className="w-3 h-3 text-amber-300" />
                               </div>
                             ) : (
                               <div
@@ -1498,7 +1543,36 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                 </>
               )}
 
-              {targetLayer.type !== 'folder' &&
+              {(targetLayer.type === 'text' || targetLayer.type === 'balloon') && onEditVectorLayer && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onEditVectorLayer(targetLayer);
+                    setContextMenu(null);
+                  }}
+                  className="w-full text-left px-2.5 py-1 rounded hover:bg-[#2c2c2c] text-cyan-300 cursor-pointer"
+                >
+                  {targetLayer.type === 'text' ? 'Edit Text...' : 'Edit Speech Balloon...'}
+                </button>
+              )}
+
+              {(targetLayer.type === 'text' ||
+                targetLayer.type === 'balloon' ||
+                targetLayer.type === 'vector') &&
+                onRasterizeLayer && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onRasterizeLayer(targetLayer.id);
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-2.5 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer"
+                  >
+                    Rasterize Layer
+                  </button>
+                )}
+
+              {!isFolderLikeLayer(targetLayer) &&
                 targetLayer.type !== 'adjustment' &&
                 onOpenLayerStylesModal && (
                   <button

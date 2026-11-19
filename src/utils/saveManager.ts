@@ -3,10 +3,14 @@ import {
   LayerItem,
   CanvasColorMode,
   BlendMode,
+  isFolderLikeLayer,
+  hasTileBackedLayer,
 } from '../types/editor';
 import { getCanvasCompositeOperation } from './canvasUtils';
-import { groupLayersForCompositing } from './compositor';
+import { buildLayerTree, groupTreeNodesForCompositing, LayerTreeNode } from './compositor';
 import { applyAdjustment } from './tonalEngine';
+import { applyMultiFrameClip, renderFrameBorder } from './frameEngine';
+import { renderBalloonLayerData, renderTextLayerData } from './vectorLayerRenderer';
 import { recoveryService } from '../services/recoveryService';
 import { SparseTileGrid, releaseTemporaryCanvas } from './tileEngine';
 import { documentStore } from './documentStore';
@@ -52,24 +56,42 @@ function toAgPsdBlendMode(mode: BlendMode): any {
  * Returns `{ canvas, isTemporary }` so caller immediately releases temporary canvases.
  */
 function acquireLayerExportCanvas(
-  layerId: string,
+  layer: LayerItem,
   dimensions: CanvasDimensions,
   layerCanvasesMap: Map<string, HTMLCanvasElement>,
   tileGrid?: SparseTileGrid
 ): { canvas: HTMLCanvasElement | null; isTemporary: boolean } {
-  const existing = layerCanvasesMap.get(layerId);
+  // Always render non-destructive text/balloon layers crisply from vector metadata when available
+  if (layer.type === 'text' && layer.textData && typeof document !== 'undefined') {
+    const temp = document.createElement('canvas');
+    temp.width = dimensions.width;
+    temp.height = dimensions.height;
+    const ctx = temp.getContext('2d');
+    if (ctx) renderTextLayerData(ctx, layer.textData);
+    return { canvas: temp, isTemporary: true };
+  }
+  if (layer.type === 'balloon' && layer.balloonData && typeof document !== 'undefined') {
+    const temp = document.createElement('canvas');
+    temp.width = dimensions.width;
+    temp.height = dimensions.height;
+    const ctx = temp.getContext('2d');
+    if (ctx) renderBalloonLayerData(ctx, layer.balloonData);
+    return { canvas: temp, isTemporary: true };
+  }
+  const existing = layerCanvasesMap.get(layer.id);
   if (existing) {
     return { canvas: existing, isTemporary: false };
   }
-  if (tileGrid && tileGrid.hasLayerTiles(layerId)) {
-    const temp = tileGrid.exportLayerToCanvas(layerId, dimensions.width, dimensions.height);
+  if (tileGrid && tileGrid.hasLayerTiles(layer.id)) {
+    const temp = tileGrid.exportLayerToCanvas(layer.id, dimensions.width, dimensions.height);
     return { canvas: temp, isTemporary: true };
   }
   return { canvas: null, isTemporary: false };
 }
 
 /**
- * Composites all visible layers with their blend modes and opacities onto a single canvas.
+ * Composites all visible layers with their blend modes, opacities, frame-folder polygon clipping,
+ * and non-destructive vector text/balloon layers onto a single canvas.
  */
 export function compositeCanvas(
   dimensions: CanvasDimensions,
@@ -90,10 +112,6 @@ export function compositeCanvas(
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, dimensions.width, dimensions.height);
   }
-
-  // Render layers bottom-to-top grouped by clipping masks
-  const renderOrder = layers.slice().reverse();
-  const groups = groupLayersForCompositing(renderOrder);
 
   const getMaskedLayerCanvas = (
     layer: LayerItem,
@@ -124,75 +142,159 @@ export function compositeCanvas(
     return { canvas: masked, isTemporary: true };
   };
 
-  for (const group of groups) {
-    const baseLayer = group.baseLayer;
-    if (baseLayer.type === 'folder' || !isLayerEffectivelyVisible(baseLayer)) continue;
+  const renderTreeNodes = (
+    targetCtx: CanvasRenderingContext2D,
+    nodes: LayerTreeNode[],
+    opacityMul: number
+  ) => {
+    const renderOrder = nodes.slice().reverse();
+    const groups = groupTreeNodesForCompositing(renderOrder);
 
-    if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
-      const imgData = ctx.getImageData(0, 0, dimensions.width, dimensions.height);
-      applyAdjustment(
-        imgData,
-        baseLayer.adjustmentData,
-        baseLayer.maskEnabled !== false ? baseLayer.maskCanvas : undefined,
-        getEffectiveOpacity(baseLayer)
-      );
-      ctx.putImageData(imgData, 0, 0);
-      continue;
-    }
+    for (const group of groups) {
+      const baseNode = group.baseNode;
+      const baseLayer = baseNode.layer;
+      if (!baseLayer.visible || baseLayer.opacity <= 0.001) continue;
 
-    const baseAcq = acquireLayerExportCanvas(baseLayer.id, dimensions, layerCanvasesMap, tileGrid);
-    if (!baseAcq.canvas) continue;
-    const maskedBase = getMaskedLayerCanvas(baseLayer, baseAcq.canvas);
+      if (baseLayer.type === 'frame-folder') {
+        const folderAlpha = opacityMul * baseLayer.opacity;
+        const frames = (baseLayer.comicFrames || []).filter((f) => f.polygon.length >= 3);
+        const shouldClip = frames.length > 0 && frames.some((f) => f.clipChildren !== false);
+        const folderCanvas = document.createElement('canvas');
+        folderCanvas.width = dimensions.width;
+        folderCanvas.height = dimensions.height;
+        const fCtx = folderCanvas.getContext('2d');
+        if (fCtx) {
+          fCtx.save();
+          if (shouldClip) {
+            applyMultiFrameClip(fCtx, frames);
+          }
+          for (const frame of frames) {
+            if (frame.fillBackground !== false) {
+              fCtx.fillStyle = frame.fillColor || '#ffffff';
+              fCtx.beginPath();
+              fCtx.moveTo(frame.polygon[0].x, frame.polygon[0].y);
+              for (let i = 1; i < frame.polygon.length; i++) {
+                fCtx.lineTo(frame.polygon[i].x, frame.polygon[i].y);
+              }
+              fCtx.closePath();
+              fCtx.fill();
+            }
+          }
+          if (baseNode.children.length > 0) {
+            renderTreeNodes(fCtx, baseNode.children, 1.0);
+          }
+          fCtx.restore();
+          for (const frame of frames) {
+            renderFrameBorder(fCtx, frame, false);
+          }
+          targetCtx.save();
+          targetCtx.globalAlpha = Math.max(0, Math.min(1, folderAlpha));
+          const blend = baseLayer.blendMode === 'pass-through' ? 'normal' : baseLayer.blendMode;
+          targetCtx.globalCompositeOperation = getCanvasCompositeOperation(blend);
+          targetCtx.drawImage(folderCanvas, 0, 0);
+          targetCtx.restore();
+        }
+        releaseTemporaryCanvas(folderCanvas);
+        continue;
+      }
 
-    const activeClipped = group.clippedLayers.filter(
-      (cl) => cl.type !== 'folder' && cl.type !== 'adjustment' && isLayerEffectivelyVisible(cl)
-    );
+      if (baseLayer.type === 'folder') {
+        const folderAlpha = opacityMul * baseLayer.opacity;
+        if (baseLayer.blendMode === 'pass-through') {
+          if (baseNode.children.length > 0) {
+            renderTreeNodes(targetCtx, baseNode.children, folderAlpha);
+          }
+        } else {
+          const folderCanvas = document.createElement('canvas');
+          folderCanvas.width = dimensions.width;
+          folderCanvas.height = dimensions.height;
+          const fCtx = folderCanvas.getContext('2d');
+          if (fCtx) {
+            if (baseNode.children.length > 0) {
+              renderTreeNodes(fCtx, baseNode.children, 1.0);
+            }
+            targetCtx.save();
+            targetCtx.globalAlpha = Math.max(0, Math.min(1, folderAlpha));
+            targetCtx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+            targetCtx.drawImage(folderCanvas, 0, 0);
+            targetCtx.restore();
+          }
+          releaseTemporaryCanvas(folderCanvas);
+        }
+        continue;
+      }
 
-    if (activeClipped.length === 0) {
-      ctx.save();
-      ctx.globalAlpha = getEffectiveOpacity(baseLayer);
-      ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
-      ctx.drawImage(maskedBase.canvas, 0, 0);
-      ctx.restore();
-    } else {
-      // Group isolated offscreen canvas for base + clipped layers
-      const groupCanvas = document.createElement('canvas');
-      groupCanvas.width = dimensions.width;
-      groupCanvas.height = dimensions.height;
-      const gCtx = groupCanvas.getContext('2d');
-      if (gCtx) {
-        gCtx.save();
-        gCtx.globalAlpha = getEffectiveOpacity(baseLayer);
-        gCtx.drawImage(maskedBase.canvas, 0, 0);
-        gCtx.restore();
+      if (!isLayerEffectivelyVisible(baseLayer)) continue;
 
-        for (const clipped of activeClipped) {
-          const clipAcq = acquireLayerExportCanvas(clipped.id, dimensions, layerCanvasesMap, tileGrid);
-          if (!clipAcq.canvas) continue;
-          const maskedClip = getMaskedLayerCanvas(clipped, clipAcq.canvas);
+      if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
+        const imgData = targetCtx.getImageData(0, 0, dimensions.width, dimensions.height);
+        applyAdjustment(
+          imgData,
+          baseLayer.adjustmentData,
+          baseLayer.maskEnabled !== false ? baseLayer.maskCanvas : undefined,
+          baseLayer.opacity * opacityMul
+        );
+        targetCtx.putImageData(imgData, 0, 0);
+        continue;
+      }
 
+      const baseAcq = acquireLayerExportCanvas(baseLayer, dimensions, layerCanvasesMap, tileGrid);
+      if (!baseAcq.canvas) continue;
+      const maskedBase = getMaskedLayerCanvas(baseLayer, baseAcq.canvas);
+
+      const activeClipped = group.clippedNodes
+        .map((n) => n.layer)
+        .filter((cl) => !isFolderLikeLayer(cl) && cl.type !== 'adjustment' && cl.visible && cl.opacity > 0.001);
+
+      if (activeClipped.length === 0) {
+        targetCtx.save();
+        targetCtx.globalAlpha = Math.max(0, Math.min(1, baseLayer.opacity * opacityMul));
+        targetCtx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+        targetCtx.drawImage(maskedBase.canvas, 0, 0);
+        targetCtx.restore();
+      } else {
+        const groupCanvas = document.createElement('canvas');
+        groupCanvas.width = dimensions.width;
+        groupCanvas.height = dimensions.height;
+        const gCtx = groupCanvas.getContext('2d');
+        if (gCtx) {
           gCtx.save();
-          gCtx.globalAlpha = getEffectiveOpacity(clipped);
-          gCtx.globalCompositeOperation = 'source-atop';
-          gCtx.drawImage(maskedClip.canvas, 0, 0);
+          gCtx.globalAlpha = Math.max(0, Math.min(1, baseLayer.opacity * opacityMul));
+          gCtx.drawImage(maskedBase.canvas, 0, 0);
           gCtx.restore();
 
-          if (maskedClip.isTemporary) releaseTemporaryCanvas(maskedClip.canvas);
-          if (clipAcq.isTemporary) releaseTemporaryCanvas(clipAcq.canvas);
+          for (const clipped of activeClipped) {
+            const clipAcq = acquireLayerExportCanvas(clipped, dimensions, layerCanvasesMap, tileGrid);
+            if (!clipAcq.canvas) continue;
+            const maskedClip = getMaskedLayerCanvas(clipped, clipAcq.canvas);
+
+            gCtx.save();
+            gCtx.globalAlpha = Math.max(0, Math.min(1, clipped.opacity * opacityMul));
+            gCtx.globalCompositeOperation = 'source-atop';
+            gCtx.drawImage(maskedClip.canvas, 0, 0);
+            gCtx.restore();
+
+            if (maskedClip.isTemporary) releaseTemporaryCanvas(maskedClip.canvas);
+            if (clipAcq.isTemporary) releaseTemporaryCanvas(clipAcq.canvas);
+          }
+
+          targetCtx.save();
+          targetCtx.globalAlpha = 1.0;
+          targetCtx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+          targetCtx.drawImage(groupCanvas, 0, 0);
+          targetCtx.restore();
         }
-
-        ctx.save();
-        ctx.globalAlpha = 1.0;
-        ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
-        ctx.drawImage(groupCanvas, 0, 0);
-        ctx.restore();
+        releaseTemporaryCanvas(groupCanvas);
       }
-      releaseTemporaryCanvas(groupCanvas);
-    }
 
-    if (maskedBase.isTemporary) releaseTemporaryCanvas(maskedBase.canvas);
-    if (baseAcq.isTemporary) releaseTemporaryCanvas(baseAcq.canvas);
-  }
+      if (maskedBase.isTemporary) releaseTemporaryCanvas(maskedBase.canvas);
+      if (baseAcq.isTemporary) releaseTemporaryCanvas(baseAcq.canvas);
+    }
+  };
+
+  const tree = buildLayerTree(layers);
+  renderTreeNodes(ctx, tree, 1.0);
+  void getEffectiveOpacity;
 
   return exportCanvas;
 }
@@ -217,6 +319,86 @@ export function canvasToBlob(
   });
 }
 
+export interface SerializedSoraProject {
+  app: string;
+  version: string;
+  name: string;
+  dimensions: CanvasDimensions;
+  colorMode: CanvasColorMode;
+  layers: Array<Omit<LayerItem, 'maskCanvas'>>;
+  canvases: Record<string, string>;
+  masks: Record<string, string>;
+}
+
+/**
+ * Pure serializer for native `.sora` / `.ink` project JSON, preserving non-destructive
+ * text, speech balloon, vector, adjustment, and frame-folder metadata.
+ */
+export function buildSoraProjectPayload(
+  data: SaveDocumentData,
+  tileGrid?: SparseTileGrid
+): SerializedSoraProject {
+  const layerImages: Record<string, string> = {};
+  const maskImages: Record<string, string> = {};
+  const serializableLayers = data.layers.map((l) => {
+    if (hasTileBackedLayer(l)) {
+      const acq = acquireLayerExportCanvas(l, data.dimensions, data.layerCanvasesMap, tileGrid);
+      if (acq.canvas && typeof acq.canvas.toDataURL === 'function') {
+        layerImages[l.id] = acq.canvas.toDataURL('image/png');
+        if (acq.isTemporary) releaseTemporaryCanvas(acq.canvas);
+      }
+    }
+    if (l.maskCanvas && typeof l.maskCanvas.toDataURL === 'function') {
+      maskImages[l.id] = l.maskCanvas.toDataURL('image/png');
+    }
+    const { maskCanvas: _mc, ...rest } = l;
+    return rest;
+  });
+
+  return {
+    app: 'Ink Studio',
+    version: '1.2',
+    name: data.name,
+    dimensions: data.dimensions,
+    colorMode: data.colorMode,
+    layers: serializableLayers,
+    canvases: layerImages,
+    masks: maskImages,
+  };
+}
+
+/**
+ * Pure parser for `.sora` / `.ink` JSON strings validating structural integrity
+ * and restoring non-destructive text, balloon, and frame-folder layer metadata.
+ */
+export function parseSoraProjectJson(jsonText: string): SerializedSoraProject {
+  const parsed = JSON.parse(jsonText);
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.layers)) {
+    throw new Error('Invalid .sora project payload: missing layers array');
+  }
+  const layers = parsed.layers.map((l: any) => {
+    const clean = { ...l };
+    if (clean.maskCanvas && typeof clean.maskCanvas.getContext !== 'function') {
+      clean.maskCanvas = undefined;
+    }
+    return clean;
+  });
+  return {
+    app: typeof parsed.app === 'string' ? parsed.app : 'Ink Studio',
+    version: typeof parsed.version === 'string' ? parsed.version : '1.0',
+    name: typeof parsed.name === 'string' ? parsed.name : 'Untitled',
+    dimensions: {
+      width: Number(parsed.dimensions?.width) || 1440,
+      height: Number(parsed.dimensions?.height) || 900,
+      dpi: Number(parsed.dimensions?.dpi) || 300,
+    },
+    colorMode: parsed.colorMode || 'color',
+    layers,
+    canvases: parsed.canvases && typeof parsed.canvases === 'object' ? parsed.canvases : {},
+    masks: parsed.masks && typeof parsed.masks === 'object' ? parsed.masks : {},
+  };
+}
+
 /**
  * Serializes the document according to the requested file extension.
  */
@@ -234,9 +416,9 @@ export async function serializeDocument(
       const children = data.layers
         .slice()
         .reverse()
-        .filter((l) => l.type === 'raster' || l.type === 'vector' || l.type === 'frame')
+        .filter((l) => hasTileBackedLayer(l))
         .map((layer) => {
-          const acq = acquireLayerExportCanvas(layer.id, data.dimensions, data.layerCanvasesMap, tileGrid);
+          const acq = acquireLayerExportCanvas(layer, data.dimensions, data.layerCanvasesMap, tileGrid);
           if (acq.isTemporary && acq.canvas) tempCanvases.push(acq.canvas);
           return {
             name: layer.name,
@@ -278,34 +460,7 @@ export async function serializeDocument(
 
   // 2. Native Ink Studio Project (.ink, .sora) format
   if (ext === '.ink' || ext === '.sora') {
-    const layerImages: Record<string, string> = {};
-    const maskImages: Record<string, string> = {};
-    const serializableLayers = data.layers.map((l) => {
-      if (l.type === 'raster' || l.type === 'vector' || l.type === 'frame') {
-        const acq = acquireLayerExportCanvas(l.id, data.dimensions, data.layerCanvasesMap, tileGrid);
-        if (acq.canvas) {
-          layerImages[l.id] = acq.canvas.toDataURL('image/png');
-          if (acq.isTemporary) releaseTemporaryCanvas(acq.canvas);
-        }
-      }
-      if (l.maskCanvas && typeof l.maskCanvas.toDataURL === 'function') {
-        maskImages[l.id] = l.maskCanvas.toDataURL('image/png');
-      }
-      const { maskCanvas: _mc, ...rest } = l;
-      return rest;
-    });
-
-    const projectData = {
-      app: 'Ink Studio',
-      version: '1.1',
-      name: data.name,
-      dimensions: data.dimensions,
-      colorMode: data.colorMode,
-      layers: serializableLayers,
-      canvases: layerImages,
-      masks: maskImages,
-    };
-
+    const projectData = buildSoraProjectPayload(data, tileGrid);
     const json = JSON.stringify(projectData);
     return {
       data: new Blob([json], { type: 'application/json' }),

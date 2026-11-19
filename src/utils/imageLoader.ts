@@ -1,6 +1,8 @@
-import { LoadedDocument, LayerItem, CanvasColorMode } from '../types/editor';
+import { LoadedDocument, LayerItem, CanvasColorMode, isFolderLikeLayer } from '../types/editor';
 import { createCanvasThumbnail } from './canvasUtils';
 import { renderVectorLayer } from './vectorEngine';
+import { renderBalloonLayerData, renderTextLayerData } from './vectorLayerRenderer';
+import { parseSoraProjectJson } from './saveManager';
 
 /**
  * Loads standard raster/vector image formats (.png, .jpg, .jpeg, .webp, .bmp, .gif, .svg).
@@ -105,19 +107,13 @@ export async function openFile(file: File): Promise<LoadedDocument> {
   if (ext === '.ink' || ext === '.sora' || ext === '.json') {
     try {
       const text = await file.text();
-      const project = JSON.parse(text);
+      const project = parseSoraProjectJson(text);
       if (project.layers && Array.isArray(project.layers)) {
-        const width = project.dimensions?.width || 1440;
-        const height = project.dimensions?.height || 900;
-        const dpi = project.dimensions?.dpi || 300;
+        const width = project.dimensions.width;
+        const height = project.dimensions.height;
+        const dpi = project.dimensions.dpi || 300;
         const colorMode: CanvasColorMode = project.colorMode || 'color';
-        const layers: LayerItem[] = project.layers.map((l: any) => {
-          // Ensure stale/serialized plain-object maskCanvas does not break CanvasRenderingContext2D calls
-          if (l.maskCanvas && typeof l.maskCanvas.getContext !== 'function') {
-            return { ...l, maskCanvas: undefined };
-          }
-          return l;
-        });
+        const layers: LayerItem[] = project.layers;
         const layerCanvases = new Map<string, HTMLCanvasElement>();
 
         const loadPromises = layers.map((layer) => {
@@ -144,14 +140,30 @@ export async function openFile(file: File): Promise<LoadedDocument> {
             );
           }
 
-          if (layer.type !== 'folder' && layer.type !== 'adjustment') {
+          if (!isFolderLikeLayer(layer) && layer.type !== 'adjustment') {
             tasks.push(
               new Promise<void>((resolve) => {
-                const dataUrl = project.canvases?.[layer.id];
                 const canvas = document.createElement('canvas');
                 canvas.width = width;
                 canvas.height = height;
 
+                // Always re-render non-destructive text/balloon from crisp vector data when available
+                if (layer.type === 'text' && layer.textData) {
+                  const ctx = canvas.getContext('2d');
+                  if (ctx) renderTextLayerData(ctx, layer.textData);
+                  layerCanvases.set(layer.id, canvas);
+                  resolve();
+                  return;
+                }
+                if (layer.type === 'balloon' && layer.balloonData) {
+                  const ctx = canvas.getContext('2d');
+                  if (ctx) renderBalloonLayerData(ctx, layer.balloonData);
+                  layerCanvases.set(layer.id, canvas);
+                  resolve();
+                  return;
+                }
+
+                const dataUrl = project.canvases?.[layer.id];
                 if (dataUrl) {
                   const img = new Image();
                   img.onload = () => {

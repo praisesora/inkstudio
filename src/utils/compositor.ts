@@ -8,9 +8,15 @@
  * anti-moiré screentones, vector layers, and comic frame clipping.
  */
 
-import { LayerItem, CanvasDimensions, BlendMode, CanvasColorMode, LayerStyles, SoftProofSettings } from '../types/editor';
+import { LayerItem, CanvasDimensions, BlendMode, CanvasColorMode, LayerStyles, SoftProofSettings, isFolderLikeLayer } from '../types/editor';
 import { SparseTileGrid, TILE_SIZE, TileBuffer, globalTileGrid, getTileKey } from './tileEngine';
 import { getCanvasCompositeOperation } from './canvasUtils';
+import {
+  applyMultiFrameClip,
+  buildFrameBorderTriangles,
+  renderFrameBorder,
+  triangulatePolygon,
+} from './frameEngine';
 import {
   buildCurvesCombinedLut,
   buildGradientMapLut,
@@ -94,6 +100,47 @@ export function groupTreeNodesForCompositing(nodesBottomToTop: LayerTreeNode[]):
 
   return groups;
 }
+
+// Document-Space Solid Polygon Shaders for Frame Border Folder Stencil Clipping & Borders
+export const FRAME_POLY_VERTEX_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 a_docPos;
+uniform vec2 u_docDimensions;
+uniform vec2 u_viewportSize;
+uniform vec2 u_pan;
+uniform float u_zoom;
+uniform float u_rotationRad;
+uniform vec2 u_flip;
+uniform float u_dpr;
+
+void main() {
+  vec2 centered = (a_docPos - u_docDimensions * 0.5) * u_flip;
+  float cosR = cos(u_rotationRad);
+  float sinR = sin(u_rotationRad);
+  vec2 rotated = vec2(
+    centered.x * cosR - centered.y * sinR,
+    centered.x * sinR + centered.y * cosR
+  );
+  vec2 screenPos = (u_pan + rotated * u_zoom) * u_dpr;
+  vec2 clipPos = vec2(
+    (2.0 * screenPos.x / u_viewportSize.x) - 1.0,
+    1.0 - (2.0 * screenPos.y / u_viewportSize.y)
+  );
+  gl_Position = vec4(clipPos, 0.0, 1.0);
+}
+`;
+
+export const FRAME_POLY_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+
+uniform vec4 u_color;
+out vec4 fragColor;
+
+void main() {
+  fragColor = vec4(u_color.rgb * u_color.a, u_color.a);
+}
+`;
 
 // Fullscreen blit for isolated folder compositing
 export const FOLDER_BLIT_VERTEX_SHADER = `#version 300 es
@@ -1430,17 +1477,17 @@ export function isUnitNormalAssociative(unit: CompositingUnit): boolean {
   if (baseLayer.type === 'adjustment') {
     return false;
   }
-  if (baseLayer.type === 'folder') {
-    // Pass-through folders were flattened; an isolated folder isolates its children's blend modes,
-    // so it is normal-associative iff the folder's own blend mode is normal.
-    return baseLayer.blendMode === 'normal';
+  if (baseLayer.type === 'folder' || baseLayer.type === 'frame-folder') {
+    // Pass-through regular folders were flattened; isolated folders and frame-folders
+    // isolate their children's blend modes, so normal/pass-through is normal-associative.
+    return baseLayer.blendMode === 'normal' || baseLayer.blendMode === 'pass-through';
   }
   if (baseLayer.blendMode !== 'normal' && baseLayer.blendMode !== 'pass-through') {
     return false;
   }
   for (const cn of unit.group.clippedNodes) {
     const cl = cn.layer;
-    if (!cl.visible || cl.opacity <= 0.001 || cl.type === 'folder') continue;
+    if (!cl.visible || cl.opacity <= 0.001 || isFolderLikeLayer(cl)) continue;
     if (cl.blendMode !== 'normal' && cl.blendMode !== 'pass-through') {
       return false;
     }
@@ -1457,14 +1504,14 @@ export function canSingleUnitBakeWithBlendMode(unit: CompositingUnit): BlendMode
   if (baseLayer.type === 'adjustment') {
     return null;
   }
-  if (baseLayer.type === 'folder') {
+  if (baseLayer.type === 'folder' || baseLayer.type === 'frame-folder') {
     if (baseLayer.blendMode !== 'normal' && baseLayer.blendMode !== 'pass-through') {
       return baseLayer.blendMode;
     }
     return null;
   }
   const visibleClipped = unit.group.clippedNodes.filter(
-    (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && cn.layer.type !== 'folder'
+    (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && !isFolderLikeLayer(cn.layer)
   );
   if (
     visibleClipped.length === 0 &&
@@ -1585,8 +1632,9 @@ function serializeLayerNodeSignature(
     ? `1:${l.maskVersion ?? 0}:${maskEpoch}:${l.maskCanvas.width}x${l.maskCanvas.height}`
     : '0';
   const exprSig = `${l.expressionColor ?? 'color'}:${l.monoThreshold ?? 128}:${l.monoExpressBlack !== false ? 1 : 0}:${l.monoExpressWhite !== false ? 1 : 0}`;
+  const frameSig = l.type === 'frame-folder' && l.comicFrames ? JSON.stringify(l.comicFrames) : '';
 
-  let sig = `${l.id}|${l.type}|${l.visible ? 1 : 0}|${l.opacity}|${inheritedOpacity}|${l.blendMode}|${l.clipped ? 1 : 0}|v:${contentVer}|m:${maskSig}|t:${toneSig}|c:${tintSig}|e:${exprSig}|s:${stylesSig}|a:${adjSig}`;
+  let sig = `${l.id}|${l.type}|${l.visible ? 1 : 0}|${l.opacity}|${inheritedOpacity}|${l.blendMode}|${l.clipped ? 1 : 0}|v:${contentVer}|m:${maskSig}|t:${toneSig}|c:${tintSig}|e:${exprSig}|s:${stylesSig}|a:${adjSig}|f:${frameSig}`;
 
   if (node.children.length > 0) {
     const childSigs: string[] = [];
@@ -1958,6 +2006,19 @@ export class ViewportCompositor {
   private uBlitHasBackdropLoc: WebGLUniformLocation | null = null;
   private uBlitBlendModeLoc: WebGLUniformLocation | null = null;
   private uBlitOpacityLoc: WebGLUniformLocation | null = null;
+
+  // Frame Border Folder polygon program & dynamic vertex buffer
+  private framePolyProgram: WebGLProgram | null = null;
+  private framePolyBuffer: WebGLBuffer | null = null;
+  private aFramePolyDocPosLoc: number = -1;
+  private uFramePolyDocDimensionsLoc: WebGLUniformLocation | null = null;
+  private uFramePolyViewportSizeLoc: WebGLUniformLocation | null = null;
+  private uFramePolyPanLoc: WebGLUniformLocation | null = null;
+  private uFramePolyZoomLoc: WebGLUniformLocation | null = null;
+  private uFramePolyRotationRadLoc: WebGLUniformLocation | null = null;
+  private uFramePolyFlipLoc: WebGLUniformLocation | null = null;
+  private uFramePolyDprLoc: WebGLUniformLocation | null = null;
+  private uFramePolyColorLoc: WebGLUniformLocation | null = null;
 
   // Ping-Pong FBOs (eliminates all gl.copyTexSubImage2D calls for custom blend modes)
   private scenePingPong: PingPongTarget | null = null;
@@ -2464,6 +2525,37 @@ export class ViewportCompositor {
           }
         } else {
           console.error('Soft proof shader compile error:', gl.getShaderInfoLog(proofVs), gl.getShaderInfoLog(proofFs));
+        }
+      }
+
+      // Compile Frame Border Folder Polygon Program
+      const frameVs = gl.createShader(gl.VERTEX_SHADER);
+      const frameFs = gl.createShader(gl.FRAGMENT_SHADER);
+      if (frameVs && frameFs) {
+        gl.shaderSource(frameVs, FRAME_POLY_VERTEX_SHADER);
+        gl.compileShader(frameVs);
+        gl.shaderSource(frameFs, FRAME_POLY_FRAGMENT_SHADER);
+        gl.compileShader(frameFs);
+        if (gl.getShaderParameter(frameVs, gl.COMPILE_STATUS) && gl.getShaderParameter(frameFs, gl.COMPILE_STATUS)) {
+          const fProg = gl.createProgram();
+          if (fProg) {
+            gl.attachShader(fProg, frameVs);
+            gl.attachShader(fProg, frameFs);
+            gl.linkProgram(fProg);
+            if (gl.getProgramParameter(fProg, gl.LINK_STATUS)) {
+              this.framePolyProgram = fProg;
+              this.aFramePolyDocPosLoc = gl.getAttribLocation(fProg, 'a_docPos');
+              this.uFramePolyDocDimensionsLoc = gl.getUniformLocation(fProg, 'u_docDimensions');
+              this.uFramePolyViewportSizeLoc = gl.getUniformLocation(fProg, 'u_viewportSize');
+              this.uFramePolyPanLoc = gl.getUniformLocation(fProg, 'u_pan');
+              this.uFramePolyZoomLoc = gl.getUniformLocation(fProg, 'u_zoom');
+              this.uFramePolyRotationRadLoc = gl.getUniformLocation(fProg, 'u_rotationRad');
+              this.uFramePolyFlipLoc = gl.getUniformLocation(fProg, 'u_flip');
+              this.uFramePolyDprLoc = gl.getUniformLocation(fProg, 'u_dpr');
+              this.uFramePolyColorLoc = gl.getUniformLocation(fProg, 'u_color');
+              this.framePolyBuffer = gl.createBuffer();
+            }
+          }
         }
       }
 
@@ -3511,6 +3603,148 @@ export class ViewportCompositor {
       return;
     }
 
+    if (baseLayer.type === 'frame-folder') {
+      const folderTarget = this.ensureFolderPingPong(gl, depth, viewportW, viewportH);
+      if (!folderTarget) return;
+
+      const frames = (baseLayer.comicFrames || []).filter((f) => f.polygon.length >= 3);
+
+      // 1. Render nested child layers into folderTarget.surfaces[0] cleanly (no stencil conflict with child clipping masks)
+      folderTarget.activeIndex = 0;
+      const childSurf = folderTarget.surfaces[0];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, childSurf.fbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+      gl.disable(gl.STENCIL_TEST);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+      if (baseNode.children.length > 0) {
+        this.renderNodeList(
+          gl,
+          baseNode.children,
+          dimensions,
+          grid,
+          frustum,
+          viewportW,
+          viewportH,
+          transform,
+          dpr,
+          folderTarget,
+          depth + 1,
+          1.0
+        );
+      }
+
+      const renderedChildrenTex = folderTarget.surfaces[folderTarget.activeIndex].texture;
+      const outIdx: 0 | 1 = folderTarget.activeIndex === 0 ? 1 : 0;
+      const outSurf = folderTarget.surfaces[outIdx];
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, outSurf.fbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+      gl.disable(gl.STENCIL_TEST);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+      const shouldClip = frames.length > 0 && frames.some((f) => f.clipChildren !== false);
+
+      if (frames.length > 0 && this.framePolyProgram && this.framePolyBuffer) {
+        // 2. Write frame polygon interiors into stencil buffer (and optional background fill)
+        if (shouldClip) {
+          gl.enable(gl.STENCIL_TEST);
+          gl.stencilMask(0xFF);
+          gl.stencilFunc(gl.ALWAYS, 1, 0xFF);
+          gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+        }
+
+        for (const frame of frames) {
+          const fillVerts = triangulatePolygon(frame.polygon);
+          if (fillVerts.length < 6) continue;
+          const doFill = frame.fillBackground !== false;
+          if (!doFill) {
+            gl.colorMask(false, false, false, false);
+          }
+          const [fr, fg, fb] = this.parseHexColor(frame.fillColor || '#ffffff');
+          this.drawFramePolygonTriangles(
+            gl,
+            fillVerts,
+            fr,
+            fg,
+            fb,
+            1.0,
+            dimensions,
+            viewportW,
+            viewportH,
+            transform,
+            dpr
+          );
+          if (!doFill) {
+            gl.colorMask(true, true, true, true);
+          }
+        }
+
+        // 3. Blit rendered children strictly inside stencil == 1
+        if (shouldClip) {
+          gl.stencilMask(0x00);
+          gl.stencilFunc(gl.EQUAL, 1, 0xFF);
+          gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+        }
+
+        this.blitFolderTexture(
+          gl,
+          renderedChildrenTex,
+          'normal',
+          1.0,
+          viewportW,
+          viewportH,
+          null,
+          shouldClip
+        );
+
+        gl.stencilMask(0xFF);
+        gl.disable(gl.STENCIL_TEST);
+
+        // 4. Draw crisp frame borders ON TOP of clipped folder contents
+        for (const frame of frames) {
+          const borderVerts = buildFrameBorderTriangles(frame.polygon, frame.borderWidth || 3);
+          if (borderVerts.length < 6) continue;
+          const [sr, sg, sb] = this.parseHexColor(frame.strokeColor || '#000000');
+          this.drawFramePolygonTriangles(
+            gl,
+            borderVerts,
+            sr,
+            sg,
+            sb,
+            1.0,
+            dimensions,
+            viewportW,
+            viewportH,
+            transform,
+            dpr
+          );
+        }
+
+        folderTarget.activeIndex = outIdx;
+      }
+
+      // 5. Composite finished frame folder onto parent framebuffer
+      const parentFbo = target ? target.surfaces[target.activeIndex].fbo : null;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, parentFbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+
+      const folderBlend = baseLayer.blendMode === 'pass-through' ? 'normal' : baseLayer.blendMode;
+      this.blitFolderTexture(
+        gl,
+        folderTarget.surfaces[folderTarget.activeIndex].texture,
+        folderBlend,
+        baseLayer.opacity * unit.inheritedOpacity,
+        viewportW,
+        viewportH,
+        target,
+        false
+      );
+      return;
+    }
+
     if (baseLayer.type === 'folder') {
       const folderTarget = this.ensureFolderPingPong(gl, depth, viewportW, viewportH);
       if (!folderTarget) return;
@@ -3558,7 +3792,7 @@ export class ViewportCompositor {
 
     const activeClippedLayers = group.clippedNodes
       .map((n) => n.layer)
-      .filter((cl) => cl.visible && cl.opacity > 0.001 && cl.type !== 'folder');
+      .filter((cl) => cl.visible && cl.opacity > 0.001 && !isFolderLikeLayer(cl));
 
     const baseEffectiveOpacity = unit.inheritedOpacity;
 
@@ -4433,6 +4667,40 @@ export class ViewportCompositor {
     return true;
   }
 
+  private drawFramePolygonTriangles(
+    gl: WebGL2RenderingContext,
+    vertices: Float32Array,
+    r: number,
+    g: number,
+    b: number,
+    a: number,
+    dimensions: CanvasDimensions,
+    viewportW: number,
+    viewportH: number,
+    transform: ViewportTransform,
+    dpr: number
+  ): void {
+    if (!this.framePolyProgram || !this.framePolyBuffer || vertices.length < 6) return;
+    gl.useProgram(this.framePolyProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.framePolyBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.DYNAMIC_DRAW);
+    if (this.aFramePolyDocPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aFramePolyDocPosLoc);
+      gl.vertexAttribPointer(this.aFramePolyDocPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+    gl.uniform2f(this.uFramePolyDocDimensionsLoc, dimensions.width, dimensions.height);
+    gl.uniform2f(this.uFramePolyViewportSizeLoc, viewportW, viewportH);
+    gl.uniform2f(this.uFramePolyPanLoc, transform.pan.x, transform.pan.y);
+    gl.uniform1f(this.uFramePolyZoomLoc, transform.zoom);
+    gl.uniform1f(this.uFramePolyRotationRadLoc, (transform.rotation * Math.PI) / 180);
+    gl.uniform2f(this.uFramePolyFlipLoc, transform.flipX ? -1.0 : 1.0, transform.flipY ? -1.0 : 1.0);
+    gl.uniform1f(this.uFramePolyDprLoc, dpr);
+    gl.uniform4f(this.uFramePolyColorLoc, r, g, b, a);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.drawArrays(gl.TRIANGLES, 0, vertices.length / 2);
+    this.restoreStandardProgram(gl);
+  }
+
   /**
    * Blits an isolated folder or baked cache texture onto the active Ping-Pong target
    * with full programmable blend mode support and zero gl.copyTexSubImage2D calls.
@@ -4897,6 +5165,54 @@ export class ViewportCompositor {
       const baseLayer = baseNode.layer;
       if (!baseLayer.visible || baseLayer.opacity <= 0.001) continue;
 
+      if (baseLayer.type === 'frame-folder') {
+        const folderEffectiveOpacity = opacityMultiplier * baseLayer.opacity;
+        const frames = (baseLayer.comicFrames || []).filter((f) => f.polygon.length >= 3);
+        const shouldClip = frames.length > 0 && frames.some((f) => f.clipChildren !== false);
+        let folderCanvas: HTMLCanvasElement | null = null;
+        if (typeof document !== 'undefined') {
+          folderCanvas = document.createElement('canvas');
+          folderCanvas.width = dimensions.width;
+          folderCanvas.height = dimensions.height;
+        }
+        const fCtx = folderCanvas?.getContext('2d');
+        if (fCtx && folderCanvas) {
+          fCtx.save();
+          if (shouldClip) {
+            applyMultiFrameClip(fCtx, frames);
+          }
+          for (const frame of frames) {
+            if (frame.fillBackground !== false) {
+              fCtx.fillStyle = frame.fillColor || '#ffffff';
+              fCtx.beginPath();
+              fCtx.moveTo(frame.polygon[0].x, frame.polygon[0].y);
+              for (let i = 1; i < frame.polygon.length; i++) {
+                fCtx.lineTo(frame.polygon[i].x, frame.polygon[i].y);
+              }
+              fCtx.closePath();
+              fCtx.fill();
+            }
+          }
+          if (baseNode.children.length > 0) {
+            this.render2DNodeList(fCtx, baseNode.children, dimensions, grid, tileCtx, 1.0);
+          }
+          fCtx.restore();
+
+          // Render frame borders on top of clipped folder contents
+          for (const frame of frames) {
+            renderFrameBorder(fCtx, frame, false);
+          }
+
+          targetCtx.save();
+          targetCtx.globalAlpha = Math.max(0, Math.min(1, folderEffectiveOpacity));
+          const blend = baseLayer.blendMode === 'pass-through' ? 'normal' : baseLayer.blendMode;
+          targetCtx.globalCompositeOperation = getCanvasCompositeOperation(blend);
+          targetCtx.drawImage(folderCanvas, 0, 0);
+          targetCtx.restore();
+        }
+        continue;
+      }
+
       if (baseLayer.type === 'folder') {
         const isPassThrough = baseLayer.blendMode === 'pass-through';
         const folderEffectiveOpacity = opacityMultiplier * baseLayer.opacity;
@@ -4949,7 +5265,7 @@ export class ViewportCompositor {
       }
 
       const activeClipped = group.clippedNodes.filter(
-        (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && cn.layer.type !== 'folder'
+        (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && !isFolderLikeLayer(cn.layer)
       );
 
       if (activeClipped.length === 0) {
@@ -5154,6 +5470,53 @@ export class ViewportCompositor {
         const baseLayer = baseNode.layer;
         if (!baseLayer.visible || baseLayer.opacity <= 0.001) continue;
 
+        if (baseLayer.type === 'frame-folder') {
+          const folderOpacity = opacityMul * baseLayer.opacity;
+          const frames = (baseLayer.comicFrames || []).filter((f) => f.polygon.length >= 3);
+          const shouldClip = frames.length > 0 && frames.some((f) => f.clipChildren !== false);
+          const tmp = document.createElement('canvas');
+          tmp.width = outW;
+          tmp.height = outH;
+          const tmpCtx = tmp.getContext('2d');
+          if (tmpCtx) {
+            const scaledFrames = frames.map((f) => ({
+              ...f,
+              borderWidth: Math.max(1, (f.borderWidth || 3) * Math.min(scaleX, scaleY)),
+              polygon: f.polygon.map((p) => ({ x: p.x * scaleX, y: p.y * scaleY })),
+            }));
+            tmpCtx.save();
+            if (shouldClip) {
+              applyMultiFrameClip(tmpCtx, scaledFrames);
+            }
+            for (const sf of scaledFrames) {
+              if (sf.fillBackground !== false) {
+                tmpCtx.fillStyle = sf.fillColor || '#ffffff';
+                tmpCtx.beginPath();
+                tmpCtx.moveTo(sf.polygon[0].x, sf.polygon[0].y);
+                for (let i = 1; i < sf.polygon.length; i++) {
+                  tmpCtx.lineTo(sf.polygon[i].x, sf.polygon[i].y);
+                }
+                tmpCtx.closePath();
+                tmpCtx.fill();
+              }
+            }
+            if (baseNode.children.length > 0) {
+              renderNodes(tmpCtx, baseNode.children, 1.0);
+            }
+            tmpCtx.restore();
+            for (const sf of scaledFrames) {
+              renderFrameBorder(tmpCtx, sf, false);
+            }
+            dstCtx.save();
+            dstCtx.globalAlpha = Math.max(0, Math.min(1, folderOpacity));
+            const blend = baseLayer.blendMode === 'pass-through' ? 'normal' : baseLayer.blendMode;
+            dstCtx.globalCompositeOperation = getCanvasCompositeOperation(blend);
+            dstCtx.drawImage(tmp, 0, 0);
+            dstCtx.restore();
+          }
+          continue;
+        }
+
         if (baseLayer.type === 'folder') {
           const folderOpacity = opacityMul * baseLayer.opacity;
           if (baseLayer.blendMode === 'pass-through') {
@@ -5191,7 +5554,7 @@ export class ViewportCompositor {
         }
 
         const activeClipped = group.clippedNodes.filter(
-          (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && cn.layer.type !== 'folder'
+          (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && !isFolderLikeLayer(cn.layer)
         );
 
         if (activeClipped.length === 0) {
@@ -5286,6 +5649,14 @@ export class ViewportCompositor {
       if (this.blitProgram) {
         gl.deleteProgram(this.blitProgram);
         this.blitProgram = null;
+      }
+      if (this.framePolyProgram) {
+        gl.deleteProgram(this.framePolyProgram);
+        this.framePolyProgram = null;
+      }
+      if (this.framePolyBuffer) {
+        gl.deleteBuffer(this.framePolyBuffer);
+        this.framePolyBuffer = null;
       }
       if (this.softProofProgram) {
         gl.deleteProgram(this.softProofProgram);

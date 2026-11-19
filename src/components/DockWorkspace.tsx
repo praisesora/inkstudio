@@ -19,6 +19,7 @@ import {
   Eye,
   Compass,
   Images,
+  Play,
 } from 'lucide-react';
 import { CanvasColorMode, CspBrush } from '../types/editor';
 import { ThemePreset } from '../types/settings';
@@ -55,6 +56,7 @@ import { RightSidebar, RightSidebarColorSection, RightSidebarProps } from './Rig
 import { QuickAccessPanel } from './QuickAccessPanel';
 import { NavigatorPanel, NavigatorPanelProps } from './NavigatorPanel';
 import { SubViewPanel } from './SubViewPanel';
+import { AutoActionPanel, AutoActionPanelProps } from './AutoActionPanel';
 import { WorkspaceCommandHandlers } from './CommandBar';
 
 const DND_PANEL_MIME = 'application/x-inkstudio-panel';
@@ -81,6 +83,8 @@ export function renderPanelIcon(panelId: DockPanelId, className = 'w-3.5 h-3.5')
       return <History className={className} />;
     case 'quick-access':
       return <Zap className={className} />;
+    case 'auto-actions':
+      return <Play className={className} />;
   }
 }
 
@@ -173,6 +177,8 @@ export interface DockWorkspaceProps {
   layerSidebarProps: Omit<RightSidebarProps, 'width' | 'onWidthChange' | 'hideColorPanel' | 'dockedMode'>;
   // Navigator palette props
   navigatorProps?: Omit<NavigatorPanelProps, 'themePreset'>;
+  // Auto Actions palette props
+  autoActionProps?: AutoActionPanelProps;
   // Center canvas area (DocumentTabBar + CanvasArea + StatusBar)
   children: React.ReactNode;
 }
@@ -771,6 +777,7 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
   onToggleTransparentColor,
   layerSidebarProps,
   navigatorProps,
+  autoActionProps,
   children,
 }) => {
   const layout = useWorkspaceStore((s) => s.layout);
@@ -893,9 +900,14 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
               themePreset={themePreset}
             />
           );
+        case 'auto-actions':
+          return autoActionProps ? (
+            <AutoActionPanel {...autoActionProps} />
+          ) : null;
       }
     },
     [
+      autoActionProps,
       colorMode,
       commandHandlers,
       customBrushes,

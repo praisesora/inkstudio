@@ -10,7 +10,8 @@ export type DockPanelId =
   | 'color'
   | 'layers'
   | 'history'
-  | 'quick-access';
+  | 'quick-access'
+  | 'auto-actions';
 
 export type DockSide = 'left' | 'right';
 
@@ -106,6 +107,7 @@ export const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
   'layers',
   'history',
   'quick-access',
+  'auto-actions',
 ];
 
 export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
@@ -198,6 +200,15 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 184,
     minWidth: 136,
     maxWidth: 320,
+  },
+  'auto-actions': {
+    id: 'auto-actions',
+    title: 'Auto Action',
+    shortTitle: 'Actions',
+    defaultSide: 'right',
+    defaultWidth: 224,
+    minWidth: 176,
+    maxWidth: 360,
   },
 };
 

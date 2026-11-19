@@ -111,7 +111,7 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
           fontStyle: settings.italic ? 'italic' : 'normal',
           textAlign: settings.align,
           color: settings.color,
-          lineHeight: 1.25,
+          lineHeight: settings.lineSpacing ?? 1.25,
           writingMode: settings.writingMode === 'vertical-rl' ? 'vertical-rl' : 'horizontal-tb',
           textOrientation: 'mixed',
           textShadow: settings.outline
@@ -213,6 +213,31 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
                 value={settings.fontSize}
                 onChange={(e) => onUpdateSettings((prev) => ({ ...prev, fontSize: Number(e.target.value) }))}
                 className="flex-1 accent-cyan-400"
+              />
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <label className="text-[11px] text-[#999999] w-16 shrink-0">
+                Line: {(settings.lineSpacing ?? 1.25).toFixed(2)}
+              </label>
+              <input
+                type="range"
+                min={0.8}
+                max={2.5}
+                step={0.05}
+                value={settings.lineSpacing ?? 1.25}
+                onChange={(e) => onUpdateSettings((prev) => ({ ...prev, lineSpacing: Number(e.target.value) }))}
+                className="flex-1 accent-cyan-400"
+              />
+            </div>
+
+            <div className="flex items-center justify-between">
+              <span className="text-[11px] text-[#999999]">Text Color:</span>
+              <input
+                type="color"
+                value={settings.color || '#000000'}
+                onChange={(e) => onUpdateSettings((prev) => ({ ...prev, color: e.target.value }))}
+                className="w-6 h-5 bg-transparent cursor-pointer border border-[#383a40] rounded"
               />
             </div>
           </div>

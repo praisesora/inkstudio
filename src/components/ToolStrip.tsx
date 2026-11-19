@@ -16,6 +16,7 @@ import {
   PenTool,
   MessageSquare,
   Spline,
+  MousePointer2,
 } from 'lucide-react';
 import { ToolType } from '../types/editor';
 import { LiquifyIcon } from './LiquifyIcon';
@@ -89,6 +90,7 @@ export const ToolStrip: React.FC<ToolStripProps> = React.memo(
         dividerAfter: true,
       },
       { id: 'fill', label: 'Fill (G)', icon: <PaintBucket className="w-3.5 h-3.5" /> },
+      { id: 'object', label: 'Object (O)', icon: <MousePointer2 className="w-3.5 h-3.5" /> },
       { id: 'text', label: 'Text (T)', icon: <Type className="w-3.5 h-3.5" /> },
       { id: 'frame', label: 'Frame Border (F)', icon: <Frame className="w-3.5 h-3.5" /> },
       { id: 'balloon', label: 'Speech Balloon', icon: <MessageSquare className="w-3.5 h-3.5" /> },

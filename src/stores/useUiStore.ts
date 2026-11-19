@@ -41,6 +41,7 @@ export interface UiStoreState {
   isToneModalOpen: boolean;
   isMangaEffectsModalOpen: boolean;
   isWebtoonExportModalOpen: boolean;
+  isTimelapseExportModalOpen: boolean;
   isRecoveryModalOpen: boolean;
   crashedSessions: CrashedSessionInfo[];
   tonalModalState: TonalModalState;
@@ -94,6 +95,7 @@ const createInitialUiState = (): UiStoreState => ({
   isToneModalOpen: false,
   isMangaEffectsModalOpen: false,
   isWebtoonExportModalOpen: false,
+  isTimelapseExportModalOpen: false,
   isRecoveryModalOpen: false,
   crashedSessions: [],
   tonalModalState: { ...DEFAULT_TONAL_MODAL_STATE },
@@ -206,6 +208,10 @@ export const uiStoreActions = {
     useUiStore.setState({ isWebtoonExportModalOpen: open });
   },
 
+  setTimelapseExportModalOpen(open: boolean): void {
+    useUiStore.setState({ isTimelapseExportModalOpen: open });
+  },
+
   setRecoveryModal(open: boolean, sessions?: CrashedSessionInfo[]): void {
     useUiStore.setState((prev) => ({
       isRecoveryModalOpen: open,
@@ -267,6 +273,7 @@ export function selectIsAnyModalOpen(state: UiStoreState, isHostModalOpen = fals
     state.isToneModalOpen ||
     state.isMangaEffectsModalOpen ||
     state.isWebtoonExportModalOpen ||
+    state.isTimelapseExportModalOpen ||
     state.isRecoveryModalOpen ||
     state.tonalModalState.isOpen ||
     state.adjustmentModalState.isOpen ||

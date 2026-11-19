@@ -93,7 +93,7 @@ export const DEFAULT_ILLUSTRATION_LAYOUT: WorkspaceLayout = {
         },
         {
           id: 'grp-layers-history',
-          panelIds: ['layers', 'history'],
+          panelIds: ['layers', 'history', 'auto-actions'],
           activePanelId: 'layers',
           heightRatio: 0.48,
         },
@@ -235,7 +235,7 @@ export const MINIMALIST_TABLET_LAYOUT: WorkspaceLayout = {
       groups: [
         {
           id: 'grp-tablet-layers',
-          panelIds: ['navigator', 'sub-view', 'layers', 'history', 'quick-access'],
+          panelIds: ['navigator', 'sub-view', 'layers', 'history', 'auto-actions', 'quick-access'],
           activePanelId: 'layers',
           heightRatio: 1,
         },

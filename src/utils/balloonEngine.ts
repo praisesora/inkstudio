@@ -274,9 +274,9 @@ export function renderSpeechBalloon(
       fontFamily: balloon.fontFamily || 'sans-serif',
       writingMode: balloon.vertical ? 'vertical-rl' : 'horizontal-tb',
       align: 'center',
-      color: strokeColor,
+      color: balloon.textColor || strokeColor,
       bold: true,
-      lineHeightRatio: 1.3,
+      lineHeightRatio: balloon.lineSpacing || 1.3,
     });
   }
 
@@ -319,11 +319,20 @@ export function hitTestBalloon(
   point: Point | { x: number; y: number }
 ): boolean {
   const { x, y, width: w, height: h } = balloon.bounds;
-  // Bounding box hit test with small margin
-  return (
+  if (
     point.x >= x - 5 &&
     point.x <= x + w + 5 &&
     point.y >= y - 5 &&
     point.y <= y + h + 5
-  );
+  ) {
+    return true;
+  }
+  // Also hit-test tail tip and midpoint area
+  const { start, tip } = balloon.tail;
+  const distTip = Math.hypot(point.x - tip.x, point.y - tip.y);
+  if (distTip <= 16) return true;
+  const midX = (start.x + tip.x) * 0.5;
+  const midY = (start.y + tip.y) * 0.5;
+  if (Math.hypot(point.x - midX, point.y - midY) <= 18) return true;
+  return false;
 }

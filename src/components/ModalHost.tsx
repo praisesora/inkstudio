@@ -28,6 +28,7 @@ import { ClipboardInviteToast } from './ClipboardInviteToast';
 import { WebLandingModal } from './WebLandingModal';
 import { MangaEffectsModal } from './MangaEffectsModal';
 import { WebtoonExportModal } from './WebtoonExportModal';
+import { TimelapseExportModal } from './TimelapseExportModal';
 
 export interface InviteLinkPayload {
   roomName: string;
@@ -85,6 +86,7 @@ export interface ModalHostProps {
   webLandingInvite: InviteLinkPayload | null;
   setWebLandingInvite: (invite: InviteLinkPayload | null) => void;
   joinRoom: (host: string, port: number, roomName: string, name: string) => void;
+  onCaptureTimelapseNow?: () => void;
   showToast: (msg: string) => void;
 }
 
@@ -122,6 +124,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     webLandingInvite,
     setWebLandingInvite,
     joinRoom,
+    onCaptureTimelapseNow,
     showToast,
   }) => {
     const dimensions = useDocumentStore((s) => s.dimensions);
@@ -140,6 +143,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     const isToneModalOpen = useUiStore((s) => s.isToneModalOpen);
     const isMangaEffectsModalOpen = useUiStore((s) => s.isMangaEffectsModalOpen);
     const isWebtoonExportModalOpen = useUiStore((s) => s.isWebtoonExportModalOpen);
+    const isTimelapseExportModalOpen = useUiStore((s) => s.isTimelapseExportModalOpen);
     const isLoadingFile = useUiStore((s) => s.isLoadingFile);
     const loadingStatus = useUiStore((s) => s.loadingStatus);
     const toastMessage = useUiStore((s) => s.toastMessage);
@@ -308,6 +312,15 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           canvasWidth={dimensions.width}
           canvasHeight={dimensions.height}
           documentTitle={activeDoc?.name || 'webtoon_chapter'}
+        />
+
+        <TimelapseExportModal
+          isOpen={isTimelapseExportModalOpen}
+          onClose={() => uiStoreActions.setTimelapseExportModalOpen(false)}
+          documentId={activeDocumentId}
+          documentName={activeDoc?.name || 'artwork'}
+          onCaptureNow={onCaptureTimelapseNow}
+          showToast={showToast}
         />
       </>
     );

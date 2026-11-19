@@ -602,42 +602,152 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
         );
       }
 
+      if (currentTool === 'object') {
+        return (
+          <div className="p-2.5 space-y-2.5 overflow-y-auto flex-1">
+            <div className="text-[11px] font-medium text-[#e5e5e5]">Object Tool</div>
+            <p className="text-[10px] text-[#8a8a8a] leading-relaxed">
+              Click any non-destructive Text or Speech Balloon layer on the canvas to reopen its editor without quality loss.
+            </p>
+          </div>
+        );
+      }
+
       if (currentTool === 'frame') {
+        const frameMode = frameSettings.mode ?? 'create';
+        const divideMode = frameSettings.divideMode ?? 'same-folder';
         return (
           <div className="p-2.5 space-y-3 overflow-y-auto flex-1">
-            <div className="text-[11px] font-medium text-[#e5e5e5]">Frame Border</div>
-            <CompactSlider
-              label="Thickness"
-              valueLabel={`${frameSettings.thickness ?? 4}px`}
-              min={1}
-              max={100}
-              value={frameSettings.thickness ?? 4}
-              onChange={(v) => toolStoreActions.updateFrameSettings({ thickness: v })}
-            />
+            <div className="text-[11px] font-medium text-[#e5e5e5]">Frame Border Folder</div>
             <div className="grid grid-cols-2 gap-1 bg-[#161616] p-0.5 rounded">
               <button
                 type="button"
-                onClick={() => toolStoreActions.updateFrameSettings({ fillBackground: true })}
+                onClick={() => toolStoreActions.updateFrameSettings({ mode: 'create' })}
                 className={`py-1 rounded text-[10px] cursor-pointer ${
-                  frameSettings.fillBackground
-                    ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                  frameMode === 'create'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
                     : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                 }`}
               >
-                White
+                Create
               </button>
               <button
                 type="button"
-                onClick={() => toolStoreActions.updateFrameSettings({ fillBackground: false })}
+                onClick={() => toolStoreActions.updateFrameSettings({ mode: 'divide' })}
                 className={`py-1 rounded text-[10px] cursor-pointer ${
-                  !frameSettings.fillBackground
-                    ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                  frameMode === 'divide'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
                     : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                 }`}
               >
-                Empty
+                Divide
               </button>
             </div>
+
+            {frameMode === 'divide' ? (
+              <div className="space-y-2.5">
+                <div className="text-[10px] text-[#8a8a8a]">Divide Method</div>
+                <div className="grid grid-cols-1 gap-1 bg-[#161616] p-0.5 rounded">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      toolStoreActions.updateFrameSettings({ divideMode: 'same-folder' })
+                    }
+                    className={`py-1 px-2 rounded text-left text-[10px] cursor-pointer ${
+                      divideMode === 'same-folder'
+                        ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                        : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                    }`}
+                  >
+                    Divide Frame Border (Same Folder)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      toolStoreActions.updateFrameSettings({ divideMode: 'split-folders' })
+                    }
+                    className={`py-1 px-2 rounded text-left text-[10px] cursor-pointer ${
+                      divideMode === 'split-folders'
+                        ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                        : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                    }`}
+                  >
+                    Divide Frame Folder (2 Folders)
+                  </button>
+                </div>
+                <CompactSlider
+                  label="Vert Gutter"
+                  valueLabel={`${(frameSettings.gutterVerticalMm ?? 3.0).toFixed(1)}mm`}
+                  min={0.5}
+                  max={20}
+                  step={0.5}
+                  value={frameSettings.gutterVerticalMm ?? 3.0}
+                  onChange={(v) => toolStoreActions.updateFrameSettings({ gutterVerticalMm: v })}
+                />
+                <CompactSlider
+                  label="Horiz Gutter"
+                  valueLabel={`${(frameSettings.gutterHorizontalMm ?? 5.0).toFixed(1)}mm`}
+                  min={0.5}
+                  max={25}
+                  step={0.5}
+                  value={frameSettings.gutterHorizontalMm ?? 5.0}
+                  onChange={(v) => toolStoreActions.updateFrameSettings({ gutterHorizontalMm: v })}
+                />
+              </div>
+            ) : (
+              <>
+                <CompactSlider
+                  label="Border Width"
+                  valueLabel={`${frameSettings.thickness ?? 4}px`}
+                  min={1}
+                  max={100}
+                  value={frameSettings.thickness ?? 4}
+                  onChange={(v) => toolStoreActions.updateFrameSettings({ thickness: v })}
+                />
+                <CompactSlider
+                  label="Vert Gutter"
+                  valueLabel={`${(frameSettings.gutterVerticalMm ?? 3.0).toFixed(1)}mm`}
+                  min={0.5}
+                  max={20}
+                  step={0.5}
+                  value={frameSettings.gutterVerticalMm ?? 3.0}
+                  onChange={(v) => toolStoreActions.updateFrameSettings({ gutterVerticalMm: v })}
+                />
+                <CompactSlider
+                  label="Horiz Gutter"
+                  valueLabel={`${(frameSettings.gutterHorizontalMm ?? 5.0).toFixed(1)}mm`}
+                  min={0.5}
+                  max={25}
+                  step={0.5}
+                  value={frameSettings.gutterHorizontalMm ?? 5.0}
+                  onChange={(v) => toolStoreActions.updateFrameSettings({ gutterHorizontalMm: v })}
+                />
+                <div className="grid grid-cols-2 gap-1 bg-[#161616] p-0.5 rounded">
+                  <button
+                    type="button"
+                    onClick={() => toolStoreActions.updateFrameSettings({ fillBackground: true })}
+                    className={`py-1 rounded text-[10px] cursor-pointer ${
+                      frameSettings.fillBackground
+                        ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                        : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                    }`}
+                  >
+                    White
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => toolStoreActions.updateFrameSettings({ fillBackground: false })}
+                    className={`py-1 rounded text-[10px] cursor-pointer ${
+                      !frameSettings.fillBackground
+                        ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                        : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                    }`}
+                  >
+                    Empty
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         );
       }

@@ -52,6 +52,7 @@ import {
   LayerItem,
   MenuSection,
   SoftProofSettings,
+  isFolderLikeLayer,
 } from '../types/editor';
 import { PerspectiveRuler } from '../types/perspective';
 import { createDefaultAnimationTimeline } from '../utils/animationEngine';
@@ -143,6 +144,10 @@ export interface UseAppMenuSectionsParams {
   resetViewFlip: () => void;
   handleUpdateAnimationTimeline: (timeline: AnimationTimeline | null) => void;
   handleAddAnimationCel: (frameIndex: number) => void;
+  handleAddDefaultFrameFolder?: () => void;
+  handleRasterizeLayer?: (layerId: string) => void;
+  isTimelapseRecording?: boolean;
+  handleToggleTimelapseRecording?: () => void;
   showToast: (msg: string) => void;
 }
 
@@ -207,6 +212,10 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
     resetViewFlip,
     handleUpdateAnimationTimeline,
     handleAddAnimationCel,
+    handleAddDefaultFrameFolder,
+    handleRasterizeLayer,
+    isTimelapseRecording = false,
+    handleToggleTimelapseRecording,
     showToast,
   } = params;
 
@@ -315,6 +324,25 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             icon: <Archive className="w-3.5 h-3.5 text-cyan-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.setWebtoonExportModalOpen(true),
+          },
+          {
+            id: 'file-timelapse-submenu',
+            label: 'Time-lapse',
+            icon: <Film className="w-3.5 h-3.5 text-rose-400" />,
+            disabled: !hasOpenDocument,
+            submenu: [
+              {
+                id: 'file-timelapse-record',
+                label: isTimelapseRecording ? 'Pause Time-lapse Recording' : 'Record Time-lapse',
+                checked: isTimelapseRecording,
+                onClick: () => handleToggleTimelapseRecording?.(),
+              },
+              {
+                id: 'file-timelapse-export',
+                label: 'Export Time-lapse...',
+                onClick: () => uiStoreActions.setTimelapseExportModalOpen(true),
+              },
+            ],
           },
           { id: 'file-div-2', label: '', divider: true },
           {
@@ -656,6 +684,23 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             ],
           },
           {
+            id: 'layer-new-frame-folder',
+            label: 'New Frame Border Folder',
+            disabled: !hasOpenDocument || !handleAddDefaultFrameFolder,
+            onClick: () => handleAddDefaultFrameFolder?.(),
+          },
+          {
+            id: 'layer-rasterize',
+            label: 'Rasterize Layer',
+            disabled:
+              !hasOpenDocument ||
+              !activeLayer ||
+              (activeLayer.type !== 'text' &&
+                activeLayer.type !== 'balloon' &&
+                activeLayer.type !== 'vector'),
+            onClick: () => activeLayer && handleRasterizeLayer?.(activeLayer.id),
+          },
+          {
             id: 'layer-duplicate',
             label: 'Duplicate Layer',
             shortcut: 'Ctrl+J',
@@ -675,7 +720,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             disabled:
               !hasOpenDocument ||
               !activeLayer ||
-              activeLayer.type === 'folder' ||
+              isFolderLikeLayer(activeLayer) ||
               activeLayer.type === 'adjustment',
             onClick: () => handleOpenLayerStylesModal(activeLayerId),
           },
@@ -684,13 +729,13 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             label: activeLayer?.layerColorEnabled
               ? 'Disable Layer Color (Tint)'
               : 'Enable Layer Color (Tint)',
-            disabled: !hasOpenDocument || !activeLayer || activeLayer.type === 'folder',
+            disabled: !hasOpenDocument || !activeLayer || isFolderLikeLayer(activeLayer),
             onClick: () => toggleLayerColor(activeLayerId),
           },
           {
             id: 'layer-convert-submenu',
             label: 'Convert Expression Color',
-            disabled: !hasOpenDocument || !activeLayer || activeLayer.type === 'folder',
+            disabled: !hasOpenDocument || !activeLayer || isFolderLikeLayer(activeLayer),
             submenu: [
               {
                 id: 'layer-convert-color',
@@ -1372,6 +1417,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       flipX,
       flipY,
       handleAddAnimationCel,
+      handleAddDefaultFrameFolder,
       handleAddLayer,
       handleApplyFilter,
       handleApplyReverseGradient,
@@ -1391,16 +1437,19 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       handleOpenLayerStylesModal,
       handleOpenTonalModal,
       handlePasteSelectedLayer,
+      handleRasterizeLayer,
       handleSave,
       handleSaveAs,
       handleSelectAll,
       handleStartTransform,
+      handleToggleTimelapseRecording,
       handleTriggerImport3DFile,
       handleTriggerOpenFile,
       handleTriggerPasteFromFile,
       handleUndo,
       handleUpdateAnimationTimeline,
       hasOpenDocument,
+      isTimelapseRecording,
       isWebtoonMode,
       layers,
       palettesHidden,

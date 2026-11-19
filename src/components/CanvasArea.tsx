@@ -127,6 +127,7 @@ interface CanvasAreaProps {
   onUpdateBalloon?: (updater: (prev: SpeechBalloon) => SpeechBalloon) => void;
   onConfirmBalloon?: () => void;
   onDeleteBalloon?: () => void;
+  frameDragPreview?: { mode: 'create' | 'divide'; start: { x: number; y: number }; end: { x: number; y: number } } | null;
   animationTimeline?: AnimationTimelineType | null;
   onUpdateAnimationTimeline?: (timeline: AnimationTimelineType) => void;
   onAddAnimationCel?: (frameIndex: number) => void;
@@ -238,6 +239,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onUpdateBalloon,
   onConfirmBalloon,
   onDeleteBalloon,
+  frameDragPreview = null,
   isHovering: _isHovering,
   cursorPos: _cursorPos,
   onPointerDown,
@@ -1524,6 +1526,48 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             onConfirmBalloon={onConfirmBalloon || (() => {})}
             onDeleteBalloon={onDeleteBalloon || (() => {})}
           />
+        )}
+
+        {/* Frame Border Folder Create / Divide Live Preview */}
+        {frameDragPreview && (
+          <svg className="absolute inset-0 w-full h-full overflow-visible pointer-events-none z-35">
+            {frameDragPreview.mode === 'create' ? (
+              <rect
+                x={Math.min(frameDragPreview.start.x, frameDragPreview.end.x)}
+                y={Math.min(frameDragPreview.start.y, frameDragPreview.end.y)}
+                width={Math.abs(frameDragPreview.end.x - frameDragPreview.start.x)}
+                height={Math.abs(frameDragPreview.end.y - frameDragPreview.start.y)}
+                fill="rgba(0, 188, 212, 0.08)"
+                stroke="#00bcd4"
+                strokeWidth={2 / liveZoom}
+                strokeDasharray={`${6 / liveZoom},${4 / liveZoom}`}
+              />
+            ) : (
+              <>
+                <line
+                  x1={frameDragPreview.start.x}
+                  y1={frameDragPreview.start.y}
+                  x2={frameDragPreview.end.x}
+                  y2={frameDragPreview.end.y}
+                  stroke="#00e5ff"
+                  strokeWidth={2.5 / liveZoom}
+                  strokeDasharray={`${8 / liveZoom},${4 / liveZoom}`}
+                />
+                <circle
+                  cx={frameDragPreview.start.x}
+                  cy={frameDragPreview.start.y}
+                  r={4 / liveZoom}
+                  fill="#00e5ff"
+                />
+                <circle
+                  cx={frameDragPreview.end.x}
+                  cy={frameDragPreview.end.y}
+                  r={4 / liveZoom}
+                  fill="#00e5ff"
+                />
+              </>
+            )}
+          </svg>
         )}
 
         {/* Local-Only 3D Viewport Ghost Layer (Strictly Client-Side Isolated State) */}

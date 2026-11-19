@@ -1,11 +1,14 @@
-import React, { useCallback, useEffect, useMemo, useRef } from 'react';
-import { AnimationTimeline, LayerItem } from './types/editor';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AnimationTimeline, BlendMode, ExpressionColor, FilterType, LayerItem } from './types/editor';
 import {
   createDefaultAnimationTimeline,
   removeFrameCel,
   setFrameCel,
 } from './utils/animationEngine';
 import { screenToCanvas } from './utils/canvasUtils';
+import { createDefaultPageFrame } from './utils/frameEngine';
+import { AutoAction, AutoActionExecutionContext, executeAutoAction } from './utils/autoActionEngine';
+import { globalTimelapseManager } from './utils/timelapseEngine';
 import { globalTileGrid } from './utils/tileEngine';
 import { documentStore } from './utils/documentStore';
 import { multiplayerService } from './services/multiplayerService';
@@ -22,6 +25,7 @@ import { useCollabSync } from './hooks/useCollabSync';
 import { useTonalAndFilterActions } from './hooks/useTonalAndFilterActions';
 import { useAppMenuSections } from './hooks/useAppMenuSections';
 import {
+  autoActionStoreActions,
   documentStoreActions,
   selectHasOpenDocument,
   uiStoreActions,
@@ -299,7 +303,7 @@ export function App() {
     [nav.viewportRef, nav.navigation, dimensions]
   );
 
-  // Modular Shape, Fill, Eyedropper, Text, Balloon & Liquify Tools
+  // Modular Shape, Fill, Eyedropper, Text, Balloon, Frame Folder & Liquify Tools
   const shapeFillTools = useShapeAndFillTools({
     dimensions,
     colorMode,
@@ -313,8 +317,15 @@ export function App() {
     getEffectiveOpacity: layerMgr.getEffectiveOpacity,
     getActiveCanvas: drawing.getActiveCanvas,
     getCanvasCoords,
+    setActiveLayerId: layerMgr.setActiveLayerId,
+    upsertTextLayer: layerMgr.upsertTextLayer,
+    upsertBalloonLayer: layerMgr.upsertBalloonLayer,
+    createFrameFolder: layerMgr.createFrameFolder,
+    divideFrameFolder: layerMgr.divideFrameFolder,
+    deleteLayer: layerMgr.deleteLayer,
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
     pushHistoryStep: drawing.pushHistoryStep,
+    showToast,
   });
 
   // Modular Vector Edit Tool
@@ -397,13 +408,272 @@ export function App() {
     const res = layerMgr.mergeDown();
     if (res) {
       documentStoreActions.markDocumentDirty(activeDocumentId, true);
+      autoActionStoreActions.recordStep('merge-down', 'Merge Down');
       showToast('Merged layer down');
     } else {
       showToast('Cannot merge down: need an unlocked raster layer below');
     }
   }, [layerMgr.mergeDown, activeDocumentId, showToast]);
 
-  // Mark active document dirty whenever a new history step is committed on the same document
+  const handleAddDefaultFrameFolder = useCallback(() => {
+    const dpi = dimensions.dpi ?? 600;
+    const defaultFrame = createDefaultPageFrame('', dimensions.width, dimensions.height, dpi, 15);
+    const { folder } = layerMgr.createFrameFolder([defaultFrame], undefined, true);
+    drawing.pushHistoryStep('frame', 'New Frame Border Folder', null, null, folder.id);
+    autoActionStoreActions.recordStep('create-frame-folder', 'New Frame Border Folder');
+    showToast('Created Frame Border Folder');
+  }, [dimensions, layerMgr.createFrameFolder, drawing.pushHistoryStep, showToast]);
+
+  const handleRasterizeLayer = useCallback(
+    (layerId: string) => {
+      const ok = layerMgr.rasterizeLayer(layerId);
+      if (ok) {
+        drawing.pushHistoryStep('layer-convert', 'Rasterize Layer', null, null, layerId);
+        autoActionStoreActions.recordStep('rasterize-layer', 'Rasterize Layer');
+        showToast('Layer rasterized');
+      } else {
+        showToast('Only Text, Speech Balloon, or Vector layers can be rasterized');
+      }
+    },
+    [layerMgr.rasterizeLayer, drawing.pushHistoryStep, showToast]
+  );
+
+  // Auto-Action Recording Wrappers for common layer/filter commands
+  const handleRecordedAddLayer = useCallback(
+    (type: 'raster' | 'folder' = 'raster') => {
+      collab.handleAddLayer(type);
+      autoActionStoreActions.recordStep(
+        type === 'folder' ? 'create-folder' : 'create-layer',
+        type === 'folder' ? 'Create Folder' : 'Create Layer'
+      );
+    },
+    [collab.handleAddLayer]
+  );
+
+  const handleRecordedDuplicateLayer = useCallback(
+    (id: string) => {
+      layerMgr.duplicateLayer(id);
+      autoActionStoreActions.recordStep('duplicate-layer', 'Duplicate Layer');
+    },
+    [layerMgr.duplicateLayer]
+  );
+
+  const handleRecordedSetBlendMode = useCallback(
+    (id: string, blendMode: BlendMode) => {
+      layerMgr.setBlendMode(id, blendMode);
+      autoActionStoreActions.recordStep('set-blend-mode', `Blend Mode: ${blendMode}`, { blendMode });
+    },
+    [layerMgr.setBlendMode]
+  );
+
+  const handleRecordedSetOpacity = useCallback(
+    (id: string, opacity: number) => {
+      collab.handleSetOpacity(id, opacity);
+      autoActionStoreActions.recordStep('set-opacity', `Opacity: ${Math.round(opacity * 100)}%`, {
+        opacity,
+      });
+    },
+    [collab.handleSetOpacity]
+  );
+
+  const handleRecordedToggleClipping = useCallback(
+    (id: string) => {
+      layerMgr.toggleClipping(id);
+      autoActionStoreActions.recordStep('toggle-clipping', 'Toggle Clipping Mask');
+    },
+    [layerMgr.toggleClipping]
+  );
+
+  const handleRecordedApplyFilter = useCallback(
+    (type: FilterType, params?: import('./hooks/useTonalAndFilterActions').AnyFilterParams) => {
+      tonalActions.handleApplyFilter(type, params);
+      autoActionStoreActions.recordStep('apply-filter', `Filter: ${type}`, {
+        filterType: type,
+        ...(params || {}),
+      });
+    },
+    [tonalActions.handleApplyFilter]
+  );
+
+  const handleRecordedSetExpressionColor = useCallback(
+    (id: string, mode: ExpressionColor) => {
+      layerMgr.setLayerExpressionColor(id, mode);
+      autoActionStoreActions.recordStep('set-expression-color', `Expression Color: ${mode}`, { mode });
+    },
+    [layerMgr.setLayerExpressionColor]
+  );
+
+  const handlePlayAutoAction = useCallback(
+    async (action: AutoAction) => {
+      if (!hasOpenDocument) return;
+      autoActionStoreActions.setIsPlaying(true);
+      let currentLayerId = layerMgr.activeLayerId;
+      let groupStartBefore: ImageData | null = null;
+      let groupTargetLayerId = currentLayerId;
+
+      const ctx: AutoActionExecutionContext = {
+        getActiveLayerId: () => currentLayerId,
+        createLayer: (name, type = 'raster') => {
+          const created = layerMgr.addLayer(type, undefined, name, undefined, true);
+          currentLayerId = created.id;
+          return created.id;
+        },
+        createFolder: (name) => {
+          const created = layerMgr.addLayer('folder', undefined, name, undefined, true);
+          currentLayerId = created.id;
+          return created.id;
+        },
+        createFrameFolder: (name) => {
+          const dpi = dimensions.dpi ?? 600;
+          const df = createDefaultPageFrame('', dimensions.width, dimensions.height, dpi, 15);
+          const { folder } = layerMgr.createFrameFolder([df], name, true);
+          currentLayerId = folder.id;
+          return folder.id;
+        },
+        duplicateLayer: (id) => layerMgr.duplicateLayer(id),
+        deleteLayer: (id) => layerMgr.deleteLayer(id),
+        renameLayer: (id, name) => layerMgr.renameLayer(id, name),
+        setBlendMode: (id, blendMode) => layerMgr.setBlendMode(id, blendMode),
+        setOpacity: (id, opacity) => layerMgr.setOpacity(id, opacity),
+        setVisibility: (id) => layerMgr.toggleVisibility(id),
+        setClipping: (id, clipped) => {
+          const existing = layerMgr.layers.find((l) => l.id === id);
+          if (clipped === undefined || Boolean(existing?.clipped) !== clipped) {
+            layerMgr.toggleClipping(id);
+          }
+        },
+        setAlphaLock: (id) => layerMgr.toggleAlphaLock(id),
+        setExpressionColor: (id, mode) => layerMgr.setLayerExpressionColor(id, mode),
+        setLayerColor: (id, enabled, color) => {
+          if (color) layerMgr.setLayerColor(id, color);
+          const existing = layerMgr.layers.find((l) => l.id === id);
+          if (Boolean(existing?.layerColorEnabled) !== enabled) {
+            layerMgr.toggleLayerColor(id);
+          }
+        },
+        setTone: (id, enabled, opts) => {
+          const existing = layerMgr.layers.find((l) => l.id === id);
+          if (Boolean(existing?.toneEnabled) !== enabled) {
+            layerMgr.toggleTone(id);
+          }
+          if (opts?.frequency !== undefined) layerMgr.setToneFrequency(id, opts.frequency);
+          if (opts?.density !== undefined) layerMgr.setToneDensity(id, opts.density);
+          if (opts?.angle !== undefined) layerMgr.setToneAngle(id, opts.angle);
+        },
+        fillLayer: (id, color) => {
+          const canvas = layerMgr.materializeLayerCanvas(id);
+          if (!canvas) return;
+          const c2d = canvas.getContext('2d');
+          if (!c2d) return;
+          if (!groupStartBefore) {
+            groupStartBefore = c2d.getImageData(0, 0, canvas.width, canvas.height);
+            groupTargetLayerId = id;
+          }
+          c2d.save();
+          c2d.fillStyle = color;
+          c2d.fillRect(0, 0, canvas.width, canvas.height);
+          c2d.restore();
+          activeTileGrid.ingestCanvas(id, canvas, 'color-32bit');
+          activeTileGrid.notifyChange(true);
+          layerMgr.updateLayerThumbnail(id, true);
+        },
+        clearLayer: (id) => {
+          activeTileGrid.clearLayer(id);
+          const canvas = layerMgr.layerCanvasesRef.current.get(id);
+          if (canvas) {
+            canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+          }
+          activeTileGrid.notifyChange(true);
+          layerMgr.updateLayerThumbnail(id, true);
+        },
+        mergeDown: () => {
+          layerMgr.mergeDown();
+        },
+        rasterizeLayer: (id) => {
+          layerMgr.rasterizeLayer(id);
+        },
+        applyFilter: (type, params) => {
+          tonalActions.handleApplyFilter(
+            type,
+            params as unknown as import('./hooks/useTonalAndFilterActions').AnyFilterParams
+          );
+        },
+        exportImage: () => {
+          docLifecycle.handleExportImage();
+        },
+        endHistoryGroup: (label) => {
+          const targetCanvas = groupTargetLayerId
+            ? layerMgr.layerCanvasesRef.current.get(groupTargetLayerId)
+            : null;
+          const afterImg =
+            groupStartBefore && targetCanvas
+              ? targetCanvas.getContext('2d')?.getImageData(0, 0, targetCanvas.width, targetCanvas.height) ?? null
+              : null;
+          drawing.pushHistoryStep(
+            'auto-action',
+            label,
+            groupStartBefore,
+            afterImg,
+            groupTargetLayerId || currentLayerId
+          );
+        },
+      };
+
+      try {
+        const res = await executeAutoAction(action, ctx);
+        if (res.errors.length > 0) {
+          showToast(`Auto Action "${action.name}" finished with ${res.errors.length} error(s)`);
+        } else {
+          showToast(`Played "${action.name}" (${res.executedSteps} steps)`);
+        }
+      } finally {
+        autoActionStoreActions.setIsPlaying(false);
+      }
+    },
+    [
+      hasOpenDocument,
+      layerMgr,
+      dimensions,
+      activeTileGrid,
+      tonalActions.handleApplyFilter,
+      docLifecycle.handleExportImage,
+      drawing.pushHistoryStep,
+      showToast,
+    ]
+  );
+
+  // Time-lapse recording reactive toggle & keyframe capture on committed history steps
+  const [isTimelapseRecording, setIsTimelapseRecording] = useState<boolean>(() =>
+    globalTimelapseManager.isRecording(activeDocumentId)
+  );
+  useEffect(() => {
+    setIsTimelapseRecording(globalTimelapseManager.isRecording(activeDocumentId));
+    return globalTimelapseManager.subscribe(() => {
+      setIsTimelapseRecording(globalTimelapseManager.isRecording(activeDocumentId));
+    });
+  }, [activeDocumentId]);
+
+  const handleCaptureTimelapseNow = useCallback(() => {
+    if (!activeDocumentId) return;
+    globalTimelapseManager
+      .captureKeyframe(activeDocumentId, layerMgr.layers, dimensions, activeTileGrid, true)
+      .catch(() => {});
+  }, [activeDocumentId, layerMgr.layers, dimensions, activeTileGrid]);
+
+  const handleToggleTimelapseRecording = useCallback(() => {
+    if (!activeDocumentId) return;
+    const next = globalTimelapseManager.toggleRecording(activeDocumentId);
+    if (next) {
+      globalTimelapseManager
+        .captureKeyframe(activeDocumentId, layerMgr.layers, dimensions, activeTileGrid, true)
+        .catch(() => {});
+      showToast('Time-lapse recording started');
+    } else {
+      showToast('Time-lapse recording paused');
+    }
+  }, [activeDocumentId, layerMgr.layers, dimensions, activeTileGrid, showToast]);
+
+  // Mark active document dirty & record time-lapse keyframe whenever a new history step is committed
   const lastHistoryMetaRef = useRef<{ docId: string | null; itemId: string | null }>({
     docId: null,
     itemId: null,
@@ -420,9 +690,14 @@ export function App() {
       drawing.historyIndex > 0
     ) {
       documentStoreActions.markDocumentDirty(activeDocumentId, true);
+      if (globalTimelapseManager.isRecording(activeDocumentId)) {
+        globalTimelapseManager
+          .captureKeyframe(activeDocumentId, layerMgr.layers, dimensions, activeTileGrid)
+          .catch(() => {});
+      }
     }
     lastHistoryMetaRef.current = { docId: activeDocumentId, itemId: currentItemId };
-  }, [activeDocumentId, drawing.historyList, drawing.historyIndex]);
+  }, [activeDocumentId, drawing.historyList, drawing.historyIndex, layerMgr.layers, dimensions, activeTileGrid]);
 
   // Unified Pointer Dispatcher reading tool imperatively from useToolStore
   const handlePointerDown = useCallback(
@@ -432,6 +707,15 @@ export function App() {
       const pt = getCanvasCoords(e);
 
       if (tool === 'brush' || tool === 'eraser') {
+        const curLayer = layerMgr.activeLayer;
+        if (curLayer?.type === 'text' || curLayer?.type === 'balloon') {
+          showToast('Use Text/Object tool to edit, or Rasterize Layer to paint directly');
+          return;
+        }
+        if (curLayer?.type === 'frame-folder') {
+          showToast('Select a child layer inside the Frame Border Folder to draw');
+          return;
+        }
         if (selectionTools.selection?.floating) {
           selectionTools.handleCommitFloatingSelection();
         }
@@ -528,19 +812,19 @@ export function App() {
     handleExpandSelection: selectionTools.handleExpandSelection,
     handleContractSelection: selectionTools.handleContractSelection,
     handleFeatherSelection: selectionTools.handleFeatherSelection,
-    handleAddLayer: collab.handleAddLayer,
+    handleAddLayer: handleRecordedAddLayer,
     handleOpenAdjustmentModal: tonalActions.handleOpenAdjustmentModal,
     addLayerMask: layerMgr.addLayerMask,
     removeLayerMask: layerMgr.removeLayerMask,
     toggleLayerMask: layerMgr.toggleLayerMask,
     toggleMaskLinked: layerMgr.toggleMaskLinked,
-    duplicateLayer: layerMgr.duplicateLayer,
+    duplicateLayer: handleRecordedDuplicateLayer,
     handleMergeDown,
     handleOpenLayerStylesModal: tonalActions.handleOpenLayerStylesModal,
     toggleLayerColor: layerMgr.toggleLayerColor,
     handleConvertLayer: tonalActions.handleConvertLayer,
     deleteLayer: layerMgr.deleteLayer,
-    handleApplyFilter: tonalActions.handleApplyFilter,
+    handleApplyFilter: handleRecordedApplyFilter,
     zoomIn: nav.zoomIn,
     zoomOut: nav.zoomOut,
     resetZoomAndCenter: nav.resetZoomAndCenter,
@@ -550,6 +834,10 @@ export function App() {
     resetViewFlip: nav.resetViewFlip,
     handleUpdateAnimationTimeline,
     handleAddAnimationCel,
+    handleAddDefaultFrameFolder,
+    handleRasterizeLayer,
+    isTimelapseRecording,
+    handleToggleTimelapseRecording,
     showToast,
   });
 
@@ -623,6 +911,7 @@ export function App() {
       setActiveBalloon: shapeFillTools.setActiveBalloon,
       onConfirmBalloon: shapeFillTools.handleConfirmBalloon,
       onDeleteBalloon: shapeFillTools.handleDeleteBalloon,
+      frameDragPreview: shapeFillTools.frameDragPreview,
       animationTimeline: activeAnimationTimeline,
       onUpdateAnimationTimeline: handleUpdateAnimationTimeline,
       onAddAnimationCel: handleAddAnimationCel,
@@ -662,6 +951,7 @@ export function App() {
       shapeFillTools.setActiveBalloon,
       shapeFillTools.handleConfirmBalloon,
       shapeFillTools.handleDeleteBalloon,
+      shapeFillTools.frameDragPreview,
       shapeFillTools.handleSampleColor,
       handleUndo,
       drawing.redo,
@@ -720,15 +1010,15 @@ export function App() {
       toggleLayerSelection={layerMgr.toggleLayerSelection}
       handleGroupSelectedLayers={collab.handleGroupSelectedLayers}
       handleDeleteSelectedLayers={collab.handleDeleteSelectedLayers}
-      handleAddLayer={collab.handleAddLayer}
-      duplicateLayer={layerMgr.duplicateLayer}
+      handleAddLayer={handleRecordedAddLayer}
+      duplicateLayer={handleRecordedDuplicateLayer}
       handleDeleteLayer={collab.handleDeleteLayer}
       handleToggleVisibility={collab.handleToggleVisibility}
-      handleSetOpacity={collab.handleSetOpacity}
-      setBlendMode={layerMgr.setBlendMode}
+      handleSetOpacity={handleRecordedSetOpacity}
+      setBlendMode={handleRecordedSetBlendMode}
       toggleLock={layerMgr.toggleLock}
       toggleAlphaLock={layerMgr.toggleAlphaLock}
-      toggleClipping={layerMgr.toggleClipping}
+      toggleClipping={handleRecordedToggleClipping}
       toggleCollapse={layerMgr.toggleCollapse}
       handleRenameLayer={collab.handleRenameLayer}
       moveLayer={layerMgr.moveLayer}
@@ -744,7 +1034,7 @@ export function App() {
       toggleLayerColor={layerMgr.toggleLayerColor}
       setLayerColor={layerMgr.setLayerColor}
       setLayerSubColor={layerMgr.setLayerSubColor}
-      setLayerExpressionColor={layerMgr.setLayerExpressionColor}
+      setLayerExpressionColor={handleRecordedSetExpressionColor}
       setLayerMonoThreshold={layerMgr.setLayerMonoThreshold}
       setLayerMonoExpressMode={layerMgr.setLayerMonoExpressMode}
       handleApplyExpressionColor={tonalActions.handleApplyExpressionColor}
@@ -755,6 +1045,9 @@ export function App() {
       toggleMaskLinked={layerMgr.toggleMaskLinked}
       handleOpenAdjustmentModal={tonalActions.handleOpenAdjustmentModal}
       handleOpenLayerStylesModal={tonalActions.handleOpenLayerStylesModal}
+      onEditVectorLayer={shapeFillTools.openLayerForEditing}
+      onRasterizeLayer={handleRasterizeLayer}
+      onPlayAutoAction={handlePlayAutoAction}
     >
       <DocumentLifecycleManager
         layers={layerMgr.layers}
@@ -848,6 +1141,7 @@ export function App() {
         webLandingInvite={collab.webLandingInvite}
         setWebLandingInvite={collab.setWebLandingInvite}
         joinRoom={collab.joinRoom}
+        onCaptureTimelapseNow={handleCaptureTimelapseNow}
         showToast={showToast}
       />
     </AppShell>

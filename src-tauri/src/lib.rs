@@ -1,6 +1,7 @@
 mod server;
 mod recovery;
 mod scratch_disk;
+mod timelapse;
 
 use server::{start_embedded_server, stop_embedded_server, get_server_status, get_local_ip, ServerInfo};
 
@@ -230,6 +231,47 @@ async fn scratch_disk_clear(session_id: String) -> Result<(), String> {
     scratch_disk::clear_scratch_disk(&session_id).await
 }
 
+#[tauri::command]
+async fn timelapse_write_frame(
+    session_id: String,
+    frame_index: u32,
+    ext: String,
+    data: Vec<u8>,
+) -> Result<(), String> {
+    timelapse::write_frame(&session_id, frame_index, &ext, data).await
+}
+
+#[tauri::command]
+async fn timelapse_read_frame(
+    session_id: String,
+    frame_index: u32,
+    ext: String,
+) -> Result<Vec<u8>, String> {
+    timelapse::read_frame(&session_id, frame_index, &ext).await
+}
+
+#[tauri::command]
+async fn timelapse_clear(session_id: String) -> Result<(), String> {
+    timelapse::clear_session(&session_id).await
+}
+
+#[tauri::command]
+async fn timelapse_check_ffmpeg() -> bool {
+    timelapse::check_ffmpeg().await
+}
+
+#[tauri::command]
+async fn timelapse_export_ffmpeg(
+    session_id: String,
+    frame_indices: Vec<u32>,
+    ext: String,
+    fps: u32,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, String> {
+    timelapse::export_ffmpeg(&session_id, frame_indices, &ext, fps, width, height).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -253,7 +295,12 @@ pub fn run() {
             scratch_disk_init,
             scratch_disk_write_tiles,
             scratch_disk_read_tile,
-            scratch_disk_clear
+            scratch_disk_clear,
+            timelapse_write_frame,
+            timelapse_read_frame,
+            timelapse_clear,
+            timelapse_check_ffmpeg,
+            timelapse_export_ffmpeg
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

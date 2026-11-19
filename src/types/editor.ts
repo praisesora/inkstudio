@@ -14,6 +14,7 @@ export type ToolType =
   | 'text'
   | 'frame'
   | 'balloon'
+  | 'object'
   | 'vector-edit'
   | 'liquify';
 
@@ -354,6 +355,7 @@ export type HistoryActionType =
   | 'transform'
   | 'fill'
   | 'text'
+  | 'balloon'
   | 'frame'
   | 'screentone'
   | 'selection-move'
@@ -362,7 +364,8 @@ export type HistoryActionType =
   | 'expression-color'
   | 'layer-convert'
   | 'liquify'
-  | 'filter';
+  | 'filter'
+  | 'auto-action';
 
 export type LiquifyMode =
   | 'push'
@@ -396,6 +399,7 @@ export interface TextSettings {
   text: string;
   fontFamily: string;
   fontSize: number;
+  lineSpacing?: number; // lineHeightRatio, default 1.25 (horizontal) / 1.4 (vertical)
   bold: boolean;
   italic: boolean;
   align: 'left' | 'center' | 'right';
@@ -404,6 +408,11 @@ export interface TextSettings {
   outlineWidth: number;
   color: string;
   writingMode?: 'horizontal-tb' | 'vertical-rl';
+}
+
+export interface TextLayerData extends TextSettings {
+  x: number;
+  y: number;
 }
 
 export interface SpeechBalloonTail {
@@ -424,6 +433,8 @@ export interface SpeechBalloon {
   text: string;
   fontFamily: string;
   fontSize: number;
+  lineSpacing?: number;
+  textColor?: string;
   vertical: boolean;
 }
 
@@ -456,10 +467,18 @@ export interface VectorEditSettings {
   simplifyTolerance: number;
 }
 
+export type FrameToolMode = 'create' | 'divide';
+export type FrameDivideMode = 'same-folder' | 'split-folders';
+
 export interface FrameSettings {
+  mode?: FrameToolMode;
+  divideMode?: FrameDivideMode;
   thickness: number; // 1 - 100
   fillBackground: boolean;
   fillColor: string;
+  strokeColor?: string;
+  gutterVerticalMm?: number;
+  gutterHorizontalMm?: number;
 }
 
 export interface WandSettings {
@@ -584,6 +603,9 @@ export interface ComicFrame {
   gutterVertical: number;
   gutterHorizontal: number;
   clipChildren: boolean;
+  fillBackground?: boolean;
+  fillColor?: string;
+  strokeColor?: string;
 }
 
 export interface TileDelta {
@@ -693,10 +715,20 @@ export interface LayerStyles {
   outerGlow?: LayerStyleOuterGlow;
 }
 
+export type LayerType =
+  | 'raster'
+  | 'folder'
+  | 'frame-folder'
+  | 'vector'
+  | 'frame'
+  | 'adjustment'
+  | 'text'
+  | 'balloon';
+
 export interface LayerItem {
   id: string;
   name: string;
-  type: 'raster' | 'folder' | 'vector' | 'frame' | 'adjustment';
+  type: LayerType;
   visible: boolean;
   opacity: number; // 0.0 to 1.0
   blendMode: BlendMode;
@@ -735,13 +767,31 @@ export interface LayerItem {
   styles?: LayerStyles;
   // Vector Layer Data
   vectorStrokes?: VectorStroke[];
-  // Comic Frame Data
+  // Comic Frame Data (for 'frame-folder' and legacy 'frame')
   comicFrames?: ComicFrame[];
-  // Speech Balloon Data
+  // Non-destructive Text Layer Data
+  textData?: TextLayerData;
+  // Non-destructive Speech Balloon Data
+  balloonData?: SpeechBalloon;
+  // Legacy Speech Balloon array
   balloons?: SpeechBalloon[];
   // Collaborative Layer Soft-Locking
   reservedByPeerId?: string | number;
   reservedByPeerName?: string;
+}
+
+export function isFolderLikeLayer(layer: Pick<LayerItem, 'type'> | null | undefined): boolean {
+  return layer?.type === 'folder' || layer?.type === 'frame-folder';
+}
+
+export function hasTileBackedLayer(layer: Pick<LayerItem, 'type'> | null | undefined): boolean {
+  return (
+    layer?.type === 'raster' ||
+    layer?.type === 'vector' ||
+    layer?.type === 'frame' ||
+    layer?.type === 'text' ||
+    layer?.type === 'balloon'
+  );
 }
 
 export type Layer = LayerItem;

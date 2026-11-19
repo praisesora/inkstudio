@@ -129,6 +129,7 @@ const createInitialToolState = (): ToolStoreState => {
       text: '',
       fontFamily: "'Neucha', 'Anime Ace', 'Comic Sans MS', sans-serif",
       fontSize: 28,
+      lineSpacing: 1.25,
       bold: false,
       italic: false,
       align: 'center',
@@ -138,9 +139,14 @@ const createInitialToolState = (): ToolStoreState => {
       color: '#000000',
     },
     frameSettings: {
+      mode: 'create',
+      divideMode: 'same-folder',
       thickness: 4,
       fillBackground: true,
       fillColor: '#ffffff',
+      strokeColor: '#000000',
+      gutterVerticalMm: 3.0,
+      gutterHorizontalMm: 5.0,
     },
     balloonSettings: {
       shape: 'ellipse',

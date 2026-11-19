@@ -1,5 +1,23 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { LayerItem, BlendMode, CanvasDimensions, CanvasColorMode, LoadedDocument, ExpressionColor, CanvasSelection, DirtyRect, AdjustmentLayerData, LayerStyles } from '../types/editor';
+import {
+  LayerItem,
+  LayerType,
+  BlendMode,
+  CanvasDimensions,
+  CanvasColorMode,
+  LoadedDocument,
+  ExpressionColor,
+  CanvasSelection,
+  DirtyRect,
+  AdjustmentLayerData,
+  LayerStyles,
+  TextLayerData,
+  SpeechBalloon,
+  ComicFrame,
+  FrameDivideMode,
+  isFolderLikeLayer,
+  hasTileBackedLayer,
+} from '../types/editor';
 import { ResizeCanvasOptions } from '../types/settings';
 import { createCanvasThumbnail, get2DContext, getCanvasCompositeOperation } from '../utils/canvasUtils';
 import { applyLayerEffects, applyExpressionColorToImageData } from '../utils/layerEffectsEngine';
@@ -7,6 +25,8 @@ import { HalftoneDotShape } from '../utils/screentoneEngine';
 import { SparseTileGrid, globalTileGrid, releaseTemporaryCanvas } from '../utils/tileEngine';
 import { documentStore } from '../utils/documentStore';
 import { recoveryService } from '../services/recoveryService';
+import { divideFramesInFolder, Point2D } from '../utils/frameEngine';
+import { syncVectorObjectLayerToGrid } from '../utils/vectorLayerRenderer';
 
 interface UseLayerManagerProps {
   dimensions: CanvasDimensions;
@@ -125,7 +145,7 @@ export function computeBatchDeleteLayers(
     for (const l of layers) {
       if (l.parentId === parentId) {
         allToDelete.add(l.id);
-        if (l.type === 'folder') collectDescendants(l.id);
+        if (isFolderLikeLayer(l)) collectDescendants(l.id);
       }
     }
   };
@@ -133,7 +153,7 @@ export function computeBatchDeleteLayers(
   for (const id of targetSet) {
     allToDelete.add(id);
     const item = layers.find((l) => l.id === id);
-    if (item?.type === 'folder') {
+    if (isFolderLikeLayer(item)) {
       collectDescendants(id);
     }
   }
@@ -209,13 +229,13 @@ export function computeGroupLayers(
     for (const l of layers) {
       if (l.parentId === parentId) {
         movingIds.add(l.id);
-        if (l.type === 'folder') getDescendants(l.id);
+        if (isFolderLikeLayer(l)) getDescendants(l.id);
       }
     }
   };
   for (const item of selectedItems) {
     movingIds.add(item.id);
-    if (item.type === 'folder') getDescendants(item.id);
+    if (isFolderLikeLayer(item)) getDescendants(item.id);
   }
 
   const movingItems = layers
@@ -272,7 +292,7 @@ export function computeBatchReorderLayers(
   for (const id of rootIds) {
     movingIds.add(id);
     const item = layers.find((l) => l.id === id);
-    if (item?.type === 'folder') {
+    if (isFolderLikeLayer(item)) {
       getDescendantIds(id).forEach((descId) => movingIds.add(descId));
     }
   }
@@ -285,7 +305,7 @@ export function computeBatchReorderLayers(
     currCheck = layers.find((l) => l.id === currCheck?.parentId);
   }
 
-  const newParentId = (position === 'inside' && targetItem.type === 'folder')
+  const newParentId = (position === 'inside' && isFolderLikeLayer(targetItem))
     ? targetItem.id
     : targetItem.parentId;
 
@@ -614,10 +634,10 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     }
   }, [_dimensions]);
 
-  // Add a new raster layer, folder, or adjustment layer
+  // Add a new raster layer, folder, frame-folder, text, balloon, or adjustment layer
   const addLayer = useCallback(
     (
-      type: 'raster' | 'folder' | 'vector' | 'frame' | 'adjustment' = 'raster',
+      type: LayerType = 'raster',
       explicitParentId?: string | null,
       customName?: string,
       customId?: string,
@@ -632,7 +652,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       if (explicitParentId !== undefined) {
         initialParentId = explicitParentId;
       } else if (currentActiveLayer) {
-        initialParentId = currentActiveLayer.type === 'folder' ? currentActiveLayer.id : currentActiveLayer.parentId;
+        initialParentId = isFolderLikeLayer(currentActiveLayer) ? currentActiveLayer.id : currentActiveLayer.parentId;
       }
 
       const resolveLayerName = (list: LayerItem[]) => {
@@ -640,8 +660,11 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
         let count = 1;
         const prefix =
           type === 'folder' ? 'Folder ' :
+          type === 'frame-folder' ? 'Frame ' :
           type === 'vector' ? 'Vector ' :
           type === 'frame' ? 'Frame ' :
+          type === 'text' ? 'Text ' :
+          type === 'balloon' ? 'Balloon ' :
           type === 'adjustment' ? 'Adjustment ' : 'Layer ';
         list.forEach((l) => {
           if (l.type === type && l.name.startsWith(prefix)) {
@@ -685,7 +708,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
         if (explicitParentId !== undefined) {
           parentId = explicitParentId;
         } else if (activeLayer) {
-          parentId = activeLayer.type === 'folder' ? activeLayer.id : activeLayer.parentId;
+          parentId = isFolderLikeLayer(activeLayer) ? activeLayer.id : activeLayer.parentId;
         }
 
         const newLayer: LayerItem = {
@@ -701,7 +724,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
         return nextLayers;
       });
 
-      if (type === 'raster' || type === 'vector' || type === 'frame') {
+      if (hasTileBackedLayer({ type })) {
         const grid = activeTileGridRef.current;
         const isMono = createdLayer.expressionColor === 'monochrome';
         grid.setLayerFormat(id, isMono ? 'monochrome-1bit' : 'color-32bit');
@@ -841,7 +864,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       const cloneSingleLayer = (source: LayerItem, newParentId: string | null, nameSuffix: string = ' Copy'): LayerItem => {
         const newId = `${source.type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
-        if (source.type === 'raster' || source.type === 'vector' || source.type === 'frame') {
+        if (hasTileBackedLayer(source)) {
           grid.cloneLayer(source.id, newId);
 
           const srcSource = layerSourceCanvasesRef.current.get(source.id);
@@ -876,6 +899,8 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
           maskVersion: source.maskCanvas ? 1 : undefined,
           vectorStrokes: source.vectorStrokes ? JSON.parse(JSON.stringify(source.vectorStrokes)) : undefined,
           comicFrames: source.comicFrames ? JSON.parse(JSON.stringify(source.comicFrames)) : undefined,
+          textData: source.textData ? JSON.parse(JSON.stringify(source.textData)) : undefined,
+          balloonData: source.balloonData ? JSON.parse(JSON.stringify(source.balloonData)) : undefined,
           balloons: source.balloons ? JSON.parse(JSON.stringify(source.balloons)) : undefined,
           adjustmentData: source.adjustmentData ? JSON.parse(JSON.stringify(source.adjustmentData)) : undefined,
           styles: source.styles ? JSON.parse(JSON.stringify(source.styles)) : undefined,
@@ -883,7 +908,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       };
 
       const source = prev[sourceIdx];
-      if (source.type !== 'folder') {
+      if (!isFolderLikeLayer(source)) {
         const newLayer = cloneSingleLayer(source, source.parentId, ' Copy');
         const nextLayers = [...prev];
         nextLayers.splice(sourceIdx, 0, newLayer);
@@ -891,14 +916,14 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
         return nextLayers;
       }
 
-      // Recursively duplicate folder and all nested descendants in stack order
+      // Recursively duplicate folder or frame-folder and all nested descendants in stack order
       const clonedItems: LayerItem[] = [];
       const cloneFolderSubtree = (folder: LayerItem, targetParentId: string | null, isRootFolder: boolean) => {
         const folderCopy = cloneSingleLayer(folder, targetParentId, isRootFolder ? ' Copy' : '');
         clonedItems.push(folderCopy);
         const directChildren = prev.filter((l) => l.parentId === folder.id);
         for (const child of directChildren) {
-          if (child.type === 'folder') {
+          if (isFolderLikeLayer(child)) {
             cloneFolderSubtree(child, folderCopy.id, false);
           } else {
             clonedItems.push(cloneSingleLayer(child, folderCopy.id, ' Copy'));
@@ -1826,7 +1851,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       if (!item || item.id === targetFolderId) return prev;
 
       // If moving a folder into itself, ignore
-      if (item.type === 'folder' && targetFolderId) {
+      if (isFolderLikeLayer(item) && targetFolderId) {
         let curr: LayerItem | undefined = prev.find((l) => l.id === targetFolderId);
         while (curr) {
           if (curr.id === id) return prev;
@@ -1866,7 +1891,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       for (const id of selectedIds) {
         movingIds.add(id);
         const item = prev.find((l) => l.id === id);
-        if (item?.type === 'folder') {
+        if (isFolderLikeLayer(item)) {
           getDescendantIds(id).forEach((descId) => movingIds.add(descId));
         }
       }
@@ -2207,7 +2232,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       layerSourceCanvasesRef.current.clear();
 
       for (const l of doc.layers) {
-        if (l.type === 'raster' || l.type === 'vector' || l.type === 'frame') {
+        if (hasTileBackedLayer(l)) {
           const isMono = l.expressionColor === 'monochrome';
           grid.setLayerFormat(l.id, isMono ? 'monochrome-1bit' : 'color-32bit');
           grid.markLayerIngested(l.id);
@@ -2798,10 +2823,249 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
   const updateLayerStyles = useCallback((id: string, styles: LayerStyles) => {
     setLayers((prev) => {
       const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
+      if (!target || isFolderLikeLayer(target)) return prev;
       return prev.map((l) => (l.id === id ? { ...l, styles } : l));
     });
   }, []);
+
+  // Create or update a non-destructive Vector Text Layer (re-renders crisply into tileGrid)
+  const upsertTextLayer = useCallback(
+    (textData: TextLayerData, editingLayerId?: string | null): LayerItem => {
+      const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
+      const snippet = textData.text.trim().replace(/\s+/g, ' ').slice(0, 22) || 'Text';
+
+      if (editingLayerId) {
+        const existing = layersRef.current.find((l) => l.id === editingLayerId);
+        if (existing && existing.type === 'text') {
+          const updated: LayerItem = {
+            ...existing,
+            name: snippet,
+            textData: { ...textData },
+          };
+          setLayers((prev) => {
+            const next = prev.map((l) => (l.id === editingLayerId ? updated : l));
+            layersRef.current = next;
+            return next;
+          });
+          syncVectorObjectLayerToGrid(updated, dims, grid, layerCanvasesRef.current);
+          updateLayerThumbnail(editingLayerId, true);
+          return updated;
+        }
+      }
+
+      const created = addLayer('text', undefined, snippet, undefined, true);
+      const withData: LayerItem = {
+        ...created,
+        textData: { ...textData },
+      };
+      setLayers((prev) => {
+        const next = prev.map((l) => (l.id === created.id ? { ...l, textData: { ...textData } } : l));
+        layersRef.current = next;
+        return next;
+      });
+      syncVectorObjectLayerToGrid(withData, dims, grid, layerCanvasesRef.current);
+      updateLayerThumbnail(created.id, true);
+      return withData;
+    },
+    [addLayer, updateLayerThumbnail]
+  );
+
+  // Create or update a non-destructive Speech Balloon Layer (re-renders crisply into tileGrid)
+  const upsertBalloonLayer = useCallback(
+    (balloonData: SpeechBalloon, editingLayerId?: string | null): LayerItem => {
+      const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
+      const clonedBalloon: SpeechBalloon = JSON.parse(JSON.stringify(balloonData));
+      const snippet = clonedBalloon.text.trim().replace(/\s+/g, ' ').slice(0, 18);
+      const label = snippet ? `Balloon: ${snippet}` : undefined;
+
+      if (editingLayerId) {
+        const existing = layersRef.current.find((l) => l.id === editingLayerId);
+        if (existing && existing.type === 'balloon') {
+          const updated: LayerItem = {
+            ...existing,
+            name: label || existing.name,
+            balloonData: clonedBalloon,
+          };
+          setLayers((prev) => {
+            const next = prev.map((l) => (l.id === editingLayerId ? updated : l));
+            layersRef.current = next;
+            return next;
+          });
+          syncVectorObjectLayerToGrid(updated, dims, grid, layerCanvasesRef.current);
+          updateLayerThumbnail(editingLayerId, true);
+          return updated;
+        }
+      }
+
+      const created = addLayer('balloon', undefined, label, undefined, true);
+      const withData: LayerItem = {
+        ...created,
+        balloonData: clonedBalloon,
+      };
+      setLayers((prev) => {
+        const next = prev.map((l) => (l.id === created.id ? { ...l, balloonData: clonedBalloon } : l));
+        layersRef.current = next;
+        return next;
+      });
+      syncVectorObjectLayerToGrid(withData, dims, grid, layerCanvasesRef.current);
+      updateLayerThumbnail(created.id, true);
+      return withData;
+    },
+    [addLayer, updateLayerThumbnail]
+  );
+
+  // Create a true Manga Frame Border Folder with auto-clipping & initial child raster layer
+  const createFrameFolder = useCallback(
+    (
+      frames: ComicFrame[],
+      customName?: string,
+      addInitialChildLayer = true
+    ): { folder: LayerItem; childLayer: LayerItem | null } => {
+      const folder = addLayer('frame-folder', null, customName, undefined, !addInitialChildLayer);
+      const normalizedFrames = frames.map((f) => ({
+        ...f,
+        layerId: folder.id,
+        clipChildren: f.clipChildren !== false,
+      }));
+      const updatedFolder: LayerItem = {
+        ...folder,
+        comicFrames: normalizedFrames,
+      };
+      setLayers((prev) => {
+        const next = prev.map((l) =>
+          l.id === folder.id ? { ...l, comicFrames: normalizedFrames } : l
+        );
+        layersRef.current = next;
+        return next;
+      });
+
+      let childLayer: LayerItem | null = null;
+      if (addInitialChildLayer) {
+        childLayer = addLayer('raster', folder.id, 'Panel Layer', undefined, true);
+      }
+
+      activeTileGridRef.current.notifyChange(true);
+      return { folder: updatedFolder, childLayer };
+    },
+    [addLayer]
+  );
+
+  // Divide a Frame Border Folder along a cut line (single folder split polygons or 2 independent folders)
+  const divideFrameFolder = useCallback(
+    (
+      folderId: string,
+      cutStart: Point2D,
+      cutEnd: Point2D,
+      dpi = 600,
+      mode: FrameDivideMode = 'same-folder'
+    ): boolean => {
+      const current = layersRef.current;
+      const folderIdx = current.findIndex((l) => l.id === folderId && l.type === 'frame-folder');
+      if (folderIdx < 0) return false;
+      const folder = current[folderIdx];
+      const frames = folder.comicFrames || [];
+      if (frames.length === 0) return false;
+
+      const result = divideFramesInFolder(frames, cutStart, cutEnd, dpi, mode);
+      if (!result.divided) return false;
+
+      const grid = activeTileGridRef.current;
+
+      if (mode === 'same-folder' || result.folderGroups.length < 2) {
+        const nextFrames = result.frames.map((f) => ({ ...f, layerId: folder.id }));
+        setLayers((prev) => {
+          const next = prev.map((l) =>
+            l.id === folder.id ? { ...l, comicFrames: nextFrames } : l
+          );
+          layersRef.current = next;
+          return next;
+        });
+        grid.notifyChange(true);
+        return true;
+      }
+
+      // Split into 2 independent frame folders, cloning child layers into the 2nd folder so artwork stays intact
+      const [group1, group2] = result.folderGroups;
+      const newFolderId = `frame-folder-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const updatedFolder1: LayerItem = {
+        ...folder,
+        comicFrames: group1.map((f) => ({ ...f, layerId: folder.id })),
+      };
+      const newFolder2: LayerItem = {
+        ...folder,
+        id: newFolderId,
+        name: `${folder.name} B`,
+        comicFrames: group2.map((f) => ({ ...f, layerId: newFolderId })),
+      };
+
+      const directChildren = current.filter((l) => l.parentId === folder.id);
+      const clonedChildren: LayerItem[] = directChildren.map((child) => {
+        const cloneId = `${child.type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        if (hasTileBackedLayer(child)) {
+          grid.cloneLayer(child.id, cloneId);
+        }
+        return {
+          ...child,
+          id: cloneId,
+          parentId: newFolderId,
+          textData: child.textData ? JSON.parse(JSON.stringify(child.textData)) : undefined,
+          balloonData: child.balloonData ? JSON.parse(JSON.stringify(child.balloonData)) : undefined,
+          vectorStrokes: child.vectorStrokes ? JSON.parse(JSON.stringify(child.vectorStrokes)) : undefined,
+        };
+      });
+
+      setLayers((prev) => {
+        const idx = prev.findIndex((l) => l.id === folder.id);
+        if (idx < 0) return prev;
+        const next = prev.map((l) => (l.id === folder.id ? updatedFolder1 : l));
+        next.splice(idx, 0, newFolder2, ...clonedChildren);
+        layersRef.current = next;
+        return next;
+      });
+
+      grid.notifyChange(true);
+      return true;
+    },
+    []
+  );
+
+  // Rasterize a non-destructive text, balloon, or vector layer into a standard raster layer
+  const rasterizeLayer = useCallback(
+    (id: string): boolean => {
+      const target = layersRef.current.find((l) => l.id === id);
+      if (!target) return false;
+      if (target.type !== 'text' && target.type !== 'balloon' && target.type !== 'vector') {
+        return false;
+      }
+
+      const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
+
+      if (target.type === 'text' || target.type === 'balloon') {
+        syncVectorObjectLayerToGrid(target, dims, grid, layerCanvasesRef.current);
+      }
+
+      setLayers((prev) => {
+        const next = prev.map((l) => {
+          if (l.id !== id) return l;
+          const { textData: _td, balloonData: _bd, vectorStrokes: _vs, ...rest } = l;
+          return {
+            ...rest,
+            type: 'raster' as const,
+          };
+        });
+        layersRef.current = next;
+        return next;
+      });
+
+      updateLayerThumbnail(id, true);
+      grid.notifyChange(true);
+      return true;
+    },
+    [updateLayerThumbnail]
+  );
 
   return {
     layers,
@@ -2879,6 +3143,11 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     addAdjustmentLayer,
     updateAdjustmentData,
     updateLayerStyles,
+    upsertTextLayer,
+    upsertBalloonLayer,
+    createFrameFolder,
+    divideFrameFolder,
+    rasterizeLayer,
   };
 }
 

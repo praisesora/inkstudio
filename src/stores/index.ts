@@ -25,3 +25,6 @@ export type { WorkspaceStoreState } from './useWorkspaceStore';
 
 export { useSubViewStore, subViewStoreActions } from './useSubViewStore';
 export type { SubViewStoreState, SubViewImageItem, SubViewTransform } from './useSubViewStore';
+
+export { useAutoActionStore, autoActionStoreActions } from './useAutoActionStore';
+export type { AutoActionStoreState } from './useAutoActionStore';

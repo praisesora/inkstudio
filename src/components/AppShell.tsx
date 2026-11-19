@@ -19,7 +19,8 @@ import {
   resolveModernAccentColor,
 } from '../types/settings';
 import { CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
-import { TextPlacementSession } from '../hooks/drawing/useShapeAndFillTools';
+import { TextPlacementSession, FrameDragPreview } from '../hooks/drawing/useShapeAndFillTools';
+import { AutoAction } from '../utils/autoActionEngine';
 import {
   documentStoreActions,
   selectHasOpenDocument,
@@ -107,6 +108,7 @@ interface CanvasAreaContainerProps {
   setActiveBalloon: React.Dispatch<React.SetStateAction<SpeechBalloon | null>>;
   onConfirmBalloon: () => void;
   onDeleteBalloon: () => void;
+  frameDragPreview?: FrameDragPreview | null;
   animationTimeline: AnimationTimeline | null;
   onUpdateAnimationTimeline: (timeline: AnimationTimeline | null) => void;
   onAddAnimationCel: (frameIndex: number) => void;
@@ -267,6 +269,7 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       onUpdateBalloon={handleUpdateBalloon}
       onConfirmBalloon={props.onConfirmBalloon}
       onDeleteBalloon={props.onDeleteBalloon}
+      frameDragPreview={props.frameDragPreview}
       animationTimeline={props.animationTimeline}
       onUpdateAnimationTimeline={props.onUpdateAnimationTimeline}
       onAddAnimationCel={props.onAddAnimationCel}
@@ -407,6 +410,9 @@ export interface AppShellProps {
     initialType?: 'curves' | 'gradient-map' | 'levels' | 'color-balance'
   ) => void;
   handleOpenLayerStylesModal: (layerId?: string) => void;
+  onEditVectorLayer?: (layer: LayerItem) => void;
+  onRasterizeLayer?: (layerId: string) => void;
+  onPlayAutoAction?: (action: AutoAction) => void;
   children?: React.ReactNode;
 }
 
@@ -493,6 +499,9 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     toggleMaskLinked,
     handleOpenAdjustmentModal,
     handleOpenLayerStylesModal,
+    onEditVectorLayer,
+    onRasterizeLayer,
+    onPlayAutoAction,
     children,
   }) => {
     const dimensions = useDocumentStore((s) => s.dimensions);
@@ -763,6 +772,8 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         onToggleMaskLinked: toggleMaskLinked,
         onOpenAdjustmentModal: handleOpenAdjustmentModal,
         onOpenLayerStylesModal: handleOpenLayerStylesModal,
+        onEditVectorLayer,
+        onRasterizeLayer,
       }),
       [
         hasOpenDocument,
@@ -820,7 +831,21 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         toggleMaskLinked,
         handleOpenAdjustmentModal,
         handleOpenLayerStylesModal,
+        onEditVectorLayer,
+        onRasterizeLayer,
       ]
+    );
+
+    const autoActionProps = useMemo(
+      () =>
+        onPlayAutoAction
+          ? {
+              hasOpenDocument,
+              onPlayAction: onPlayAutoAction,
+              showToast,
+            }
+          : undefined,
+      [hasOpenDocument, onPlayAutoAction, showToast]
     );
 
     return (
@@ -916,6 +941,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
               onToggleTransparentColor={handleToggleTransparentColor}
               layerSidebarProps={layerSidebarProps}
               navigatorProps={navigatorProps}
+              autoActionProps={autoActionProps}
             >
               {showDocumentTabs && (
                 <DocumentTabBar

@@ -3,8 +3,11 @@ import {
   CanvasColorMode,
   CanvasDimensions,
   CanvasSelection,
+  ComicFrame,
+  FrameDivideMode,
   LayerItem,
   SpeechBalloon,
+  TextLayerData,
   TextSettings,
 } from '../../types/editor';
 import { documentStore } from '../../utils/documentStore';
@@ -18,8 +21,16 @@ import { applyLiquifyStep, createLiquifySelectionMask, DirtyRect } from '../../u
 import { applyLayerEffects } from '../../utils/layerEffectsEngine';
 import { createSelectionMask } from '../../utils/tonalEngine';
 import { get2DContext, sampleCompositedColor } from '../../utils/canvasUtils';
-import { renderMangaTextToCanvas } from '../../utils/mangaTextEngine';
-import { createDefaultSpeechBalloon, renderSpeechBalloon } from '../../utils/balloonEngine';
+import { createDefaultSpeechBalloon } from '../../utils/balloonEngine';
+import {
+  createRectFrame,
+  doesCutSegmentCrossFrame,
+  MANGA_GUTTER_HORIZONTAL_MM,
+  MANGA_GUTTER_VERTICAL_MM,
+  mmToPixels,
+  Point2D,
+} from '../../utils/frameEngine';
+import { hitTestEditableVectorLayer } from '../../utils/vectorLayerRenderer';
 import { useToolStore, toolStoreActions } from '../../stores';
 import { PushHistoryStepFn } from './types';
 
@@ -27,6 +38,13 @@ export interface TextPlacementSession {
   x: number;
   y: number;
   settings: TextSettings;
+  editingLayerId?: string | null;
+}
+
+export interface FrameDragPreview {
+  mode: 'create' | 'divide';
+  start: Point2D;
+  end: Point2D;
 }
 
 export interface UseShapeAndFillToolsParams {
@@ -42,8 +60,25 @@ export interface UseShapeAndFillToolsParams {
   getEffectiveOpacity: (layer: LayerItem) => number;
   getActiveCanvas: () => HTMLCanvasElement | null;
   getCanvasCoords: (e: React.PointerEvent<HTMLElement> | PointerEvent) => { x: number; y: number };
+  setActiveLayerId: (id: string) => void;
+  upsertTextLayer: (textData: TextLayerData, editingLayerId?: string | null) => LayerItem;
+  upsertBalloonLayer: (balloonData: SpeechBalloon, editingLayerId?: string | null) => LayerItem;
+  createFrameFolder: (
+    frames: ComicFrame[],
+    customName?: string,
+    addInitialChildLayer?: boolean
+  ) => { folder: LayerItem; childLayer: LayerItem | null };
+  divideFrameFolder: (
+    folderId: string,
+    cutStart: Point2D,
+    cutEnd: Point2D,
+    dpi?: number,
+    mode?: FrameDivideMode
+  ) => boolean;
+  deleteLayer?: (id: string) => void;
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   pushHistoryStep: PushHistoryStepFn;
+  showToast?: (msg: string) => void;
 }
 
 export interface UseShapeAndFillToolsResult {
@@ -51,6 +86,8 @@ export interface UseShapeAndFillToolsResult {
   setTextSession: React.Dispatch<React.SetStateAction<TextPlacementSession | null>>;
   activeBalloon: SpeechBalloon | null;
   setActiveBalloon: React.Dispatch<React.SetStateAction<SpeechBalloon | null>>;
+  frameDragPreview: FrameDragPreview | null;
+  openLayerForEditing: (layer: LayerItem) => boolean;
   isPipetteSamplingRef: React.MutableRefObject<boolean>;
   handleSampleColor: (pt: { x: number; y: number }) => void;
   handleConfirmText: () => void;
@@ -81,15 +118,68 @@ export function useShapeAndFillTools({
   getEffectiveOpacity,
   getActiveCanvas,
   getCanvasCoords,
+  setActiveLayerId,
+  upsertTextLayer,
+  upsertBalloonLayer,
+  createFrameFolder,
+  divideFrameFolder,
+  deleteLayer,
   updateLayerThumbnail,
   pushHistoryStep,
+  showToast,
 }: UseShapeAndFillToolsParams): UseShapeAndFillToolsResult {
   const [textSession, setTextSession] = useState<TextPlacementSession | null>(null);
   const [activeBalloon, setActiveBalloon] = useState<SpeechBalloon | null>(null);
+  const [editingBalloonLayerId, setEditingBalloonLayerId] = useState<string | null>(null);
+  const [frameDragPreview, setFrameDragPreview] = useState<FrameDragPreview | null>(null);
 
   const isPipetteSamplingRef = useRef<boolean>(false);
   const lassoFillPointsRef = useRef<Array<{ x: number; y: number }>>([]);
   const frameStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  const openLayerForEditing = useCallback(
+    (layer: LayerItem): boolean => {
+      if (layer.locked) {
+        showToast?.('Layer is locked');
+        return false;
+      }
+      if (layer.type === 'text' && layer.textData) {
+        setActiveLayerId(layer.id);
+        setActiveBalloon(null);
+        setEditingBalloonLayerId(null);
+        const td = layer.textData;
+        setTextSession({
+          x: td.x,
+          y: td.y,
+          editingLayerId: layer.id,
+          settings: {
+            text: td.text,
+            fontFamily: td.fontFamily,
+            fontSize: td.fontSize,
+            lineSpacing: td.lineSpacing ?? 1.25,
+            bold: td.bold,
+            italic: td.italic,
+            align: td.align,
+            outline: td.outline,
+            outlineColor: td.outlineColor,
+            outlineWidth: td.outlineWidth,
+            color: td.color,
+            writingMode: td.writingMode || 'horizontal-tb',
+          },
+        });
+        return true;
+      }
+      if (layer.type === 'balloon' && layer.balloonData) {
+        setActiveLayerId(layer.id);
+        setTextSession(null);
+        setEditingBalloonLayerId(layer.id);
+        setActiveBalloon(JSON.parse(JSON.stringify(layer.balloonData)));
+        return true;
+      }
+      return false;
+    },
+    [setActiveLayerId, showToast]
+  );
 
   const isLiquifyingRef = useRef<boolean>(false);
   const prevLiquifyPointRef = useRef<{ x: number; y: number } | null>(null);
@@ -137,49 +227,22 @@ export function useShapeAndFillTools({
       setTextSession(null);
       return;
     }
-    const canvas = getActiveCanvas();
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
-
-    const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
-
-    const renderTextOn = (target: HTMLCanvasElement) => {
-      const c = get2DContext(target);
-      if (!c) return;
-      const s = textSession.settings;
-      renderMangaTextToCanvas(c, s.text, textSession.x, textSession.y, {
-        fontSize: s.fontSize,
-        fontFamily: s.fontFamily,
-        writingMode: s.writingMode || 'horizontal-tb',
-        bold: s.bold,
-        italic: s.italic,
-        align: s.align,
-        color: s.color,
-        outline: s.outline,
-        outlineColor: s.outlineColor,
-        outlineWidth: s.outlineWidth,
-        anchorTopLeft: true,
-      });
+    const textData: TextLayerData = {
+      ...textSession.settings,
+      lineSpacing: textSession.settings.lineSpacing ?? 1.25,
+      x: textSession.x,
+      y: textSession.y,
     };
-
-    renderTextOn(canvas);
-    if (sourceCanvas) renderTextOn(sourceCanvas);
-
-    const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    updateLayerThumbnail(activeLayerId, true);
-    pushHistoryStep('text', 'Manga Text', beforeImageData, afterImageData, activeLayerId);
-    documentStore.getActiveTileGrid().notifyChange(true);
+    const savedLayer = upsertTextLayer(textData, textSession.editingLayerId);
+    pushHistoryStep(
+      'text',
+      textSession.editingLayerId ? 'Edit Text Layer' : 'Create Text Layer',
+      null,
+      null,
+      savedLayer.id
+    );
     setTextSession(null);
-  }, [
-    textSession,
-    getActiveCanvas,
-    activeLayerId,
-    layerSourceCanvasesRef,
-    updateLayerThumbnail,
-    pushHistoryStep,
-  ]);
+  }, [textSession, upsertTextLayer, pushHistoryStep]);
 
   const handleCancelText = useCallback(() => {
     setTextSession(null);
@@ -187,40 +250,25 @@ export function useShapeAndFillTools({
 
   const handleConfirmBalloon = useCallback(() => {
     if (!activeBalloon) return;
-    const canvas = getActiveCanvas();
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
-
-    const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
-
-    const drawOn = (target: HTMLCanvasElement) => {
-      const c = get2DContext(target);
-      if (!c) return;
-      renderSpeechBalloon(c, activeBalloon);
-    };
-
-    drawOn(canvas);
-    if (sourceCanvas) drawOn(sourceCanvas);
-
-    const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    updateLayerThumbnail(activeLayerId, true);
-    pushHistoryStep('frame', 'Speech Balloon', beforeImageData, afterImageData, activeLayerId);
-    documentStore.getActiveTileGrid().notifyChange(true);
+    const savedLayer = upsertBalloonLayer(activeBalloon, editingBalloonLayerId);
+    pushHistoryStep(
+      'balloon',
+      editingBalloonLayerId ? 'Edit Speech Balloon' : 'Create Speech Balloon',
+      null,
+      null,
+      savedLayer.id
+    );
     setActiveBalloon(null);
-  }, [
-    activeBalloon,
-    getActiveCanvas,
-    activeLayerId,
-    layerSourceCanvasesRef,
-    updateLayerThumbnail,
-    pushHistoryStep,
-  ]);
+    setEditingBalloonLayerId(null);
+  }, [activeBalloon, editingBalloonLayerId, upsertBalloonLayer, pushHistoryStep]);
 
   const handleDeleteBalloon = useCallback(() => {
+    if (editingBalloonLayerId && deleteLayer) {
+      deleteLayer(editingBalloonLayerId);
+    }
     setActiveBalloon(null);
-  }, []);
+    setEditingBalloonLayerId(null);
+  }, [editingBalloonLayerId, deleteLayer]);
 
   const startLiquifyLoop = useCallback(
     (canvas: HTMLCanvasElement, sourceCanvas: HTMLCanvasElement | undefined, isTone: boolean) => {
@@ -470,22 +518,52 @@ export function useShapeAndFillTools({
 
       if (tool === 'frame') {
         e.preventDefault();
+        const mode = useToolStore.getState().frameSettings.mode ?? 'create';
         frameStartRef.current = pt;
+        setFrameDragPreview({ mode, start: pt, end: pt });
+        return true;
+      }
+
+      if (tool === 'object') {
+        e.preventDefault();
+        const hit = hitTestEditableVectorLayer(layers, pt, isLayerEffectivelyVisible);
+        if (hit) {
+          openLayerForEditing(hit);
+        } else {
+          showToast?.('Click a Text or Speech Balloon layer to edit');
+        }
         return true;
       }
 
       if (tool === 'text') {
         e.preventDefault();
+        const hitText = hitTestEditableVectorLayer(layers, pt, isLayerEffectivelyVisible, 'text');
+        if (hitText && openLayerForEditing(hitText)) {
+          return true;
+        }
+        setActiveBalloon(null);
+        setEditingBalloonLayerId(null);
         setTextSession({
           x: Math.round(pt.x),
           y: Math.round(pt.y),
-          settings: { ...textSettings },
+          editingLayerId: null,
+          settings: { ...textSettings, color: primaryColor || textSettings.color },
         });
         return true;
       }
 
       if (tool === 'balloon') {
         e.preventDefault();
+        const hitBalloon = hitTestEditableVectorLayer(
+          layers,
+          pt,
+          isLayerEffectivelyVisible,
+          'balloon'
+        );
+        if (hitBalloon && openLayerForEditing(hitBalloon)) {
+          return true;
+        }
+        setTextSession(null);
         const newBalloon = createDefaultSpeechBalloon(
           Math.round(pt.x - 100),
           Math.round(pt.y - 70),
@@ -497,6 +575,7 @@ export function useShapeAndFillTools({
         newBalloon.strokeColor = primaryColor || '#000000';
         newBalloon.fillColor = balloonSettings.fillColor || '#ffffff';
         newBalloon.vertical = balloonSettings.vertical;
+        setEditingBalloonLayerId(null);
         setActiveBalloon(newBalloon);
         return true;
       }
@@ -518,6 +597,8 @@ export function useShapeAndFillTools({
       layers,
       updateLayerThumbnail,
       pushHistoryStep,
+      openLayerForEditing,
+      showToast,
     ]
   );
 
@@ -637,6 +718,12 @@ export function useShapeAndFillTools({
             };
           }
         }
+        return true;
+      }
+
+      if (tool === 'frame' && frameStartRef.current) {
+        const mode = useToolStore.getState().frameSettings.mode ?? 'create';
+        setFrameDragPreview({ mode, start: frameStartRef.current, end: getCanvasCoords(e) });
         return true;
       }
 
@@ -760,41 +847,82 @@ export function useShapeAndFillTools({
       if (tool === 'frame' && frameStartRef.current) {
         const s = frameStartRef.current;
         frameStartRef.current = null;
+        setFrameDragPreview(null);
+        const mode = frameSettings.mode ?? 'create';
+        const dpi = dimensions.dpi ?? 600;
+
+        if (mode === 'divide') {
+          if (Math.hypot(pt.x - s.x, pt.y - s.y) < 8) return true;
+
+          // Resolve target frame-folder: active frame-folder, active layer's parent frame-folder,
+          // or topmost visible frame-folder crossed by the cut line
+          let targetFolder: LayerItem | undefined;
+          if (activeLayer?.type === 'frame-folder') {
+            targetFolder = activeLayer;
+          } else if (activeLayer?.parentId) {
+            const parent = layers.find((l) => l.id === activeLayer.parentId);
+            if (parent?.type === 'frame-folder') targetFolder = parent;
+          }
+          if (!targetFolder) {
+            targetFolder = layers.find(
+              (l) =>
+                l.type === 'frame-folder' &&
+                isLayerEffectivelyVisible(l) &&
+                (l.comicFrames || []).some((f) => doesCutSegmentCrossFrame(f, s, pt))
+            );
+          }
+
+          if (!targetFolder) {
+            showToast?.('No Frame Border Folder intersected by cut line');
+            return true;
+          }
+
+          const divideMode = frameSettings.divideMode ?? 'same-folder';
+          const ok = divideFrameFolder(targetFolder.id, s, pt, dpi, divideMode);
+          if (ok) {
+            pushHistoryStep(
+              'frame',
+              divideMode === 'split-folders' ? 'Divide Frame Folder' : 'Divide Frame Border',
+              null,
+              null,
+              targetFolder.id
+            );
+            showToast?.(
+              divideMode === 'split-folders'
+                ? 'Frame split into 2 Frame Folders'
+                : 'Frame divided with manga gutter'
+            );
+          } else {
+            showToast?.('Cut line must cross completely through a frame border');
+          }
+          return true;
+        }
+
+        // Create Frame Border Folder mode
         const minX = Math.floor(Math.min(s.x, pt.x));
         const minY = Math.floor(Math.min(s.y, pt.y));
         const w = Math.ceil(Math.abs(pt.x - s.x));
         const h = Math.ceil(Math.abs(pt.y - s.y));
 
-        if (w >= 4 && h >= 4) {
-          const canvas = getActiveCanvas();
-          if (!canvas) return true;
-          const ctx = get2DContext(canvas);
-          if (!ctx) return true;
-          const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
-
-          const drawFrameOn = (target: HTMLCanvasElement) => {
-            const c = get2DContext(target);
-            if (!c) return;
-            c.save();
-            if (frameSettings.fillBackground) {
-              c.fillStyle = frameSettings.fillColor || '#ffffff';
-              c.fillRect(minX, minY, w, h);
-            }
-            c.strokeStyle = primaryColor || '#000000';
-            c.lineWidth = frameSettings.thickness;
-            c.lineJoin = 'miter';
-            c.strokeRect(minX, minY, w, h);
-            c.restore();
-          };
-
-          drawFrameOn(canvas);
-          if (sourceCanvas) drawFrameOn(sourceCanvas);
-
-          const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-          updateLayerThumbnail(activeLayerId, true);
-          pushHistoryStep('frame', 'Frame Border', beforeImageData, afterImageData, activeLayerId);
-          documentStore.getActiveTileGrid().notifyChange(true);
+        if (w >= 8 && h >= 8) {
+          const rectFrame = createRectFrame('', minX, minY, w, h, {
+            dpi,
+            borderWidth: frameSettings.thickness || 4,
+            gutterVerticalPx: mmToPixels(
+              frameSettings.gutterVerticalMm ?? MANGA_GUTTER_VERTICAL_MM,
+              dpi
+            ),
+            gutterHorizontalPx: mmToPixels(
+              frameSettings.gutterHorizontalMm ?? MANGA_GUTTER_HORIZONTAL_MM,
+              dpi
+            ),
+            fillBackground: frameSettings.fillBackground,
+            fillColor: frameSettings.fillColor || '#ffffff',
+            strokeColor: frameSettings.strokeColor || primaryColor || '#000000',
+          });
+          const { folder } = createFrameFolder([rectFrame], undefined, true);
+          pushHistoryStep('frame', 'Create Frame Folder', null, null, folder.id);
+          showToast?.('Created Frame Border Folder (child layers auto-clip)');
         }
         return true;
       }
@@ -805,12 +933,17 @@ export function useShapeAndFillTools({
       handleSampleColor,
       activeLayerId,
       activeLayer,
+      layers,
+      isLayerEffectivelyVisible,
       layerSourceCanvasesRef,
       layerCanvasesRef,
       pushHistoryStep,
       updateLayerThumbnail,
       getActiveCanvas,
       dimensions.dpi,
+      createFrameFolder,
+      divideFrameFolder,
+      showToast,
     ]
   );
 
@@ -819,6 +952,8 @@ export function useShapeAndFillTools({
     setTextSession,
     activeBalloon,
     setActiveBalloon,
+    frameDragPreview,
+    openLayerForEditing,
     isPipetteSamplingRef,
     handleSampleColor,
     handleConfirmText,
