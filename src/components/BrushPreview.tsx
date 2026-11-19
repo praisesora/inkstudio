@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState } from 'react';
 import { BrushSettings, BrushPresetId } from '../types/editor';
 import { renderBrushStrokePreview, BrushPreviewOptions } from '../utils/brushPreview';
 import { getPreloadedTipImage, preloadTipImage } from '../utils/brushStorage';
+import { DEFAULT_BRUSH_PRESET_ID } from '../utils/brushPresetManager';
 
 interface BrushPreviewProps {
   preset?: BrushPresetId;
@@ -18,7 +19,7 @@ interface BrushPreviewProps {
 }
 
 export const BrushPreview: React.FC<BrushPreviewProps> = React.memo(({
-  preset = 'pencil-2b',
+  preset = DEFAULT_BRUSH_PRESET_ID,
   settings,
   tool = 'brush',
   strokeColor = '#ffffff',
@@ -102,6 +103,11 @@ export const BrushPreview: React.FC<BrushPreviewProps> = React.memo(({
         flow: settings?.flow,
         opacity: settings?.opacity,
         grain: settings?.grain,
+        paperTextureMode: settings?.paperTextureMode,
+        paperTextureScale: settings?.paperTextureScale,
+        paperTextureContrast: settings?.paperTextureContrast,
+        paperTextureBrightness: settings?.paperTextureBrightness,
+        paperTextureInverted: settings?.paperTextureInverted,
         hardness: settings?.hardness,
         spacing: settings?.spacing,
         minSizeFactor: settings?.minSizeFactor,
@@ -109,12 +115,14 @@ export const BrushPreview: React.FC<BrushPreviewProps> = React.memo(({
         antiAlias: settings?.antiAlias,
         pressureCurve: settings?.pressureCurve,
         spray: settings?.spray,
+        dynamics: settings?.dynamics,
         usePressure: settings?.usePressure,
         color: strokeColor,
         backgroundColor,
         tool,
         customTipImage: customTipImage || internalTipImage || settings?.customTipImage,
         customTipAngle: customTipAngle !== undefined ? customTipAngle : settings?.customTipAngle,
+        customTipAngleDynamics: settings?.customTipAngleDynamics,
         colorMixing: settings?.colorMixing,
         amountOfPaint: settings?.amountOfPaint,
         densityOfPaint: settings?.densityOfPaint,

@@ -104,6 +104,12 @@ export const MenuBar: React.FC<MenuBarProps> = React.memo(({ sections = DEFAULT_
     activeSection && activeSubmenuId
       ? activeSection.items.find((it) => it.id === activeSubmenuId && !it.disabled && it.submenu?.length) ?? null
       : null;
+  const activeSectionHasCheckables = Boolean(
+    activeSection?.items.some((it) => it.checked !== undefined)
+  );
+  const activeSubmenuHasCheckables = Boolean(
+    activeSubmenuParent?.submenu?.some((it) => it.checked !== undefined)
+  );
 
   useEffect(() => {
     return () => clearSubmenuTimer();
@@ -400,15 +406,13 @@ export const MenuBar: React.FC<MenuBarProps> = React.memo(({ sections = DEFAULT_
                       }`}
                     >
                       <span className="flex items-center gap-2 min-w-0">
-                        <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
-                          {item.checked ? (
-                            <Check className="w-3 h-3 text-[var(--accent)]" />
-                          ) : item.icon ? (
-                            <span className="w-3.5 h-3.5 flex items-center justify-center opacity-75">
-                              {item.icon}
-                            </span>
-                          ) : null}
-                        </span>
+                        {activeSectionHasCheckables && (
+                          <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                            {item.checked ? (
+                              <Check className="w-3 h-3 text-[var(--accent)]" />
+                            ) : null}
+                          </span>
+                        )}
                         <span className="truncate">{item.label}</span>
                       </span>
                       {hasSubmenu ? (
@@ -463,15 +467,13 @@ export const MenuBar: React.FC<MenuBarProps> = React.memo(({ sections = DEFAULT_
                       }`}
                     >
                       <span className="flex items-center gap-2 min-w-0">
-                        <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
-                          {subItem.checked ? (
-                            <Check className="w-3 h-3 text-[var(--accent)]" />
-                          ) : subItem.icon ? (
-                            <span className="w-3.5 h-3.5 flex items-center justify-center opacity-75">
-                              {subItem.icon}
-                            </span>
-                          ) : null}
-                        </span>
+                        {activeSubmenuHasCheckables && (
+                          <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                            {subItem.checked ? (
+                              <Check className="w-3 h-3 text-[var(--accent)]" />
+                            ) : null}
+                          </span>
+                        )}
                         <span className="truncate">{subItem.label}</span>
                       </span>
                       {subItem.shortcut && (

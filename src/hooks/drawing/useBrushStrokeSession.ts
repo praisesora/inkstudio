@@ -520,6 +520,7 @@ export function useBrushStrokeSession({
       usePressure: bs.usePressure,
       useVelocity: bs.useVelocity,
       useTilt: Boolean(bs.useTilt),
+      tiltScale: bs.tiltScale,
       sizeSensor: bs.sizeSensor,
       opacitySensor: resolveEffectiveOpacitySensor(bs, isMonochrome, isEraser),
       densitySensor: bs.densitySensor,
@@ -587,6 +588,7 @@ export function useBrushStrokeSession({
       dualTipImage: bs.dualTipImage,
       dualBrushCompositeMode: bs.dualBrushCompositeMode,
       useTilt: Boolean(bs.useTilt),
+      tiltScale: bs.tiltScale,
       thicknessVertical: bs.thicknessVertical,
       flipH: bs.flipH,
       flipV: bs.flipV,
@@ -789,7 +791,7 @@ export function useBrushStrokeSession({
     (predEvents: PointerEvent[], vRect: DOMRect) => {
       clearPredictedCanvas();
       const bs = getBrushSettings();
-      if (getTool() === 'eraser' || bs.isTransparentInk) return;
+      if (getTool() === 'eraser' || bs.isTransparentInk || bs.colorMixing) return;
       const pipeline = strokePipelineRef.current;
       if (pipeline.getKnotCount() < 2) return;
       const pCanvas = getPredictedCanvas();
@@ -868,9 +870,12 @@ export function useBrushStrokeSession({
             minSizeFactor: bs.minSizeFactor,
             opacity: 1.0,
             flow: strokeFlow,
+            adjustDensityByGap: bs.adjustDensityByGap,
             spacing: strokeSpacing,
             thickness: bs.thickness,
             thicknessVertical: bs.thicknessVertical,
+            flipH: bs.flipH,
+            flipV: bs.flipV,
             angle: bs.customTipAngle,
             angleDynamics: bs.customTipAngleDynamics,
             rotationRandomScale: bs.customTipRotationRandomScale,
@@ -878,12 +883,24 @@ export function useBrushStrokeSession({
             antiAlias: predAA,
             pressureCurve: bs.pressureCurve,
             usePressure: bs.usePressure,
+            useTilt: Boolean(bs.useTilt),
+            tiltScale: bs.tiltScale,
+            sizeSensor: bs.sizeSensor,
+            opacitySensor: resolveEffectiveOpacitySensor(bs, isMonochrome, false),
+            densitySensor: bs.densitySensor,
             subTips: bs.subTips,
             subTipOrder: bs.subTipOrder,
             subTipImages: bs.subTipImages,
             spray: bs.spray,
             wetEdge: 0,
             grain: bs.grain ?? bs.textureDensity,
+            paperTextureMode: bs.paperTextureMode,
+            paperTextureBrightness: bs.paperTextureBrightness,
+            paperTextureContrast: bs.paperTextureContrast,
+            paperTextureInverted: bs.paperTextureInverted,
+            paperTextureImage: bs.paperTextureImage,
+            paperTextureScale: bs.paperTextureScale,
+            paperTextureRotate: bs.paperTextureRotate,
             dualBrush: bs.dualBrush,
             dualTipImage: bs.dualTipImage,
             dualBrushCompositeMode: bs.dualBrushCompositeMode,
@@ -895,12 +912,25 @@ export function useBrushStrokeSession({
       const predRadialOpts: RadialMixingOptions = {
         useGpu: bs.useGpu !== false,
         antiAlias: predAA,
+        useTilt: Boolean(bs.useTilt),
+        tiltScale: bs.tiltScale,
+        adjustDensityByGap: bs.adjustDensityByGap,
         dynamics: bs.dynamics,
         secondaryColor: bs.secondaryColor,
         dualBrush: bs.dualBrush,
         dualTipImage: bs.dualTipImage,
         dualBrushCompositeMode: bs.dualBrushCompositeMode,
         grain: bs.grain ?? bs.textureDensity,
+        paperTextureMode: bs.paperTextureMode,
+        paperTextureBrightness: bs.paperTextureBrightness,
+        paperTextureContrast: bs.paperTextureContrast,
+        paperTextureInverted: bs.paperTextureInverted,
+        paperTextureImage: bs.paperTextureImage,
+        paperTextureScale: bs.paperTextureScale,
+        paperTextureRotate: bs.paperTextureRotate,
+        sizeSensor: bs.sizeSensor,
+        opacitySensor: resolveEffectiveOpacitySensor(bs, isMonochrome, false),
+        densitySensor: bs.densitySensor,
       };
 
       const predGpuDabs = frameGpuDabsRef.current;
@@ -2563,6 +2593,10 @@ export function useBrushStrokeSession({
                   : bs;
 
               const needsIsolatedBake = (bakeBs.opacity ?? 1.0) < 0.999 || hasWetEdge;
+              const bakeSampler =
+                bakeBs.colorMixing && !isEraser
+                  ? new LayerPixelSampler(canvas || dims, currentLayerId, grid)
+                  : undefined;
 
               if (!needsIsolatedBake) {
                 renderCompleteStroke(
@@ -2573,7 +2607,8 @@ export function useBrushStrokeSession({
                   effectiveMode,
                   isBgEraser,
                   canvas || undefined,
-                  Boolean(activeLayer?.alphaLocked)
+                  Boolean(activeLayer?.alphaLocked),
+                  bakeSampler
                 );
               } else {
                 rCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bakeBs.opacity ?? 1.0));
@@ -2607,7 +2642,8 @@ export function useBrushStrokeSession({
                     effectiveMode,
                     isBgEraser,
                     canvas || undefined,
-                    false
+                    false,
+                    bakeSampler
                   );
                   bCtx.restore();
 

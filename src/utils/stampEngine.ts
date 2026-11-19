@@ -19,7 +19,7 @@ import {
   parseColorToRgb,
   rgbToHex,
 } from './colorMixingEngine';
-import { getPaperGrain } from './pencilEngine';
+import { getPaperGrain, paperGrainTable, GRAIN_SIZE } from './pencilEngine';
 import { GpuDab, WebGlBrushEngine } from './webglBrushEngine';
 import {
   evaluateFastSpline,
@@ -216,6 +216,137 @@ export function applyColorDynamics(
     b,
     hex: rgbToHex(ir, ig, ib),
   };
+}
+
+// -------------------------------------------------------------
+// Hardware-Accelerated World-Locked Paper Grain Masking (CPU/Color-Mixing Parity)
+// -------------------------------------------------------------
+
+let _invertedGrainCanvas: HTMLCanvasElement | null = null;
+let _grainScratchCanvas: HTMLCanvasElement | null = null;
+let _grainScratchCtx: CanvasRenderingContext2D | null = null;
+let _grainPattern: CanvasPattern | null = null;
+let _customGrainCanvasCache = new WeakMap<HTMLImageElement, { canvas: HTMLCanvasElement; pattern: CanvasPattern | null }>();
+
+function getInvertedGrainPattern(
+  scratchCtx: CanvasRenderingContext2D,
+  paperTextureImage?: HTMLImageElement
+): CanvasPattern | null {
+  if (typeof scratchCtx.createPattern !== 'function') return null;
+
+  if (
+    paperTextureImage &&
+    paperTextureImage.complete !== false &&
+    (paperTextureImage.naturalWidth || paperTextureImage.width) > 0
+  ) {
+    const cached = _customGrainCanvasCache.get(paperTextureImage);
+    if (cached) return cached.pattern;
+    const w = paperTextureImage.naturalWidth || paperTextureImage.width;
+    const h = paperTextureImage.naturalHeight || paperTextureImage.height;
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const gCtx = c.getContext('2d', { willReadFrequently: true });
+    if (gCtx && typeof gCtx.getImageData === 'function') {
+      gCtx.drawImage(paperTextureImage, 0, 0, w, h);
+      const img = gCtx.getImageData(0, 0, w, h);
+      const d = img.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const inv = 255 - Math.round(lum);
+        d[i] = 255;
+        d[i + 1] = 255;
+        d[i + 2] = 255;
+        d[i + 3] = inv;
+      }
+      gCtx.putImageData(img, 0, 0);
+      const pat = scratchCtx.createPattern(c, 'repeat');
+      _customGrainCanvasCache.set(paperTextureImage, { canvas: c, pattern: pat });
+      return pat;
+    }
+  }
+
+  if (!_invertedGrainCanvas) {
+    const c = document.createElement('canvas');
+    c.width = GRAIN_SIZE;
+    c.height = GRAIN_SIZE;
+    const gCtx = c.getContext('2d');
+    if (!gCtx) return null;
+    const img = gCtx.createImageData(GRAIN_SIZE, GRAIN_SIZE);
+    const d = img.data;
+    for (let i = 0; i < paperGrainTable.length; i++) {
+      const p = i * 4;
+      d[p] = 255;
+      d[p + 1] = 255;
+      d[p + 2] = 255;
+      // Alpha = (1 - paperHeight) so destination-out removes pigment in paper valleys
+      d[p + 3] = 255 - paperGrainTable[i];
+    }
+    gCtx.putImageData(img, 0, 0);
+    _invertedGrainCanvas = c;
+    _grainPattern = scratchCtx.createPattern(c, 'repeat');
+  }
+
+  return _grainPattern;
+}
+
+/**
+ * Applies world-anchored per-pixel paper/canvas grain onto a CPU dab stamp using hardware 2D compositing.
+ * Returns a pooled canvas containing the grain-masked dab, or null if unsupported (falls back to scalar grain).
+ */
+function applyCpuPerPixelPaperGrain(
+  master: CanvasImageSource,
+  worldX: number,
+  worldY: number,
+  renderW: number,
+  renderH: number,
+  grainAmount: number,
+  pressure: number,
+  paperScale: number = 1.0,
+  paperTextureImage?: HTMLImageElement
+): HTMLCanvasElement | null {
+  if (typeof document === 'undefined' || grainAmount <= 0.005) return null;
+  if (!_grainScratchCanvas) {
+    _grainScratchCanvas = document.createElement('canvas');
+    _grainScratchCanvas.width = 128;
+    _grainScratchCanvas.height = 128;
+    _grainScratchCtx = _grainScratchCanvas.getContext('2d');
+  }
+  const sCtx = _grainScratchCtx;
+  if (!sCtx || typeof sCtx.createPattern !== 'function') return null;
+
+  const pat = getInvertedGrainPattern(sCtx, paperTextureImage);
+  if (!pat) return null;
+
+  const bufSize = 128;
+  const p = Math.max(0, Math.min(1, pressure));
+  const heavyExcess = Math.max(0, (p - 0.52) / 0.48);
+  const penetration = Math.min(0.92, p * 0.28 + heavyExcess * heavyExcess * 0.64);
+  const effDensity = Math.max(0, Math.min(0.98, grainAmount * (1.0 - penetration * 0.85)));
+  if (effDensity <= 0.005) return null;
+
+  sCtx.save();
+  sCtx.globalCompositeOperation = 'source-over';
+  sCtx.globalAlpha = 1.0;
+  sCtx.clearRect(0, 0, bufSize, bufSize);
+  sCtx.drawImage(master, 0, 0, bufSize, bufSize);
+
+  // Align world-space paper pattern onto the dab's local [0..bufSize] frame
+  const scale = Math.max(0.1, paperScale);
+  const sx = (bufSize / Math.max(1, renderW)) * scale;
+  const sy = (bufSize / Math.max(1, renderH)) * scale;
+  const offX = -((worldX - renderW * 0.5) / scale);
+  const offY = -((worldY - renderH * 0.5) / scale);
+
+  sCtx.globalCompositeOperation = 'destination-out';
+  sCtx.globalAlpha = effDensity;
+  sCtx.fillStyle = pat;
+  sCtx.scale(sx, sy);
+  sCtx.translate(offX, offY);
+  sCtx.fillRect(-offX, -offY, bufSize / sx, bufSize / sy);
+  sCtx.restore();
+
+  return _grainScratchCanvas;
 }
 
 // -------------------------------------------------------------
@@ -768,7 +899,11 @@ export function drawTexturedDot(
   const tiltX = useTilt ? (point.tiltX ?? 0) : 0;
   const tiltY = useTilt ? (point.tiltY ?? 0) : 0;
   const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180) * (options.tiltScale ?? 1.0);
+  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
+  const tiltSpread = tiltMagnitude * (options.tiltScale ?? 1.0);
+  const grainPressure = useTilt && tiltMagnitude > 0.01
+    ? effPressure * (1.0 - tiltMagnitude * 0.55)
+    : effPressure;
 
   let angleRad = ((options.angle ?? 0) * Math.PI) / 180;
   if (useTilt && tiltMagnitude > 0.05) {
@@ -793,23 +928,29 @@ export function drawTexturedDot(
     dabHashFloat(point.x, point.y, 0, 42)
   );
   effectiveFlow *= sensorOpacity * sensorDensity;
+  if (useTilt && tiltMagnitude > 0.03) {
+    // Contact pressure spreads over larger tilted area -> softer graphite/chalk deposition
+    effectiveFlow *= 1.0 - tiltMagnitude * 0.28;
+  }
 
   // CPU Paper Texture modulation when not rendering on GPU (GPU shader samples paper grain per pixel)
   const grainAmount = options.grain ?? options.textureDensity ?? 0;
-  if (!gpuDabs && grainAmount > 0.005) {
+  const hasPerPixelCpuGrain = !gpuDabs && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
+  if (!gpuDabs && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
     const scale = Math.max(0.1, options.paperTextureScale ?? 1.0);
     const gNorm = getPaperGrain(point.x / scale, point.y / scale) / 255.0;
     effectiveFlow = applyCspPaperTextureAlpha(
       effectiveFlow,
       gNorm,
       grainAmount,
-      effPressure,
+      grainPressure,
       options.paperTextureMode ?? 'subtract',
       options.paperTextureBrightness ?? 0,
       options.paperTextureContrast ?? 0,
       Boolean(options.paperTextureInverted)
     );
   }
+  if (effectiveFlow <= 0.002) return;
 
   const dynamics = options.dynamics;
   const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
@@ -877,10 +1018,25 @@ export function drawTexturedDot(
     let dotRenderW = isVert ? curDabW * curDabThickness : curDabW;
     let dotRenderH = isVert ? curDabW * aspect : curDabW * aspect * curDabThickness;
     if (useTilt && tiltMagnitude > 0.01) {
-      dotRenderW *= 1.0 + tiltMagnitude * 1.6;
-      dotRenderH /= 1.0 + tiltMagnitude * 0.45;
+      dotRenderW *= 1.0 + tiltSpread * 1.85;
+      dotRenderH *= Math.max(0.55, 1.0 - tiltMagnitude * 0.25);
     }
     const flips = resolveTipFlipSigns(options.flipH, options.flipV, k, curDabX, curDabY);
+
+    if (curMaster && hasPerPixelCpuGrain) {
+      const grained = applyCpuPerPixelPaperGrain(
+        curMaster,
+        curDabX,
+        curDabY,
+        dotRenderW,
+        dotRenderH,
+        grainAmount,
+        grainPressure,
+        options.paperTextureScale ?? 1.0,
+        options.paperTextureImage
+      );
+      if (grained) curMaster = grained;
+    }
 
     if (options.spray?.enabled) {
       const pCount = options.spray.density;
@@ -906,7 +1062,7 @@ export function drawTexturedDot(
             g: dabG,
             b: dabB,
             alpha: curDabAlpha,
-            pressure: effPressure,
+            pressure: grainPressure,
             strokeDist: 0,
             flipX: flips.signX,
             flipY: flips.signY,
@@ -943,7 +1099,7 @@ export function drawTexturedDot(
         g: dabG,
         b: dabB,
         alpha: curDabAlpha,
-        pressure: effPressure,
+        pressure: grainPressure,
         strokeDist: 0,
         flipX: flips.signX,
         flipY: flips.signY,
@@ -1258,7 +1414,11 @@ export function drawTexturedCubicBezierSegment(
     const tiltX = useTilt ? pt.tiltX : 0;
     const tiltY = useTilt ? pt.tiltY : 0;
     const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-    const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180) * (options.tiltScale ?? 1.0);
+    const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
+    const tiltSpread = tiltMagnitude * (options.tiltScale ?? 1.0);
+    const grainPressure = useTilt && tiltMagnitude > 0.01
+      ? effPressure * (1.0 - tiltMagnitude * 0.55)
+      : effPressure;
 
     // Multi-sensor CSP size modulation
     if (options.sizeSensor) {
@@ -1316,6 +1476,10 @@ export function drawTexturedCubicBezierSegment(
         dabHashFloat(pt.x, pt.y, dabSeq, 52)
       );
     }
+    if (useTilt && tiltMagnitude > 0.03) {
+      // Spread graphite/chalk deposition over wider tilted contact patch
+      dabAlpha *= 1.0 - tiltMagnitude * 0.28;
+    }
 
     if (isColorMixing && reservoir) {
       let sampled = { r: 255, g: 255, b: 255, a: 0 };
@@ -1344,7 +1508,7 @@ export function drawTexturedCubicBezierSegment(
       dabColor = mixed.colorHex;
       dabAlpha = mixed.alpha;
 
-      if (sampler) {
+      if (sampler && mixed.alpha > 0.002) {
         sampler.depositDab(
           pt.x,
           pt.y,
@@ -1358,14 +1522,15 @@ export function drawTexturedCubicBezierSegment(
     }
 
     // CPU paper grain parity (when rendering live on Canvas2D without GPU batch)
-    if (!gpuDabs && grainAmount > 0.005) {
+    const hasPerPixelCpuGrain = !gpuDabs && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
+    if (!gpuDabs && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
       const scale = Math.max(0.1, options.paperTextureScale ?? 1.0);
       const gNorm = getPaperGrain(pt.x / scale, pt.y / scale) / 255.0;
       dabAlpha = applyCspPaperTextureAlpha(
         dabAlpha,
         gNorm,
         grainAmount,
-        effPressure,
+        grainPressure,
         options.paperTextureMode ?? 'subtract',
         options.paperTextureBrightness ?? 0,
         options.paperTextureContrast ?? 0,
@@ -1473,13 +1638,30 @@ export function drawTexturedCubicBezierSegment(
       let finalW = isVert ? curDabW * curDabThickness : curDabW;
       let finalH = isVert ? curDabW * aspect : curDabW * aspect * curDabThickness;
       if (useTilt && tiltMagnitude > 0.01) {
-        finalW *= 1.0 + tiltMagnitude * 1.6;
-        finalH /= 1.0 + tiltMagnitude * 0.45;
+        finalW *= 1.0 + tiltSpread * 1.85;
+        finalH *= Math.max(0.55, 1.0 - tiltMagnitude * 0.25);
       }
       stepRefW = finalW;
       stepRefH = finalH;
 
+      if (curDabAlpha <= 0.002) continue;
+
       const flips = resolveTipFlipSigns(options.flipH, options.flipV, seedIdx, curDabX, curDabY);
+
+      if (curMaster && hasPerPixelCpuGrain) {
+        const grained = applyCpuPerPixelPaperGrain(
+          curMaster,
+          curDabX,
+          curDabY,
+          finalW,
+          finalH,
+          grainAmount,
+          grainPressure,
+          options.paperTextureScale ?? 1.0,
+          options.paperTextureImage
+        );
+        if (grained) curMaster = grained;
+      }
 
       if (options.spray?.enabled) {
         const pCount = options.spray.density;
@@ -1505,7 +1687,7 @@ export function drawTexturedCubicBezierSegment(
               g: dabG,
               b: dabB,
               alpha: curDabAlpha,
-              pressure: effPressure,
+              pressure: grainPressure,
               strokeDist,
               flipX: flips.signX,
               flipY: flips.signY,
@@ -1542,7 +1724,7 @@ export function drawTexturedCubicBezierSegment(
           g: dabG,
           b: dabB,
           alpha: curDabAlpha,
-          pressure: effPressure,
+          pressure: grainPressure,
           strokeDist,
           flipX: flips.signX,
           flipY: flips.signY,
@@ -1835,7 +2017,8 @@ export function drawRadialDot(
   const tiltX = useTilt ? (point.tiltX ?? 0) : 0;
   const tiltY = useTilt ? (point.tiltY ?? 0) : 0;
   const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180) * (mixingOptions?.tiltScale ?? 1.0);
+  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
+  const tiltSpread = tiltMagnitude * (mixingOptions?.tiltScale ?? 1.0);
 
   if (mixingOptions?.sizeSensor) {
     w = Math.max(
@@ -1900,7 +2083,7 @@ export function drawRadialDot(
     dabColor = mixed.colorHex;
     dabFlow = mixed.alpha;
 
-    if (mixingOptions!.sampler) {
+    if (mixingOptions!.sampler && mixed.alpha > 0.002) {
       mixingOptions!.sampler.depositDab(
         point.x,
         point.y,
@@ -1912,12 +2095,13 @@ export function drawRadialDot(
       );
     }
   }
+  if (dabFlow <= 0.002) return;
 
   let dotW = w;
   let dotAngle = angleRad;
   if (useTilt && tiltMagnitude > 0.01) {
     const tiltAzimuth = Math.atan2(tiltY, tiltX);
-    dotW = w * (1.0 + tiltMagnitude * 1.8);
+    dotW = w * (1.0 + tiltSpread * 1.8);
     if (tiltMagnitude > 0.05) {
       dotAngle = tiltAzimuth;
     }
@@ -2010,7 +2194,7 @@ export function drawRadialDot(
     let finalW = isVert ? curDabW * curDabThickness : curDabW;
     let finalH = isVert ? curDabW : curDabW * curDabThickness;
     if (useTilt && tiltMagnitude > 0.01) {
-      finalW = w * (1.0 + tiltMagnitude * 1.8);
+      finalW = w * (1.0 + tiltSpread * 1.8);
       finalH = (w * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
     }
 
@@ -2121,7 +2305,8 @@ export function drawRadialCubicBezierSegment(
     const tiltX = useTilt ? pt.tiltX : 0;
     const tiltY = useTilt ? pt.tiltY : 0;
     const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-    const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180) * (mixingOptions?.tiltScale ?? 1.0);
+    const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
+    const tiltSpread = tiltMagnitude * (mixingOptions?.tiltScale ?? 1.0);
 
     if (mixingOptions?.sizeSensor) {
       curWidth *= evaluateCspSensor(
@@ -2211,7 +2396,7 @@ export function drawRadialCubicBezierSegment(
       }
       dabFlow = mixed.alpha;
 
-      if (sampler) {
+      if (sampler && mixed.alpha > 0.002) {
         sampler.depositDab(
           pt.x,
           pt.y,
@@ -2315,11 +2500,13 @@ export function drawRadialCubicBezierSegment(
       let finalW = isVert ? curDabW * curDabThickness : curDabW;
       let finalH = isVert ? curDabW : curDabW * curDabThickness;
       if (useTilt && tiltMagnitude > 0.01) {
-        finalW = curDabW * (1.0 + tiltMagnitude * 1.8);
+        finalW = curDabW * (1.0 + tiltSpread * 1.8);
         finalH = (curDabW * curDabThickness) / (1.0 + tiltMagnitude * 0.5);
       }
       stepRefW = finalW;
       stepRefH = finalH;
+
+      if (curDabFlow <= 0.002) continue;
 
       const flips = resolveTipFlipSigns(mixingOptions?.flipH, mixingOptions?.flipV, seedIdx, curDabX, curDabY);
 

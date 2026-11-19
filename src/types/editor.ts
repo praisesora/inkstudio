@@ -30,17 +30,29 @@ export interface Point {
   isCorner?: boolean;
 }
 
+export type BrushCategory = 'pen' | 'sketch' | 'brush';
+
 export type BrushPresetId =
-  | 'round'
+  // Pen section
   | 'g-pen'
-  | 'maru-pen'
-  | 'turnip-pen'
-  | 'airbrush-soft'
-  | 'pencil-f'
-  | 'pencil-hb'
-  | 'pencil-2b'
-  | 'pencil-4b'
-  | 'square-digital'
+  | 'real-g-pen'
+  | 'textured-pen'
+  | 'dot-pen'
+  | 'calligraphy'
+  // Sketch section
+  | 'mechanical-pencil'
+  | 'pencil-hb-2b'
+  | 'pencil-6b-8b'
+  | 'charcoal-pencil'
+  | 'standard-chalk'
+  // Brush section
+  | 'oil-painting'
+  | 'thick-oil-painting'
+  | 'chalk-painting'
+  | 'blend-brush'
+  | 'blend-chalk-brush'
+  | 'soft-round'
+  | 'noise-shader'
   | string;
 
 export interface CspEffectorCurvePoint {
@@ -817,7 +829,6 @@ export interface MenuItem {
   id: string;
   label: string;
   shortcut?: string;
-  icon?: React.ReactNode;
   disabled?: boolean;
   danger?: boolean;
   divider?: boolean;

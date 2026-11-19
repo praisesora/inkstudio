@@ -56,7 +56,12 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
     if (tool === 'eraser') {
       return <Eraser className="w-3.5 h-3.5 text-rose-400 shrink-0" />;
     }
-    if (presetId?.startsWith('pencil')) {
+    if (
+      presetId?.startsWith('pencil') ||
+      presetId === 'mechanical-pencil' ||
+      presetId === 'charcoal-pencil' ||
+      presetId === 'standard-chalk'
+    ) {
       return <Pencil className="w-3.5 h-3.5 text-amber-400 shrink-0" />;
     }
     if (presetId === 'square-digital') {

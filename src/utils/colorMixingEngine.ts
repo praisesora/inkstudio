@@ -714,15 +714,24 @@ export class PaintReservoir {
       };
 
       if (isPureSmudge) {
-        // Pure Smudge / Smear: drags underlying pigment with zero fresh ink injection
-        const pickupRate = Math.min(0.96, canvasAlpha * (0.35 + (1.0 - colorStretch) * 0.55) * pressureInfluence);
-        const mixed = mixFn(currentColor, targetColor, pickupRate);
-        this.r = mixed.r;
-        this.g = mixed.g;
-        this.b = mixed.b;
-        this.a = Math.min(1.0, this.a * 0.7 + canvasAlpha * 0.3);
-        this.isLoadedWithCanvasColor = true;
-        this.cumulativeDistance = 0;
+        // Pure Smudge / Smear: drags underlying pigment with zero fresh foreground injection
+        if (!this.isLoadedWithCanvasColor) {
+          // First contact with painted canvas: snap reservoir cleanly to canvas pigment
+          this.r = targetColor.r;
+          this.g = targetColor.g;
+          this.b = targetColor.b;
+          this.a = canvasAlpha;
+          this.isLoadedWithCanvasColor = true;
+          this.cumulativeDistance = 0;
+        } else {
+          const pickupRate = Math.min(0.96, canvasAlpha * (0.35 + (1.0 - colorStretch) * 0.55) * pressureInfluence);
+          const mixed = mixFn(currentColor, targetColor, pickupRate);
+          this.r = mixed.r;
+          this.g = mixed.g;
+          this.b = mixed.b;
+          this.a = Math.min(1.0, this.a * 0.72 + canvasAlpha * 0.28);
+          this.cumulativeDistance = 0;
+        }
       } else if (mixingMode === 'running_color') {
         // Step 1: Absorb underlying canvas pigment into wet bristles (does not self-brighten on own trail)
         const pickupScale = stepDist > 0 ? Math.min(1.0, Math.max(0.2, stepDist / 2.5)) : 1.0;
@@ -774,6 +783,11 @@ export class PaintReservoir {
       }
     } else {
       // Moving into unpainted / dry area: apply Color Stretch decay
+      if (isPureSmudge && !this.isLoadedWithCanvasColor) {
+        // Pure blender on untouched transparent canvas must not emit foreground color
+        this.a = 0;
+        return { r: 0, g: 0, b: 0, alpha: 0, colorHex: '#000000' };
+      }
       if (this.isLoadedWithCanvasColor && stepDist > 0) {
         const stretchDistanceLimit = Math.max(24, colorStretch * 800);
         const decayRate = 1.0 - Math.exp(-stepDist / stretchDistanceLimit);
@@ -820,7 +834,9 @@ export class PaintReservoir {
       r: finalR,
       g: finalG,
       b: finalB,
-      alpha: Math.max(0.005, Math.min(1.0, dabAlpha)),
+      alpha: isPureSmudge
+        ? Math.max(0, Math.min(1.0, dabAlpha))
+        : Math.max(0.005, Math.min(1.0, dabAlpha)),
       colorHex: rgbToHex(finalR, finalG, finalB),
     };
   }

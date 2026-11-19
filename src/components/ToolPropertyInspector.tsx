@@ -25,7 +25,11 @@ import {
 import { saveCustomBrushDebounced } from '../utils/brushStorage';
 import { resolveBrushTipImage } from '../utils/brushOutline';
 import { BUILTIN_BRUSHES } from '../utils/presetBrushes';
-import { resetBrushSettingsToDefault, ERASER_PRESET_ID } from '../utils/brushPresetManager';
+import {
+  resetBrushSettingsToDefault,
+  ERASER_PRESET_ID,
+  DEFAULT_BRUSH_PRESET_ID,
+} from '../utils/brushPresetManager';
 import { renderBrushStrokePreview } from '../utils/brushPreview';
 import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/CspBrushEngine';
 import { useToolStore, toolStoreActions, useUiStore, uiStoreActions } from '../stores';
@@ -144,8 +148,14 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
       if (!canvas) return;
       const cssWidth = Math.max(96, width - 16);
       const cssHeight = 32;
-      const rafId = requestAnimationFrame(() => {
+      let loadListenerCleanup: (() => void) | null = null;
+      const drawPreview = () => {
         const resolvedTip = resolveBrushTipImage(brushSettings);
+        if (resolvedTip && !resolvedTip.complete) {
+          const onLoad = () => drawPreview();
+          resolvedTip.addEventListener('load', onLoad, { once: true });
+          loadListenerCleanup = () => resolvedTip.removeEventListener('load', onLoad);
+        }
         renderBrushStrokePreview(
           canvas,
           cssWidth,
@@ -156,6 +166,11 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             flow: brushSettings.flow,
             opacity: brushSettings.opacity,
             grain: brushSettings.grain,
+            paperTextureMode: brushSettings.paperTextureMode,
+            paperTextureScale: brushSettings.paperTextureScale,
+            paperTextureContrast: brushSettings.paperTextureContrast,
+            paperTextureBrightness: brushSettings.paperTextureBrightness,
+            paperTextureInverted: brushSettings.paperTextureInverted,
             hardness: brushSettings.hardness,
             spacing: brushSettings.spacing,
             minSizeFactor: brushSettings.minSizeFactor,
@@ -165,6 +180,7 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             tool: currentTool === 'eraser' ? 'eraser' : 'brush',
             customTipImage: resolvedTip,
             customTipAngle: brushSettings.customTipAngle,
+            customTipAngleDynamics: brushSettings.customTipAngleDynamics,
             thickness: brushSettings.thickness,
             thicknessVertical: brushSettings.thicknessVertical,
             flipH: brushSettings.flipH,
@@ -174,6 +190,7 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             antiAlias: brushSettings.antiAlias,
             pressureCurve: brushSettings.pressureCurve,
             spray: brushSettings.spray,
+            dynamics: brushSettings.dynamics,
             colorMixing: brushSettings.colorMixing,
             amountOfPaint: brushSettings.amountOfPaint,
             densityOfPaint: brushSettings.densityOfPaint,
@@ -182,11 +199,15 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
           },
           true
         );
-      });
-      return () => cancelAnimationFrame(rafId);
+      };
+      const rafId = requestAnimationFrame(drawPreview);
+      return () => {
+        cancelAnimationFrame(rafId);
+        loadListenerCleanup?.();
+      };
     }, [isHidden, isBrushOrEraser, width, currentTool, brushSettings]);
 
-    const activePreset: BrushPresetId = brushSettings.preset || 'pencil-2b';
+    const activePreset: BrushPresetId = brushSettings.preset || DEFAULT_BRUSH_PRESET_ID;
     const activeBuiltinBrush = BUILTIN_BRUSHES.find((b) => b.id === activePreset);
     const isCustomBrushActive =
       currentTool === 'brush' &&
@@ -1289,7 +1310,7 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                     const def = resetBrushSettingsToDefault(
                       currentTool === 'eraser'
                         ? ERASER_PRESET_ID
-                        : brushSettings.preset || 'pencil-2b',
+                        : brushSettings.preset || DEFAULT_BRUSH_PRESET_ID,
                       customBrushes
                     );
                     handleUpdateBrushSettings(def);

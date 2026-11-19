@@ -257,16 +257,20 @@ void main() {
   // 2. CSP 5-Mode Paper Grain / Canvas Tooth
   if (u_paperGrain > 0.001) {
     float g = samplePaperTooth(v_worldPos);
-    float penetration = clamp(v_pressure * 0.65, 0.0, 0.85);
-    float effDensity = u_paperGrain * (1.0 - penetration * 0.6);
+    float p = clamp(v_pressure, 0.0, 1.0);
+    float heavyExcess = max(0.0, (p - 0.52) / 0.48);
+    float penetration = min(0.92, p * 0.28 + heavyExcess * heavyExcess * 0.64);
+    float effDensity = u_paperGrain * (1.0 - penetration * 0.85);
 
     if (u_paperMode == 1) {
       // Multiply
       tipAlpha *= (1.0 - effDensity * (1.0 - g));
     } else if (u_paperMode == 2) {
-      // Compare
-      float thresh = (1.0 - g) * effDensity;
-      tipAlpha = tipAlpha > thresh ? clamp((tipAlpha - thresh) / max(0.08, 1.0 - thresh), 0.0, 1.0) : 0.0;
+      // Compare: physical dry-media height-field tooth (true zero in recessed paper valleys)
+      float contactHeight = g * (0.22 + 0.78 * tipAlpha);
+      float cutoff = effDensity * 0.68;
+      float tooth = smoothstep(cutoff - 0.05, cutoff + 0.16, contactHeight);
+      tipAlpha *= tooth;
     } else if (u_paperMode == 3) {
       // Overlay
       float ov = tipAlpha < 0.5 ? (2.0 * tipAlpha * g) : (1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - g));
@@ -783,6 +787,7 @@ export class WebGlBrushEngine {
    */
   public getOrCreateTipTexture(image: HTMLImageElement, repeatWrap: boolean = false): WebGLTexture | null {
     if (!this.gl || !image || !image.src) return null;
+    if (image.complete === false || (image.naturalWidth || image.width || 0) <= 0) return null;
     const cacheKey = `${repeatWrap ? 'rep:' : 'tip:'}${image.src}`;
     const cached = this.tipTexturesMap.get(cacheKey);
     if (cached) return cached;
@@ -806,7 +811,16 @@ export class WebGlBrushEngine {
     const wrap = repeatWrap ? gl.REPEAT : gl.CLAMP_TO_EDGE;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    const texW = image.naturalWidth || image.width || 0;
+    const texH = image.naturalHeight || image.height || 0;
+    const isPow2 = texW > 0 && texH > 0 && (texW & (texW - 1)) === 0 && (texH & (texH - 1)) === 0;
+    if (!repeatWrap && isPow2 && typeof gl.generateMipmap === 'function') {
+      // Trilinear mipmapping keeps 128x128 pencil tips crisp and alias-free at 2px-10px sizes
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    } else {
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
     this.tipTexturesMap.set(cacheKey, tex);

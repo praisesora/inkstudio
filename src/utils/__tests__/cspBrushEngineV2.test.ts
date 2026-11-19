@@ -162,11 +162,12 @@ describe('CSP Brush Engine V2 - Mathematics, Sensors & Post-Processing', () => {
     expect(data[rimIdx + 3]).toBeGreaterThan(180);
   });
 
-  it('steps brush size presets cleanly and includes all 18 studio presets', () => {
+  it('steps brush size presets cleanly and exposes G-Pen builtin preset', () => {
     expect(stepBrushSizePreset(10, 1)).toBe(12);
     expect(stepBrushSizePreset(10, -1)).toBe(8);
     expect(stepBrushSizePreset(0.5, -1)).toBe(0.5);
     expect(stepBrushSizePreset(2000, 1)).toBe(2000);
-    expect(BUILTIN_BRUSHES.length).toBeGreaterThanOrEqual(18);
+    expect(BUILTIN_BRUSHES.map((b) => b.id)).toContain('g-pen');
+    expect(BUILTIN_BRUSHES.length).toBe(17);
   });
 });

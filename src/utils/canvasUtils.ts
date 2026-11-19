@@ -549,7 +549,8 @@ export function renderCompleteStroke(
   colorMode: CanvasColorMode = 'color',
   isBgEraser: boolean = false,
   underlyingCanvas?: HTMLCanvasElement,
-  alphaLocked: boolean = false
+  alphaLocked: boolean = false,
+  explicitSampler?: LayerPixelSampler
 ) {
   if (!points || points.length === 0) return;
 
@@ -598,6 +599,7 @@ export function renderCompleteStroke(
       usePressure: brushSettings.usePressure,
       useVelocity: brushSettings.useVelocity,
       useTilt,
+      tiltScale: brushSettings.tiltScale,
       sizeSensor: brushSettings.sizeSensor,
       opacitySensor: brushSettings.opacitySensor,
       densitySensor: brushSettings.densitySensor,
@@ -629,7 +631,9 @@ export function renderCompleteStroke(
       dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
       useGpu: brushSettings.useGpu !== false,
       underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: brushSettings.colorMixing && underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      sampler: brushSettings.colorMixing
+        ? (explicitSampler || (underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined))
+        : undefined,
       reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
       isEraser: isEraser && !isBgEraser,
       isBgEraser,
@@ -650,7 +654,9 @@ export function renderCompleteStroke(
     colorStretch: brushSettings.colorStretch,
     mixingMode: brushSettings.mixingMode,
     underlyingCanvas: underlyingCanvas || ctx.canvas,
-    sampler: brushSettings.colorMixing && underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+    sampler: brushSettings.colorMixing
+      ? (explicitSampler || (underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined))
+      : undefined,
     reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
     alphaLocked,
     isTransparentInk,
@@ -661,6 +667,7 @@ export function renderCompleteStroke(
     dualTipImage: brushSettings.dualTipImage,
     dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
     useTilt,
+    tiltScale: brushSettings.tiltScale,
     thicknessVertical: brushSettings.thicknessVertical,
     flipH: brushSettings.flipH,
     flipV: brushSettings.flipV,

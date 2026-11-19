@@ -136,7 +136,7 @@ export function useCollabSync({
       const isEraser = msg.tool === 'eraser';
       const isBgEraser =
         isEraser && (msg.layerId === 'layer-bg' || msg.layerId.startsWith('layer-bg'));
-      const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
+      const isPencil = !isEraser && !bs.customTipImage && (bs.preset?.startsWith('pencil') ?? false);
       const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, colorMode);
 
       if (isPencil) {
@@ -178,7 +178,7 @@ export function useCollabSync({
       const isBgEraser =
         isEraser &&
         (strokeState.layerId === 'layer-bg' || strokeState.layerId.startsWith('layer-bg'));
-      const isPencil = !isEraser && (bs.preset?.startsWith('pencil') ?? false);
+      const isPencil = !isEraser && !bs.customTipImage && (bs.preset?.startsWith('pencil') ?? false);
       const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(bs.color, colorMode);
       const pts = strokeState.points;
 

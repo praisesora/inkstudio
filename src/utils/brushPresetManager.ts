@@ -12,7 +12,6 @@ import {
   CspTipFlipMode,
 } from '../types/editor';
 import { getBuiltinBrushConfig } from './presetBrushes';
-import { PENCIL_CONFIGS, PencilGrade } from './pencilEngine';
 import { getPreloadedTipImage, getCachedCustomBrushes } from './brushStorage';
 
 export const BRUSH_SIZE_PRESETS: number[] = [
@@ -50,8 +49,17 @@ export function stepBrushSizePreset(currentSize: number, direction: -1 | 1): num
 export const STORAGE_KEY_SETTINGS = 'sora_paint_brush_settings_by_id';
 export const STORAGE_KEY_ACTIVE_PRESET = 'sora_paint_active_brush_preset';
 export const STORAGE_KEY_BOTTOM_TAB = 'sora_paint_left_bottom_tab';
+const STORAGE_KEY_PRESET_SCHEMA = 'sora_paint_brush_preset_schema_v';
+const BUILTIN_PRESET_SCHEMA_VERSION = 2;
+const SKETCH_PRESET_IDS = [
+  'mechanical-pencil',
+  'pencil-hb-2b',
+  'pencil-6b-8b',
+  'charcoal-pencil',
+  'standard-chalk',
+];
 export const ERASER_PRESET_ID = 'tool-eraser';
-export const DEFAULT_BRUSH_PRESET_ID = 'pencil-2b';
+export const DEFAULT_BRUSH_PRESET_ID = 'g-pen';
 
 export interface BrushPersistentSettings {
   size?: number;
@@ -108,7 +116,73 @@ export interface BrushPersistentSettings {
   dynamics?: BrushDynamics;
 }
 
+export const NEUTRAL_BRUSH_DEFAULTS: Partial<BrushSettings> = {
+  brushDensity: undefined,
+  adjustDensityByGap: false,
+  blendTipsMode: 'darken',
+  brushCombineMode: undefined,
+  useTilt: false,
+  tiltScale: 1.0,
+  useVelocity: false,
+  velocityDynamics: false,
+  postCorrection: 0,
+  sharpCorners: true,
+  thickness: 1.0,
+  thicknessVertical: false,
+  flipH: 'none',
+  flipV: 'none',
+  antiAlias: 2,
+  grain: 0,
+  textureDensity: 0,
+  sizeSensor: undefined,
+  opacitySensor: undefined,
+  densitySensor: undefined,
+  customTipDataUrl: undefined,
+  customTipImage: undefined,
+  customTipAngle: 0,
+  customTipAngleDynamics: 'none',
+  customTipRotationRandomScale: 0,
+  isColorTip: false,
+  subTips: undefined,
+  subTipOrder: undefined,
+  subTipImages: undefined,
+  pressureCurve: undefined,
+  velocityCurve: undefined,
+  pressureCurveGamma: 1.0,
+  spray: undefined,
+  taper: undefined,
+  isRibbon: false,
+  colorMixing: false,
+  perceptualMixing: true,
+  amountOfPaint: 0.7,
+  densityOfPaint: 0.8,
+  colorStretch: 0.6,
+  mixingMode: 'blend',
+  wetEdge: 0,
+  wetEdgeRadius: undefined,
+  wetEdgeAlphaPower: undefined,
+  wetEdgeValuePower: undefined,
+  paperTexture: undefined,
+  paperTextureImage: undefined,
+  paperTextureMode: 'subtract',
+  paperTextureBrightness: 0,
+  paperTextureContrast: 0,
+  paperTextureApplyEachPlot: false,
+  paperTextureInverted: false,
+  paperTextureScale: 1.0,
+  paperTextureRotate: 0,
+  dualBrush: false,
+  dualBrushCompositeMode: 'multiply',
+  dualSize: undefined,
+  dualSpacing: undefined,
+  dualTipDataUrl: undefined,
+  dualTipImage: undefined,
+  dynamics: undefined,
+  useGpu: true,
+};
+
 export const DEFAULT_ERASER_SETTINGS: Partial<BrushSettings> = {
+  ...NEUTRAL_BRUSH_DEFAULTS,
   preset: ERASER_PRESET_ID,
   brushName: 'Eraser',
   size: 30,
@@ -133,7 +207,24 @@ export function loadAllSavedBrushSettings(): Record<string, BrushPersistentSetti
   if (_memorySettingsCache) return _memorySettingsCache;
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STORAGE_KEY_SETTINGS) : null;
-    _memorySettingsCache = raw ? JSON.parse(raw) : {};
+    const parsed: Record<string, BrushPersistentSettings> = raw ? JSON.parse(raw) : {};
+    if (typeof localStorage !== 'undefined') {
+      const storedVer = Number(localStorage.getItem(STORAGE_KEY_PRESET_SCHEMA) || '0');
+      if (storedVer < BUILTIN_PRESET_SCHEMA_VERSION) {
+        let mutated = false;
+        for (const id of SKETCH_PRESET_IDS) {
+          if (parsed[id]) {
+            delete parsed[id];
+            mutated = true;
+          }
+        }
+        if (mutated) {
+          localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify(parsed));
+        }
+        localStorage.setItem(STORAGE_KEY_PRESET_SCHEMA, String(BUILTIN_PRESET_SCHEMA_VERSION));
+      }
+    }
+    _memorySettingsCache = parsed;
   } catch {
     _memorySettingsCache = {};
   }
@@ -283,7 +374,10 @@ export function resetBrushSettingsToDefault(
 export function getActivePresetId(): string {
   try {
     if (typeof localStorage === 'undefined') return DEFAULT_BRUSH_PRESET_ID;
-    return localStorage.getItem(STORAGE_KEY_ACTIVE_PRESET) || DEFAULT_BRUSH_PRESET_ID;
+    const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_PRESET);
+    if (!saved) return DEFAULT_BRUSH_PRESET_ID;
+    if (saved.startsWith('csp-') || getBuiltinBrushConfig(saved)) return saved;
+    return DEFAULT_BRUSH_PRESET_ID;
   } catch {
     return DEFAULT_BRUSH_PRESET_ID;
   }
@@ -341,6 +435,7 @@ export function getEffectiveBrushSettings(
       }
 
       return {
+        ...NEUTRAL_BRUSH_DEFAULTS,
         preset: cspMatch.id,
         brushName: cspMatch.name,
         size: cspMatch.size,
@@ -419,72 +514,31 @@ export function getEffectiveBrushSettings(
   const builtinCfg = getBuiltinBrushConfig(presetId as BrushPresetId);
   if (builtinCfg) {
     return {
+      ...NEUTRAL_BRUSH_DEFAULTS,
       preset: presetId,
-      customTipDataUrl: undefined,
-      customTipImage: undefined,
-      customTipAngle: 0,
-      customTipAngleDynamics: 'none',
-      thickness: 1.0,
-      thicknessVertical: false,
-      flipH: 'none',
-      flipV: 'none',
-      blendTipsMode: 'darken',
-      adjustDensityByGap: false,
-      antiAlias: 2,
-      postCorrection: 0,
-      sharpCorners: true,
-      useTilt: false,
-      colorMixing: false,
-      perceptualMixing: true,
-      wetEdge: 0,
-      grain: 0,
-      spray: undefined,
       ...builtinCfg,
       ...saved,
     };
   }
 
-  // 4. Pencil configs fallback
-  const pencilConfig = PENCIL_CONFIGS[presetId as PencilGrade];
-  if (pencilConfig) {
-    return {
-      preset: presetId,
-      brushName: pencilConfig.name,
-      customTipDataUrl: undefined,
-      customTipImage: undefined,
-      customTipAngle: 0,
-      size: pencilConfig.defaultSize,
-      flow: pencilConfig.flow,
-      hardness: pencilConfig.hardness,
-      minSizeFactor: pencilConfig.minSizeFactor,
-      grain: pencilConfig.grain,
-      spacing: pencilConfig.spacing,
-      usePressure: true,
-      useTilt: true,
-      smoothing: true,
-      stabilization: 15,
-      sharpCorners: true,
-      useGpu: true,
-      ...saved,
-    };
-  }
-
-  // 5. Default fallback (pencil-2b)
+  // 4. Default fallback (g-pen)
+  const defaultCfg = getBuiltinBrushConfig(DEFAULT_BRUSH_PRESET_ID);
+  const defaultSaved = getSavedBrushSettings(DEFAULT_BRUSH_PRESET_ID);
   return {
-    preset: 'pencil-2b',
-    brushName: 'Pencil (2B)',
-    size: 3.5,
-    minSizeFactor: 0.25,
-    flow: 0.74,
-    hardness: 0.8,
-    grain: 0.95,
-    spacing: 0.08,
+    ...NEUTRAL_BRUSH_DEFAULTS,
+    preset: DEFAULT_BRUSH_PRESET_ID,
+    brushName: 'G-Pen',
+    size: 8,
+    minSizeFactor: 0.04,
+    flow: 1.0,
+    opacity: 1.0,
+    hardness: 1.0,
+    spacing: 0.04,
+    stabilization: 20,
     usePressure: true,
-    useTilt: true,
     smoothing: true,
-    stabilization: 15,
-    sharpCorners: true,
     useGpu: true,
-    ...saved,
+    ...defaultCfg,
+    ...defaultSaved,
   };
 }

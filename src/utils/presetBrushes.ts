@@ -1,305 +1,84 @@
-import { BrushPresetId, BrushSettings } from '../types/editor';
-import { dabHashFloat } from '../engine/CspBrushEngine';
-
-export type BrushCategory = 'pencil-line' | 'color-paint';
+import {
+  BrushCategory,
+  BrushPresetId,
+  BrushSettings,
+  DEFAULT_BRUSH_DYNAMICS,
+} from '../types/editor';
+import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/CspBrushEngine';
+import {
+  generateRealGPenTip,
+  generateTexturedPenTip,
+  generateCalligraphyTip,
+  generateMechanicalPencilTip,
+  generateHb2bPencilTip,
+  generate6b8bPencilTip,
+  generateCharcoalTip,
+  generateChalkTip,
+  generateOilBristleTip,
+  generateThickOilTip,
+  generateChalkPaintTip,
+  generateNoiseShaderTip,
+  generateFinePaperTexture,
+  generateSketchPaperTexture,
+  generateCharcoalPaperTexture,
+  generateCanvasWeaveTexture,
+  generateNoiseGrainTexture,
+} from './proceduralBrushTips';
 
 export interface BuiltinBrushDefinition {
   id: BrushPresetId;
-  name: string;
   category: BrushCategory;
-  categoryName: string;
+  name: string;
   badge: string;
   badgeBg: string;
   badgeText: string;
   badgeBorder: string;
   desc: string;
-  icon: 'pencil' | 'paintbrush' | 'palette' | 'square';
+  icon: 'pen' | 'pencil' | 'paintbrush';
   settings: Partial<BrushSettings>;
   tipGenerator?: () => string; // Returns Base64 PNG data URL
+  paperTextureGenerator?: () => string; // Returns seamless Base64 PNG data URL
 }
 
-// -------------------------------------------------------------
-// Procedural High-Resolution Tip Mask Generators
-// -------------------------------------------------------------
-
-let _squareTipDataUrl: string | null = null;
-export function getSquareTipDataUrl(): string {
-  if (_squareTipDataUrl) return _squareTipDataUrl;
-  const canvas = document.createElement('canvas');
-  canvas.width = 64;
-  canvas.height = 64;
-  const ctx = canvas.getContext('2d');
-  if (!ctx || typeof canvas.toDataURL !== 'function') return '';
-  ctx.clearRect(0, 0, 64, 64);
-  ctx.fillStyle = '#ffffff';
-  ctx.fillRect(4, 4, 56, 56);
-  _squareTipDataUrl = canvas.toDataURL('image/png');
-  return _squareTipDataUrl;
+export interface BuiltinBrushSection {
+  id: BrushCategory;
+  label: string;
 }
 
-let _realGPenTipDataUrl: string | null = null;
-export function getRealGPenTipDataUrl(): string {
-  if (_realGPenTipDataUrl) return _realGPenTipDataUrl;
-  const size = 96;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (!ctx || typeof canvas.toDataURL !== 'function' || typeof ctx.createImageData !== 'function') {
-    return '';
-  }
+export const BUILTIN_BRUSH_SECTIONS: BuiltinBrushSection[] = [
+  { id: 'pen', label: 'Pen' },
+  { id: 'sketch', label: 'Sketch' },
+  { id: 'brush', label: 'Brush' },
+];
 
-  const imgData = ctx.createImageData(size, size);
-  const data = imgData.data;
-  const half = size * 0.5;
-  const maxR = half - 3;
-
-  for (let y = 0; y < size; y++) {
-    const dy = y - half;
-    for (let x = 0; x < size; x++) {
-      const dx = x - half;
-      const r = Math.hypot(dx, dy) / maxR;
-      if (r > 1.08) continue;
-
-      const angleIdx = Math.round(((Math.atan2(dy, dx) + Math.PI) / (Math.PI * 2)) * 96);
-      const angularTooth =
-        (dabHashFloat(angleIdx, 0, 1, 701) - 0.5) * 0.14 +
-        (dabHashFloat(Math.floor(angleIdx * 0.5), 1, 2, 709) - 0.5) * 0.1;
-      const microGrain = (dabHashFloat(x, y, 3, 719) - 0.5) * 0.12;
-      const effEdge = 0.9 + angularTooth + microGrain * 0.5;
-
-      let alpha = 0;
-      if (r <= effEdge - 0.08) {
-        alpha = 1.0;
-      } else if (r < effEdge + 0.08) {
-        const t = (effEdge + 0.08 - r) / 0.16;
-        alpha = t * t * (3 - 2 * t);
-      }
-
-      if (alpha > 0.01) {
-        const idx = (y * size + x) * 4;
-        data[idx] = 255;
-        data[idx + 1] = 255;
-        data[idx + 2] = 255;
-        data[idx + 3] = Math.round(alpha * 255);
-      }
-    }
-  }
-
-  ctx.putImageData(imgData, 0, 0);
-  _realGPenTipDataUrl = canvas.toDataURL('image/png');
-  return _realGPenTipDataUrl;
-}
-
-let _bristleTipDataUrl: string | null = null;
-export function getBristleTipDataUrl(): string {
-  if (_bristleTipDataUrl) return _bristleTipDataUrl;
-  const size = 96;
-  const canvas = document.createElement('canvas');
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext('2d');
-  if (!ctx || typeof canvas.toDataURL !== 'function' || typeof ctx.createImageData !== 'function') {
-    return '';
-  }
-
-  const imgData = ctx.createImageData(size, size);
-  const data = imgData.data;
-  const half = size * 0.5;
-  const maxR = half - 4;
-
-  // Deterministic multi-filament hog-bristle cluster
-  const filaments: { cx: number; cy: number; rad: number; str: number }[] = [];
-  const count = 42;
-  for (let i = 0; i < count; i++) {
-    const u = dabHashFloat(i, 11, i, 811);
-    const v = dabHashFloat(i, 23, i, 823);
-    const rr = maxR * 0.86 * Math.sqrt(u);
-    const th = v * Math.PI * 2;
-    filaments.push({
-      cx: half + rr * Math.cos(th),
-      cy: half + rr * Math.sin(th) * 0.68,
-      rad: 2.2 + dabHashFloat(i, 37, i, 829) * 3.8,
-      str: 0.55 + dabHashFloat(i, 41, i, 839) * 0.45,
-    });
-  }
-
-  for (let y = 0; y < size; y++) {
-    for (let x = 0; x < size; x++) {
-      let acc = 0;
-      for (let f = 0; f < filaments.length; f++) {
-        const fil = filaments[f];
-        const d = Math.hypot(x - fil.cx, y - fil.cy) / fil.rad;
-        if (d < 1.0) {
-          const w = (1.0 - d) * (1.0 - d) * fil.str;
-          if (w > acc) acc = Math.min(1.0, acc * 0.35 + w);
-        }
-      }
-      if (acc > 0.02) {
-        const idx = (y * size + x) * 4;
-        data[idx] = 255;
-        data[idx + 1] = 255;
-        data[idx + 2] = 255;
-        data[idx + 3] = Math.min(255, Math.round(acc * 255));
-      }
-    }
-  }
-
-  ctx.putImageData(imgData, 0, 0);
-  _bristleTipDataUrl = canvas.toDataURL('image/png');
-  return _bristleTipDataUrl;
-}
-
-// Preloaded images cache
 const preloadedTipImages = new Map<string, HTMLImageElement>();
 export function getPreloadedBuiltinTipImage(dataUrl: string): HTMLImageElement | undefined {
   if (!dataUrl || typeof Image === 'undefined') return undefined;
-  if (preloadedTipImages.has(dataUrl)) {
-    return preloadedTipImages.get(dataUrl);
-  }
+  const cached = preloadedTipImages.get(dataUrl);
+  if (cached) return cached;
   const img = new Image();
   img.src = dataUrl;
+  if (typeof img.decode === 'function') {
+    img.decode().catch(() => {});
+  }
   preloadedTipImages.set(dataUrl, img);
   return img;
 }
 
-// Eagerly generate and preload built-in brush tip textures at startup
-if (typeof document !== 'undefined' && typeof Image !== 'undefined') {
-  try {
-    const square = getSquareTipDataUrl();
-    if (square) getPreloadedBuiltinTipImage(square);
-    const realG = getRealGPenTipDataUrl();
-    if (realG) getPreloadedBuiltinTipImage(realG);
-    const bristle = getBristleTipDataUrl();
-    if (bristle) getPreloadedBuiltinTipImage(bristle);
-  } catch {
-    // Headless test environments may mock document.createElement minimally
-  }
-}
-
-// -------------------------------------------------------------
-// Built-in Brushes Directory organized by Category
-// -------------------------------------------------------------
-
 export const BUILTIN_BRUSHES: BuiltinBrushDefinition[] = [
-  // ============================================================
-  // CATEGORY 1: PENCIL & LINE
-  // ============================================================
-  {
-    id: 'pencil-2b',
-    name: 'Pencil (2B)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: '2B',
-    badgeBg: 'bg-amber-500/15',
-    badgeText: 'text-amber-300',
-    badgeBorder: 'border-amber-500/30',
-    desc: 'Soft & Black Sketching',
-    icon: 'pencil',
-    settings: {
-      size: 3.5,
-      minSizeFactor: 0.25,
-      flow: 0.74,
-      hardness: 0.8,
-      grain: 0.95,
-      spacing: 0.08,
-      usePressure: true,
-      useTilt: true,
-      smoothing: true,
-      stabilization: 15,
-      sharpCorners: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'pencil-4b',
-    name: 'Pencil (4B)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: '4B',
-    badgeBg: 'bg-orange-500/15',
-    badgeText: 'text-orange-300',
-    badgeBorder: 'border-orange-500/30',
-    desc: 'Extra Soft & Velvety Carbon',
-    icon: 'pencil',
-    settings: {
-      size: 4.5,
-      minSizeFactor: 0.2,
-      flow: 0.88,
-      hardness: 0.7,
-      grain: 0.98,
-      spacing: 0.08,
-      usePressure: true,
-      useTilt: true,
-      smoothing: true,
-      stabilization: 15,
-      sharpCorners: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'pencil-hb',
-    name: 'Pencil (HB)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'HB',
-    badgeBg: 'bg-emerald-500/15',
-    badgeText: 'text-emerald-300',
-    badgeBorder: 'border-emerald-500/30',
-    desc: 'Medium Classic',
-    icon: 'pencil',
-    settings: {
-      size: 3.0,
-      minSizeFactor: 0.3,
-      flow: 0.65,
-      hardness: 0.82,
-      grain: 0.92,
-      spacing: 0.08,
-      usePressure: true,
-      useTilt: true,
-      smoothing: true,
-      stabilization: 15,
-      sharpCorners: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'pencil-f',
-    name: 'Pencil (F)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'F',
-    badgeBg: 'bg-sky-500/15',
-    badgeText: 'text-sky-300',
-    badgeBorder: 'border-sky-500/30',
-    desc: 'Firm & Fine Lead',
-    icon: 'pencil',
-    settings: {
-      size: 2.5,
-      minSizeFactor: 0.35,
-      flow: 0.55,
-      hardness: 0.85,
-      grain: 0.88,
-      spacing: 0.08,
-      usePressure: true,
-      useTilt: true,
-      smoothing: true,
-      stabilization: 15,
-      sharpCorners: true,
-      useGpu: true,
-    },
-  },
+  // =========================================================================
+  // PEN SECTION
+  // =========================================================================
   {
     id: 'g-pen',
-    name: 'G-Pen (Manga Ink)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
+    category: 'pen',
+    name: 'G-Pen',
     badge: 'Pen',
     badgeBg: 'bg-indigo-500/15',
     badgeText: 'text-indigo-300',
     badgeBorder: 'border-indigo-500/30',
     desc: 'Sharp Pressure Taper & Inking',
-    icon: 'paintbrush',
+    icon: 'pen',
     settings: {
       size: 8,
       minSizeFactor: 0.04,
@@ -318,408 +97,741 @@ export const BUILTIN_BRUSHES: BuiltinBrushDefinition[] = [
   },
   {
     id: 'real-g-pen',
-    name: 'Real G-Pen (Textured Nib)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'Real G',
+    category: 'pen',
+    name: 'Real G-Pen',
+    badge: 'Pen',
     badgeBg: 'bg-indigo-500/15',
-    badgeText: 'text-indigo-200',
-    badgeBorder: 'border-indigo-400/30',
-    desc: 'Organic Analog Manga Nib & Tooth',
-    icon: 'paintbrush',
-    tipGenerator: getRealGPenTipDataUrl,
+    badgeText: 'text-indigo-300',
+    badgeBorder: 'border-indigo-500/30',
+    desc: 'Organic Manga Nib with Subtle Ink-on-Paper Edge Texture',
+    icon: 'pen',
+    tipGenerator: generateRealGPenTip,
+    settings: {
+      size: 8,
+      minSizeFactor: 0.05,
+      flow: 0.96,
+      opacity: 1.0,
+      hardness: 0.96,
+      antiAlias: 2,
+      spacing: 0.045,
+      stabilization: 18,
+      sharpCorners: true,
+      usePressure: true,
+      useTilt: false,
+      smoothing: true,
+      pressureCurve: CSP_PRESSURE_CURVE_PRESETS['g-pen'].points,
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.24,
+      textureDensity: 0.24,
+      paperTextureMode: 'outline',
+      paperTextureScale: 0.85,
+      paperTextureContrast: 25,
+      taper: {
+        useIn: false,
+        inLength: 0,
+        inRatio: 0,
+        useOut: true,
+        outLength: 10,
+        outRatio: 0.25,
+        endingSharpness: 0.72,
+        affectSize: true,
+      },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'textured-pen',
+    category: 'pen',
+    name: 'Textured Pen',
+    badge: 'Pen',
+    badgeBg: 'bg-indigo-500/15',
+    badgeText: 'text-indigo-300',
+    badgeBorder: 'border-indigo-500/30',
+    desc: 'Expressive Dry-Edge Inking Pen with Paper Tooth Breakup',
+    icon: 'pen',
+    tipGenerator: generateTexturedPenTip,
     settings: {
       size: 9,
-      minSizeFactor: 0.03,
-      flow: 1.0,
+      minSizeFactor: 0.08,
+      flow: 0.92,
       opacity: 1.0,
-      hardness: 1.0,
-      antiAlias: 1,
-      spacing: 0.045,
-      grain: 0.38,
-      paperTextureMode: 'subtract',
-      customTipAngleDynamics: 'direction',
-      stabilization: 18,
-      sharpCorners: true,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'maru-pen',
-    name: 'Maru Pen (Mapping Pen)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'Maru',
-    badgeBg: 'bg-violet-500/15',
-    badgeText: 'text-violet-300',
-    badgeBorder: 'border-violet-500/30',
-    desc: 'Delicate Manga Crosshatching & Hairlines',
-    icon: 'paintbrush',
-    settings: {
-      size: 4.5,
-      minSizeFactor: 0.02,
-      flow: 1.0,
-      opacity: 1.0,
-      hardness: 1.0,
+      hardness: 0.92,
       antiAlias: 2,
-      spacing: 0.035,
-      stabilization: 24,
-      sharpCorners: true,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'turnip-pen',
-    name: 'Turnip Pen (Kabura Pen)',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'Turnip',
-    badgeBg: 'bg-teal-500/15',
-    badgeText: 'text-teal-300',
-    badgeBorder: 'border-teal-500/30',
-    desc: 'Uniform Contours & Manga Character Lineart',
-    icon: 'paintbrush',
-    settings: {
-      size: 9.0,
-      minSizeFactor: 0.28,
-      flow: 1.0,
-      opacity: 1.0,
-      hardness: 1.0,
-      antiAlias: 2,
-      spacing: 0.05,
-      stabilization: 18,
-      sharpCorners: true,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'calligraphy-pen',
-    name: 'Calligraphy Pen',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'Calli',
-    badgeBg: 'bg-fuchsia-500/15',
-    badgeText: 'text-fuchsia-300',
-    badgeBorder: 'border-fuchsia-500/30',
-    desc: '45-Degree Flat Chisel Nib',
-    icon: 'paintbrush',
-    settings: {
-      size: 14,
-      minSizeFactor: 0.35,
-      flow: 1.0,
-      opacity: 1.0,
-      hardness: 1.0,
-      thickness: 0.22,
-      customTipAngle: 45,
-      customTipAngleDynamics: 'none',
-      antiAlias: 2,
-      spacing: 0.035,
-      stabilization: 22,
-      sharpCorners: true,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'round',
-    name: 'Round Brush',
-    category: 'pencil-line',
-    categoryName: 'Pencil & Line',
-    badge: 'Ink',
-    badgeBg: 'bg-blue-500/15',
-    badgeText: 'text-blue-300',
-    badgeBorder: 'border-blue-500/30',
-    desc: 'Smooth Digital Inking',
-    icon: 'paintbrush',
-    settings: {
-      size: 14,
-      minSizeFactor: 0.15,
-      flow: 0.85,
-      opacity: 1.0,
-      hardness: 0.9,
-      spacing: 0.08,
+      spacing: 0.055,
       stabilization: 15,
       sharpCorners: true,
       usePressure: true,
       useTilt: false,
       smoothing: true,
-      useGpu: true,
-    },
-  },
-  // ============================================================
-  // CATEGORY 2: COLOR & PAINT
-  // ============================================================
-  {
-    id: 'airbrush-soft',
-    name: 'Soft Airbrush',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Air',
-    badgeBg: 'bg-pink-500/15',
-    badgeText: 'text-pink-300',
-    badgeBorder: 'border-pink-500/30',
-    desc: 'Silky Gaussian Radial Falloff & Delicate Glaze',
-    icon: 'paintbrush',
-    settings: {
-      size: 48,
-      minSizeFactor: 0.35,
-      flow: 0.28,
-      opacity: 1.0,
-      hardness: 0.0,
-      spacing: 0.08,
-      adjustDensityByGap: true,
-      stabilization: 10,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.56,
+      textureDensity: 0.56,
+      paperTextureMode: 'subtract',
+      paperTextureScale: 1.0,
+      paperTextureContrast: 38,
+      opacitySensor: { usePressure: true, pressureMin: 0.55 },
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.08,
+        angleJitter: 1.0,
+        flowJitter: 0.12,
+      },
       useGpu: true,
     },
   },
   {
-    id: 'spray-tone',
-    name: 'Tone Spray Airbrush',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Spray',
-    badgeBg: 'bg-rose-500/15',
-    badgeText: 'text-rose-300',
-    badgeBorder: 'border-rose-500/30',
-    desc: 'Crisp Binary Manga Tone Stipple Spray',
-    icon: 'paintbrush',
-    tipGenerator: getSquareTipDataUrl,
+    id: 'dot-pen',
+    category: 'pen',
+    name: 'Dot Pen',
+    badge: 'Pen',
+    badgeBg: 'bg-indigo-500/15',
+    badgeText: 'text-indigo-300',
+    badgeBorder: 'border-indigo-500/30',
+    desc: '1-Bit Pixel Crisp Binary Pen (Zero Anti-Aliasing)',
+    icon: 'pen',
     settings: {
-      size: 44,
-      minSizeFactor: 0.4,
-      flow: 0.95,
+      size: 1,
+      minSizeFactor: 1.0,
+      flow: 1.0,
       opacity: 1.0,
       hardness: 1.0,
       antiAlias: 0,
-      spacing: 0.14,
-      spray: {
-        enabled: true,
-        size: 2,
-        density: 12,
-        bias: 0.3,
-      },
-      stabilization: 8,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'flat-marker',
-    name: 'Flat Marker (Copic)',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Marker',
-    badgeBg: 'bg-cyan-500/15',
-    badgeText: 'text-cyan-300',
-    badgeBorder: 'border-cyan-500/30',
-    desc: 'Compare-Density Even Wash Chisel Marker',
-    icon: 'square',
-    settings: {
-      size: 28,
-      minSizeFactor: 0.65,
-      flow: 0.58,
-      opacity: 0.78,
-      hardness: 0.92,
-      thickness: 0.32,
-      customTipAngle: 30,
-      customTipAngleDynamics: 'none',
-      blendTipsMode: 'compare',
-      adjustDensityByGap: true,
       spacing: 0.04,
-      stabilization: 12,
-      usePressure: true,
+      stabilization: 0,
+      sharpCorners: true,
+      usePressure: false,
       useTilt: false,
-      smoothing: true,
-      useGpu: true,
+      smoothing: false,
+      useGpu: false,
     },
   },
   {
-    id: 'opaque-watercolor',
-    name: 'Opaque Watercolor',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Water',
-    badgeBg: 'bg-sky-500/15',
-    badgeText: 'text-sky-300',
-    badgeBorder: 'border-sky-500/30',
-    desc: 'Creamy Perceptual OKLab Blending Brush',
-    icon: 'palette',
+    id: 'calligraphy',
+    category: 'pen',
+    name: 'Calligraphy',
+    badge: 'Pen',
+    badgeBg: 'bg-indigo-500/15',
+    badgeText: 'text-indigo-300',
+    badgeBorder: 'border-indigo-500/30',
+    desc: 'Broad-Edge Angled Chisel Nib with Thick/Thin Directional Contrast',
+    icon: 'pen',
+    tipGenerator: generateCalligraphyTip,
     settings: {
-      size: 26,
-      minSizeFactor: 0.28,
-      flow: 0.74,
+      size: 18,
+      minSizeFactor: 0.45,
+      flow: 1.0,
       opacity: 1.0,
-      hardness: 0.45,
-      spacing: 0.06,
-      colorMixing: true,
-      perceptualMixing: true,
-      mixingMode: 'blend',
-      amountOfPaint: 0.58,
-      densityOfPaint: 0.75,
-      colorStretch: 0.68,
-      stabilization: 12,
+      hardness: 0.98,
+      antiAlias: 2,
+      thickness: 0.18,
+      customTipAngle: -38,
+      customTipAngleDynamics: 'none',
+      spacing: 0.04,
+      stabilization: 16,
+      sharpCorners: true,
       usePressure: true,
       useTilt: false,
       smoothing: true,
+      pressureCurve: CSP_PRESSURE_CURVE_PRESETS.firm.points,
       useGpu: true,
     },
   },
+
+  // =========================================================================
+  // SKETCH SECTION
+  // =========================================================================
   {
-    id: 'transparent-watercolor',
-    name: 'Transparent Watercolor',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Wash',
-    badgeBg: 'bg-blue-500/15',
-    badgeText: 'text-blue-200',
-    badgeBorder: 'border-blue-400/30',
-    desc: 'Capillary Wet-Edge Rim & Cold-Press Grain',
-    icon: 'palette',
-    settings: {
-      size: 32,
-      minSizeFactor: 0.32,
-      flow: 0.44,
-      opacity: 0.9,
-      hardness: 0.35,
-      spacing: 0.06,
-      blendTipsMode: 'compare',
-      adjustDensityByGap: true,
-      grain: 0.45,
-      paperTextureMode: 'multiply',
-      wetEdge: 0.65,
-      wetEdgeRadius: 3.5,
-      wetEdgeAlphaPower: 35,
-      wetEdgeValuePower: 18,
-      colorMixing: true,
-      perceptualMixing: true,
-      mixingMode: 'running_color',
-      amountOfPaint: 0.45,
-      densityOfPaint: 0.55,
-      colorStretch: 0.72,
-      stabilization: 12,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
-      useGpu: true,
-    },
-  },
-  {
-    id: 'oil-paint',
-    name: 'Thick Oil Paint',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Oil',
+    id: 'mechanical-pencil',
+    category: 'sketch',
+    name: 'Mechanical Pencil',
+    badge: 'Sketch',
     badgeBg: 'bg-amber-500/15',
     badgeText: 'text-amber-300',
     badgeBorder: 'border-amber-500/30',
-    desc: 'Directional Hog-Bristle Impasto Mixing',
-    icon: 'palette',
-    tipGenerator: getBristleTipDataUrl,
+    desc: 'Firm 0.5mm Lead — Thin, Tilt-Independent, Crisp Edge & Minimal Grain',
+    icon: 'pencil',
+    tipGenerator: generateMechanicalPencilTip,
+    paperTextureGenerator: generateFinePaperTexture,
     settings: {
-      size: 30,
-      minSizeFactor: 0.3,
-      flow: 0.92,
-      opacity: 1.0,
+      size: 2.8,
+      minSizeFactor: 0.72,
+      flow: 0.44,
+      opacity: 0.94,
       hardness: 0.95,
-      spacing: 0.045,
-      customTipAngleDynamics: 'direction',
-      grain: 0.25,
-      paperTextureMode: 'subtract',
-      colorMixing: true,
-      perceptualMixing: true,
-      mixingMode: 'blend',
-      amountOfPaint: 0.74,
-      densityOfPaint: 0.88,
-      colorStretch: 0.8,
-      stabilization: 12,
+      antiAlias: 1,
+      spacing: 0.1,
+      stabilization: 6,
+      sharpCorners: true,
       usePressure: true,
       useTilt: false,
       smoothing: true,
+      pressureCurve: CSP_PRESSURE_CURVE_PRESETS.firm.points,
+      opacitySensor: { usePressure: true, pressureMin: 0.22 },
+      densitySensor: { usePressure: true, pressureMin: 0.35 },
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.34,
+      textureDensity: 0.34,
+      paperTextureMode: 'compare',
+      paperTextureScale: 0.7,
+      paperTextureContrast: 22,
       useGpu: true,
     },
   },
   {
-    id: 'soft-blender',
-    name: 'Soft Smudge Blender',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Blend',
-    badgeBg: 'bg-purple-500/15',
-    badgeText: 'text-purple-300',
-    badgeBorder: 'border-purple-500/30',
-    desc: 'Zero-Pigment Wet Color Stretch & Blur',
-    icon: 'palette',
+    id: 'pencil-hb-2b',
+    category: 'sketch',
+    name: 'HB / 2B Pencil',
+    badge: 'Sketch',
+    badgeBg: 'bg-amber-500/15',
+    badgeText: 'text-amber-300',
+    badgeBorder: 'border-amber-500/30',
+    desc: 'Classic Graphite — Moderate Tooth, Smooth Pressure Flow & Gentle Tilt Shading',
+    icon: 'pencil',
+    tipGenerator: generateHb2bPencilTip,
+    paperTextureGenerator: generateSketchPaperTexture,
     settings: {
-      size: 36,
-      minSizeFactor: 0.5,
+      size: 5.5,
+      minSizeFactor: 0.45,
+      flow: 0.38,
+      opacity: 0.96,
+      hardness: 0.78,
+      antiAlias: 2,
+      spacing: 0.13,
+      stabilization: 5,
+      sharpCorners: true,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 0.95,
+      smoothing: true,
+      pressureCurve: [
+        [0, 0],
+        [0.3, 0.24],
+        [0.7, 0.7],
+        [1, 1],
+      ],
+      opacitySensor: { usePressure: true, pressureMin: 0.14 },
+      densitySensor: { usePressure: true, pressureMin: 0.25 },
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.64,
+      textureDensity: 0.64,
+      paperTextureMode: 'compare',
+      paperTextureScale: 0.75,
+      paperTextureContrast: 28,
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.06,
+        flowJitter: 0.14,
+      },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'pencil-6b-8b',
+    category: 'sketch',
+    name: '6B / 8B Pencil',
+    badge: 'Sketch',
+    badgeBg: 'bg-amber-500/15',
+    badgeText: 'text-amber-300',
+    badgeBorder: 'border-amber-500/30',
+    desc: 'Rich Soft Graphite — Strong Paper Tooth, Heavy-Pressure Clog & Broad Tilt Edge',
+    icon: 'pencil',
+    tipGenerator: generate6b8bPencilTip,
+    paperTextureGenerator: generateSketchPaperTexture,
+    settings: {
+      size: 9,
+      minSizeFactor: 0.36,
+      flow: 0.56,
+      opacity: 1.0,
+      hardness: 0.65,
+      antiAlias: 2,
+      thickness: 0.7,
+      spacing: 0.14,
+      stabilization: 4,
+      sharpCorners: true,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 2.1,
+      smoothing: true,
+      pressureCurve: [
+        [0, 0],
+        [0.25, 0.28],
+        [0.6, 0.74],
+        [1, 1],
+      ],
+      opacitySensor: { usePressure: true, pressureMin: 0.18 },
+      densitySensor: { usePressure: true, pressureMin: 0.3 },
+      customTipAngleDynamics: 'direction-random',
+      customTipRotationRandomScale: 0.28,
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.86,
+      textureDensity: 0.86,
+      paperTextureMode: 'compare',
+      paperTextureScale: 0.9,
+      paperTextureContrast: 38,
+      paperTextureBrightness: -4,
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.1,
+        flowJitter: 0.18,
+      },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'charcoal-pencil',
+    category: 'sketch',
+    name: 'Charcoal Pencil',
+    badge: 'Sketch',
+    badgeBg: 'bg-amber-500/15',
+    badgeText: 'text-amber-300',
+    badgeBorder: 'border-amber-500/30',
+    desc: 'Deep Matte Dry Carbon — Jagged Edge, Aggressive Tooth, Edge Crumbs & Tilt Shading',
+    icon: 'pencil',
+    tipGenerator: generateCharcoalTip,
+    paperTextureGenerator: generateCharcoalPaperTexture,
+    settings: {
+      size: 16,
+      minSizeFactor: 0.3,
+      flow: 0.68,
+      opacity: 1.0,
+      hardness: 0.5,
+      antiAlias: 2,
+      thickness: 0.72,
+      spacing: 0.18,
+      stabilization: 3,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 2.2,
+      smoothing: true,
+      pressureCurve: [
+        [0, 0],
+        [0.22, 0.3],
+        [0.55, 0.76],
+        [1, 1],
+      ],
+      opacitySensor: { usePressure: true, pressureMin: 0.2 },
+      densitySensor: { usePressure: true, pressureMin: 0.32 },
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.92,
+      textureDensity: 0.92,
+      paperTextureMode: 'compare',
+      paperTextureScale: 1.0,
+      paperTextureContrast: 48,
+      paperTextureBrightness: -6,
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.2,
+        angleJitter: 1.0,
+        roundnessJitter: 0.16,
+        scatter: 0.05,
+        scatterBothAxes: true,
+        count: 1,
+        flowJitter: 0.22,
+      },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'standard-chalk',
+    category: 'sketch',
+    name: 'Standard Chalk',
+    badge: 'Sketch',
+    badgeBg: 'bg-amber-500/15',
+    badgeText: 'text-amber-300',
+    badgeBorder: 'border-amber-500/30',
+    desc: 'Powdery Dry Chalk Stick — Heavy Mineral Tooth & Tilt Shading',
+    icon: 'pencil',
+    tipGenerator: generateChalkTip,
+    paperTextureGenerator: generateCharcoalPaperTexture,
+    settings: {
+      size: 22,
+      minSizeFactor: 0.45,
+      flow: 0.52,
+      opacity: 0.96,
+      hardness: 0.6,
+      antiAlias: 2,
+      thickness: 0.62,
+      customTipAngle: 18,
+      customTipAngleDynamics: 'direction-random',
+      customTipRotationRandomScale: 0.18,
+      flipH: 'random',
+      flipV: 'random',
+      spacing: 0.16,
+      stabilization: 4,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 1.7,
+      smoothing: true,
+      opacitySensor: { usePressure: true, pressureMin: 0.18 },
+      grain: 0.88,
+      textureDensity: 0.88,
+      paperTextureMode: 'compare',
+      paperTextureScale: 1.05,
+      paperTextureContrast: 44,
+      paperTextureBrightness: -4,
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.08,
+        angleJitter: 0.15,
+        flowJitter: 0.16,
+        scatter: 0.03,
+      },
+      useGpu: true,
+    },
+  },
+
+  // =========================================================================
+  // BRUSH SECTION (COLORING & PAINTING)
+  // =========================================================================
+  {
+    id: 'oil-painting',
+    category: 'brush',
+    name: 'Oil Painting Brush',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Natural Bristle Oil — Perceptual Pigment Mixing & Smooth Color Stretch',
+    icon: 'paintbrush',
+    tipGenerator: generateOilBristleTip,
+    paperTextureGenerator: generateCanvasWeaveTexture,
+    settings: {
+      size: 32,
+      minSizeFactor: 0.35,
+      flow: 0.88,
+      opacity: 1.0,
+      hardness: 0.75,
+      antiAlias: 2,
+      thickness: 0.85,
+      spacing: 0.06,
+      stabilization: 8,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 0.9,
+      smoothing: true,
+      customTipAngleDynamics: 'direction',
+      flipH: 'none',
+      flipV: 'alternate',
+      colorMixing: true,
+      perceptualMixing: true,
+      mixingMode: 'blend',
+      amountOfPaint: 0.62,
+      densityOfPaint: 0.82,
+      colorStretch: 0.68,
+      grain: 0.22,
+      textureDensity: 0.22,
+      paperTextureMode: 'multiply',
+      paperTextureScale: 1.2,
+      opacitySensor: { usePressure: true, pressureMin: 0.35 },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'thick-oil-painting',
+    category: 'brush',
+    name: 'Thick Oil Painting',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Heavy Impasto Flat Bristles — Loaded Pigment Ridges & Rich Paint Drag',
+    icon: 'paintbrush',
+    tipGenerator: generateThickOilTip,
+    paperTextureGenerator: generateCanvasWeaveTexture,
+    settings: {
+      size: 38,
+      minSizeFactor: 0.45,
+      flow: 0.96,
+      opacity: 1.0,
+      hardness: 0.9,
+      antiAlias: 2,
+      thickness: 0.62,
+      spacing: 0.055,
+      stabilization: 10,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 1.1,
+      smoothing: true,
+      customTipAngleDynamics: 'direction',
+      flipH: 'none',
+      flipV: 'none',
+      colorMixing: true,
+      perceptualMixing: true,
+      mixingMode: 'running_color',
+      amountOfPaint: 0.78,
+      densityOfPaint: 0.96,
+      colorStretch: 0.82,
+      grain: 0.3,
+      textureDensity: 0.3,
+      paperTextureMode: 'multiply',
+      paperTextureScale: 1.35,
+      opacitySensor: { usePressure: true, pressureMin: 0.55 },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'chalk-painting',
+    category: 'brush',
+    name: 'Chalk Painting',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Painterly Textured Chalk — Blended Pigments with Dry Gritty Tooth',
+    icon: 'paintbrush',
+    tipGenerator: generateChalkPaintTip,
+    paperTextureGenerator: generateCharcoalPaperTexture,
+    settings: {
+      size: 34,
+      minSizeFactor: 0.32,
       flow: 0.85,
       opacity: 1.0,
+      hardness: 0.72,
+      antiAlias: 2,
+      thickness: 0.74,
+      spacing: 0.065,
+      stabilization: 6,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 1.2,
+      smoothing: true,
+      customTipAngleDynamics: 'direction-random',
+      customTipRotationRandomScale: 0.18,
+      flipH: 'random',
+      flipV: 'random',
+      colorMixing: true,
+      perceptualMixing: true,
+      mixingMode: 'blend',
+      amountOfPaint: 0.65,
+      densityOfPaint: 0.86,
+      colorStretch: 0.58,
+      grain: 0.52,
+      textureDensity: 0.52,
+      paperTextureMode: 'multiply',
+      paperTextureScale: 1.25,
+      paperTextureContrast: 32,
+      opacitySensor: { usePressure: true, pressureMin: 0.25 },
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.06,
+        angleJitter: 0.12,
+        flowJitter: 0.1,
+      },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'blend-brush',
+    category: 'brush',
+    name: 'Blend Brush',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Pure Soft Color Blender — Smooths & Harmonizes Existing Paint',
+    icon: 'paintbrush',
+    settings: {
+      size: 36,
+      minSizeFactor: 0.45,
+      flow: 0.65,
+      opacity: 1.0,
       hardness: 0.25,
-      spacing: 0.05,
+      antiAlias: 3,
+      spacing: 0.06,
+      stabilization: 8,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: false,
+      smoothing: true,
       colorMixing: true,
       perceptualMixing: true,
       mixingMode: 'smear',
       amountOfPaint: 0.0,
-      densityOfPaint: 0.0,
-      colorStretch: 0.86,
-      stabilization: 10,
-      usePressure: true,
-      useTilt: false,
-      smoothing: true,
+      densityOfPaint: 0.72,
+      colorStretch: 0.74,
+      grain: 0,
+      textureDensity: 0,
+      opacitySensor: { usePressure: true, pressureMin: 0.2 },
       useGpu: true,
     },
   },
   {
-    id: 'square-digital',
-    name: 'Square Color Brush',
-    category: 'color-paint',
-    categoryName: 'Color & Paint',
-    badge: 'Square',
-    badgeBg: 'bg-teal-500/15',
-    badgeText: 'text-teal-300',
-    badgeBorder: 'border-teal-500/30',
-    desc: 'Classic Flat Digital Coloring & Hard-Surface Blocking',
-    icon: 'square',
-    tipGenerator: getSquareTipDataUrl,
+    id: 'blend-chalk-brush',
+    category: 'brush',
+    name: 'Blend Chalk Brush',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Textured Chalk Blender — Smudges Pigment While Preserving Gritty Tooth',
+    icon: 'paintbrush',
+    tipGenerator: generateChalkPaintTip,
+    paperTextureGenerator: generateCharcoalPaperTexture,
     settings: {
-      size: 24,
-      minSizeFactor: 0.25,
-      flow: 0.95,
+      size: 32,
+      minSizeFactor: 0.4,
+      flow: 0.72,
       opacity: 1.0,
-      hardness: 1.0,
-      spacing: 0.07,
-      stabilization: 12,
+      hardness: 0.55,
+      antiAlias: 2,
+      thickness: 0.78,
+      spacing: 0.065,
+      stabilization: 6,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 1.0,
+      smoothing: true,
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      colorMixing: true,
+      perceptualMixing: true,
+      mixingMode: 'smear',
+      amountOfPaint: 0.0,
+      densityOfPaint: 0.78,
+      colorStretch: 0.68,
+      grain: 0.55,
+      textureDensity: 0.55,
+      paperTextureMode: 'multiply',
+      paperTextureScale: 1.25,
+      paperTextureContrast: 30,
+      opacitySensor: { usePressure: true, pressureMin: 0.22 },
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        angleJitter: 0.35,
+        flowJitter: 0.14,
+      },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'soft-round',
+    category: 'brush',
+    name: 'Soft Round',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Silky Airbrush Gradient — Cosine Soft Falloff & Pressure Opacity',
+    icon: 'paintbrush',
+    settings: {
+      size: 48,
+      minSizeFactor: 0.55,
+      flow: 0.35,
+      opacity: 1.0,
+      hardness: 0.0,
+      antiAlias: 3,
+      spacing: 0.06,
+      stabilization: 8,
+      sharpCorners: false,
       usePressure: true,
       useTilt: false,
       smoothing: true,
-      customTipAngle: 0,
-      customTipAngleDynamics: 'none',
-      colorMixing: true,
-      perceptualMixing: true,
-      amountOfPaint: 0.88,
-      densityOfPaint: 0.95,
-      colorStretch: 0.4,
-      mixingMode: 'blend',
+      adjustDensityByGap: true,
+      pressureCurve: CSP_PRESSURE_CURVE_PRESETS.soft.points,
+      opacitySensor: { usePressure: true, pressureMin: 0.08 },
+      useGpu: true,
+    },
+  },
+  {
+    id: 'noise-shader',
+    category: 'brush',
+    name: 'Textured Grain / Noise Shader',
+    badge: 'Brush',
+    badgeBg: 'bg-emerald-500/15',
+    badgeText: 'text-emerald-300',
+    badgeBorder: 'border-emerald-500/30',
+    desc: 'Stippled Film-Grain Atmospheric Shader for Organic Textured Gradients',
+    icon: 'paintbrush',
+    tipGenerator: generateNoiseShaderTip,
+    paperTextureGenerator: generateNoiseGrainTexture,
+    settings: {
+      size: 56,
+      minSizeFactor: 0.45,
+      flow: 0.48,
+      opacity: 1.0,
+      hardness: 0.15,
+      antiAlias: 2,
+      spacing: 0.11,
+      stabilization: 5,
+      sharpCorners: false,
+      usePressure: true,
+      useTilt: true,
+      tiltScale: 1.1,
+      smoothing: true,
+      adjustDensityByGap: true,
+      customTipAngleDynamics: 'random',
+      flipH: 'random',
+      flipV: 'random',
+      grain: 0.68,
+      textureDensity: 0.68,
+      paperTextureMode: 'multiply',
+      paperTextureScale: 0.85,
+      paperTextureContrast: 48,
+      opacitySensor: { usePressure: true, pressureMin: 0.08 },
+      densitySensor: { usePressure: true, pressureMin: 0.15 },
+      dynamics: {
+        ...DEFAULT_BRUSH_DYNAMICS,
+        sizeJitter: 0.12,
+        angleJitter: 1.0,
+        flowJitter: 0.25,
+        scatter: 0.14,
+        scatterBothAxes: true,
+        count: 1,
+      },
       useGpu: true,
     },
   },
 ];
+
+let _assetsPrewarmed = false;
+
+/**
+ * Decodes all procedural builtin tip and paper PNG images into browser memory once
+ * so the very first stroke on any preset hits already-decoded textures with zero latency.
+ */
+export function prewarmBuiltinBrushAssets(): void {
+  if (_assetsPrewarmed || typeof document === 'undefined' || typeof Image === 'undefined') return;
+  _assetsPrewarmed = true;
+  for (let i = 0; i < BUILTIN_BRUSHES.length; i++) {
+    const def = BUILTIN_BRUSHES[i];
+    if (def.tipGenerator) {
+      const url = def.tipGenerator();
+      if (url) getPreloadedBuiltinTipImage(url);
+    }
+    if (def.paperTextureGenerator) {
+      const url = def.paperTextureGenerator();
+      if (url) getPreloadedBuiltinTipImage(url);
+    }
+  }
+}
+
+// Schedule non-blocking prewarm in browser environments after initial paint
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  const scheduleWarm =
+    typeof (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback ===
+    'function'
+      ? (window as unknown as { requestIdleCallback: (cb: () => void) => number }).requestIdleCallback
+      : (cb: () => void) => window.setTimeout(cb, 60);
+  scheduleWarm(() => prewarmBuiltinBrushAssets());
+}
 
 /**
  * Returns the full brush settings for a builtin preset.
@@ -730,11 +842,19 @@ export function getBuiltinBrushConfig(presetId: BrushPresetId): Partial<BrushSet
 
   let tipDataUrl: string | undefined = undefined;
   let tipImage: HTMLImageElement | undefined = undefined;
-
   if (def.tipGenerator) {
     tipDataUrl = def.tipGenerator();
     if (tipDataUrl) {
       tipImage = getPreloadedBuiltinTipImage(tipDataUrl);
+    }
+  }
+
+  let paperTexture: string | undefined = undefined;
+  let paperTextureImage: HTMLImageElement | undefined = undefined;
+  if (def.paperTextureGenerator) {
+    paperTexture = def.paperTextureGenerator();
+    if (paperTexture) {
+      paperTextureImage = getPreloadedBuiltinTipImage(paperTexture);
     }
   }
 
@@ -743,6 +863,8 @@ export function getBuiltinBrushConfig(presetId: BrushPresetId): Partial<BrushSet
     brushName: def.name,
     customTipDataUrl: tipDataUrl,
     customTipImage: tipImage,
+    paperTexture,
+    paperTextureImage,
     ...def.settings,
   };
 }

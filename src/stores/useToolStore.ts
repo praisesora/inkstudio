@@ -60,22 +60,23 @@ const DEFAULT_RECENT_COLORS = [
 function createInitialBrushSettings(): { presetId: BrushPresetId; brushSettings: BrushSettings } {
   const activePreset = getActivePresetId();
   const effective = getEffectiveBrushSettings(activePreset);
+  const resolvedPreset = (effective.preset || activePreset || DEFAULT_BRUSH_PRESET_ID) as BrushPresetId;
   return {
-    presetId: activePreset,
+    presetId: resolvedPreset,
     brushSettings: {
-      preset: activePreset,
-      size: effective.size ?? 3.5,
-      minSizeFactor: effective.minSizeFactor ?? 0.25,
+      preset: resolvedPreset,
+      size: effective.size ?? 8,
+      minSizeFactor: effective.minSizeFactor ?? 0.04,
       color: '#000000',
       secondaryColor: '#ffffff',
       opacity: effective.opacity ?? 1.0,
-      flow: effective.flow ?? 0.74,
-      spacing: effective.spacing ?? 0.08,
-      grain: effective.grain ?? 0.95,
+      flow: effective.flow ?? 1.0,
+      spacing: effective.spacing ?? 0.04,
+      grain: effective.grain ?? 0,
       usePressure: effective.usePressure ?? true,
       smoothing: effective.smoothing ?? true,
-      stabilization: effective.stabilization ?? 15,
-      hardness: effective.hardness ?? 0.8,
+      stabilization: effective.stabilization ?? 20,
+      hardness: effective.hardness ?? 1.0,
       ...effective,
     } as BrushSettings,
   };

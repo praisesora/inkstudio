@@ -1,48 +1,5 @@
 import { useMemo } from 'react';
 import {
-  FilePlus,
-  FolderOpen,
-  Save,
-  Download,
-  Trash2,
-  Film,
-  Layers,
-  Undo2,
-  Redo2,
-  ZoomIn,
-  ZoomOut,
-  RotateCcw,
-  FlipHorizontal,
-  FlipVertical,
-  Plus,
-  Info as InfoIcon,
-  Copy,
-  ClipboardPaste,
-  ImagePlus,
-  Scaling,
-  Settings,
-  FolderDown,
-  PaintBucket,
-  SlidersHorizontal,
-  Compass,
-  Eye,
-  EyeOff,
-  Magnet,
-  Lock,
-  Unlock,
-  Box,
-  Maximize2,
-  Minimize2,
-  Feather,
-  BoxSelect,
-  X,
-  Smartphone,
-  Archive,
-  Sparkles,
-  MessageSquare,
-  Spline,
-} from 'lucide-react';
-import {
   AnimationTimeline,
   CanvasDimensions,
   CanvasSelection,
@@ -237,20 +194,17 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'file-new',
             label: 'New...',
             shortcut: 'Ctrl+N',
-            icon: <FilePlus className="w-3.5 h-3.5 text-sky-400" />,
             onClick: () => uiStoreActions.setNewCanvasModalOpen(true),
           },
           {
             id: 'file-open',
             label: 'Open...',
             shortcut: 'Ctrl+O',
-            icon: <FolderOpen className="w-3.5 h-3.5 text-amber-400" />,
             onClick: handleTriggerOpenFile,
           },
           {
             id: 'file-import-sut',
             label: 'Import CSP Brush (.sut)...',
-            icon: <FolderDown className="w-3.5 h-3.5 text-cyan-400" />,
             onClick: () => {
               const input = document.createElement('input');
               input.type = 'file';
@@ -290,7 +244,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'file-import-3d',
             label: 'Import 3D Model (.glb, .obj)...',
-            icon: <Box className="w-3.5 h-3.5 text-purple-400" />,
             disabled: !hasOpenDocument,
             onClick: handleTriggerImport3DFile,
           },
@@ -299,7 +252,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'file-save',
             label: 'Save',
             shortcut: 'Ctrl+S',
-            icon: <Save className="w-3.5 h-3.5 text-blue-400" />,
             disabled: !hasOpenDocument,
             onClick: handleSave,
           },
@@ -307,28 +259,24 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'file-save-as',
             label: 'Save As...',
             shortcut: 'Ctrl+Shift+S',
-            icon: <Save className="w-3.5 h-3.5 text-indigo-400" />,
             disabled: !hasOpenDocument,
             onClick: handleSaveAs,
           },
           {
             id: 'file-export-image',
             label: 'Export Image...',
-            icon: <Download className="w-3.5 h-3.5 text-emerald-400" />,
             disabled: !hasOpenDocument,
             onClick: handleExportImage,
           },
           {
             id: 'file-export-webtoon',
             label: 'Export Webtoon Chapter Slices (.zip)...',
-            icon: <Archive className="w-3.5 h-3.5 text-cyan-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.setWebtoonExportModalOpen(true),
           },
           {
             id: 'file-timelapse-submenu',
             label: 'Time-lapse',
-            icon: <Film className="w-3.5 h-3.5 text-rose-400" />,
             disabled: !hasOpenDocument,
             submenu: [
               {
@@ -348,7 +296,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'file-clear',
             label: 'Clear Canvas',
-            icon: <Trash2 className="w-3.5 h-3.5 text-rose-400" />,
             danger: true,
             disabled: !hasOpenDocument,
             onClick: clearCanvas,
@@ -363,7 +310,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-undo',
             label: 'Undo',
             shortcut: 'Ctrl+Z',
-            icon: <Undo2 className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument || !canUndo,
             onClick: handleUndo,
           },
@@ -371,7 +317,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-redo',
             label: 'Redo',
             shortcut: 'Ctrl+Y',
-            icon: <Redo2 className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument || !canRedo,
             onClick: redo,
           },
@@ -380,7 +325,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-copy',
             label: 'Copy',
             shortcut: 'Ctrl+C',
-            icon: <Copy className="w-3.5 h-3.5 text-sky-400" />,
             disabled: !hasOpenDocument || !activeLayer,
             onClick: handleCopySelectedLayer,
           },
@@ -388,21 +332,18 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-paste',
             label: 'Paste',
             shortcut: 'Ctrl+V',
-            icon: <ClipboardPaste className="w-3.5 h-3.5 text-amber-400" />,
             disabled: !hasOpenDocument,
             onClick: handlePasteSelectedLayer,
           },
           {
             id: 'edit-paste-file',
             label: 'Paste from file...',
-            icon: <ImagePlus className="w-3.5 h-3.5 text-emerald-400" />,
             disabled: !hasOpenDocument,
             onClick: handleTriggerPasteFromFile,
           },
           {
             id: 'edit-import-3d',
             label: 'Import 3D File (.glb, .obj)...',
-            icon: <Box className="w-3.5 h-3.5 text-purple-400" />,
             disabled: !hasOpenDocument,
             onClick: handleTriggerImport3DFile,
           },
@@ -410,7 +351,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-delete',
             label: 'Delete',
             shortcut: 'Del',
-            icon: <Trash2 className="w-3.5 h-3.5 text-rose-400" />,
             danger: true,
             disabled: !hasOpenDocument || layers.filter((l) => l.type === 'raster').length <= 1,
             onClick: handleDeleteSelectedLayer,
@@ -425,7 +365,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-transform',
             label: 'Free Transform',
             shortcut: 'Ctrl+T',
-            icon: <Scaling className="w-3.5 h-3.5 text-cyan-400" />,
             disabled: !hasOpenDocument,
             onClick: handleStartTransform,
           },
@@ -439,14 +378,12 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'edit-fill-sel',
             label: 'Fill Selection',
-            icon: <PaintBucket className="w-3.5 h-3.5 text-amber-400" />,
             disabled: !hasOpenDocument || !selection,
             onClick: handleFillSelectionColor,
           },
           {
             id: 'edit-tonal-correction',
             label: 'Tonal Correction',
-            icon: <SlidersHorizontal className="w-3.5 h-3.5 text-violet-400" />,
             disabled:
               !hasOpenDocument || !activeLayer || activeLayer.locked || activeLayer.type !== 'raster',
             submenu: [
@@ -518,7 +455,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'edit-resize-canvas',
             label: 'Resize Canvas...',
-            icon: <Scaling className="w-3.5 h-3.5 text-indigo-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.setResizeCanvasModalOpen(true),
           },
@@ -527,7 +463,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'edit-settings',
             label: 'Settings...',
             shortcut: 'Ctrl+,',
-            icon: <Settings className="w-3.5 h-3.5 text-slate-300" />,
             onClick: () => uiStoreActions.setSettingsModalOpen(true),
           },
         ],
@@ -540,7 +475,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'select-all',
             label: 'Select All',
             shortcut: 'Ctrl+A',
-            icon: <BoxSelect className="w-3.5 h-3.5 text-sky-400" />,
             disabled: !hasOpenDocument,
             onClick: handleSelectAll,
           },
@@ -548,7 +482,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'select-deselect',
             label: 'Deselect',
             shortcut: 'Ctrl+D',
-            icon: <X className="w-3.5 h-3.5 text-rose-400" />,
             disabled: !hasOpenDocument || !selection,
             onClick: handleDeselect,
           },
@@ -556,7 +489,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'select-invert',
             label: 'Invert Selection',
             shortcut: 'Ctrl+Shift+I',
-            icon: <RotateCcw className="w-3.5 h-3.5 text-amber-400" />,
             disabled: !hasOpenDocument,
             onClick: handleInvertSelection,
           },
@@ -564,21 +496,18 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'select-expand',
             label: 'Expand (+5px)...',
-            icon: <Maximize2 className="w-3.5 h-3.5 text-indigo-400" />,
             disabled: !hasOpenDocument || !selection,
             onClick: () => handleExpandSelection(5),
           },
           {
             id: 'select-contract',
             label: 'Contract (-5px)...',
-            icon: <Minimize2 className="w-3.5 h-3.5 text-emerald-400" />,
             disabled: !hasOpenDocument || !selection,
             onClick: () => handleContractSelection(5),
           },
           {
             id: 'select-feather',
             label: 'Feather (5px)...',
-            icon: <Feather className="w-3.5 h-3.5 text-purple-400" />,
             disabled: !hasOpenDocument || !selection,
             onClick: () => handleFeatherSelection(5),
           },
@@ -587,7 +516,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'select-transform',
             label: 'Transform Selection',
             shortcut: 'Ctrl+T',
-            icon: <Scaling className="w-3.5 h-3.5 text-cyan-400" />,
             disabled: !hasOpenDocument || !selection,
             onClick: handleStartTransform,
           },
@@ -601,7 +529,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'layer-new-raster',
             label: 'New Raster Layer',
             shortcut: 'Ctrl+Shift+N',
-            icon: <Plus className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument,
             onClick: () => handleAddLayer('raster'),
           },
@@ -614,7 +541,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'layer-new-3d',
             label: 'New 3D Reference Layer...',
-            icon: <Box className="w-3.5 h-3.5 text-purple-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.set3DLayerOpen(true),
           },
@@ -896,7 +822,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               {
                 id: 'ruler-add-1p',
                 label: 'Add 1-Point Perspective Ruler',
-                icon: <Compass className="w-3.5 h-3.5 text-cyan-400" />,
                 disabled: !hasOpenDocument,
                 onClick: () => {
                   documentStoreActions.setPerspectiveRuler(
@@ -908,7 +833,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               {
                 id: 'ruler-add-2p',
                 label: 'Add 2-Point Perspective Ruler',
-                icon: <Compass className="w-3.5 h-3.5 text-purple-400" />,
                 disabled: !hasOpenDocument,
                 onClick: () => {
                   documentStoreActions.setPerspectiveRuler(
@@ -920,7 +844,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               {
                 id: 'ruler-add-3p-birds',
                 label: "Add 3-Point Perspective Ruler (Bird's-Eye)",
-                icon: <Compass className="w-3.5 h-3.5 text-emerald-400" />,
                 disabled: !hasOpenDocument,
                 onClick: () => {
                   documentStoreActions.setPerspectiveRuler(
@@ -932,7 +855,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               {
                 id: 'ruler-add-3p-worms',
                 label: "Add 3-Point Perspective Ruler (Worm's-Eye)",
-                icon: <Compass className="w-3.5 h-3.5 text-amber-400" />,
                 disabled: !hasOpenDocument,
                 onClick: () => {
                   const base = createDefaultPerspectiveRuler('3-point', dimensions);
@@ -950,11 +872,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
                   ? 'Hide Perspective Ruler'
                   : 'Show Perspective Ruler',
                 shortcut: 'Ctrl+Shift+R',
-                icon: perspectiveRuler.enabled ? (
-                  <EyeOff className="w-3.5 h-3.5 text-sky-400" />
-                ) : (
-                  <Eye className="w-3.5 h-3.5 text-sky-400" />
-                ),
                 disabled: !hasOpenDocument,
                 onClick: () =>
                   documentStoreActions.setPerspectiveRuler((prev) =>
@@ -965,7 +882,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
                 id: 'ruler-toggle-snap',
                 label: perspectiveRuler.snapEnabled ? 'Disable Snapping' : 'Enable Snapping',
                 shortcut: 'Ctrl+Shift+P',
-                icon: <Magnet className="w-3.5 h-3.5 text-emerald-400" />,
                 disabled: !hasOpenDocument,
                 onClick: () =>
                   documentStoreActions.setPerspectiveRuler((prev) =>
@@ -977,11 +893,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
                 label: perspectiveRuler.locked
                   ? 'Unlock Handles (Edit Mode)'
                   : 'Lock Handles (Freeze for Inking)',
-                icon: perspectiveRuler.locked ? (
-                  <Unlock className="w-3.5 h-3.5 text-amber-400" />
-                ) : (
-                  <Lock className="w-3.5 h-3.5 text-amber-400" />
-                ),
                 disabled: !hasOpenDocument,
                 onClick: () =>
                   documentStoreActions.setPerspectiveRuler((prev) =>
@@ -1058,7 +969,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
                 id: 'ruler-remove',
                 label: 'Remove Perspective Ruler from Canvas',
                 danger: true,
-                icon: <Trash2 className="w-3.5 h-3.5 text-red-400" />,
                 disabled: !hasOpenDocument,
                 onClick: () => {
                   documentStoreActions.setPerspectiveRuler(null);
@@ -1075,7 +985,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'view-zoom-in',
             label: 'Zoom In',
             shortcut: 'Ctrl++',
-            icon: <ZoomIn className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument,
             onClick: zoomIn,
           },
@@ -1083,7 +992,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'view-zoom-out',
             label: 'Zoom Out',
             shortcut: 'Ctrl+-',
-            icon: <ZoomOut className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument,
             onClick: zoomOut,
           },
@@ -1098,7 +1006,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'view-reset-rotation',
             label: 'Reset Rotation',
             shortcut: 'Ctrl+Alt+0',
-            icon: <RotateCcw className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument,
             onClick: resetRotation,
           },
@@ -1107,7 +1014,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'view-flip-horizontal',
             label: 'Flip View Horizontal',
             shortcut: 'Shift+H',
-            icon: <FlipHorizontal className="w-3.5 h-3.5" />,
             checked: flipX,
             disabled: !hasOpenDocument,
             onClick: toggleFlipHorizontal,
@@ -1116,7 +1022,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'view-flip-vertical',
             label: 'Flip View Vertical',
             shortcut: 'Shift+V',
-            icon: <FlipVertical className="w-3.5 h-3.5" />,
             checked: flipY,
             disabled: !hasOpenDocument,
             onClick: toggleFlipVertical,
@@ -1158,7 +1063,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             label: isWebtoonMode
               ? 'Exit Webtoon Studio Mode'
               : 'Webtoon Studio Mode (9:16 Mockup)',
-            icon: <Smartphone className="w-3.5 h-3.5 text-emerald-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.toggleWebtoonMode(),
           },
@@ -1217,21 +1121,18 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'manga-effects-generator',
             label: 'Manga Effect Lines Generator...',
-            icon: <Sparkles className="w-3.5 h-3.5 text-amber-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.setMangaEffectsModalOpen(true),
           },
           {
             id: 'manga-balloon-tool',
             label: 'Parametric Speech Balloon Tool',
-            icon: <MessageSquare className="w-3.5 h-3.5 text-cyan-400" />,
             disabled: !hasOpenDocument,
             onClick: () => toolStoreActions.selectTool('balloon'),
           },
           {
             id: 'manga-correct-line',
             label: 'Correct Line (Vector Pinch/Width/Simplify)',
-            icon: <Spline className="w-3.5 h-3.5 text-indigo-400" />,
             disabled: !hasOpenDocument,
             onClick: () => toolStoreActions.selectTool('vector-edit'),
           },
@@ -1241,14 +1142,12 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             label: isWebtoonMode
               ? 'Exit Webtoon Studio Mode'
               : 'Webtoon Studio Mode (9:16 Simulator)',
-            icon: <Smartphone className="w-3.5 h-3.5 text-emerald-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.toggleWebtoonMode(),
           },
           {
             id: 'manga-webtoon-export',
             label: 'Export Webtoon Chapter Slices (.zip)...',
-            icon: <Archive className="w-3.5 h-3.5 text-sky-400" />,
             disabled: !hasOpenDocument,
             onClick: () => uiStoreActions.setWebtoonExportModalOpen(true),
           },
@@ -1264,7 +1163,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               ? 'Hide Animation Timeline'
               : 'Show Animation Timeline',
             shortcut: 'Ctrl+Alt+A',
-            icon: <Film className="w-3.5 h-3.5 text-emerald-400" />,
             disabled: !hasOpenDocument,
             onClick: () => {
               if (activeAnimationTimeline) {
@@ -1278,7 +1176,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             id: 'anim-new-cel',
             label: 'Add Cel to Current Frame',
             shortcut: 'Alt+C',
-            icon: <Plus className="w-3.5 h-3.5" />,
             disabled: !hasOpenDocument || !activeAnimationTimeline,
             onClick: () => {
               if (activeAnimationTimeline) {
@@ -1291,7 +1188,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             label: activeAnimationTimeline?.onionSkin.enabled
               ? 'Disable Onion Skinning'
               : 'Enable Onion Skinning',
-            icon: <Layers className="w-3.5 h-3.5 text-purple-400" />,
             disabled: !hasOpenDocument || !activeAnimationTimeline,
             onClick: () => {
               if (activeAnimationTimeline) {
@@ -1335,7 +1231,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               {
                 id: 'window-ws-reset',
                 label: 'Reset Workspace',
-                icon: <RotateCcw className="w-3.5 h-3.5 text-amber-400" />,
                 onClick: () => {
                   workspaceStoreActions.resetWorkspace();
                   showToast('Workspace reset to preset defaults');
@@ -1385,7 +1280,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           {
             id: 'help-about',
             label: 'About Ink Studio',
-            icon: <InfoIcon className="w-3.5 h-3.5 text-[#93c5fd]" />,
             onClick: () => {
               alert(
                 'Ink Studio - Professional Digital Painting & Manga Studio\n\n' +

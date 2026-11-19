@@ -1,24 +1,31 @@
 import React, { useState, useRef } from 'react';
 import {
   Paintbrush,
+  PenTool,
   Pencil,
   Plus,
   Trash2,
   Loader2,
   FolderDown,
-  Palette,
-  Square,
   Sparkles,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
-import { BrushPresetId, CspBrush } from '../types/editor';
+import { BrushCategory, BrushPresetId, CspBrush } from '../types/editor';
 import { parseSutFile } from '../utils/sutParser';
 import {
   saveCustomBrush,
   deleteCustomBrush,
   prepareBrushSettingsForCsp,
 } from '../utils/brushStorage';
-import { BUILTIN_BRUSHES, BrushCategory } from '../utils/presetBrushes';
 import {
+  BUILTIN_BRUSHES,
+  BUILTIN_BRUSH_SECTIONS,
+  BuiltinBrushDefinition,
+} from '../utils/presetBrushes';
+import {
+  DEFAULT_BRUSH_PRESET_ID,
+  NEUTRAL_BRUSH_DEFAULTS,
   getEffectiveBrushSettings,
   getSavedBrushSettings,
   saveActivePresetId,
@@ -30,6 +37,12 @@ export interface SubToolListProps {
   setCustomBrushes: React.Dispatch<React.SetStateAction<CspBrush[]>>;
 }
 
+function renderBuiltinIcon(icon: BuiltinBrushDefinition['icon']) {
+  if (icon === 'pen') return <PenTool className="w-3 h-3 shrink-0 opacity-80" />;
+  if (icon === 'pencil') return <Pencil className="w-3 h-3 shrink-0 opacity-80" />;
+  return <Paintbrush className="w-3 h-3 shrink-0 opacity-80" />;
+}
+
 export const SubToolList: React.FC<SubToolListProps> = React.memo(
   ({ customBrushes, setCustomBrushes }) => {
     const currentTool = useToolStore((s) => s.tool);
@@ -37,26 +50,19 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
 
     const [isImportingSut, setIsImportingSut] = useState(false);
     const [isDraggingFileOver, setIsDraggingFileOver] = useState(false);
-    const [selectedCategory, setSelectedCategory] = useState<'all' | BrushCategory | 'csp'>('all');
+    const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({});
     const sutInputRef = useRef<HTMLInputElement>(null);
+
+    const toggleSection = (key: string) => {
+      setCollapsedSections((prev) => ({ ...prev, [key]: !prev[key] }));
+    };
 
     const handleSelectBrushPreset = (presetId: BrushPresetId) => {
       toolStoreActions.selectTool('brush');
       saveActivePresetId(presetId);
       const effective = getEffectiveBrushSettings(presetId, customBrushes);
       toolStoreActions.updateBrushSettings({
-        customTipDataUrl: undefined,
-        customTipImage: undefined,
-        customTipAngle: 0,
-        customTipAngleDynamics: 'none',
-        flipH: 'none',
-        flipV: 'none',
-        isRibbon: false,
-        colorMixing: false,
-        wetEdge: 0,
-        grain: 0,
-        spray: undefined,
-        taper: undefined,
+        ...NEUTRAL_BRUSH_DEFAULTS,
         ...effective,
         preset: presetId,
       });
@@ -68,6 +74,7 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
       const prepared = await prepareBrushSettingsForCsp(brush);
       const saved = getSavedBrushSettings(brush.id);
       toolStoreActions.updateBrushSettings({
+        ...NEUTRAL_BRUSH_DEFAULTS,
         ...prepared,
         ...saved,
         preset: brush.id,
@@ -109,52 +116,25 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
         await deleteCustomBrush(brushId);
         setCustomBrushes((prev) => prev.filter((b) => b.id !== brushId));
         if (activePreset === brushId) {
-          handleSelectBrushPreset('pencil-2b');
+          handleSelectBrushPreset(DEFAULT_BRUSH_PRESET_ID);
         }
       }
     };
 
-    const visibleBuiltinBrushes = BUILTIN_BRUSHES.filter((b) => {
-      if (selectedCategory === 'all') return true;
-      if (selectedCategory === 'csp') return false;
-      return b.category === selectedCategory;
-    });
-
-    const showCspBrushes = selectedCategory === 'all' || selectedCategory === 'csp';
+    const brushesByCategory = (cat: BrushCategory) =>
+      BUILTIN_BRUSHES.filter((b) => b.category === cat);
 
     return (
       <>
-        {/* Category Filter Strip + Import .sut */}
-        <div className="px-1.5 py-1.5 flex items-center gap-1 shrink-0">
-          <select
-            value={selectedCategory}
-            onChange={(e) =>
-              setSelectedCategory(e.target.value as 'all' | BrushCategory | 'csp')
-            }
-            aria-label="Brush Category"
-            className="flex-1 min-w-0 h-5 bg-[#161616] text-[#e5e5e5] text-[11px] px-1.5 rounded cursor-pointer"
-          >
-            <option value="all" className="bg-[#202020]">
-              All Brushes
-            </option>
-            <option value="pencil-line" className="bg-[#202020]">
-              Pencil &amp; Ink
-            </option>
-            <option value="color-paint" className="bg-[#202020]">
-              Color &amp; Paint
-            </option>
-            <option value="csp" className="bg-[#202020]">
-              CSP Imported
-            </option>
-          </select>
-
+        <div className="px-1.5 py-1 flex items-center justify-end shrink-0">
           <button
             type="button"
             onClick={() => sutInputRef.current?.click()}
             title="Import CSP Brush (.sut)"
-            className="w-5 h-5 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+            className="h-5 px-1.5 rounded flex items-center gap-1 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
           >
             <Plus className="w-3 h-3" />
+            <span>Import .sut</span>
           </button>
         </div>
 
@@ -170,7 +150,7 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
           }}
         />
 
-        {/* Compact High-Density Sub-Tool List */}
+        {/* Compact High-Density Sectioned Sub-Tool List */}
         <div
           onDragOver={(e) => {
             if (e.dataTransfer.types.includes('Files')) {
@@ -187,7 +167,7 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
             );
             for (const f of files) handleImportSut(f);
           }}
-          className="flex-1 overflow-y-auto px-1.5 py-0.5 space-y-0.5 relative min-h-[84px]"
+          className="flex-1 overflow-y-auto px-1.5 py-0.5 space-y-1 relative min-h-[84px]"
         >
           {isDraggingFileOver && (
             <div className="absolute inset-1 bg-[#161616]/95 rounded flex flex-col items-center justify-center p-2 text-center z-30 pointer-events-none">
@@ -203,85 +183,108 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
             </div>
           )}
 
-          {visibleBuiltinBrushes.map((item) => {
-            const isSelected =
-              currentTool === 'brush' &&
-              (activePreset === item.id || (!activePreset && item.id === 'pencil-2b'));
+          {BUILTIN_BRUSH_SECTIONS.map((section) => {
+            const items = brushesByCategory(section.id);
+            if (items.length === 0) return null;
+            const isCollapsed = Boolean(collapsedSections[section.id]);
 
             return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => handleSelectBrushPreset(item.id)}
-                title={`${item.name} - ${item.desc}`}
-                className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-left transition-colors cursor-pointer ${
-                  isSelected
-                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
-                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
-                }`}
-              >
-                {item.icon === 'pencil' ? (
-                  <Pencil className="w-3 h-3 shrink-0 opacity-80" />
-                ) : item.icon === 'palette' ? (
-                  <Palette className="w-3 h-3 shrink-0 opacity-80" />
-                ) : item.icon === 'square' ? (
-                  <Square className="w-3 h-3 shrink-0 opacity-80" />
-                ) : (
-                  <Paintbrush className="w-3 h-3 shrink-0 opacity-80" />
-                )}
-                <span className="text-[11px] truncate leading-tight flex-1">{item.name}</span>
-              </button>
+              <div key={section.id} className="space-y-0.5">
+                <button
+                  type="button"
+                  onClick={() => toggleSection(section.id)}
+                  className="w-full flex items-center gap-1 px-1 py-0.5 text-[9px] uppercase tracking-wider text-[#6e6e6e] hover:text-[#b5b5b5] select-none cursor-pointer"
+                >
+                  {isCollapsed ? (
+                    <ChevronRight className="w-2.5 h-2.5 shrink-0" />
+                  ) : (
+                    <ChevronDown className="w-2.5 h-2.5 shrink-0" />
+                  )}
+                  <span>{section.label}</span>
+                </button>
+
+                {!isCollapsed &&
+                  items.map((item) => {
+                    const isSelected =
+                      currentTool === 'brush' &&
+                      (activePreset === item.id ||
+                        (!activePreset && item.id === DEFAULT_BRUSH_PRESET_ID));
+
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => handleSelectBrushPreset(item.id)}
+                        title={`${item.name} - ${item.desc}`}
+                        className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-left transition-colors cursor-pointer ${
+                          isSelected
+                            ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                            : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                        }`}
+                      >
+                        {renderBuiltinIcon(item.icon)}
+                        <span className="text-[11px] truncate leading-tight flex-1">
+                          {item.name}
+                        </span>
+                      </button>
+                    );
+                  })}
+              </div>
             );
           })}
 
-          {showCspBrushes &&
-            customBrushes.map((brush) => {
-              const isSelected = currentTool === 'brush' && activePreset === brush.id;
-              return (
-                <div
-                  key={brush.id}
-                  onClick={() => handleSelectCustomBrush(brush)}
-                  title={brush.name}
-                  className={`group flex items-center justify-between gap-1 px-2 py-1 rounded cursor-pointer transition-colors ${
-                    isSelected
-                      ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
-                      : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
-                  }`}
-                >
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    {brush.tipDataUrl ? (
-                      <img
-                        src={brush.tipDataUrl}
-                        alt=""
-                        className="w-3 h-3 object-contain shrink-0 brightness-125"
-                      />
-                    ) : (
-                      <Sparkles className="w-3 h-3 shrink-0 opacity-80" />
-                    )}
-                    <span className="text-[11px] truncate leading-tight">{brush.name}</span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
-                    title="Delete brush"
-                    className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-red-400 shrink-0 cursor-pointer"
-                  >
-                    <Trash2 className="w-2.5 h-2.5" />
-                  </button>
-                </div>
-              );
-            })}
-
-          {selectedCategory === 'csp' && customBrushes.length === 0 && (
-            <div className="py-4 px-2 text-center space-y-2">
-              <p className="text-[10px] text-[#8a8a8a]">Drop .sut brush file</p>
+          {customBrushes.length > 0 && (
+            <div className="space-y-0.5 pt-0.5">
               <button
                 type="button"
-                onClick={() => sutInputRef.current?.click()}
-                className="px-2 py-1 rounded bg-[#2c2c2c] text-[10px] text-[#e5e5e5] cursor-pointer"
+                onClick={() => toggleSection('custom')}
+                className="w-full flex items-center gap-1 px-1 py-0.5 text-[9px] uppercase tracking-wider text-[#6e6e6e] hover:text-[#b5b5b5] select-none cursor-pointer"
               >
-                Import .sut
+                {collapsedSections.custom ? (
+                  <ChevronRight className="w-2.5 h-2.5 shrink-0" />
+                ) : (
+                  <ChevronDown className="w-2.5 h-2.5 shrink-0" />
+                )}
+                <span>Imported</span>
               </button>
+
+              {!collapsedSections.custom &&
+                customBrushes.map((brush) => {
+                  const isSelected = currentTool === 'brush' && activePreset === brush.id;
+                  return (
+                    <div
+                      key={brush.id}
+                      onClick={() => handleSelectCustomBrush(brush)}
+                      title={brush.name}
+                      className={`group flex items-center justify-between gap-1 px-2 py-1 rounded cursor-pointer transition-colors ${
+                        isSelected
+                          ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                          : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        {brush.tipDataUrl ? (
+                          <img
+                            src={brush.tipDataUrl}
+                            alt=""
+                            className="w-3 h-3 object-contain shrink-0 brightness-125"
+                          />
+                        ) : (
+                          <Sparkles className="w-3 h-3 shrink-0 opacity-80" />
+                        )}
+                        <span className="text-[11px] truncate leading-tight">{brush.name}</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
+                        title="Delete brush"
+                        className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-red-400 shrink-0 cursor-pointer"
+                      >
+                        <Trash2 className="w-2.5 h-2.5" />
+                      </button>
+                    </div>
+                  );
+                })}
             </div>
           )}
         </div>

@@ -127,34 +127,57 @@ function sfc32(a: number, b: number, c: number, d: number) {
 (function initPaperGrain() {
   const rand = sfc32(0x9e3779b9, 0x243f6a88, 0xb7e15162, 0x8aed2a6b);
 
-  // Generate 2D white & cellular noise seeds
-  const white = new Float32Array(GRAIN_SIZE * GRAIN_SIZE);
-  for (let i = 0; i < white.length; i++) {
-    white[i] = rand();
-  }
+  // Build tileable periodic value-noise grids for smooth multi-octave cold-press paper synthesis
+  const makeGrid = (res: number) => {
+    const g = new Float32Array(res * res);
+    for (let i = 0; i < g.length; i++) g[i] = rand();
+    return g;
+  };
 
-  // Multi-scale procedural synthesis
+  const samplePeriodic = (grid: Float32Array, res: number, fx: number, fy: number): number => {
+    const mask = res - 1;
+    const x0 = Math.floor(fx);
+    const y0 = Math.floor(fy);
+    const tx = fx - x0;
+    const ty = fy - y0;
+    // Smooth cubic Hermite interpolation eliminates grid-aligned banding & blockiness
+    const sx = tx * tx * (3 - 2 * tx);
+    const sy = ty * ty * (3 - 2 * ty);
+    const ix0 = x0 & mask;
+    const iy0 = y0 & mask;
+    const ix1 = (ix0 + 1) & mask;
+    const iy1 = (iy0 + 1) & mask;
+    const v00 = grid[iy0 * res + ix0];
+    const v10 = grid[iy0 * res + ix1];
+    const v01 = grid[iy1 * res + ix0];
+    const v11 = grid[iy1 * res + ix1];
+    const top = v00 + (v10 - v00) * sx;
+    const bot = v01 + (v11 - v01) * sx;
+    return top + (bot - top) * sy;
+  };
+
+  const gCoarse = makeGrid(64);  // 8px cold-press paper hills/valleys
+  const gMedium = makeGrid(128); // 4px primary cotton paper tooth
+  const gFine = makeGrid(256);   // 2px interwoven cellulose fibers
+  const gMicro = makeGrid(512);  // 1px mineral grit micro-tooth
+
   for (let y = 0; y < GRAIN_SIZE; y++) {
+    const row = y * GRAIN_SIZE;
     for (let x = 0; x < GRAIN_SIZE; x++) {
-      // 1. High frequency micro-tooth (mineral surface)
-      const n1 = white[y * GRAIN_SIZE + x];
+      // Slight anisotropic weave warp for natural organic paper fibers
+      const warpX = x + Math.sin(y * 0.09817477) * 1.4;
+      const warpY = y + Math.cos(x * 0.09817477) * 1.4;
 
-      // 2. Medium frequency intertwined fibers (cellulose weave: slightly directional)
-      const x2 = (x + Math.sin(y * 0.12) * 2) & GRAIN_MASK;
-      const y2 = (y + Math.cos(x * 0.12) * 2) & GRAIN_MASK;
-      const n2 = white[y2 * GRAIN_SIZE + x2];
+      const nCoarse = samplePeriodic(gCoarse, 64, x * 0.125, y * 0.125);
+      const nMedium = samplePeriodic(gMedium, 128, warpX * 0.25, warpY * 0.25);
+      const nFine = samplePeriodic(gFine, 256, warpX * 0.5, warpY * 0.5);
+      const nMicro = gMicro[row + x];
 
-      // 3. Low frequency paper tooth clumps
-      const x3 = (x >> 2) & (GRAIN_SIZE / 4 - 1);
-      const y3 = (y >> 2) & (GRAIN_SIZE / 4 - 1);
-      const n3 = white[y3 * GRAIN_SIZE + x3];
-
-      // Combine octaves with weighted contrast curve
-      const combined = n1 * 0.52 + n2 * 0.32 + n3 * 0.16;
-
-      // Enhance paper tooth peak-to-valley contrast
-      const curved = Math.pow(combined, 1.4);
-      paperGrainTable[y * GRAIN_SIZE + x] = Math.min(255, Math.max(0, Math.round(curved * 255)));
+      const combined = nCoarse * 0.28 + nMedium * 0.36 + nFine * 0.24 + nMicro * 0.12;
+      // S-curve contrast shaping for crisp tooth peaks and realistic paper valleys
+      const stretched = Math.max(0, Math.min(1, (combined - 0.18) / 0.64));
+      const curved = Math.pow(stretched, 1.18);
+      paperGrainTable[row + x] = Math.min(255, Math.max(0, Math.round(curved * 255)));
     }
   }
 })();

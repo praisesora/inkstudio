@@ -1,7 +1,10 @@
 import {
+  BrushDynamics,
   BrushPresetId,
+  CspAngleDynamicsMode,
   CspAntiAliasLevel,
   CspBlendTipsMode,
+  CspPaperTextureMode,
   CspSpraySettings,
   CspTipFlipMode,
 } from '../types/editor';
@@ -13,6 +16,7 @@ import {
   dabHashFloat,
   computeGapAdjustedAlpha,
   resolveTipFlipSigns,
+  applyCspPaperTextureAlpha,
 } from '../engine/CspBrushEngine';
 
 export interface BrushPreviewOptions {
@@ -21,6 +25,11 @@ export interface BrushPreviewOptions {
   flow?: number;
   opacity?: number;
   grain?: number;
+  paperTextureMode?: CspPaperTextureMode;
+  paperTextureScale?: number;
+  paperTextureContrast?: number;
+  paperTextureBrightness?: number;
+  paperTextureInverted?: boolean;
   hardness?: number;
   spacing?: number;
   minSizeFactor?: number;
@@ -31,6 +40,7 @@ export interface BrushPreviewOptions {
   tool?: 'brush' | 'eraser';
   customTipImage?: HTMLImageElement;
   customTipAngle?: number;
+  customTipAngleDynamics?: CspAngleDynamicsMode;
   thickness?: number;
   thicknessVertical?: boolean;
   flipH?: CspTipFlipMode;
@@ -40,6 +50,7 @@ export interface BrushPreviewOptions {
   antiAlias?: number;
   pressureCurve?: [number, number][];
   spray?: CspSpraySettings;
+  dynamics?: BrushDynamics;
   colorMixing?: boolean;
   amountOfPaint?: number;
   densityOfPaint?: number;
@@ -102,7 +113,7 @@ export function renderBrushStrokePreview(
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
-  const preset = options.preset || (options.customTipImage ? 'custom' : 'pencil-2b');
+  const preset = options.preset || (options.customTipImage ? 'custom' : 'g-pen');
   const builtinCfg =
     !options.customTipImage && options.preset ? getBuiltinBrushConfig(options.preset) : null;
   const tipImage = options.customTipImage || builtinCfg?.customTipImage;
@@ -119,6 +130,13 @@ export function renderBrushStrokePreview(
   const thickness = options.thickness ?? builtinCfg?.thickness ?? 1.0;
   const thicknessVertical = Boolean(options.thicknessVertical ?? builtinCfg?.thicknessVertical);
   const customTipAngle = options.customTipAngle ?? builtinCfg?.customTipAngle ?? 0;
+  const angleDynamics = options.customTipAngleDynamics ?? builtinCfg?.customTipAngleDynamics ?? 'none';
+  const dynamics = options.dynamics ?? builtinCfg?.dynamics;
+  const paperMode = options.paperTextureMode ?? builtinCfg?.paperTextureMode ?? 'subtract';
+  const paperScale = options.paperTextureScale ?? builtinCfg?.paperTextureScale ?? 1.0;
+  const paperContrast = options.paperTextureContrast ?? builtinCfg?.paperTextureContrast ?? 0;
+  const paperBrightness = options.paperTextureBrightness ?? builtinCfg?.paperTextureBrightness ?? 0;
+  const paperInverted = Boolean(options.paperTextureInverted ?? builtinCfg?.paperTextureInverted);
   const spacing = options.spacing ?? builtinCfg?.spacing ?? (isPencil ? 0.07 : 0.045);
   const blendTipsMode = options.blendTipsMode ?? builtinCfg?.blendTipsMode ?? 'darken';
   const adjustByGap = Boolean(options.adjustDensityByGap ?? builtinCfg?.adjustDensityByGap);
@@ -223,7 +241,7 @@ export function renderBrushStrokePreview(
     offCtx.fillStyle = 'rgba(255, 255, 255, 0.18)';
     offCtx.fillRect(padX - 4, centerY - amp - 4, strokeLength + 8, (amp + 4) * 2);
 
-    const eraserMaster = getRadialDabMaster(hardness, '#000000', true, aaLevel);
+    const eraserMaster = getRadialDabMaster(hardness, '#000000', true, displayWidth, aaLevel);
     const baseAngleRad = (customTipAngle * Math.PI) / 180;
     const effSpacing = clamp(spacing, 0.02, 0.25);
 
@@ -268,13 +286,18 @@ export function renderBrushStrokePreview(
       }
     }
     offCtx.restore();
-  } else if (tipImage) {
+  } else if (tipImage && tipImage.complete !== false && (tipImage.naturalWidth || tipImage.width) > 0) {
     const tip = tipImage;
     const rawAspect = (tip.naturalHeight || tip.height || 1) / (tip.naturalWidth || tip.width || 1);
     const baseAngleRad = (customTipAngle * Math.PI) / 180;
     const master = getTintedTipMaster(tip, strokeColor);
     const effSpacing = clamp(spacing, 0.02, 0.25);
     const baseFlow = computeGapAdjustedAlpha(flow, effSpacing, adjustByGap);
+    const scatterAmt = clamp(dynamics?.scatter ?? 0, 0, 1.5);
+    const sizeJit = clamp(dynamics?.sizeJitter ?? 0, 0, 1);
+    const flowJit = clamp(dynamics?.flowJitter ?? 0, 0, 1);
+    const angleJit = clamp(dynamics?.angleJitter ?? 0, 0, 1);
+    const dabCount = Math.max(1, Math.min(3, Math.round(dynamics?.count ?? 1)));
 
     offCtx.save();
     let distanceAcc = 0;
@@ -282,13 +305,19 @@ export function renderBrushStrokePreview(
     for (let i = 0; i < pts.length - 1; i++) {
       const p1 = pts[i];
       const p2 = pts[i + 1];
-      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      const segDx = p2.x - p1.x;
+      const segDy = p2.y - p1.y;
+      const segDist = Math.hypot(segDx, segDy);
+      const tangentAngle = Math.atan2(segDy, segDx);
+      const nx = segDist > 1e-4 ? -segDy / segDist : 0;
+      const ny = segDist > 1e-4 ? segDx / segDist : 1;
       const stepCount = Math.max(1, Math.ceil(segDist / 0.6));
       for (let s = 0; s < stepCount; s++) {
         const t = s / stepCount;
-        const curX = p1.x + t * (p2.x - p1.x);
-        const curY = p1.y + t * (p2.y - p1.y);
+        const curX = p1.x + t * segDx;
+        const curY = p1.y + t * segDy;
         const curW = p1.width + t * (p2.width - p1.width);
+        const curP = p1.pressure + t * (p2.pressure - p1.pressure);
         const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
 
         const requiredStep = Math.max(0.5, curW * effSpacing);
@@ -296,27 +325,89 @@ export function renderBrushStrokePreview(
         if (distanceAcc >= requiredStep) {
           distanceAcc = 0;
           dabIdx++;
-          const baseW = Math.max(1.2, curW);
-          const stampW = thicknessVertical ? baseW * thickness : baseW;
-          const stampH = thicknessVertical ? baseW * rawAspect : baseW * rawAspect * thickness;
-          const alpha = clamp(opacity * baseFlow * curTipAlpha, 0.03, 1.0);
-          const flips = resolveTipFlipSigns(options.flipH, options.flipV, curX, curY, dabIdx);
 
-          if (options.spray?.enabled) {
-            const pSize = Math.max(1, options.spray.size || 2);
-            const radius = baseW * 0.5;
-            const count = Math.max(1, options.spray.density || 4);
-            for (let sp = 0; sp < count; sp++) {
-              const r = radius * Math.sqrt(dabHashFloat(curX, curY, dabIdx * 32 + sp, 91));
-              const th = dabHashFloat(curX, curY, dabIdx * 32 + sp, 92) * Math.PI * 2;
+          for (let k = 0; k < dabCount; k++) {
+            const seq = dabIdx * 8 + k;
+            let baseW = Math.max(1.2, curW);
+            if (sizeJit > 0) {
+              baseW *= Math.max(0.2, 1.0 - dabHashFloat(curX, curY, seq, 1) * sizeJit);
+            }
+            const stampW = thicknessVertical ? baseW * thickness : baseW;
+            const stampH = thicknessVertical ? baseW * rawAspect : baseW * rawAspect * thickness;
+
+            let alpha = clamp(opacity * baseFlow * curTipAlpha, 0.03, 1.0);
+            if (flowJit > 0) {
+              alpha *= Math.max(0.1, 1.0 - dabHashFloat(curX, curY, seq, 6) * flowJit);
+            }
+            if (grain > 0.01) {
+              const gNorm = getPaperGrain((curX * 1.4) / Math.max(0.2, paperScale), (curY * 1.4) / Math.max(0.2, paperScale)) / 255.0;
+              alpha = applyCspPaperTextureAlpha(
+                alpha,
+                gNorm,
+                grain,
+                curP,
+                paperMode,
+                paperBrightness,
+                paperContrast,
+                paperInverted
+              );
+            }
+            if (alpha <= 0.005) continue;
+
+            let dabAngle = baseAngleRad;
+            if (angleDynamics === 'direction' || angleDynamics === 'direction-random') {
+              dabAngle += tangentAngle;
+            }
+            if (angleDynamics === 'random' || angleDynamics === 'direction-random' || angleJit > 0) {
+              const jScale = angleDynamics === 'random' ? 1.0 : Math.max(angleJit, 0.3);
+              dabAngle += (dabHashFloat(curX, curY, seq, 3) - 0.5) * Math.PI * 2 * jScale;
+            }
+
+            let drawX = curX;
+            let drawY = curY;
+            if (scatterAmt > 0) {
+              const off = (dabHashFloat(curX, curY, seq, 4) * 2 - 1) * baseW * scatterAmt;
+              drawX += nx * off;
+              drawY += ny * off;
+            }
+
+            const flips = resolveTipFlipSigns(options.flipH, options.flipV, seq, drawX, drawY);
+
+            if (options.spray?.enabled) {
+              const pSize = Math.max(1, options.spray.size || 2);
+              const radius = baseW * 0.5;
+              const count = Math.max(1, options.spray.density || 4);
+              for (let sp = 0; sp < count; sp++) {
+                const r = radius * Math.sqrt(dabHashFloat(drawX, drawY, seq * 32 + sp, 91));
+                const th = dabHashFloat(drawX, drawY, seq * 32 + sp, 92) * Math.PI * 2;
+                drawSingleStamp(
+                  offCtx,
+                  master,
+                  drawX + r * Math.cos(th),
+                  drawY + r * Math.sin(th),
+                  pSize,
+                  pSize * rawAspect,
+                  dabAngle,
+                  alpha,
+                  false,
+                  false,
+                  false,
+                  false,
+                  flips.signX,
+                  flips.signY,
+                  aaLevel,
+                  blendTipsMode
+                );
+              }
+            } else {
               drawSingleStamp(
                 offCtx,
                 master,
-                curX + r * Math.cos(th),
-                curY + r * Math.sin(th),
-                pSize,
-                pSize * rawAspect,
-                baseAngleRad,
+                drawX,
+                drawY,
+                stampW,
+                stampH,
+                dabAngle,
                 alpha,
                 false,
                 false,
@@ -328,25 +419,6 @@ export function renderBrushStrokePreview(
                 blendTipsMode
               );
             }
-          } else {
-            drawSingleStamp(
-              offCtx,
-              master,
-              curX,
-              curY,
-              stampW,
-              stampH,
-              baseAngleRad,
-              alpha,
-              false,
-              false,
-              false,
-              false,
-              flips.signX,
-              flips.signY,
-              aaLevel,
-              blendTipsMode
-            );
           }
         }
       }
@@ -404,11 +476,11 @@ export function renderBrushStrokePreview(
     const effHardness = clamp(hardness, 0.0, 1.0);
     const effSpacing = clamp(spacing, 0.02, 0.25);
     const effFlow = computeGapAdjustedAlpha(clamp(flow, 0.01, 1.0), effSpacing, adjustByGap);
-    const master = getRadialDabMaster(effHardness, strokeColor, false, aaLevel);
+    const master = getRadialDabMaster(effHardness, strokeColor, false, displayWidth, aaLevel);
     const baseAngleRad = (customTipAngle * Math.PI) / 180;
 
     if (options.wetEdge && options.wetEdge > 0.05) {
-      const rimMaster = getRadialDabMaster(Math.min(1.0, effHardness + 0.12), strokeColor, false, aaLevel);
+      const rimMaster = getRadialDabMaster(Math.min(1.0, effHardness + 0.12), strokeColor, false, displayWidth, aaLevel);
       let wetAcc = 0;
       for (let i = 0; i < pts.length - 1; i++) {
         const p1 = pts[i];

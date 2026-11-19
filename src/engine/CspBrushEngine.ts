@@ -375,9 +375,12 @@ export function applyCspPaperTextureAlpha(
   }
   g = Math.max(0, Math.min(1, g));
 
-  //Stylus pressure pushes pigment deeper into paper valleys
-  const penetration = Math.max(0, Math.min(0.85, pressure * 0.65));
-  const effDensity = textureDensity * (1.0 - penetration * 0.6);
+  // Nonlinear valley-clogging physics: light-to-medium pressure catches crisp paper peaks;
+  // heavy pressure (> 0.55) compresses soft graphite/charcoal into valleys to clog the grain.
+  const p = Math.max(0, Math.min(1, pressure));
+  const heavyExcess = Math.max(0, (p - 0.52) / 0.48);
+  const penetration = Math.min(0.92, p * 0.28 + heavyExcess * heavyExcess * 0.64);
+  const effDensity = textureDensity * (1.0 - penetration * 0.85);
 
   switch (mode) {
     case 'multiply': {
@@ -389,8 +392,17 @@ export function applyCspPaperTextureAlpha(
       return Math.max(0, Math.min(1, tipAlpha - sub * (1.0 - penetration * 0.5)));
     }
     case 'compare': {
-      const thresh = (1.0 - g) * effDensity;
-      return tipAlpha > thresh ? Math.min(1, (tipAlpha - thresh) / Math.max(0.08, 1.0 - thresh)) : 0;
+      // Physical dry-media height-field tooth:
+      // Pigment deposits only where paper fiber ridges reach the tip contact plane;
+      // recessed valleys cut cleanly to 0.0 (preventing multi-dab overlap from filling valleys)
+      // until heavy pressure compresses soft lead into the troughs.
+      const contactHeight = g * (0.22 + 0.78 * tipAlpha);
+      const cutoff = effDensity * 0.68;
+      const edgeLow = cutoff - 0.05;
+      const edgeHigh = cutoff + 0.16;
+      const t = Math.max(0, Math.min(1, (contactHeight - edgeLow) / Math.max(0.01, edgeHigh - edgeLow)));
+      const tooth = t * t * (3.0 - 2.0 * t);
+      return Math.max(0, Math.min(1, tipAlpha * tooth));
     }
     case 'overlay': {
       const ov = tipAlpha < 0.5
