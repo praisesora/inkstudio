@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { LayerItem, BlendMode, CanvasDimensions, CanvasColorMode, LoadedDocument, ExpressionColor, CanvasSelection, DirtyRect, AdjustmentLayerData, LayerStyles } from '../types/editor';
 import { ResizeCanvasOptions } from '../types/settings';
-import { createCanvasThumbnail, get2DContext } from '../utils/canvasUtils';
+import { createCanvasThumbnail, get2DContext, getCanvasCompositeOperation } from '../utils/canvasUtils';
 import { applyLayerEffects, applyExpressionColorToImageData } from '../utils/layerEffectsEngine';
 import { HalftoneDotShape } from '../utils/screentoneEngine';
 import { SparseTileGrid, globalTileGrid, releaseTemporaryCanvas } from '../utils/tileEngine';
@@ -1959,6 +1959,85 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     updateLayerThumbnail(activeLayerId);
   }, [activeLayerId, updateLayerThumbnail]);
 
+  // Merge active raster layer down onto the raster layer directly below it
+  const mergeDown = useCallback(
+    (targetLayerId?: string): { targetId: string; removedId: string } | null => {
+      const currentLayers = layersRef.current;
+      const srcId = targetLayerId || activeLayerId;
+      const srcIdx = currentLayers.findIndex((l) => l.id === srcId);
+      if (srcIdx < 0) return null;
+
+      const srcLayer = currentLayers[srcIdx];
+      if (!srcLayer || srcLayer.type !== 'raster' || srcLayer.locked) return null;
+
+      // Find the next raster layer below (higher index in top-to-bottom stack)
+      let dstIdx = -1;
+      for (let i = srcIdx + 1; i < currentLayers.length; i++) {
+        if (currentLayers[i].type === 'raster') {
+          dstIdx = i;
+          break;
+        }
+      }
+      if (dstIdx < 0) return null;
+      const dstLayer = currentLayers[dstIdx];
+      if (dstLayer.locked) return null;
+
+      const srcCanvas = materializeLayerCanvas(srcLayer.id);
+      const dstCanvas = materializeLayerCanvas(dstLayer.id);
+      if (!srcCanvas || !dstCanvas) return null;
+
+      const dstCtx = get2DContext(dstCanvas);
+      if (!dstCtx) return null;
+
+      // Composite upper layer (respecting mask if present and enabled)
+      let drawSource: HTMLCanvasElement = srcCanvas;
+      let tempMasked: HTMLCanvasElement | null = null;
+      if (srcLayer.maskCanvas && srcLayer.maskEnabled !== false) {
+        tempMasked = document.createElement('canvas');
+        tempMasked.width = srcCanvas.width;
+        tempMasked.height = srcCanvas.height;
+        const tCtx = get2DContext(tempMasked);
+        if (tCtx) {
+          tCtx.drawImage(srcCanvas, 0, 0);
+          tCtx.globalCompositeOperation = 'destination-in';
+          tCtx.drawImage(srcLayer.maskCanvas, 0, 0);
+          drawSource = tempMasked;
+        }
+      }
+
+      dstCtx.save();
+      dstCtx.globalAlpha = srcLayer.visible ? Math.max(0, Math.min(1, srcLayer.opacity)) : 0;
+      dstCtx.globalCompositeOperation = getCanvasCompositeOperation(srcLayer.blendMode);
+      dstCtx.drawImage(drawSource, 0, 0);
+      dstCtx.restore();
+
+      if (tempMasked) {
+        releaseTemporaryCanvas(tempMasked);
+      }
+
+      // Sync destination canvas back into SparseTileGrid & remove source layer
+      const grid = activeTileGridRef.current;
+      const dstData = dstCtx.getImageData(0, 0, dstCanvas.width, dstCanvas.height);
+      grid.writeImageData(dstLayer.id, dstData, 0, 0, 'color-32bit');
+      grid.clearLayer(srcLayer.id);
+      layerCanvasesRef.current.delete(srcLayer.id);
+      layerSourceCanvasesRef.current.delete(srcLayer.id);
+      layerSourceCanvasesRef.current.delete(dstLayer.id);
+      (dstCanvas as unknown as { __isBlank?: boolean }).__isBlank = false;
+
+      const nextLayers = currentLayers.filter((l) => l.id !== srcLayer.id);
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
+      setActiveLayerId(dstLayer.id);
+      setSelectedLayerIds([dstLayer.id]);
+
+      grid.notifyChange(true);
+      updateLayerThumbnail(dstLayer.id);
+      return { targetId: dstLayer.id, removedId: srcLayer.id };
+    },
+    [activeLayerId, materializeLayerCanvas, setActiveLayerId, updateLayerThumbnail]
+  );
+
   // Switch active document tab in O(1): binds session's SparseTileGrid without clearing or re-slicing
   const switchDocumentSession = useCallback(
     (documentId: string, nextLayers: LayerItem[], nextActiveLayerId: string, nextDims?: CanvasDimensions) => {
@@ -2784,6 +2863,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     getEffectiveOpacity,
     isLayerEffectivelyVisible,
     clearActiveLayer,
+    mergeDown,
     resetToNewCanvas,
     setDefaultToneFrequency: (freq: number) => {
       defaultToneFrequencyRef.current = Math.max(20, Math.min(85, Math.round(freq || 60)));

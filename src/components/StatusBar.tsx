@@ -76,7 +76,11 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(({
 
   if (_themePreset === 'modern') {
     return (
-      <footer className="h-7 bg-[#0f1015] border-t border-white/[0.08] px-3 text-white/70 flex items-center justify-between text-xs select-none z-20 shrink-0">
+      <footer
+        data-testid="status-bar"
+        data-theme-preset="modern"
+        className="h-7 bg-[#1a1a1a] border-t border-white/[0.06] px-3 text-white/70 flex items-center justify-between text-xs select-none z-20 shrink-0"
+      >
         {/* Tool & Smoothing Status */}
         <div className="flex items-center space-x-2">
           <div className="bg-white/[0.04] border border-white/[0.06] px-2 py-0.5 rounded-md flex items-center space-x-2">
@@ -176,7 +180,11 @@ export const StatusBar: React.FC<StatusBarProps> = React.memo(({
   }
 
   return (
-    <footer className="h-7 bg-gradient-to-b from-[#464649] to-[#363638] border-t border-[#232325] px-2.5 text-[#b0b0b6] flex items-center justify-between text-xs select-none z-20 shrink-0 transition-colors">
+    <footer
+      data-testid="status-bar"
+      data-theme-preset="vintage-manga"
+      className="h-7 bg-gradient-to-b from-[#464649] to-[#363638] border-t border-[#232325] px-2.5 text-[#b0b0b6] flex items-center justify-between text-xs select-none z-20 shrink-0 transition-colors"
+    >
       {/* Tool & Smoothing Status */}
       <div className="flex items-center space-x-2">
         <div className="bg-[#2b2b2e] border border-[#202022] shadow-[inset_1px_1px_2px_rgba(0,0,0,0.5),0_1px_0_rgba(255,255,255,0.08)] px-2 py-0.5 rounded-[2px] flex items-center space-x-2">

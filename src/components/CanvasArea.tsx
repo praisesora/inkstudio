@@ -1619,8 +1619,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         </div>
       )}
 
-      {/* Subtle Zero-Height Canvas Coordinate / Pressure Readout */}
-      {(showCursorCoordinates || showPressureInStatusBar) && (
+      {/* Subtle Zero-Height Canvas Coordinate / Pressure Readout (only shown if bottom StatusBar is hidden) */}
+      {false && (showCursorCoordinates || showPressureInStatusBar) && (
         <div
           ref={pointerStatRef}
           className="pointer-events-none absolute bottom-2 right-3 z-30 text-[10px] font-mono text-[#8a8a8a]/70 select-none"

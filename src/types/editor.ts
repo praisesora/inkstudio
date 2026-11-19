@@ -327,6 +327,7 @@ export type AnimationExportFormat = 'gif' | 'apng' | 'webm' | 'mp4' | 'png-zip';
 export interface DocumentTab {
   id: string;
   name: string;
+  isDirty?: boolean;
   dimensions: CanvasDimensions;
   colorMode: CanvasColorMode;
   savedFileInfo?: {

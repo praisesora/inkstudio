@@ -1,10 +1,7 @@
-import React, { useState } from 'react';
+import React, { useMemo } from 'react';
 import {
-  Undo2,
-  Redo2,
   Minus,
   Plus,
-  X,
   Users,
   Settings,
   RotateCcw,
@@ -23,8 +20,9 @@ import { formatZoomPercent } from '../hooks/useCanvasNavigation';
 import { formatRotationDegrees } from '../utils/canvasUtils';
 import { MenuBar } from './MenuBar';
 import { WindowControls } from './WindowControls';
+import { CommandBar, WorkspaceCommandHandlers } from './CommandBar';
 
-interface HeaderProps {
+export interface HeaderProps {
   canUndo: boolean;
   canRedo: boolean;
   onUndo: () => void;
@@ -50,6 +48,7 @@ interface HeaderProps {
   onCloseDocument?: (id: string) => void;
   onNewDocument?: () => void;
   onRenameDocument?: (id: string, newName: string) => void;
+  commandHandlers?: WorkspaceCommandHandlers;
   isCollabConnected?: boolean;
   collabPeerCount?: number;
   onOpenCollabModal?: () => void;
@@ -79,43 +78,59 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   colorMode = 'color',
   menuSections,
   hasOpenDocument = true,
-  documents = [],
-  activeDocumentId = null,
-  onSelectDocument,
-  onCloseDocument,
-  onNewDocument,
-  onRenameDocument,
+  commandHandlers,
   isCollabConnected = false,
   collabPeerCount = 1,
   onOpenCollabModal,
   onOpenSettings,
-  themePreset,
+  themePreset = 'modern',
   softProofSettings,
   appView = 'workspace',
   onSelectAppView,
 }) => {
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingName, setEditingName] = useState<string>('');
-
-  const handleStartRename = (e: React.MouseEvent, doc: DocumentTab) => {
-    e.stopPropagation();
-    setEditingId(doc.id);
-    setEditingName(doc.name);
-  };
-
-  const handleFinishRename = (id: string) => {
-    if (editingName.trim() && onRenameDocument) {
-      onRenameDocument(id, editingName.trim());
-    }
-    setEditingId(null);
-  };
-
   const isRotated = Math.abs(rotation % 360) > 0.05;
+  const isVintage = themePreset === 'vintage-manga';
+
+  const resolvedHandlers = useMemo<WorkspaceCommandHandlers>(
+    () =>
+      commandHandlers ?? {
+        canUndo,
+        canRedo,
+        onUndo,
+        onRedo,
+        onFlipHorizontal: onToggleFlipHorizontal,
+        onFlipVertical: onToggleFlipVertical,
+        flipX,
+        flipY,
+        onResetZoom,
+        onResetRotation,
+        hasOpenDocument,
+      },
+    [
+      commandHandlers,
+      canUndo,
+      canRedo,
+      onUndo,
+      onRedo,
+      onToggleFlipHorizontal,
+      onToggleFlipVertical,
+      flipX,
+      flipY,
+      onResetZoom,
+      onResetRotation,
+      hasOpenDocument,
+    ]
+  );
 
   return (
     <header
       data-tauri-drag-region
-      className="h-[36px] px-2 flex items-center justify-between gap-2 bg-[#202020] text-[#e5e5e5] select-none z-40 shrink-0"
+      data-theme-preset={themePreset}
+      className={`h-[36px] px-2 flex items-center justify-between gap-2 select-none z-40 shrink-0 ${
+        isVintage
+          ? 'bg-gradient-to-b from-[#49494d] to-[#363638] border-b border-[#232325] text-[#f0f0f4]'
+          : 'bg-[#202020] text-[#e5e5e5]'
+      }`}
     >
       {/* Left: App Icon (Home Toggle) + Menu Bar */}
       <div
@@ -142,84 +157,14 @@ export const Header: React.FC<HeaderProps> = React.memo(({
         <MenuBar sections={menuSections} />
       </div>
 
-      {/* Center: Consolidated Compact Document Tabs */}
-      <div
-        className="flex-1 min-w-0 flex items-center gap-1 overflow-x-auto no-scrollbar px-1"
-        style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-      >
-        {documents.map((doc) => {
-          const isActive = doc.id === activeDocumentId && appView === 'workspace';
-          return (
-            <div
-              key={doc.id}
-              onClick={() => onSelectDocument?.(doc.id)}
-              onDoubleClick={(e) => handleStartRename(e, doc)}
-              title={`${doc.name} (${doc.dimensions.width}×${doc.dimensions.height}px)`}
-              className={`group relative h-6 flex items-center gap-1.5 pl-2.5 pr-1.5 rounded text-[11px] cursor-pointer shrink-0 transition-colors ${
-                isActive
-                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
-                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
-              }`}
-            >
-              {isActive && (
-                <span
-                  className="w-1.5 h-1.5 rounded-full shrink-0"
-                  style={{ backgroundColor: 'var(--accent)' }}
-                />
-              )}
-
-              {editingId === doc.id ? (
-                <input
-                  type="text"
-                  value={editingName}
-                  onChange={(e) => setEditingName(e.target.value)}
-                  onBlur={() => handleFinishRename(doc.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleFinishRename(doc.id);
-                    if (e.key === 'Escape') setEditingId(null);
-                  }}
-                  autoFocus
-                  onClick={(e) => e.stopPropagation()}
-                  className="bg-[#161616] text-[#e5e5e5] text-[11px] px-1 py-0.5 rounded w-24"
-                />
-              ) : (
-                <span className="truncate max-w-[130px]">{doc.name}</span>
-              )}
-
-              {onCloseDocument && (
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseDocument(doc.id);
-                  }}
-                  title="Close tab"
-                  className={`w-4 h-4 rounded flex items-center justify-center transition-colors cursor-pointer ${
-                    isActive
-                      ? 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#161616]/50'
-                      : 'opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-[#e5e5e5]'
-                  }`}
-                >
-                  <X className="w-2.5 h-2.5" />
-                </button>
-              )}
-            </div>
-          );
-        })}
-
-        {onNewDocument && (
-          <button
-            type="button"
-            onClick={onNewDocument}
-            title="New Canvas (Ctrl+N)"
-            className="w-6 h-6 rounded flex items-center justify-center shrink-0 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5" />
-          </button>
+      {/* Center: Customizable CSP Command Bar + Workspace Preset Selector */}
+      <div className="flex-1 min-w-0 flex items-center justify-center px-1">
+        {appView === 'workspace' && (
+          <CommandBar handlers={resolvedHandlers} themePreset={themePreset} />
         )}
       </div>
 
-      {/* Right: Mode Badges, Undo/Redo, Zoom Level, Settings & Window Controls */}
+      {/* Right: Mode Badges, Zoom Level, View Flip, Collab, Settings & Window Controls */}
       <div
         className="flex items-center gap-1.5 shrink-0"
         style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
@@ -262,41 +207,13 @@ export const Header: React.FC<HeaderProps> = React.memo(({
           </button>
         )}
 
-        {/* Undo / Redo */}
-        <div className="flex items-center gap-0.5">
-          <button
-            type="button"
-            onClick={onUndo}
-            disabled={!canUndo}
-            title="Undo (Ctrl+Z)"
-            className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${
-              canUndo
-                ? 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
-                : 'text-[#8a8a8a]/25 cursor-not-allowed'
-            }`}
-          >
-            <Undo2 className="w-3.5 h-3.5" />
-          </button>
-          <button
-            type="button"
-            onClick={onRedo}
-            disabled={!canRedo}
-            title="Redo (Ctrl+Y)"
-            className={`w-6 h-6 rounded flex items-center justify-center transition-colors ${
-              canRedo
-                ? 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
-                : 'text-[#8a8a8a]/25 cursor-not-allowed'
-            }`}
-          >
-            <Redo2 className="w-3.5 h-3.5" />
-          </button>
-        </div>
-
         {/* Compact Zoom Control */}
         <div
-          className={`h-6 flex items-center bg-[#161616] rounded px-0.5 ${
-            !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
-          }`}
+          className={`h-6 flex items-center rounded px-0.5 ${
+            isVintage
+              ? 'bg-[#2b2b2e] border border-[#202022]'
+              : 'bg-[#161616]'
+          } ${!hasOpenDocument ? 'opacity-40 pointer-events-none' : ''}`}
         >
           <button
             type="button"
@@ -327,9 +244,9 @@ export const Header: React.FC<HeaderProps> = React.memo(({
         {/* Non-Destructive View Flip Controls (CSP-style Mirror View) */}
         {(onToggleFlipHorizontal || onToggleFlipVertical) && (
           <div
-            className={`h-6 flex items-center bg-[#161616] rounded px-0.5 gap-0.5 ${
-              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
-            }`}
+            className={`h-6 flex items-center rounded px-0.5 gap-0.5 ${
+              isVintage ? 'bg-[#2b2b2e] border border-[#202022]' : 'bg-[#161616]'
+            } ${!hasOpenDocument ? 'opacity-40 pointer-events-none' : ''}`}
           >
             {onToggleFlipHorizontal && (
               <button

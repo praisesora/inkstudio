@@ -9,9 +9,10 @@ import {
   Sparkles,
 } from 'lucide-react';
 import { ToolType } from '../types/editor';
+import { ThemePreset } from '../types/settings';
 import { BRUSH_SIZE_PRESETS } from '../utils/brushPresetManager';
 
-interface BrushSizePaletteProps {
+export interface BrushSizePaletteProps {
   currentSize: number;
   onSelectSize: (size: number) => void;
   activeBrushName: string;
@@ -21,9 +22,10 @@ interface BrushSizePaletteProps {
   onResetAllSettings?: () => void;
   className?: string;
   hideHeader?: boolean;
+  themePreset?: ThemePreset;
 }
 
-export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
+export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
   currentSize,
   onSelectSize,
   activeBrushName,
@@ -33,9 +35,11 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
   onResetAllSettings,
   className = '',
   hideHeader = false,
+  themePreset = 'modern',
 }) => {
   const [showMenu, setShowMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const isVintage = themePreset === 'vintage-manga';
 
   useEffect(() => {
     if (!showMenu) return;
@@ -48,7 +52,6 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
     return () => window.removeEventListener('mousedown', handleOutsideClick);
   }, [showMenu]);
 
-  // Determine tool icon matching the active tool/preset
   const renderToolIcon = () => {
     if (tool === 'eraser') {
       return <Eraser className="w-3.5 h-3.5 text-rose-400 shrink-0" />;
@@ -60,84 +63,75 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
       return <Square className="w-3.5 h-3.5 text-teal-400 shrink-0" />;
     }
     if (presetId?.startsWith('csp-')) {
-      return <Sparkles className="w-3.5 h-3.5 text-[#5ce1e6] shrink-0" />;
+      return (
+        <Sparkles
+          className={`w-3.5 h-3.5 shrink-0 ${
+            isVintage ? 'text-[#5ce1e6]' : 'text-[var(--accent)]'
+          }`}
+        />
+      );
     }
-    return <Paintbrush className="w-3.5 h-3.5 text-[#5ce1e6] shrink-0" />;
+    return (
+      <Paintbrush
+        className={`w-3.5 h-3.5 shrink-0 ${
+          isVintage ? 'text-[#5ce1e6]' : 'text-[var(--accent)]'
+        }`}
+      />
+    );
   };
 
-  // Renders the Clip Studio Paint style circle preview inside each cell
   const renderSizeCircle = (size: number) => {
-    if (size <= 0.7) {
-      return <div className="w-[1.5px] h-[1.5px] rounded-full bg-white" />;
-    }
-    if (size <= 1) {
-      return <div className="w-[2px] h-[2px] rounded-full bg-white" />;
-    }
-    if (size <= 1.5) {
-      return <div className="w-[2.5px] h-[2.5px] rounded-full bg-white" />;
-    }
-    if (size <= 2) {
-      return <div className="w-[3px] h-[3px] rounded-full bg-white" />;
-    }
-    if (size <= 2.5) {
-      return <div className="w-[3.5px] h-[3.5px] rounded-full bg-white" />;
-    }
-    if (size <= 3) {
-      return <div className="w-[4px] h-[4px] rounded-full bg-white" />;
-    }
-    if (size <= 4) {
-      return <div className="w-[5px] h-[5px] rounded-full bg-white" />;
-    }
-    if (size <= 5) {
-      return <div className="w-[6px] h-[6px] rounded-full bg-white" />;
-    }
-    if (size <= 6) {
-      return <div className="w-[7px] h-[7px] rounded-full bg-white" />;
-    }
-    if (size <= 7) {
-      return <div className="w-[8px] h-[8px] rounded-full bg-white" />;
-    }
-    if (size <= 8) {
-      return <div className="w-[9.5px] h-[9.5px] rounded-full bg-white" />;
-    }
-    if (size <= 10) {
-      return <div className="w-[11.5px] h-[11.5px] rounded-full bg-white" />;
-    }
-    if (size <= 12) {
-      return <div className="w-[13.5px] h-[13.5px] rounded-full bg-white" />;
-    }
-    if (size <= 15) {
-      return <div className="w-[15.5px] h-[15.5px] rounded-full bg-white" />;
-    }
-    if (size <= 17) {
-      return <div className="w-[17.5px] h-[17.5px] rounded-full bg-white" />;
-    }
-    if (size <= 20) {
-      return <div className="w-[19.5px] h-[19.5px] rounded-full bg-white" />;
-    }
-    if (size <= 25) {
-      return (
-        <div className="w-[22px] h-[16px] overflow-hidden flex items-end justify-center relative">
-          <div className="w-[22px] h-[22px] rounded-full bg-white relative top-[3px]" />
-          <div className="absolute bottom-0 w-full h-[1px] bg-[#666666]/60" />
-        </div>
-      );
+    const dotClass = isVintage ? 'bg-[#f0f0f4]' : 'bg-[#e5e5e5]';
+    const smallMap: Array<[number, number]> = [
+      [0.7, 1.5],
+      [1, 2],
+      [1.5, 2.5],
+      [2, 3],
+      [2.5, 3.5],
+      [3, 4],
+      [4, 5],
+      [5, 6],
+      [6, 7],
+      [7, 8],
+      [8, 9.5],
+      [10, 11.5],
+      [12, 13.5],
+      [15, 15.5],
+      [17, 17.5],
+      [20, 19.5],
+    ];
+    for (const [maxSize, px] of smallMap) {
+      if (size <= maxSize) {
+        return (
+          <div
+            className={`rounded-full ${dotClass}`}
+            style={{ width: `${px}px`, height: `${px}px` }}
+          />
+        );
+      }
     }
     if (size <= 30) {
+      const d = size <= 25 ? 22 : 24;
+      const top = size <= 25 ? 3 : 4;
       return (
-        <div className="w-[24px] h-[16px] overflow-hidden flex items-end justify-center relative">
-          <div className="w-[24px] h-[24px] rounded-full bg-white relative top-[4px]" />
+        <div
+          className="h-[16px] overflow-hidden flex items-end justify-center relative"
+          style={{ width: `${d}px` }}
+        >
+          <div
+            className={`rounded-full ${dotClass} relative`}
+            style={{ width: `${d}px`, height: `${d}px`, top: `${top}px` }}
+          />
           <div className="absolute bottom-0 w-full h-[1px] bg-[#666666]/60" />
         </div>
       );
     }
 
-    // Sizes >= 40: large dome filled white with flat bottom edge (CSP signature style)
-    const domeDiameter = Math.min(32, 24 + Math.min(8, Math.log10(size / 30) * 4));
+    const domeDiameter = Math.min(30, 22 + Math.min(8, Math.log10(size / 30) * 4));
     return (
-      <div className="w-[28px] h-[16px] overflow-hidden flex items-end justify-center relative">
+      <div className="w-[26px] h-[16px] overflow-hidden flex items-end justify-center relative">
         <div
-          className="rounded-full bg-white relative"
+          className={`rounded-full ${dotClass} relative`}
           style={{
             width: `${domeDiameter}px`,
             height: `${domeDiameter}px`,
@@ -150,24 +144,44 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
   };
 
   return (
-    <div className={`flex flex-col select-none bg-[#1e2023] ${className}`}>
-      {/* Header Bar matching Clip Studio Paint screenshot */}
+    <div
+      data-testid="brush-size-palette"
+      data-theme-preset={themePreset}
+      className={`flex flex-col h-full min-h-0 select-none ${
+        isVintage ? 'bg-[#363638] text-[#e5e5e5]' : 'bg-[#202020] text-[#e5e5e5]'
+      } ${className}`}
+    >
       {!hideHeader && (
-        <div className="h-8 px-2.5 flex items-center justify-between border-b border-[#2b2d31] bg-[#1a1b1e] shrink-0 text-white relative">
-          <div className="flex items-center space-x-2 min-w-0">
-            {/* Menu icon (≡) */}
+        <div
+          className={`h-7 px-2 flex items-center justify-between shrink-0 relative ${
+            isVintage
+              ? 'bg-gradient-to-b from-[#464649] to-[#363638] border-b border-[#232325] text-[#f0f0f4]'
+              : 'bg-[#1a1a1a] border-b border-white/[0.06] text-[#e5e5e5]'
+          }`}
+        >
+          <div className="flex items-center space-x-1.5 min-w-0">
             <div className="relative" ref={menuRef}>
               <button
                 type="button"
                 onClick={() => setShowMenu((prev) => !prev)}
                 title="Brush Size Options"
-                className="p-1 text-[#8c9099] hover:text-white hover:bg-[#282a2e] rounded transition-colors cursor-pointer"
+                className={`p-1 rounded transition-colors cursor-pointer ${
+                  isVintage
+                    ? 'text-[#b0b0b6] hover:text-white hover:bg-[#4e4e52]'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                }`}
               >
                 <Menu className="w-3.5 h-3.5" />
               </button>
 
               {showMenu && (
-                <div className="absolute top-7 left-0 w-48 bg-[#18191b] border border-[#33363e] rounded shadow-xl py-1 z-50 text-[11px] text-[#cccccc]">
+                <div
+                  className={`absolute top-6 left-0 w-44 rounded shadow-xl py-1 z-50 text-[11px] ${
+                    isVintage
+                      ? 'bg-[#2b2b2e] border border-[#202022] text-[#e0e0e4]'
+                      : 'bg-[#1a1a1a] border border-white/[0.1] text-[#cccccc]'
+                  }`}
+                >
                   {onResetSizeToDefault && (
                     <button
                       type="button"
@@ -175,9 +189,9 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
                         onResetSizeToDefault();
                         setShowMenu(false);
                       }}
-                      className="w-full px-3 py-1.5 text-left hover:bg-[#26282e] hover:text-white flex items-center space-x-2 cursor-pointer"
+                      className="w-full px-3 py-1.5 text-left hover:bg-[#2c2c2c] hover:text-white flex items-center space-x-2 cursor-pointer"
                     >
-                      <RotateCcw className="w-3 h-3 text-[#5ce1e6]" />
+                      <RotateCcw className="w-3 h-3 text-[var(--accent)]" />
                       <span>Reset Size to Default</span>
                     </button>
                   )}
@@ -188,41 +202,50 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
                         onResetAllSettings();
                         setShowMenu(false);
                       }}
-                      className="w-full px-3 py-1.5 text-left hover:bg-[#26282e] hover:text-rose-400 flex items-center space-x-2 cursor-pointer"
+                      className="w-full px-3 py-1.5 text-left hover:bg-[#2c2c2c] hover:text-rose-400 flex items-center space-x-2 cursor-pointer"
                     >
                       <RotateCcw className="w-3 h-3 text-rose-400" />
                       <span>Reset All Brush Settings</span>
                     </button>
                   )}
-                  <div className="px-3 py-1 text-[10px] text-[#717682] border-t border-[#26282e] mt-1">
+                  <div className="px-3 py-1 text-[10px] text-[#8a8a8a] border-t border-white/[0.06] mt-1">
                     Current: {currentSize} px
                   </div>
                 </div>
               )}
             </div>
 
-            {/* Tool Icon */}
             {renderToolIcon()}
 
-            {/* Brush Size Label */}
             <span
-              className="text-xs font-semibold tracking-tight text-[#e0e3ea] truncate"
+              className="text-[11px] font-medium tracking-tight truncate"
               title={`Brush size [${activeBrushName || 'Brush'}]`}
             >
-              Brush size [{activeBrushName || 'Brush'}]
+              {activeBrushName || 'Brush'}
             </span>
           </div>
 
-          {/* Current Size Badge */}
-          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#141517] border border-[#2b2d31] text-[#5ce1e6] shrink-0">
-            {currentSize} px
+          <span
+            className={`text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 ${
+              isVintage
+                ? 'bg-[#2b2b2e] border border-[#202022] text-[#38bdf8]'
+                : 'bg-[#161616] text-[var(--accent)]'
+            }`}
+          >
+            {currentSize}px
           </span>
         </div>
       )}
 
-      {/* 6-Column Grid of 40 Presets matching screenshot */}
-      <div className="p-1 overflow-y-auto">
-        <div className="grid grid-cols-6 border-t border-l border-[#2d3036] bg-[#141518]">
+      {/* Responsive CSP-style grid of brush size presets */}
+      <div className="p-1 flex-1 min-h-0 overflow-y-auto">
+        <div
+          className={`grid grid-cols-[repeat(auto-fill,minmax(32px,1fr))] border-t border-l ${
+            isVintage
+              ? 'border-[#252528] bg-[#2a2a2d]'
+              : 'border-[#2a2a2a] bg-[#161616]'
+          }`}
+        >
           {BRUSH_SIZE_PRESETS.map((preset) => {
             const isSelected = Math.abs(currentSize - preset) < 0.05;
 
@@ -232,19 +255,22 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
                 type="button"
                 onClick={() => onSelectSize(preset)}
                 title={`${preset} px`}
-                className={`h-11 flex flex-col items-center justify-between py-1 px-0.5 border-r border-b transition-colors cursor-pointer relative group ${
+                aria-pressed={isSelected}
+                className={`h-10 flex flex-col items-center justify-between py-1 px-0.5 border-r border-b transition-colors cursor-pointer relative ${
                   isSelected
-                    ? 'bg-[#37485e] border-[#4e6a88] text-white shadow-inner font-semibold z-10'
-                    : 'bg-[#1b1c1f]/80 hover:bg-[#282b31] border-[#292b30] text-[#a8acb6] hover:text-white'
+                    ? isVintage
+                      ? 'bg-[#337bb5] border-[#4e95cf] text-white font-semibold z-10'
+                      : 'bg-[var(--accent-subtle)] border-[var(--accent-border)] text-[var(--accent)] font-semibold z-10'
+                    : isVintage
+                    ? 'bg-[#343437] hover:bg-[#444448] border-[#252528] text-[#b8b8be] hover:text-white'
+                    : 'bg-[#202020] hover:bg-[#2c2c2c] border-[#2a2a2a] text-[#8a8a8a] hover:text-[#e5e5e5]'
                 }`}
               >
-                {/* Visual circle preview */}
-                <div className="w-full h-5 flex items-center justify-center overflow-hidden">
+                <div className="w-full h-4 flex items-center justify-center overflow-hidden">
                   {renderSizeCircle(preset)}
                 </div>
 
-                {/* Preset size numeric label */}
-                <span className="text-[10px] font-mono tracking-tight leading-none text-center">
+                <span className="text-[9px] font-mono tracking-tight leading-none text-center">
                   {preset}
                 </span>
               </button>
@@ -254,4 +280,6 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = ({
       </div>
     </div>
   );
-};
+});
+
+BrushSizePalette.displayName = 'BrushSizePalette';

@@ -30,14 +30,80 @@ import {
 } from '../types/editor';
 import { BLEND_MODES } from '../utils/canvasUtils';
 import { ColorPanel } from './ColorPanel';
+import { useToolStore, toolStoreActions } from '../stores';
 
-interface RightSidebarProps {
-  primaryColor: string;
-  secondaryColor: string;
-  onPrimaryColorChange: (color: string, commit?: boolean) => void;
-  onSecondaryColorChange: (color: string, commit?: boolean) => void;
-  onSwapColors: () => void;
-  recentColors: string[];
+interface RightSidebarColorSectionProps {
+  colorMode: CanvasColorMode;
+  containerWidth: number;
+  fullHeight?: boolean;
+  primaryColor?: string;
+  secondaryColor?: string;
+  onPrimaryColorChange?: (color: string, commit?: boolean) => void;
+  onSecondaryColorChange?: (color: string, commit?: boolean) => void;
+  onSwapColors?: () => void;
+  recentColors?: string[];
+  currentTool?: ToolType;
+  onSelectTool?: (tool: ToolType) => void;
+}
+
+export const RightSidebarColorSection: React.FC<RightSidebarColorSectionProps> = React.memo(
+  ({
+    colorMode,
+    containerWidth,
+    fullHeight = false,
+    primaryColor: primaryProp,
+    secondaryColor: secondaryProp,
+    onPrimaryColorChange,
+    onSecondaryColorChange,
+    onSwapColors,
+    recentColors: recentProp,
+    currentTool: toolProp,
+    onSelectTool,
+  }) => {
+    const storePrimary = useToolStore((s) => s.primaryColor);
+    const storeSecondary = useToolStore((s) => s.secondaryColor);
+    const storeRecent = useToolStore((s) => s.recentColors);
+    const storeTool = useToolStore((s) => s.tool);
+
+    return (
+      <section
+        className={
+          fullHeight
+            ? 'h-full w-full overflow-hidden bg-[#202020]'
+            : 'h-[28%] max-h-[30%] shrink-0 overflow-hidden bg-[#202020]'
+        }
+      >
+        <ColorPanel
+          primaryColor={primaryProp ?? storePrimary}
+          secondaryColor={secondaryProp ?? storeSecondary}
+          onPrimaryColorChange={
+            onPrimaryColorChange ??
+            ((color, commit) => toolStoreActions.setPrimaryColor(color, commit, colorMode))
+          }
+          onSecondaryColorChange={
+            onSecondaryColorChange ??
+            ((color, commit) => toolStoreActions.setSecondaryColor(color, commit, colorMode))
+          }
+          onSwapColors={onSwapColors ?? (() => toolStoreActions.swapColors(colorMode))}
+          colorMode={colorMode}
+          currentTool={toolProp ?? storeTool}
+          onSelectTool={onSelectTool ?? ((t) => toolStoreActions.selectTool(t))}
+          recentColors={recentProp ?? storeRecent}
+          containerWidth={containerWidth}
+        />
+      </section>
+    );
+  }
+);
+RightSidebarColorSection.displayName = 'RightSidebarColorSection';
+
+export interface RightSidebarProps {
+  primaryColor?: string;
+  secondaryColor?: string;
+  onPrimaryColorChange?: (color: string, commit?: boolean) => void;
+  onSecondaryColorChange?: (color: string, commit?: boolean) => void;
+  onSwapColors?: () => void;
+  recentColors?: string[];
   historyList: HistoryItemMeta[];
   historyIndex: number;
   onJumpToHistory: (index: number) => void;
@@ -101,6 +167,8 @@ interface RightSidebarProps {
   hasOpenDocument?: boolean;
   onNewCanvas?: () => void;
   onOpenFile?: () => void;
+  hideColorPanel?: boolean;
+  dockedMode?: 'full' | 'layers' | 'history';
 }
 
 const ClipToLayerIcon: React.FC<{ className?: string }> = ({ className = 'w-3 h-3' }) => (
@@ -127,7 +195,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onSwapColors,
   recentColors,
   colorMode = 'color',
-  currentTool = 'brush',
+  currentTool,
   onSelectTool,
   historyList,
   historyIndex,
@@ -184,8 +252,15 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   hasOpenDocument = true,
   onNewCanvas,
   onOpenFile,
+  hideColorPanel = false,
+  dockedMode = 'full',
 }) => {
-  const [bottomTab, setBottomTab] = useState<'layers' | 'history'>('layers');
+  const [bottomTab, setBottomTab] = useState<'layers' | 'history'>(
+    dockedMode === 'history' ? 'history' : 'layers'
+  );
+  const effectiveTab: 'layers' | 'history' =
+    dockedMode === 'layers' ? 'layers' : dockedMode === 'history' ? 'history' : bottomTab;
+  const isDockedSingle = dockedMode !== 'full';
   const [editingLayerId, setEditingLayerId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState<string>('');
   const [draggedLayerId, setDraggedLayerId] = useState<string | null>(null);
@@ -412,67 +487,79 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
 
   return (
     <aside
-      style={{ width }}
-      className="relative bg-[#161616] flex flex-col gap-px text-[#e5e5e5] text-xs select-none z-10 shrink-0 overflow-hidden"
+      style={isDockedSingle ? undefined : { width }}
+      className={
+        isDockedSingle
+          ? 'relative w-full h-full bg-[#202020] flex flex-col text-[#e5e5e5] text-xs select-none overflow-hidden min-h-0'
+          : 'relative bg-[#161616] flex flex-col gap-px text-[#e5e5e5] text-xs select-none z-10 shrink-0 overflow-hidden'
+      }
     >
       {/* Left Resize Seam */}
-      <div
-        onMouseDown={(e) => {
-          e.preventDefault();
-          setIsResizing(true);
-          startXRef.current = e.clientX;
-          startWidthRef.current = width;
-        }}
-        title="Resize sidebar"
-        className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-[var(--accent)]/40 transition-colors z-30"
-      />
+      {!isDockedSingle && (
+        <div
+          onMouseDown={(e) => {
+            e.preventDefault();
+            setIsResizing(true);
+            startXRef.current = e.clientX;
+            startWidthRef.current = width;
+          }}
+          title="Resize sidebar"
+          className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-[var(--accent)]/40 transition-colors z-30"
+        />
+      )}
 
-      {/* 1. Compact Color Wheel (<= 30% of sidebar height) */}
-      <section className="h-[28%] max-h-[30%] shrink-0 overflow-hidden bg-[#202020]">
-        <ColorPanel
+      {/* 1. Compact Color Wheel (<= 30% of sidebar height) - isolated store subscriber */}
+      {!hideColorPanel && !isDockedSingle && (
+        <RightSidebarColorSection
+          colorMode={colorMode}
+          containerWidth={width}
           primaryColor={primaryColor}
           secondaryColor={secondaryColor}
           onPrimaryColorChange={onPrimaryColorChange}
           onSecondaryColorChange={onSecondaryColorChange}
           onSwapColors={onSwapColors}
-          colorMode={colorMode}
+          recentColors={recentColors}
           currentTool={currentTool}
           onSelectTool={onSelectTool}
-          recentColors={recentColors}
-          containerWidth={width}
         />
-      </section>
+      )}
 
-      {/* 2. Spacious Layers Panel (>= 70% of sidebar height) */}
-      <section className="flex-1 min-h-[70%] flex flex-col bg-[#202020] overflow-hidden">
+      {/* 2. Spacious Layers / History Panel */}
+      <section className={`flex-1 ${isDockedSingle ? 'min-h-0' : 'min-h-[70%]'} flex flex-col bg-[#202020] overflow-hidden`}>
         {/* Header Bar: Layers / History Switch + Quick Layer Actions */}
         <div className="h-7 px-1.5 flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-0.5">
-            <button
-              type="button"
-              onClick={() => setBottomTab('layers')}
-              className={`px-1.5 py-0.5 rounded text-[11px] transition-colors cursor-pointer ${
-                bottomTab === 'layers'
-                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
-                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
-              }`}
-            >
-              Layers
-            </button>
-            <button
-              type="button"
-              onClick={() => setBottomTab('history')}
-              className={`px-1.5 py-0.5 rounded text-[11px] transition-colors cursor-pointer ${
-                bottomTab === 'history'
-                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
-                  : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
-              }`}
-            >
-              History
-            </button>
-          </div>
+          {isDockedSingle ? (
+            <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a] font-medium px-1">
+              {effectiveTab === 'layers' ? `${layers.length} Layers` : `${historyList.length} Steps`}
+            </span>
+          ) : (
+            <div className="flex items-center gap-0.5">
+              <button
+                type="button"
+                onClick={() => setBottomTab('layers')}
+                className={`px-1.5 py-0.5 rounded text-[11px] transition-colors cursor-pointer ${
+                  effectiveTab === 'layers'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                }`}
+              >
+                Layers
+              </button>
+              <button
+                type="button"
+                onClick={() => setBottomTab('history')}
+                className={`px-1.5 py-0.5 rounded text-[11px] transition-colors cursor-pointer ${
+                  effectiveTab === 'history'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                }`}
+              >
+                History
+              </button>
+            </div>
+          )}
 
-          {bottomTab === 'layers' && hasOpenDocument && (
+          {effectiveTab === 'layers' && hasOpenDocument && (
             <div className="flex items-center gap-0.5">
               <button
                 type="button"
@@ -513,7 +600,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
             </div>
           )}
 
-          {bottomTab === 'history' && (
+          {effectiveTab === 'history' && (
             <div className="flex items-center gap-0.5">
               <button
                 type="button"
@@ -546,7 +633,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
         </div>
 
         {/* Layers Content */}
-        {bottomTab === 'layers' ? (
+        {effectiveTab === 'layers' ? (
           <div className="flex-1 flex flex-col overflow-hidden min-h-0">
             {!hasOpenDocument ? (
               <div className="flex-1 flex flex-col items-center justify-center p-4 text-center text-[#8a8a8a]">
