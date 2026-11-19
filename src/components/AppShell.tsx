@@ -507,6 +507,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     const modernAccent = useUiStore((s) => s.appSettings.modernAccent || 'neutral');
     const modernCustomColor = useUiStore((s) => s.appSettings.modernCustomColor);
     const themePreset = useUiStore((s) => s.appSettings.themePreset);
+    const showCheckerboard = useUiStore((s) => s.appSettings.showCheckerboard);
     const userName = useUiStore((s) => s.appSettings.userName);
     const showStatusBar = useWorkspaceStore((s) => s.showStatusBar);
     const showDocumentTabs = useWorkspaceStore((s) => s.showDocumentTabs);
@@ -644,6 +645,63 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         canvasProps.onDeselect,
         handleSwapColors,
         handleToggleTransparentColor,
+      ]
+    );
+
+    const handleZoomActualSize = useCallback(() => {
+      canvasProps.navigation.setZoomLive?.(1.0, true);
+    }, [canvasProps.navigation]);
+
+    const handleRotateLeft = useCallback(() => {
+      canvasProps.navigation.rotateBy?.(-15);
+    }, [canvasProps.navigation]);
+
+    const handleRotateRight = useCallback(() => {
+      canvasProps.navigation.rotateBy?.(15);
+    }, [canvasProps.navigation]);
+
+    const navigatorProps = useMemo(
+      () => ({
+        viewportRef: canvasProps.viewportRef,
+        navigation: canvasProps.navigation,
+        dimensions,
+        layers: canvasProps.layers,
+        tileGrid: canvasProps.tileGrid,
+        showCheckerboard,
+        zoom,
+        rotation,
+        flipX,
+        flipY,
+        onZoomIn: zoomIn,
+        onZoomOut: zoomOut,
+        onFitToScreen: resetZoomAndCenter,
+        onZoomActualSize: handleZoomActualSize,
+        onRotateLeft: handleRotateLeft,
+        onRotateRight: handleRotateRight,
+        onResetRotation: resetRotation,
+        onToggleFlipHorizontal: toggleFlipHorizontal,
+        onToggleFlipVertical: toggleFlipVertical,
+      }),
+      [
+        canvasProps.viewportRef,
+        canvasProps.navigation,
+        canvasProps.layers,
+        canvasProps.tileGrid,
+        dimensions,
+        showCheckerboard,
+        zoom,
+        rotation,
+        flipX,
+        flipY,
+        zoomIn,
+        zoomOut,
+        resetZoomAndCenter,
+        handleZoomActualSize,
+        handleRotateLeft,
+        handleRotateRight,
+        resetRotation,
+        toggleFlipHorizontal,
+        toggleFlipVertical,
       ]
     );
 
@@ -857,6 +915,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
               onInvertSelection={canvasProps.onInvertSelection}
               onToggleTransparentColor={handleToggleTransparentColor}
               layerSidebarProps={layerSidebarProps}
+              navigatorProps={navigatorProps}
             >
               {showDocumentTabs && (
                 <DocumentTabBar

@@ -5045,6 +5045,188 @@ export class ViewportCompositor {
     ctx.restore();
   }
 
+  private static previewTileCanvas: HTMLCanvasElement | null = null;
+  private static previewScratchCanvas: HTMLCanvasElement | null = null;
+
+  /**
+   * Lightweight low-LOD composite preview renderer for Navigator & thumbnails.
+   * Reads directly from SparseTileGrid mipmap LOD tiles (no WebGL context creation, no GPU readPixels stall).
+   */
+  public static renderLowResPreview(
+    targetCanvas: HTMLCanvasElement,
+    layers: LayerItem[],
+    dimensions: CanvasDimensions,
+    grid: SparseTileGrid = globalTileGrid,
+    options: { showCheckerboard?: boolean } = {}
+  ): void {
+    if (typeof document === 'undefined') return;
+    const ctx = targetCanvas.getContext('2d');
+    if (!ctx) return;
+
+    const outW = Math.max(1, Math.floor(targetCanvas.width));
+    const outH = Math.max(1, Math.floor(targetCanvas.height));
+    const docW = Math.max(1, dimensions.width);
+    const docH = Math.max(1, dimensions.height);
+
+    // Choose lowest sufficient LOD based on downscale ratio (avoids reading full-res tiles on 4K+ canvases)
+    const ratio = Math.max(docW / outW, docH / outH);
+    const targetLod = ratio >= 7 ? 3 : ratio >= 3.5 ? 2 : ratio >= 1.8 ? 1 : 0;
+    const lodDocSize = TILE_SIZE << targetLod;
+    const scaleX = outW / docW;
+    const scaleY = outH / docH;
+
+    // 1. Background
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+    if (options.showCheckerboard) {
+      const cell = 6;
+      ctx.fillStyle = '#202020';
+      ctx.fillRect(0, 0, outW, outH);
+      ctx.fillStyle = '#2a2a2a';
+      for (let y = 0; y < outH; y += cell) {
+        const offset = ((y / cell) & 1) * cell;
+        for (let x = offset; x < outW; x += cell * 2) {
+          ctx.fillRect(x, y, cell, cell);
+        }
+      }
+    } else {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, outW, outH);
+    }
+
+    if (!ViewportCompositor.previewTileCanvas) {
+      ViewportCompositor.previewTileCanvas = document.createElement('canvas');
+      ViewportCompositor.previewTileCanvas.width = TILE_SIZE;
+      ViewportCompositor.previewTileCanvas.height = TILE_SIZE;
+    }
+    const tileCanvas = ViewportCompositor.previewTileCanvas;
+    const tileCtx = tileCanvas.getContext('2d', { willReadFrequently: true });
+    if (!tileCtx) {
+      ctx.restore();
+      return;
+    }
+
+    const drawSingleLayer = (
+      dstCtx: CanvasRenderingContext2D,
+      layer: LayerItem,
+      opacityMul: number,
+      compositeOverride?: GlobalCompositeOperation
+    ) => {
+      const alpha = Math.max(0, Math.min(1, layer.opacity * opacityMul));
+      if (alpha <= 0.001) return;
+
+      const tiles = grid.getOrBuildLodTiles(layer.id, targetLod);
+      if (tiles.length === 0) return;
+
+      dstCtx.save();
+      dstCtx.globalAlpha = alpha;
+      dstCtx.globalCompositeOperation = compositeOverride ?? getCanvasCompositeOperation(layer.blendMode);
+      dstCtx.imageSmoothingEnabled = true;
+
+      for (const tile of tiles) {
+        const rgba = grid.getTileAsRGBA(tile);
+        const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
+        imgData.data.set(rgba);
+        tileCtx.putImageData(imgData, 0, 0);
+
+        const dx = tile.tileX * lodDocSize * scaleX;
+        const dy = tile.tileY * lodDocSize * scaleY;
+        const dw = lodDocSize * scaleX;
+        const dh = lodDocSize * scaleY;
+        dstCtx.drawImage(tileCanvas, dx, dy, dw, dh);
+      }
+
+      dstCtx.restore();
+    };
+
+    const renderNodes = (
+      dstCtx: CanvasRenderingContext2D,
+      nodes: LayerTreeNode[],
+      opacityMul: number
+    ) => {
+      const renderOrder = nodes.slice().reverse();
+      const groups = groupTreeNodesForCompositing(renderOrder);
+
+      for (const group of groups) {
+        const baseNode = group.baseNode;
+        const baseLayer = baseNode.layer;
+        if (!baseLayer.visible || baseLayer.opacity <= 0.001) continue;
+
+        if (baseLayer.type === 'folder') {
+          const folderOpacity = opacityMul * baseLayer.opacity;
+          if (baseLayer.blendMode === 'pass-through') {
+            if (baseNode.children.length > 0) {
+              renderNodes(dstCtx, baseNode.children, folderOpacity);
+            }
+          } else {
+            const tmp = document.createElement('canvas');
+            tmp.width = outW;
+            tmp.height = outH;
+            const tmpCtx = tmp.getContext('2d');
+            if (tmpCtx) {
+              if (baseNode.children.length > 0) {
+                renderNodes(tmpCtx, baseNode.children, 1.0);
+              }
+              dstCtx.save();
+              dstCtx.globalAlpha = Math.max(0, Math.min(1, folderOpacity));
+              dstCtx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+              dstCtx.drawImage(tmp, 0, 0);
+              dstCtx.restore();
+            }
+          }
+          continue;
+        }
+
+        if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
+          try {
+            const imgData = dstCtx.getImageData(0, 0, outW, outH);
+            applyAdjustment(imgData, baseLayer.adjustmentData, undefined, baseLayer.opacity * opacityMul);
+            dstCtx.putImageData(imgData, 0, 0);
+          } catch {
+            // Ignore in headless/mock contexts without getImageData
+          }
+          continue;
+        }
+
+        const activeClipped = group.clippedNodes.filter(
+          (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && cn.layer.type !== 'folder'
+        );
+
+        if (activeClipped.length === 0) {
+          drawSingleLayer(dstCtx, baseLayer, opacityMul);
+        } else {
+          if (!ViewportCompositor.previewScratchCanvas) {
+            ViewportCompositor.previewScratchCanvas = document.createElement('canvas');
+          }
+          const grpCanvas = ViewportCompositor.previewScratchCanvas;
+          if (grpCanvas.width !== outW) grpCanvas.width = outW;
+          if (grpCanvas.height !== outH) grpCanvas.height = outH;
+          const grpCtx = grpCanvas.getContext('2d');
+          if (!grpCtx) {
+            drawSingleLayer(dstCtx, baseLayer, opacityMul);
+            continue;
+          }
+          grpCtx.clearRect(0, 0, outW, outH);
+          drawSingleLayer(grpCtx, baseLayer, 1.0, 'source-over');
+          for (const cn of activeClipped) {
+            drawSingleLayer(grpCtx, cn.layer, 1.0, 'source-atop');
+          }
+          dstCtx.save();
+          dstCtx.globalAlpha = Math.max(0, Math.min(1, opacityMul));
+          dstCtx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+          dstCtx.drawImage(grpCanvas, 0, 0);
+          dstCtx.restore();
+        }
+      }
+    };
+
+    const tree = buildLayerTree(layers);
+    renderNodes(ctx, tree, 1.0);
+    ctx.restore();
+  }
+
   /**
    * Clear all allocated WebGL textures, FBOs, buffers, and programs.
    */

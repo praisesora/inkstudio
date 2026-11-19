@@ -17,6 +17,8 @@ import {
   PanelLeft,
   PanelRight,
   Eye,
+  Compass,
+  Images,
 } from 'lucide-react';
 import { CanvasColorMode, CspBrush } from '../types/editor';
 import { ThemePreset } from '../types/settings';
@@ -51,6 +53,8 @@ import { ToolPropertyInspector } from './ToolPropertyInspector';
 import { BrushSizePalette } from './BrushSizePalette';
 import { RightSidebar, RightSidebarColorSection, RightSidebarProps } from './RightSidebar';
 import { QuickAccessPanel } from './QuickAccessPanel';
+import { NavigatorPanel, NavigatorPanelProps } from './NavigatorPanel';
+import { SubViewPanel } from './SubViewPanel';
 import { WorkspaceCommandHandlers } from './CommandBar';
 
 const DND_PANEL_MIME = 'application/x-inkstudio-panel';
@@ -65,6 +69,10 @@ export function renderPanelIcon(panelId: DockPanelId, className = 'w-3.5 h-3.5')
       return <Sliders className={className} />;
     case 'brush-size':
       return <CircleDot className={className} />;
+    case 'navigator':
+      return <Compass className={className} />;
+    case 'sub-view':
+      return <Images className={className} />;
     case 'color':
       return <Palette className={className} />;
     case 'layers':
@@ -163,6 +171,8 @@ export interface DockWorkspaceProps {
   onToggleTransparentColor?: () => void;
   // Layer & history props forwarded cleanly to RightSidebar docked panels
   layerSidebarProps: Omit<RightSidebarProps, 'width' | 'onWidthChange' | 'hideColorPanel' | 'dockedMode'>;
+  // Navigator palette props
+  navigatorProps?: Omit<NavigatorPanelProps, 'themePreset'>;
   // Center canvas area (DocumentTabBar + CanvasArea + StatusBar)
   children: React.ReactNode;
 }
@@ -760,6 +770,7 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
   onInvertSelection,
   onToggleTransparentColor,
   layerSidebarProps,
+  navigatorProps,
   children,
 }) => {
   const layout = useWorkspaceStore((s) => s.layout);
@@ -845,6 +856,12 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
           );
         case 'brush-size':
           return <BrushSizeDockedContent themePreset={themePreset} />;
+        case 'navigator':
+          return navigatorProps ? (
+            <NavigatorPanel {...navigatorProps} themePreset={themePreset} />
+          ) : null;
+        case 'sub-view':
+          return <SubViewPanel colorMode={colorMode} themePreset={themePreset} />;
         case 'color':
           return (
             <RightSidebarColorSection
@@ -883,6 +900,7 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
       commandHandlers,
       customBrushes,
       layerSidebarProps,
+      navigatorProps,
       onContractSelection,
       onDeselect,
       onExpandSelection,

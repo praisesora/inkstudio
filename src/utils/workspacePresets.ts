@@ -80,16 +80,22 @@ export const DEFAULT_ILLUSTRATION_LAYOUT: WorkspaceLayout = {
       collapsed: false,
       groups: [
         {
+          id: 'grp-navigator-subview',
+          panelIds: ['navigator', 'sub-view'],
+          activePanelId: 'navigator',
+          heightRatio: 0.26,
+        },
+        {
           id: 'grp-color',
           panelIds: ['color'],
           activePanelId: 'color',
-          heightRatio: 0.3,
+          heightRatio: 0.26,
         },
         {
           id: 'grp-layers-history',
           panelIds: ['layers', 'history'],
           activePanelId: 'layers',
-          heightRatio: 0.7,
+          heightRatio: 0.48,
         },
       ],
     },
@@ -170,16 +176,22 @@ export const MANGA_STUDIO_LAYOUT: WorkspaceLayout = {
       collapsed: false,
       groups: [
         {
+          id: 'grp-manga-nav-subview',
+          panelIds: ['navigator', 'sub-view'],
+          activePanelId: 'navigator',
+          heightRatio: 0.26,
+        },
+        {
           id: 'grp-manga-layers',
           panelIds: ['layers'],
           activePanelId: 'layers',
-          heightRatio: 0.72,
+          heightRatio: 0.5,
         },
         {
           id: 'grp-manga-history',
           panelIds: ['history'],
           activePanelId: 'history',
-          heightRatio: 0.28,
+          heightRatio: 0.24,
         },
       ],
     },
@@ -223,7 +235,7 @@ export const MINIMALIST_TABLET_LAYOUT: WorkspaceLayout = {
       groups: [
         {
           id: 'grp-tablet-layers',
-          panelIds: ['layers', 'history', 'quick-access'],
+          panelIds: ['navigator', 'sub-view', 'layers', 'history', 'quick-access'],
           activePanelId: 'layers',
           heightRatio: 1,
         },

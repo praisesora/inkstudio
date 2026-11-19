@@ -5,6 +5,8 @@ export type DockPanelId =
   | 'subtool'
   | 'tool-property'
   | 'brush-size'
+  | 'navigator'
+  | 'sub-view'
   | 'color'
   | 'layers'
   | 'history'
@@ -98,6 +100,8 @@ export const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
   'subtool',
   'tool-property',
   'brush-size',
+  'navigator',
+  'sub-view',
   'color',
   'layers',
   'history',
@@ -140,6 +144,24 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 196,
     minWidth: 148,
     maxWidth: 340,
+  },
+  navigator: {
+    id: 'navigator',
+    title: 'Navigator',
+    shortTitle: 'Nav',
+    defaultSide: 'right',
+    defaultWidth: 224,
+    minWidth: 176,
+    maxWidth: 380,
+  },
+  'sub-view': {
+    id: 'sub-view',
+    title: 'Sub View',
+    shortTitle: 'SubView',
+    defaultSide: 'right',
+    defaultWidth: 224,
+    minWidth: 176,
+    maxWidth: 400,
   },
   color: {
     id: 'color',

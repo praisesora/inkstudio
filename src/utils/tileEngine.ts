@@ -1545,39 +1545,51 @@ export class SparseTileGrid {
   }
 
   /**
-   * Ensures LOD 3 mipmap tiles exist and are up-to-date for all populated regions of `layerId`.
+   * Ensures mipmap tiles at `targetLod` (0..3) exist and are up-to-date for all populated regions of `layerId`.
    */
-  public getOrBuildLod3Tiles(layerId: string): TileBuffer[] {
-    const lod3Coords = new Map<string, { tx: number; ty: number }>();
+  public getOrBuildLodTiles(layerId: string, targetLod: number): TileBuffer[] {
+    const lod = Math.max(0, Math.min(3, Math.floor(targetLod)));
+    if (lod === 0) {
+      return this.getLayerTiles(layerId);
+    }
+
+    const lodCoords = new Map<string, { tx: number; ty: number }>();
 
     for (const tile of this.tiles.values()) {
       if (tile.layerId !== layerId) continue;
       if ((tile.lod ?? 0) === 0) {
-        const l3x = tile.tileX >> 3;
-        const l3y = tile.tileY >> 3;
-        const k = `${l3x}:${l3y}`;
-        if (!lod3Coords.has(k)) {
-          lod3Coords.set(k, { tx: l3x, ty: l3y });
+        const ltx = tile.tileX >> lod;
+        const lty = tile.tileY >> lod;
+        const k = `${ltx}:${lty}`;
+        if (!lodCoords.has(k)) {
+          lodCoords.set(k, { tx: ltx, ty: lty });
         }
-      } else if (tile.lod === 3) {
+      } else if (tile.lod === lod) {
         const k = `${tile.tileX}:${tile.tileY}`;
-        if (!lod3Coords.has(k)) {
-          lod3Coords.set(k, { tx: tile.tileX, ty: tile.tileY });
+        if (!lodCoords.has(k)) {
+          lodCoords.set(k, { tx: tile.tileX, ty: tile.tileY });
         }
       }
     }
 
     const result: TileBuffer[] = [];
-    for (const { tx, ty } of lod3Coords.values()) {
-      let tile = this.getTile(layerId, tx, ty, 3);
-      if (!tile || tile.data === null || this.isLodTileDirty(layerId, tx, ty, 3)) {
-        tile = this.generateLodTile(layerId, tx, ty, 3);
+    for (const { tx, ty } of lodCoords.values()) {
+      let tile = this.getTile(layerId, tx, ty, lod);
+      if (!tile || tile.data === null || this.isLodTileDirty(layerId, tx, ty, lod)) {
+        tile = this.generateLodTile(layerId, tx, ty, lod);
       }
       if (tile && tile.data !== null) {
         result.push(tile);
       }
     }
     return result;
+  }
+
+  /**
+   * Ensures LOD 3 mipmap tiles exist and are up-to-date for all populated regions of `layerId`.
+   */
+  public getOrBuildLod3Tiles(layerId: string): TileBuffer[] {
+    return this.getOrBuildLodTiles(layerId, 3);
   }
 
   /**

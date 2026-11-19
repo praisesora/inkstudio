@@ -31,6 +31,10 @@ export interface CanvasNavigationHandle {
   flipYRef: React.MutableRefObject<boolean>;
   getCameraState: () => CameraTransformState;
   subscribeCamera: (listener: CameraSubscriber) => () => void;
+  setPanLive?: (pan: { x: number; y: number }, commit?: boolean) => void;
+  setZoomLive?: (targetZoom: number, commit?: boolean) => void;
+  rotateBy?: (deltaDeg: number) => void;
+  commitCameraState?: () => void;
 }
 
 export const ZOOM_PRESETS = [
@@ -315,11 +319,56 @@ export function useCanvasNavigation({
     [broadcastCameraImmediate]
   );
 
+  /** Zero-React-rerender live pan update for smooth 60-240Hz Navigator drag. */
+  const setPanLive = useCallback(
+    (nextPan: { x: number; y: number }, commit = false) => {
+      if (!Number.isFinite(nextPan.x) || !Number.isFinite(nextPan.y)) return;
+      panRef.current = { x: nextPan.x, y: nextPan.y };
+      if (commit) {
+        broadcastCameraImmediate();
+        commitNavStateImmediate();
+      } else {
+        scheduleCameraBroadcast();
+      }
+    },
+    [broadcastCameraImmediate, commitNavStateImmediate, scheduleCameraBroadcast]
+  );
+
   const setRotation = useCallback(
     (newRotationOrFn: number | ((prev: number) => number)) => {
       const next = typeof newRotationOrFn === 'function' ? newRotationOrFn(rotationRef.current) : newRotationOrFn;
       rotationRef.current = next;
       setRotationState(next);
+      broadcastCameraImmediate();
+    },
+    [broadcastCameraImmediate]
+  );
+
+  /** Rotates canvas around the viewport center by `deltaDeg` degrees. */
+  const rotateBy = useCallback(
+    (deltaDeg: number) => {
+      if (!Number.isFinite(deltaDeg) || Math.abs(deltaDeg) < 0.0001) return;
+      const viewport = viewportRef.current;
+      const nextRotation = rotationRef.current + deltaDeg;
+      if (!viewport || viewport.clientWidth <= 0 || viewport.clientHeight <= 0) {
+        rotationRef.current = nextRotation;
+        setRotationState(nextRotation);
+        broadcastCameraImmediate();
+        return;
+      }
+      const vc = {
+        x: viewport.clientWidth / 2,
+        y: viewport.clientHeight / 2,
+      };
+      const dRad = (deltaDeg * Math.PI) / 180;
+      const rx = panRef.current.x - vc.x;
+      const ry = panRef.current.y - vc.y;
+      const newPanX = vc.x + rx * Math.cos(dRad) - ry * Math.sin(dRad);
+      const newPanY = vc.y + rx * Math.sin(dRad) + ry * Math.cos(dRad);
+      rotationRef.current = nextRotation;
+      panRef.current = { x: newPanX, y: newPanY };
+      setRotationState(nextRotation);
+      setPanState({ x: newPanX, y: newPanY });
       broadcastCameraImmediate();
     },
     [broadcastCameraImmediate]
@@ -513,6 +562,33 @@ export function useCanvasNavigation({
       broadcastCameraImmediate();
     },
     [broadcastCameraImmediate]
+  );
+
+  /** Zero-React-rerender live zoom around viewport center (for Navigator slider scrubbing). */
+  const setZoomLive = useCallback(
+    (targetZoom: number, commit = false) => {
+      if (!Number.isFinite(targetZoom)) return;
+      const currentZoom = zoomRef.current;
+      const clampedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, targetZoom));
+      const viewport = viewportRef.current;
+      if (viewport && viewport.clientWidth > 0 && viewport.clientHeight > 0 && Math.abs(clampedZoom - currentZoom) >= 0.00001) {
+        const centerX = viewport.clientWidth / 2;
+        const centerY = viewport.clientHeight / 2;
+        const ratio = clampedZoom / currentZoom;
+        panRef.current = {
+          x: centerX - (centerX - panRef.current.x) * ratio,
+          y: centerY - (centerY - panRef.current.y) * ratio,
+        };
+      }
+      zoomRef.current = clampedZoom;
+      if (commit) {
+        broadcastCameraImmediate();
+        commitNavStateImmediate();
+      } else {
+        scheduleCameraBroadcast();
+      }
+    },
+    [broadcastCameraImmediate, commitNavStateImmediate, scheduleCameraBroadcast]
   );
 
   const zoomIn = useCallback(() => {
@@ -980,8 +1056,12 @@ export function useCanvasNavigation({
       flipYRef,
       getCameraState,
       subscribeCamera,
+      setPanLive,
+      setZoomLive,
+      rotateBy,
+      commitCameraState: commitNavStateImmediate,
     }),
-    [getCameraState, subscribeCamera]
+    [getCameraState, subscribeCamera, setPanLive, setZoomLive, rotateBy, commitNavStateImmediate]
   );
 
   const activeHeldModifierAction = resolveHeldKeyModifierAction(
@@ -1018,13 +1098,18 @@ export function useCanvasNavigation({
     startZoomDrag,
     zoomIn,
     zoomOut,
+    zoomToViewportCenter,
     resetZoomAndCenter,
     resetRotation,
+    rotateBy,
     toggleFlipHorizontal,
     toggleFlipVertical,
     resetViewFlip,
     setZoom,
     setPan,
+    setPanLive,
+    setZoomLive,
+    commitCameraState: commitNavStateImmediate,
     setRotation,
     centerCanvas,
   };
