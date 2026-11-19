@@ -231,27 +231,30 @@ export class LayerPixelSampler {
   private tilesX: number = 1;
 
   constructor(
-    sourceCanvas: HTMLCanvasElement,
+    sourceCanvas: HTMLCanvasElement | { width: number; height: number } | null,
     layerId?: string,
     tileGrid: SparseTileGrid = globalTileGrid,
     origTilesMap?: Map<number, ImageData>
   ) {
-    this.width = sourceCanvas.width;
-    this.height = sourceCanvas.height;
+    this.width = sourceCanvas?.width ?? 0;
+    this.height = sourceCanvas?.height ?? 0;
     this.tilesX = Math.max(1, Math.ceil(this.width / TILE_SIZE));
     this.origTilesMap = origTilesMap ?? null;
-    this.sourceCtx = sourceCanvas.getContext('2d', { willReadFrequently: true });
+    this.sourceCtx =
+      sourceCanvas && 'getContext' in sourceCanvas && typeof sourceCanvas.getContext === 'function'
+        ? sourceCanvas.getContext('2d', { willReadFrequently: true })
+        : null;
 
-    // If a SparseTileGrid has tiles for this layer, or if the canvas is large (> 512x512),
-    // or if an origTilesMap is provided for clean live sampling,
+    // If a SparseTileGrid has tiles for this layer, or if no source canvas is provided (tile-native layer),
+    // or if the canvas is large (> 512x512), or if an origTilesMap is provided for clean live sampling,
     // use zero-stall on-demand 256x256 tile caching instead of a synchronous full-document getImageData!
-    const hasGridTiles = Boolean(layerId && tileGrid && tileGrid.getLayerTiles(layerId).length > 0);
+    const hasGridTiles = Boolean(layerId && tileGrid && (tileGrid.hasLayerTiles(layerId) || tileGrid.isLayerIngested(layerId)));
     const isLargeCanvas = this.width * this.height > 512 * 512;
 
-    if (hasGridTiles || isLargeCanvas || Boolean(origTilesMap)) {
+    if (hasGridTiles || !this.sourceCtx || isLargeCanvas || Boolean(origTilesMap)) {
       this.useLazyTiles = true;
       this.layerId = layerId ?? null;
-      this.tileGrid = hasGridTiles ? tileGrid : null;
+      this.tileGrid = layerId && tileGrid ? tileGrid : null;
       // Allocate a minimal 1-pixel placeholder for legacy property access
       this.data = new Uint8ClampedArray(4);
       this.u32 = new Uint32Array(this.data.buffer);

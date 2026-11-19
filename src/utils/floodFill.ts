@@ -49,14 +49,18 @@ export interface FloodFillOptions {
   selectionMask?: Uint8Array | null;
 }
 
+import { SparseTileGrid, releaseTemporaryCanvas } from './tileEngine';
+import { documentStore } from './documentStore';
+
 /**
  * Creates a flat composite canvas of all visible layers.
- * Used for "Refer to Other Layers" bucket fill.
+ * Reads directly from SparseTileGrid when a layer has no materialized backing canvas.
  */
 export function compositeVisibleLayers(
   layers: LayerItem[],
   layerCanvasesMap: Map<string, HTMLCanvasElement>,
-  dimensions: CanvasDimensions
+  dimensions: CanvasDimensions,
+  tileGrid?: SparseTileGrid
 ): HTMLCanvasElement {
   const composite = document.createElement('canvas');
   composite.width = dimensions.width;
@@ -64,11 +68,18 @@ export function compositeVisibleLayers(
   const ctx = composite.getContext('2d');
   if (!ctx) return composite;
 
+  const grid = tileGrid ?? documentStore.getActiveTileGrid();
+
   // Render order is bottom to top (reverse of layers array)
   const renderOrder = layers.slice().reverse();
   for (const layer of renderOrder) {
     if (layer.type === 'folder' || !layer.visible) continue;
-    const lCanvas = layerCanvasesMap.get(layer.id);
+    let lCanvas = layerCanvasesMap.get(layer.id) || null;
+    let isTemp = false;
+    if (!lCanvas && grid && grid.hasLayerTiles(layer.id)) {
+      lCanvas = grid.exportLayerToCanvas(layer.id, dimensions.width, dimensions.height);
+      isTemp = true;
+    }
     if (!lCanvas) continue;
 
     ctx.save();
@@ -76,6 +87,10 @@ export function compositeVisibleLayers(
     ctx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
     ctx.drawImage(lCanvas, 0, 0);
     ctx.restore();
+
+    if (isTemp) {
+      releaseTemporaryCanvas(lCanvas);
+    }
   }
 
   return composite;
@@ -88,11 +103,12 @@ export function compositeVisibleLayers(
 export function compositeReferenceLayers(
   layers: LayerItem[],
   layerCanvasesMap: Map<string, HTMLCanvasElement>,
-  dimensions: CanvasDimensions
+  dimensions: CanvasDimensions,
+  tileGrid?: SparseTileGrid
 ): HTMLCanvasElement {
   const refLayers = layers.filter((l) => l.visible && l.isReference && l.type !== 'folder');
   if (refLayers.length === 0) {
-    return compositeVisibleLayers(layers, layerCanvasesMap, dimensions);
+    return compositeVisibleLayers(layers, layerCanvasesMap, dimensions, tileGrid);
   }
 
   const composite = document.createElement('canvas');
@@ -101,9 +117,16 @@ export function compositeReferenceLayers(
   const ctx = composite.getContext('2d');
   if (!ctx) return composite;
 
+  const grid = tileGrid ?? documentStore.getActiveTileGrid();
+
   const renderOrder = refLayers.slice().reverse();
   for (const layer of renderOrder) {
-    const lCanvas = layerCanvasesMap.get(layer.id);
+    let lCanvas = layerCanvasesMap.get(layer.id) || null;
+    let isTemp = false;
+    if (!lCanvas && grid && grid.hasLayerTiles(layer.id)) {
+      lCanvas = grid.exportLayerToCanvas(layer.id, dimensions.width, dimensions.height);
+      isTemp = true;
+    }
     if (!lCanvas) continue;
 
     ctx.save();
@@ -111,6 +134,10 @@ export function compositeReferenceLayers(
     ctx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
     ctx.drawImage(lCanvas, 0, 0);
     ctx.restore();
+
+    if (isTemp) {
+      releaseTemporaryCanvas(lCanvas);
+    }
   }
 
   return composite;

@@ -100,7 +100,8 @@ import {
   screenToCanvas,
   sampleCompositedColor,
 } from './utils/canvasUtils';
-import { globalTileGrid, globalTileMemoryManager } from './utils/tileEngine';
+import { globalTileGrid } from './utils/tileEngine';
+import { documentStore } from './utils/documentStore';
 import { getNextCollabLayerName } from './hooks/useLayerManager';
 import { drawPencilDot, drawPencilBezierSegment, PencilGrade } from './utils/pencilEngine';
 import { Point } from './types/editor';
@@ -578,6 +579,12 @@ export function App() {
     } as BrushSettings;
   });
 
+  // Active document's isolated SparseTileGrid (instant O(1) switch across tabs)
+  const activeTileGrid = useMemo(
+    () => (activeDocumentId ? documentStore.getOrCreateSession(activeDocumentId).tileGrid : globalTileGrid),
+    [activeDocumentId]
+  );
+
   // Layer Management System
   const {
     layers,
@@ -590,6 +597,8 @@ export function App() {
     groupSelectedLayers,
     activeLayer,
     layerCanvasesRef,
+    materializeLayerCanvas,
+    releaseLayerCanvas,
     registerLayerCanvas,
     updateLayerThumbnail,
     addLayer,
@@ -619,6 +628,7 @@ export function App() {
     setDefaultToneFrequency,
     clearDocument,
     loadDocument,
+    switchDocumentSession,
     layerSourceCanvasesRef,
     toggleTone,
     setToneFrequency,
@@ -646,7 +656,7 @@ export function App() {
     addAdjustmentLayer,
     updateAdjustmentData,
     updateLayerStyles,
-  } = useLayerManager({ dimensions, activeSessionId: activeDocumentId });
+  } = useLayerManager({ dimensions, activeSessionId: activeDocumentId, tileGrid: activeTileGrid });
 
   // Synchronize active document recovery session and WAL periodic checkpointing
   const recoveryStateRef = useRef({
@@ -698,7 +708,7 @@ export function App() {
         try {
           const thumbW = 120;
           const thumbH = Math.max(68, Math.round((dims.height / Math.max(1, dims.width)) * thumbW));
-          const dataUrl = globalTileGrid.generateThumbnail(targetLayerId, thumbW, thumbH, dims);
+          const dataUrl = documentStore.getActiveTileGrid().generateThumbnail(targetLayerId, thumbW, thumbH, dims);
           const commaIdx = dataUrl.indexOf(',');
           if (commaIdx < 0) return null;
           const b64 = dataUrl.slice(commaIdx + 1);
@@ -851,15 +861,25 @@ export function App() {
         showToast('Select an unlocked raster layer to apply filter');
         return;
       }
+      const grid = documentStore.getActiveTileGrid();
       const isTone = Boolean(activeLayer.toneEnabled && layerSourceCanvasesRef.current?.get(activeLayerId));
       const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
       const displayCanvas = layerCanvasesRef.current.get(activeLayerId);
-      const targetCanvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-      if (!targetCanvas || !displayCanvas) return;
-      const ctx = get2DContext(targetCanvas);
-      if (!ctx) return;
 
-      const beforeImageData = ctx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+      const width = dimensions.width;
+      const height = dimensions.height;
+      if (width <= 0 || height <= 0) return;
+
+      let beforeImageData: ImageData;
+      if (isTone && sourceCanvas) {
+        const sCtx = get2DContext(sourceCanvas);
+        if (!sCtx) return;
+        beforeImageData = sCtx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
+      } else {
+        const raw = grid.readImageData(activeLayerId, 0, 0, width, height);
+        beforeImageData = new ImageData(new Uint8ClampedArray(raw.data), width, height);
+      }
+
       const rawFiltered = applyFilter(
         new ImageData(new Uint8ClampedArray(beforeImageData.data), beforeImageData.width, beforeImageData.height),
         type,
@@ -868,9 +888,9 @@ export function App() {
 
       let finalImageData = rawFiltered;
       if (selection) {
-        const selMask = createSelectionMask(selection, targetCanvas.width, targetCanvas.height);
+        const selMask = createSelectionMask(selection, width, height);
         if (selMask) {
-          finalImageData = new ImageData(new Uint8ClampedArray(beforeImageData.data), targetCanvas.width, targetCanvas.height);
+          finalImageData = new ImageData(new Uint8ClampedArray(beforeImageData.data), width, height);
           const src = beforeImageData.data;
           const flt = rawFiltered.data;
           const dst = finalImageData.data;
@@ -895,18 +915,25 @@ export function App() {
         }
       }
 
-      ctx.putImageData(finalImageData, 0, 0);
-
-      if (!isTone && sourceCanvas) {
-        get2DContext(sourceCanvas)?.putImageData(finalImageData, 0, 0);
-      }
+      const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
+      const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
 
       if (isTone && sourceCanvas) {
-        applyLayerEffects(sourceCanvas, displayCanvas, activeLayer, dimensions.dpi ?? 600);
+        get2DContext(sourceCanvas)?.putImageData(finalImageData, 0, 0);
+        const effDisplay = displayCanvas || materializeLayerCanvas(activeLayerId);
+        if (effDisplay) {
+          applyLayerEffects(sourceCanvas, effDisplay, activeLayer, dimensions.dpi ?? 600);
+          grid.ingestCanvas(activeLayerId, effDisplay, targetFormat);
+        }
       } else {
-        const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
-        const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
-        globalTileGrid.writeImageData(activeLayerId, finalImageData, 0, 0, targetFormat);
+        grid.writeImageData(activeLayerId, finalImageData, 0, 0, targetFormat);
+        if (displayCanvas) {
+          get2DContext(displayCanvas)?.putImageData(finalImageData, 0, 0);
+          releaseLayerCanvas(activeLayerId);
+        }
+        if (sourceCanvas) {
+          get2DContext(sourceCanvas)?.putImageData(finalImageData, 0, 0);
+        }
       }
 
       pushHistoryStepRef.current?.(
@@ -916,11 +943,11 @@ export function App() {
         finalImageData,
         activeLayerId
       );
-      globalTileGrid.notifyChange(true);
+      grid.notifyChange(true);
       updateLayerThumbnail(activeLayerId, true);
       showToast(`Filter applied: ${type.replace('-', ' ')}`);
     },
-    [hasOpenDocument, activeLayer, activeLayerId, selection, dimensions.dpi, layerCanvasesRef, layerSourceCanvasesRef, colorMode, updateLayerThumbnail, showToast]
+    [hasOpenDocument, activeLayer, activeLayerId, selection, dimensions.width, dimensions.height, dimensions.dpi, layerCanvasesRef, layerSourceCanvasesRef, materializeLayerCanvas, releaseLayerCanvas, colorMode, updateLayerThumbnail, showToast]
   );
 
   const {
@@ -1169,9 +1196,9 @@ export function App() {
         if (ctx) {
           renderVectorStroke(ctx, msg.vectorStroke);
           const fullData = ctx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
-          globalTileGrid.writeImageData(targetLayerId, fullData, 0, 0, targetFormat);
+          documentStore.getActiveTileGrid().writeImageData(targetLayerId, fullData, 0, 0, targetFormat);
         }
-        globalTileGrid.notifyChange(true);
+        documentStore.getActiveTileGrid().notifyChange(true);
         updateLayerThumbnail(targetLayerId, true);
       } else {
         const ctx = get2DContext(targetCanvas);
@@ -1250,10 +1277,10 @@ export function App() {
 
           if (dirtyW > 0 && dirtyH > 0) {
             const afterData = ctx.getImageData(dirtyX, dirtyY, dirtyW, dirtyH);
-            globalTileGrid.writeImageData(targetLayerId, afterData, dirtyX, dirtyY, targetFormat);
+            documentStore.getActiveTileGrid().writeImageData(targetLayerId, afterData, dirtyX, dirtyY, targetFormat);
           }
 
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
           updateLayerThumbnail(targetLayerId, true);
         }
       }
@@ -1337,12 +1364,12 @@ export function App() {
           if (isBg) {
             ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, targetCanvas.width, targetCanvas.height);
-            globalTileGrid.ingestCanvas(layerId, targetCanvas, 'color-32bit');
+            documentStore.getActiveTileGrid().ingestCanvas(layerId, targetCanvas, 'color-32bit');
           } else {
             ctx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
-            globalTileGrid.clearLayer(layerId);
+            documentStore.getActiveTileGrid().clearLayer(layerId);
           }
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
           updateLayerThumbnail(layerId, true);
         }
       }
@@ -1551,6 +1578,8 @@ export function App() {
     navigation,
     activeLayerId,
     activeSessionId: activeDocumentId,
+    tileGrid: activeTileGrid,
+    materializeLayerCanvas,
     activeLayerLocked: activeLayer?.locked ?? false,
     activeLayerVisible: activeLayer ? isLayerEffectivelyVisible(activeLayer) : true,
     layerCanvasesRef,
@@ -1779,9 +1808,9 @@ export function App() {
       } else {
         const lyr = layers.find((l) => l.id === targetLayerId);
         const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-        globalTileGrid.writeImageData(targetLayerId, afterData, 0, 0, isMono ? 'monochrome-1bit' : 'color-32bit');
+        documentStore.getActiveTileGrid().writeImageData(targetLayerId, afterData, 0, 0, isMono ? 'monochrome-1bit' : 'color-32bit');
       }
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().notifyChange(true);
     }
 
     updateLayerThumbnail(targetLayerId, true);
@@ -1811,7 +1840,7 @@ export function App() {
             afterData,
             targetLayerId
           );
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
         }
       }
       setSelection(null);
@@ -1888,7 +1917,7 @@ export function App() {
       afterImageData,
       activeLayerId
     );
-    globalTileGrid.notifyChange(true);
+    documentStore.getActiveTileGrid().notifyChange(true);
   }, [selection, getActiveCanvas, activeLayerId, layerCanvasesRef, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
 
   const handleFillSelectionColor = useCallback(() => {
@@ -2107,51 +2136,28 @@ export function App() {
         handleCommitFloatingSelection();
       }
 
+      const grid = documentStore.getActiveTileGrid();
       let targetLayerId = activeLayerId;
       let targetLayer = layers.find((l) => l.id === targetLayerId);
-      let displayCanvas = layerCanvasesRef.current.get(targetLayerId);
+      let hasPixels = grid.hasLayerTiles(targetLayerId);
 
-      // Verify if target layer has pixels, or if user is accidentally on an empty layer
-      let hasPixels = false;
-      if (displayCanvas) {
-        const dCtx = get2DContext(displayCanvas);
-        if (dCtx) {
-          const dData = dCtx.getImageData(0, 0, displayCanvas.width, displayCanvas.height).data;
-          for (let i = 3; i < dData.length; i += 4) {
-            if (dData[i] > 0) {
-              hasPixels = true;
-              break;
-            }
-          }
-        }
-      }
-
-      // If active layer is completely empty, check if another visible raster layer has artwork (e.g. image layer below)
       if (!hasPixels) {
-        const candidate = layers.find((l) => {
-          if (l.id === targetLayerId || l.type !== 'raster' || !l.visible) return false;
-          const c = layerCanvasesRef.current.get(l.id);
-          if (!c) return false;
-          const cCtx = get2DContext(c);
-          if (!cCtx) return false;
-          const cData = cCtx.getImageData(0, 0, c.width, c.height).data;
-          for (let j = 3; j < cData.length; j += 4) {
-            if (cData[j] > 0) return true;
-          }
-          return false;
-        });
-
+        const candidate = layers.find(
+          (l) => l.id !== targetLayerId && l.type === 'raster' && l.visible && grid.hasLayerTiles(l.id)
+        );
         if (candidate) {
           targetLayerId = candidate.id;
           targetLayer = candidate;
-          displayCanvas = layerCanvasesRef.current.get(candidate.id);
           setActiveLayerId(candidate.id);
           showToast(`Switched to "${candidate.name}" (active layer had no pixels)`);
+          hasPixels = true;
         } else {
           showToast('Selected layer is empty. Draw or open an image first.');
           return;
         }
       }
+
+      const displayCanvas = materializeLayerCanvas(targetLayerId);
 
       const isTone = Boolean(targetLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId));
       const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
@@ -2233,8 +2239,8 @@ export function App() {
 
       if (displayCanvas) {
         const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
-        globalTileGrid.ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-        globalTileGrid.notifyChange(true);
+        documentStore.getActiveTileGrid().ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        documentStore.getActiveTileGrid().notifyChange(true);
       }
     },
     [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]
@@ -2283,7 +2289,10 @@ export function App() {
         finalData,
         targetLayerId
       );
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().notifyChange(true);
+      if (!isTone) {
+        releaseLayerCanvas(targetLayerId);
+      }
 
       const resetState = {
         isOpen: false,
@@ -2305,6 +2314,7 @@ export function App() {
       updateLayerThumbnail,
       getTonalLabel,
       pushHistoryStep,
+      releaseLayerCanvas,
       showToast,
     ]
   );
@@ -2333,8 +2343,11 @@ export function App() {
           }
           if (displayCanvas) {
             const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
-            globalTileGrid.ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-            globalTileGrid.notifyChange(true);
+            documentStore.getActiveTileGrid().ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+            documentStore.getActiveTileGrid().notifyChange(true);
+            if (!isTone) {
+              releaseLayerCanvas(targetLayerId);
+            }
           }
         }
       }
@@ -2350,7 +2363,7 @@ export function App() {
     };
     tonalModalStateRef.current = resetState;
     setTonalModalState(resetState);
-  }, [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]);
+  }, [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi, releaseLayerCanvas]);
 
   const handleApplyReverseGradient = useCallback(() => {
     if (!hasOpenDocument || !activeLayer || activeLayer.locked || activeLayer.type !== 'raster') return;
@@ -2476,8 +2489,8 @@ export function App() {
         floatCanvas = lifted.floatingCanvas;
         beforeData = lifted.beforeImageData;
         const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-        globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-        globalTileGrid.notifyChange(true);
+        documentStore.getActiveTileGrid().ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        documentStore.getActiveTileGrid().notifyChange(true);
         updateLayerThumbnail(activeLayerId, true);
       }
 
@@ -2597,10 +2610,10 @@ export function App() {
             }
           }
           const isMono = colorMode === 'monochrome' || lyr.expressionColor === 'monochrome';
-          globalTileGrid.ingestCanvas(lyr.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+          documentStore.getActiveTileGrid().ingestCanvas(lyr.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           updateLayerThumbnail(lyr.id, true);
         }
-        globalTileGrid.notifyChange(true);
+        documentStore.getActiveTileGrid().notifyChange(true);
 
         const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
         setTransformSession({
@@ -2672,8 +2685,8 @@ export function App() {
       }
 
       const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-      globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      documentStore.getActiveTileGrid().notifyChange(true);
       updateLayerThumbnail(activeLayerId, true);
 
       const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
@@ -2756,7 +2769,7 @@ export function App() {
         const beforeDataForLayer = transformSession.layerBeforeImages?.get(lId);
         const afterDataForLayer = cCtx.getImageData(0, 0, c.width, c.height);
         const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-        globalTileGrid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+        documentStore.getActiveTileGrid().ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
         if (beforeDataForLayer) {
           pushHistoryStep(
             'transform',
@@ -2769,7 +2782,7 @@ export function App() {
         updateLayerThumbnail(lId, true);
       }
 
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().notifyChange(true);
       setTransformSession(null);
       setTool('brush');
       return;
@@ -2833,7 +2846,7 @@ export function App() {
       afterImageData,
       transformSession.layerId
     );
-    globalTileGrid.notifyChange(true);
+    documentStore.getActiveTileGrid().notifyChange(true);
 
     updateLayerThumbnail(transformSession.layerId, true);
     setTransformSession(null);
@@ -2876,11 +2889,11 @@ export function App() {
             }
           }
           const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-          globalTileGrid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+          documentStore.getActiveTileGrid().ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           updateLayerThumbnail(lId, true);
         }
       }
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().notifyChange(true);
       setTransformSession(null);
       setTool('brush');
       return;
@@ -2911,8 +2924,8 @@ export function App() {
         }
       }
       const isMono = colorMode === 'monochrome' || layer?.expressionColor === 'monochrome';
-      globalTileGrid.ingestCanvas(transformSession.layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().ingestCanvas(transformSession.layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      documentStore.getActiveTileGrid().notifyChange(true);
       updateLayerThumbnail(transformSession.layerId, true);
     }
     setTransformSession(null);
@@ -2972,7 +2985,7 @@ export function App() {
       afterImageData,
       activeLayerId
     );
-    globalTileGrid.notifyChange(true);
+    documentStore.getActiveTileGrid().notifyChange(true);
 
     setTextSession(null);
   }, [textSession, getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
@@ -3009,7 +3022,7 @@ export function App() {
       afterImageData,
       activeLayerId
     );
-    globalTileGrid.notifyChange(true);
+    documentStore.getActiveTileGrid().notifyChange(true);
 
     setActiveBalloon(null);
   }, [activeBalloon, getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep]);
@@ -3044,7 +3057,7 @@ export function App() {
       const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       updateLayerThumbnail(activeLayerId, true);
       pushHistoryStep('brush', `Manga Effect (${type})`, beforeImageData, afterImageData, activeLayerId);
-      globalTileGrid.notifyChange(true);
+      documentStore.getActiveTileGrid().notifyChange(true);
       showToast(`Applied manga ${type} lines`);
     },
     [getActiveCanvas, activeLayerId, layerSourceCanvasesRef, updateLayerThumbnail, pushHistoryStep, showToast]
@@ -3185,10 +3198,10 @@ export function App() {
             if (dCtx && dirty.width > 0 && dirty.height > 0) {
               const subData = dCtx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
               const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              globalTileGrid.writeImageData(activeLayerId, subData, dirty.x, dirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
+              documentStore.getActiveTileGrid().writeImageData(activeLayerId, subData, dirty.x, dirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
             }
           }
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
         }
 
         liquifyRafIdRef.current = requestAnimationFrame(tick);
@@ -3261,9 +3274,9 @@ export function App() {
             } else if (dirty.width > 0 && dirty.height > 0) {
               const subData = ctx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
               const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              globalTileGrid.writeImageData(targetLayerId, subData, dirty.x, dirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
+              documentStore.getActiveTileGrid().writeImageData(targetLayerId, subData, dirty.x, dirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
             }
-            globalTileGrid.notifyChange(true);
+            documentStore.getActiveTileGrid().notifyChange(true);
           }
           startLiquifyLoop(canvas, sourceCanvas, isTone);
         }
@@ -3430,8 +3443,8 @@ export function App() {
             const lifted = liftSelectionToFloating(canvas, selection, sourceCanvas, isBg);
             if (lifted) {
               const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-              globalTileGrid.notifyChange(true);
+              documentStore.getActiveTileGrid().ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+              documentStore.getActiveTileGrid().notifyChange(true);
               updateLayerThumbnail(activeLayerId, true);
               const floatingObj = {
                 canvas: lifted.floatingCanvas,
@@ -3548,7 +3561,7 @@ export function App() {
           afterImageData,
           activeLayerId
         );
-        globalTileGrid.notifyChange(true);
+        documentStore.getActiveTileGrid().notifyChange(true);
         return;
       }
 
@@ -3685,8 +3698,8 @@ export function App() {
               ctx.clearRect(0, 0, canvas.width, canvas.height);
               renderVectorLayer(ctx, newStrokes);
               const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
-              globalTileGrid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-              globalTileGrid.notifyChange(true);
+              documentStore.getActiveTileGrid().ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+              documentStore.getActiveTileGrid().notifyChange(true);
               updateLayerThumbnail(activeLayerId, true);
             }
           }
@@ -3756,10 +3769,10 @@ export function App() {
             if (cCtx) {
               const subData = cCtx.getImageData(overallDirty.x, overallDirty.y, overallDirty.width, overallDirty.height);
               const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              globalTileGrid.writeImageData(targetLayerId, subData, overallDirty.x, overallDirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
+              documentStore.getActiveTileGrid().writeImageData(targetLayerId, subData, overallDirty.x, overallDirty.y, isMono ? 'monochrome-1bit' : 'color-32bit');
             }
           }
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
           if (!liquifyDirtyRectRef.current) {
             liquifyDirtyRectRef.current = overallDirty;
           } else {
@@ -3931,7 +3944,7 @@ export function App() {
                 afterImageData,
                 targetLayerId
               );
-              globalTileGrid.notifyChange(true);
+              documentStore.getActiveTileGrid().notifyChange(true);
               updateLayerThumbnail(targetLayerId, true);
             }
           }
@@ -4037,7 +4050,7 @@ export function App() {
           afterImageData,
           activeLayerId
         );
-        globalTileGrid.notifyChange(true);
+        documentStore.getActiveTileGrid().notifyChange(true);
         return;
       }
 
@@ -4084,7 +4097,7 @@ export function App() {
             afterImageData,
             activeLayerId
           );
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
         }
         return;
       }
@@ -4102,7 +4115,7 @@ export function App() {
             undefined,
             { before: vectorEditBeforeStrokesRef.current, after: [...activeLayer.vectorStrokes] }
           );
-          globalTileGrid.notifyChange(true);
+          documentStore.getActiveTileGrid().notifyChange(true);
         }
         return;
       }
@@ -4175,19 +4188,20 @@ export function App() {
       }
 
       const defaultFreq = options.defaultFrequency ?? 60;
+      const newDocId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const { layers: initialLayers, activeLayerId: topId } = resetToNewCanvas(
         newDims,
         options.backgroundColor,
         options.colorMode,
-        defaultFreq
+        defaultFreq,
+        newDocId
       );
       needsAdaptiveFitRef.current = true;
       pendingFitDimsRef.current = newDims;
       resetZoomAndCenter(newDims);
-      resetHistory();
+      resetHistory(newDocId);
 
       // Add to document tabs (empty perspective ruler by default)
-      const newDocId = `doc-${Date.now()}`;
       const newDoc: DocumentTab = {
         id: newDocId,
         name,
@@ -4222,6 +4236,7 @@ export function App() {
     const initColorMode = appSettings.defaultColorMode || 'color';
     const initBg = appSettings.defaultBgColor || '#ffffff';
     const initName = 'Untitled*';
+    const newDocId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     setDimensions(initDims);
     setColorMode(initColorMode);
     setDocumentName(initName);
@@ -4229,13 +4244,13 @@ export function App() {
       initDims,
       initBg,
       initColorMode,
-      60
+      60,
+      newDocId
     );
     needsAdaptiveFitRef.current = true;
     pendingFitDimsRef.current = initDims;
     resetZoomAndCenter(initDims);
-    resetHistory();
-    const newDocId = `doc-${Date.now()}`;
+    resetHistory(newDocId);
     setDocuments([
       {
         id: newDocId,
@@ -4363,7 +4378,7 @@ export function App() {
   const handleUpdateSettings = useCallback((newSettings: AppSettings) => {
     setAppSettings(newSettings);
     saveAppSettings(newSettings);
-    globalTileMemoryManager.setBudgetMb(newSettings.tileMemoryBudgetMb || 1024);
+    documentStore.setTileBudgetMb(newSettings.tileMemoryBudgetMb || 1024);
     setBrushSettings((prev) => ({
       ...prev,
       stabilization: newSettings.defaultStabilization,
@@ -4372,9 +4387,9 @@ export function App() {
     }));
   }, []);
 
-  // Synchronize initial tile memory budget
+  // Synchronize initial tile memory budget (shared across all open documents)
   useEffect(() => {
-    globalTileMemoryManager.setBudgetMb(appSettings.tileMemoryBudgetMb || 1024);
+    documentStore.setTileBudgetMb(appSettings.tileMemoryBudgetMb || 1024);
   }, [appSettings.tileMemoryBudgetMb]);
 
   // File loading handler
@@ -4414,19 +4429,19 @@ export function App() {
         setLoadingStatus(`Loading ${file.name}...`);
 
         const doc = await openFile(file);
+        const newDocId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         setDimensions(doc.dimensions);
         setColorMode(doc.colorMode);
         setDocumentName(doc.name);
         setSavedFileInfo(null); // Reset handle on new import
 
-        loadDocument(doc);
+        loadDocument(doc, newDocId);
         needsAdaptiveFitRef.current = true;
         pendingFitDimsRef.current = doc.dimensions;
         resetZoomAndCenter(doc.dimensions);
-        resetHistory();
+        resetHistory(newDocId);
 
-        // Create document tab
-        const newDocId = `doc-${Date.now()}`;
+        // Create document tab (pixel storage lives in DocumentStore's isolated SparseTileGrid)
         const newDoc: DocumentTab = {
           id: newDocId,
           name: doc.name,
@@ -4469,18 +4484,13 @@ export function App() {
     [loadDocument, resetHistory, resetZoomAndCenter, showToast]
   );
 
-  // Keep active document tab's layers in sync
+  // Keep active document tab's metadata in sync (without copying full HTMLCanvasElements into state)
   useEffect(() => {
     if (!activeDocumentId) return;
     setDocuments((prev) => {
       const curr = prev.find((d) => d.id === activeDocumentId);
       if (!curr) return prev;
-      if (
-        curr.layers === layers &&
-        curr.activeLayerId === activeLayerId &&
-        curr.layerCanvasesMap &&
-        curr.layerCanvasesMap.size === layerCanvasesRef.current.size
-      ) {
+      if (curr.layers === layers && curr.activeLayerId === activeLayerId) {
         return prev;
       }
       return prev.map((d) =>
@@ -4489,19 +4499,21 @@ export function App() {
               ...d,
               layers,
               activeLayerId,
-              layerCanvasesMap: new Map(layerCanvasesRef.current),
             }
           : d
       );
     });
-  }, [layers, activeLayerId, activeDocumentId, layerCanvasesRef]);
+  }, [layers, activeLayerId, activeDocumentId]);
 
-  // Tab selection, close, and rename handlers
+  // Tab selection, close, and rename handlers — O(1) SparseTileGrid switch without clearing or re-slicing
   const handleSelectDocument = useCallback(
     (id: string) => {
+      if (id === activeDocumentId) {
+        setAppView('workspace');
+        return;
+      }
       const doc = documents.find((d) => d.id === id);
       if (!doc) return;
-      setActiveDocumentId(id);
       setAppView('workspace');
       setDimensions(doc.dimensions);
       setColorMode(doc.colorMode);
@@ -4518,21 +4530,14 @@ export function App() {
       } else {
         setSavedFileInfo(null);
       }
-      if (doc.layers && doc.layers.length > 0) {
-        loadDocument({
-          dimensions: doc.dimensions,
-          colorMode: doc.colorMode,
-          name: doc.name,
-          layers: doc.layers,
-          layerCanvases: doc.layerCanvasesMap,
-        });
-      }
+      switchDocumentSession(id, doc.layers || [], doc.activeLayerId || '', doc.dimensions);
+      setActiveDocumentId(id);
       setPerspectiveRuler(doc.perspectiveRuler ?? null);
       needsAdaptiveFitRef.current = true;
       pendingFitDimsRef.current = doc.dimensions;
       resetZoomAndCenter(doc.dimensions);
     },
-    [documents, loadDocument, resetZoomAndCenter]
+    [activeDocumentId, documents, resetZoomAndCenter, setDefaultToneFrequency, switchDocumentSession]
   );
 
   const handleCloseDocument = useCallback(
@@ -4542,7 +4547,6 @@ export function App() {
         if (id === activeDocumentId) {
           if (next.length > 0) {
             const nextActive = next[next.length - 1];
-            setActiveDocumentId(nextActive.id);
             setDimensions(nextActive.dimensions);
             setColorMode(nextActive.colorMode);
             setDocumentName(nextActive.name);
@@ -4557,25 +4561,26 @@ export function App() {
               setSavedFileInfo(null);
             }
             if (nextActive.layers && nextActive.layers.length > 0) {
-              loadDocument({
-                dimensions: nextActive.dimensions,
-                colorMode: nextActive.colorMode,
-                name: nextActive.name,
-                layers: nextActive.layers,
-                layerCanvases: nextActive.layerCanvasesMap,
-              });
+              switchDocumentSession(
+                nextActive.id,
+                nextActive.layers,
+                nextActive.activeLayerId || '',
+                nextActive.dimensions
+              );
+              setActiveDocumentId(nextActive.id);
               needsAdaptiveFitRef.current = true;
               pendingFitDimsRef.current = nextActive.dimensions;
               resetZoomAndCenter(nextActive.dimensions);
             } else {
+              setActiveDocumentId(nextActive.id);
               clearDocument();
             }
           } else {
+            documentStore.setActiveDocument(null);
             setActiveDocumentId(null);
             setDocumentName('');
             setSavedFileInfo(null);
             clearDocument();
-            resetHistory();
             setPerspectiveRuler(null);
             setAppView('home');
           }
@@ -4583,10 +4588,12 @@ export function App() {
         return next;
       });
       if (id) {
+        // Dispose isolated SparseTileGrid, scratch disk tiles, Undo cache, and temporary buffers
+        documentStore.closeSession(id).catch(console.warn);
         recoveryService.closeSession(id).catch(console.warn);
       }
     },
-    [activeDocumentId, clearDocument, loadDocument, resetHistory]
+    [activeDocumentId, clearDocument, resetZoomAndCenter, switchDocumentSession]
   );
 
   // Fault-Tolerant Crash Recovery Restore Handler
@@ -4594,8 +4601,9 @@ export function App() {
     async (session: CrashedSessionInfo) => {
       try {
         const replayData = await recoveryService.loadSessionData(session.session_id);
+        const restoredSession = documentStore.getOrCreateSession(session.session_id);
         const { manifest, replayedStrokesCount, replayedMutationsCount } =
-          recoveryService.replaySessionData(replayData, globalTileGrid);
+          recoveryService.replaySessionData(replayData, restoredSession.tileGrid);
 
         const restoredDims: CanvasDimensions = {
           width: manifest.width,
@@ -4603,26 +4611,17 @@ export function App() {
           dpi: manifest.dpi,
         };
 
-        // Reconstruct layer canvases backing buffers
-        const restoredLayerCanvases = new Map<string, HTMLCanvasElement>();
-        for (const layer of manifest.layers) {
-          if (layer.type === 'raster' || layer.type === 'vector' || layer.type === 'frame') {
-            const canvas = document.createElement('canvas');
-            canvas.width = restoredDims.width;
-            canvas.height = restoredDims.height;
-            globalTileGrid.renderLayerToCanvas(layer.id, canvas);
-            restoredLayerCanvases.set(layer.id, canvas);
-          }
-        }
-
-        // Load document into useLayerManager
-        loadDocument({
-          name: manifest.documentName,
-          dimensions: restoredDims,
-          colorMode: manifest.colorMode,
-          layers: manifest.layers,
-          layerCanvases: restoredLayerCanvases,
-        });
+        // Bind document directly to the replayed SparseTileGrid (zero full-canvas reconstruction!)
+        loadDocument(
+          {
+            name: manifest.documentName,
+            dimensions: restoredDims,
+            colorMode: manifest.colorMode,
+            layers: manifest.layers,
+          },
+          session.session_id,
+          true
+        );
         if (manifest.activeLayerId) {
           setActiveLayerId(manifest.activeLayerId);
         }
@@ -4639,7 +4638,6 @@ export function App() {
           colorMode: manifest.colorMode,
           layers: manifest.layers,
           activeLayerId: manifest.activeLayerId || manifest.layers[0]?.id || '',
-          layerCanvasesMap: restoredLayerCanvases,
         };
 
         setDocuments((prev) => {
@@ -4652,7 +4650,7 @@ export function App() {
         needsAdaptiveFitRef.current = true;
         pendingFitDimsRef.current = restoredDims;
         resetZoomAndCenter(restoredDims);
-        resetHistory();
+        resetHistory(session.session_id);
 
         // Push undo history entry
         pushHistoryStep(
@@ -4664,7 +4662,7 @@ export function App() {
         );
 
         // Invalidate GPU textures & trigger compositor
-        globalTileGrid.notifyChange(true);
+        restoredSession.tileGrid.notifyChange(true);
 
         setIsRecoveryModalOpen(false);
         setCrashedSessions((prev) => prev.filter((s) => s.session_id !== session.session_id));
@@ -4733,6 +4731,7 @@ export function App() {
       colorMode,
       layers,
       layerCanvasesMap: layerCanvasesRef.current,
+      tileGrid: documentStore.getActiveTileGrid(),
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
       tabId: activeDocumentId || undefined,
@@ -4832,6 +4831,7 @@ export function App() {
       colorMode,
       layers,
       layerCanvasesMap: layerCanvasesRef.current,
+      tileGrid: documentStore.getActiveTileGrid(),
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
       tabId: activeDocumentId || undefined,
@@ -4883,6 +4883,7 @@ export function App() {
       colorMode,
       layers,
       layerCanvasesMap: layerCanvasesRef.current,
+      tileGrid: documentStore.getActiveTileGrid(),
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
     };
@@ -6835,6 +6836,7 @@ export function App() {
                 layers={layers}
                 activeLayerId={activeLayerId}
                 colorMode={colorMode}
+                tileGrid={activeTileGrid}
                 layerCanvasesRef={layerCanvasesRef}
                 registerLayerCanvas={registerLayerCanvas}
                 getEffectiveOpacity={getEffectiveOpacity}
@@ -7136,7 +7138,8 @@ export function App() {
             layerCanvasesRef.current,
             getEffectiveOpacity,
             isLayerEffectivelyVisible,
-            false
+            false,
+            documentStore.getActiveTileGrid()
           )
         }
         canvasWidth={dimensions.width}

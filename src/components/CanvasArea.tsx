@@ -22,7 +22,7 @@ import { PerspectiveRulerOverlay } from './PerspectiveRulerOverlay';
 import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
 import { Local3DContainer } from './Local3DContainer';
 import { ViewportCompositor } from '../utils/compositor';
-import { globalTileGrid } from '../utils/tileEngine';
+import { SparseTileGrid, globalTileGrid } from '../utils/tileEngine';
 import { getBrushTipOutline, resolveBrushTipImage, TipOutline } from '../utils/brushOutline';
 import { preloadTipImage } from '../utils/brushStorage';
 import { Smartphone, Archive } from 'lucide-react';
@@ -123,6 +123,7 @@ interface CanvasAreaProps {
   onViewportReady?: (viewport: HTMLDivElement) => void;
   activeLayerId?: string;
   colorMode?: CanvasColorMode;
+  tileGrid?: SparseTileGrid;
 }
 
 export function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
@@ -227,7 +228,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onPointerLeave,
   layers,
   layerCanvasesRef,
-  registerLayerCanvas,
+  registerLayerCanvas: _registerLayerCanvas,
   getEffectiveOpacity: _getEffectiveOpacity,
   isLayerEffectivelyVisible: _isLayerEffectivelyVisible,
   interactionRef,
@@ -282,7 +283,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   softProofSettings,
   activeLayerId,
   colorMode = 'color',
+  tileGrid = globalTileGrid,
 }) => {
+  const tileGridRef = useRef<SparseTileGrid>(tileGrid);
+  tileGridRef.current = tileGrid;
 
   const effectiveDraftCanvasRef = draftCanvasRef || strokeCanvasRef;
   const localPredictedCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -692,7 +696,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             flipY: cam.flipY,
           },
           rp.dimensions,
-          globalTileGrid,
+          tileGridRef.current,
           buildCompositorOptions(rp, dpr)
         );
       }
@@ -758,7 +762,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
               flipY: rp.flipY,
             },
             rp.dimensions,
-            globalTileGrid,
+            tileGridRef.current,
             buildCompositorOptions(rp, dpr)
           );
         }
@@ -822,26 +826,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       compositorRef.current = new ViewportCompositor(vCanvas);
     }
 
-    // Ingest unindexed layer canvases into globalTileGrid
-    if (layerCanvasesRef?.current) {
-      for (const layer of layers) {
-        if (layer.type === 'raster' || layer.type === 'vector' || layer.type === 'frame') {
-          let c = layerCanvasesRef.current.get(layer.id);
-          if (!c) {
-            c = document.createElement('canvas');
-            c.width = dimensions.width;
-            c.height = dimensions.height;
-            registerLayerCanvas(layer.id, c);
-          }
-          if (c && !globalTileGrid.isLayerIngested(layer.id)) {
-            const isBg = layer.id === 'layer-bg' || layer.id.startsWith('layer-bg');
-            const isMono = !isBg && (layer.expressionColor === 'monochrome' || colorMode === 'monochrome');
-            globalTileGrid.ingestCanvas(layer.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
-          }
-        }
-      }
-    }
-
     const dpr = window.devicePixelRatio || 1;
     const rp = renderParamsRef.current;
     compositorRef.current.render(
@@ -854,14 +838,15 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         flipY: rp.flipY,
       },
       dimensions,
-      globalTileGrid,
+      tileGrid,
       buildCompositorOptions(rp, dpr)
     );
-  }, [effectiveLayers, layers, pan, zoom, rotation, flipX, flipY, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas, onionSkinFrames, softProofSettings, activeLayerId, brushSettings.opacity, colorMode]);
+  }, [effectiveLayers, layers, pan, zoom, rotation, flipX, flipY, dimensions, showCheckerboard, onionSkinFrames, softProofSettings, activeLayerId, brushSettings.opacity, colorMode, tileGrid]);
 
-  // Event-Driven Compositor Invalidation via SparseTileGrid subscription
+  // Event-Driven Compositor Invalidation via active document's SparseTileGrid subscription
   useEffect(() => {
     let rafId: number | null = null;
+    const activeGrid = tileGrid;
     const renderCompositor = () => {
       if (compositorRef.current) {
         const dpr = window.devicePixelRatio || 1;
@@ -876,7 +861,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             flipY: rp.flipY,
           },
           rp.dimensions,
-          globalTileGrid,
+          activeGrid,
           buildCompositorOptions(rp, dpr)
         );
       }
@@ -898,12 +883,12 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       });
     };
 
-    const unsubscribe = globalTileGrid.subscribe(handleGridChange);
+    const unsubscribe = activeGrid.subscribe(handleGridChange);
     return () => {
       unsubscribe();
       if (rafId !== null) cancelAnimationFrame(rafId);
     };
-  }, []);
+  }, [tileGrid]);
 
   useEffect(() => {
     return () => {

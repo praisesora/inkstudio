@@ -1358,6 +1358,7 @@ export interface LayerStackCacheInput {
   getLayerContentVersion: (layerId: string) => number;
   getMaskInvalidationEpoch?: (layerId: string) => number;
   gridEpoch?: number;
+  gridId?: number;
 }
 
 export interface LayerStackCacheEvaluation {
@@ -1643,7 +1644,7 @@ export class LayerStackCacheTracker {
       `${input.viewportW}x${input.viewportH}@${input.dpr}|` +
       `${dimensions.width}x${dimensions.height}@${dimensions.dpi ?? 600}|` +
       `${transform.pan.x},${transform.pan.y},${transform.zoom},${transform.rotation},` +
-      `${transform.flipX ? 1 : 0},${transform.flipY ? 1 : 0}|ep:${input.gridEpoch ?? 0}`;
+      `${transform.flipX ? 1 : 0},${transform.flipY ? 1 : 0}|g:${input.gridId ?? 0}|ep:${input.gridEpoch ?? 0}`;
 
     // Onion skin frames are baked into the below cache right after the artboard background
     let onionSig = '';
@@ -2040,7 +2041,7 @@ export class ViewportCompositor {
       this.onContextRestoredHandler = () => {
         this.contextLost = false;
         this.initGL();
-        globalTileGrid.notifyChange(true);
+        (this.lastRenderedGrid || globalTileGrid).notifyChange(true);
       };
       canvas.addEventListener('webglcontextlost', this.onContextLostHandler, false);
       canvas.addEventListener('webglcontextrestored', this.onContextRestoredHandler, false);
@@ -2885,7 +2886,8 @@ export class ViewportCompositor {
     grid: SparseTileGrid,
     batchTick: number
   ): number {
-    const key = getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0);
+    const gridId = typeof grid.getGridId === 'function' ? grid.getGridId() : 0;
+    const key = `${gridId}:${getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0)}`;
     const accessTick = ++this.arrayAccessCounter;
     let slot = this.arrayPoolByKey.get(key);
 
@@ -2954,7 +2956,8 @@ export class ViewportCompositor {
   private getTileTexture(tile: TileBuffer, grid: SparseTileGrid): WebGLTexture | null {
     if (!this.gl) return null;
     const gl = this.gl;
-    const key = getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0);
+    const gridId = typeof grid.getGridId === 'function' ? grid.getGridId() : 0;
+    const key = `${gridId}:${getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0)}`;
     const accessTick = ++this.textureAccessCounter;
 
     let slot = this.activePoolByKey.get(key);
@@ -3177,6 +3180,8 @@ export class ViewportCompositor {
    * 2. Baked Layer Stack Cache (`belowActiveCacheFbo` + `activeUnit` + `aboveActiveCacheFbo`)
    * 3. TEXTURE_2D_ARRAY + gl.drawArraysInstanced tile batching
    */
+  private lastRenderedGrid: SparseTileGrid | null = null;
+
   public render(
     layers: LayerItem[],
     transform: ViewportTransform,
@@ -3184,6 +3189,7 @@ export class ViewportCompositor {
     grid: SparseTileGrid = globalTileGrid,
     _options: CompositorOptions = { dimensions }
   ): void {
+    this.lastRenderedGrid = grid;
     const gl = this.gl;
     this.currentOptions = _options;
     this.currentZoom = transform.zoom;
@@ -3263,6 +3269,7 @@ export class ViewportCompositor {
           typeof grid.getLayerVersion === 'function' ? grid.getLayerVersion(id) : 0,
         getMaskInvalidationEpoch: (id) => this.maskInvalidationEpochs.get(id) ?? 0,
         gridEpoch: typeof grid.getGridEpoch === 'function' ? grid.getGridEpoch() : 0,
+        gridId: typeof grid.getGridId === 'function' ? grid.getGridId() : 0,
       });
 
       const { partition } = cacheEval;

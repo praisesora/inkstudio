@@ -20,6 +20,7 @@ import {
   serializeSparseTileGrid,
   deserializeSparseTileGrid,
 } from '../utils/tileEngine';
+import { documentStore } from '../utils/documentStore';
 
 export const WAL_MAGIC_BYTES = new Uint8Array([0x49, 0x4e, 0x4b, 0x57]); // 'INKW'
 export const WAL_ENTRY_STROKE_TILE_DELTA = 1;
@@ -392,8 +393,9 @@ class RecoveryService {
     }
 
     try {
-      // 1. Snapshot SparseTileGrid
-      const rawSnapshot = serializeSparseTileGrid(globalTileGrid);
+      // 1. Snapshot SparseTileGrid for this specific document session
+      const targetGrid = documentStore.getSession(activeId)?.tileGrid ?? globalTileGrid;
+      const rawSnapshot = serializeSparseTileGrid(targetGrid);
       const compressedSnapshot = deflateSync(rawSnapshot, { level: 4 });
 
       // 2. Manifest JSON (strip DOM canvas elements before serializing)

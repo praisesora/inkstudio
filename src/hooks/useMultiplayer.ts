@@ -13,7 +13,8 @@ import {
 } from '../types/multiplayer';
 import { multiplayerService } from '../services/multiplayerService';
 import { LayerItem, CanvasDimensions, CanvasColorMode } from '../types/editor';
-import { globalTileGrid, TILE_SIZE, TileBuffer } from '../utils/tileEngine';
+import { TILE_SIZE, TileBuffer } from '../utils/tileEngine';
+import { documentStore } from '../utils/documentStore';
 
 const PEER_COLORS = [
   '#f43f5e', // Rose
@@ -195,9 +196,10 @@ export function useMultiplayer({
               layerDataUrls: {},
             });
 
-            // Progressive Tile Streaming: stream active layer tiles progressively from sparse tile grid
+            // Progressive Tile Streaming: stream active layer tiles progressively from active document's sparse tile grid
+            const activeGrid = documentStore.getActiveTileGrid();
             for (const layer of effectiveLayers) {
-              const tiles = globalTileGrid.getLayerTiles(layer.id);
+              const tiles = activeGrid.getLayerTiles(layer.id);
               for (const tile of tiles) {
                 multiplayerService.sendTileDelta(layer.id, tile);
               }
@@ -375,17 +377,18 @@ export function useMultiplayer({
             lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
             lod: 0,
           };
-          globalTileGrid.setTile(tMsg.layerId, tMsg.tileX, tMsg.tileY, tile);
+          const activeGrid = documentStore.getActiveTileGrid();
+          activeGrid.setTile(tMsg.layerId, tMsg.tileX, tMsg.tileY, tile);
           const canvas = layerCanvasesRef.current.get(tMsg.layerId);
           if (canvas) {
-            globalTileGrid.renderLayerToCanvas(tMsg.layerId, canvas, {
+            activeGrid.renderLayerToCanvas(tMsg.layerId, canvas, {
               x: tMsg.tileX * TILE_SIZE,
               y: tMsg.tileY * TILE_SIZE,
               width: TILE_SIZE,
               height: TILE_SIZE,
             });
           }
-          globalTileGrid.notifyChange(true);
+          activeGrid.notifyChange(true);
           break;
         }
 

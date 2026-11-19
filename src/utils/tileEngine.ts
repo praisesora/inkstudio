@@ -620,8 +620,8 @@ export class TauriScratchDiskDriver implements IScratchDiskDriver {
 export class InMemoryScratchDiskDriver implements IScratchDiskDriver {
   private storage: Map<string, Uint8Array> = new Map();
 
-  public async init(_sessionId: string): Promise<void> {
-    this.storage.clear();
+  public async init(sessionId: string): Promise<void> {
+    await this.clear(sessionId);
   }
 
   public async writeTiles(sessionId: string, tiles: TileWritePayload[]): Promise<number> {
@@ -666,6 +666,7 @@ export interface TileMemoryManagerOptions {
   budgetMb?: number;
   driver?: IScratchDiskDriver;
   sessionId?: string;
+  onMemoryChanged?: () => void;
 }
 
 export class TileMemoryManager {
@@ -680,6 +681,7 @@ export class TileMemoryManager {
   private inFlightPageIns: Map<string, Promise<Uint8Array>> = new Map();
   private evictionPromise: Promise<void> | null = null;
   private needsAnotherEvictionPass: boolean = false;
+  private onMemoryChanged?: () => void;
 
   constructor(grid: SparseTileGrid, options?: TileMemoryManagerOptions) {
     this.grid = grid;
@@ -687,6 +689,7 @@ export class TileMemoryManager {
     this.budgetBytes = Math.max(1, mb) * 1024 * 1024;
     this.sessionId = options?.sessionId || `session-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
     this.driver = options?.driver || createDefaultScratchDiskDriver();
+    this.onMemoryChanged = options?.onMemoryChanged;
     void this.driver.init(this.sessionId);
   }
 
@@ -731,14 +734,18 @@ export class TileMemoryManager {
       this.activeBytes += tile.data.byteLength;
       tile.lastAccessTimestamp = typeof performance !== 'undefined' ? performance.now() : Date.now();
       if (tile.lod === 0) {
-        void this.checkBudgetAndEvict();
+        if (this.onMemoryChanged) {
+          this.onMemoryChanged();
+        } else {
+          void this.checkBudgetAndEvict();
+        }
       }
     }
   }
 
   public notifyTileFreed(tile: TileBuffer): void {
     if (tile.data !== null) {
-      this.activeBytes -= tile.data.byteLength;
+      this.activeBytes = Math.max(0, this.activeBytes - tile.data.byteLength);
     }
   }
 
@@ -939,7 +946,7 @@ export class TileMemoryManager {
       await this.driver.writeTiles(this.sessionId, payloads);
       for (const tile of validTiles) {
         if (tile.data) {
-          this.activeBytes -= tile.data.byteLength;
+          this.activeBytes = Math.max(0, this.activeBytes - tile.data.byteLength);
           tile.data = null;
           tile.isPagedToDisk = true;
           tile.dirty = false;
@@ -948,10 +955,76 @@ export class TileMemoryManager {
     }
   }
 
+  /**
+   * Drops all cached LOD > 0 tiles and evicts up to `bytesToFree` of LOD 0 tiles to scratch disk.
+   * Used by DocumentStore to cooperatively reclaim RAM from inactive document tabs.
+   */
+  public async evictBytesToDisk(bytesToFree: number): Promise<number> {
+    if (bytesToFree <= 0 || this.activeBytes <= 0) return 0;
+    let freed = 0;
+
+    // 1. Drop regenerable LOD > 0 tiles first (zero disk I/O)
+    for (const tile of this.grid.getAllTiles()) {
+      if (tile.lod > 0 && tile.data !== null) {
+        const sz = tile.data.byteLength;
+        this.activeBytes = Math.max(0, this.activeBytes - sz);
+        freed += sz;
+        tile.data = null;
+        tile.dirty = true;
+      }
+    }
+
+    if (freed >= bytesToFree) return freed;
+
+    // 2. Evict LOD 0 tiles oldest-first to scratch disk
+    const lod0: TileBuffer[] = [];
+    for (const tile of this.grid.getAllTiles()) {
+      if (tile.lod === 0 && tile.data !== null) {
+        lod0.push(tile);
+      }
+    }
+    lod0.sort((a, b) => a.lastAccessTimestamp - b.lastAccessTimestamp);
+
+    const toEvict: TileBuffer[] = [];
+    for (const tile of lod0) {
+      if (freed >= bytesToFree) break;
+      toEvict.push(tile);
+      freed += tile.data?.byteLength || 0;
+    }
+
+    if (toEvict.length > 0) {
+      await this.evictTiles(toEvict);
+    }
+
+    return freed;
+  }
+
+  /**
+   * Offloads all in-memory tiles of this document to scratch disk.
+   */
+  public async evictAllToDisk(): Promise<number> {
+    return this.evictBytesToDisk(this.activeBytes);
+  }
+
   public async clear(): Promise<void> {
     this.inFlightPageIns.clear();
     this.activeBytes = 0;
     await this.driver.clear(this.sessionId);
+  }
+}
+
+let nextSparseTileGridId = 1;
+
+/**
+ * Releases an HTMLCanvasElement's backing store immediately so Chromium/WebView2 reclaims RAM.
+ */
+export function releaseTemporaryCanvas(canvas: HTMLCanvasElement | null | undefined): void {
+  if (!canvas) return;
+  try {
+    canvas.width = 0;
+    canvas.height = 0;
+  } catch {
+    // Ignore read-only or detached mock canvases in tests
   }
 }
 
@@ -966,6 +1039,7 @@ export class TileMemoryManager {
  * Completely deprecates multi-gigabyte full-sized DOM layer canvases.
  */
 export class SparseTileGrid {
+  private readonly gridId: number = nextSparseTileGridId++;
   private tiles: Map<string, TileBuffer> = new Map();
   private layerFormats: Map<string, TileFormat> = new Map();
   private ingestedLayers: Set<string> = new Set();
@@ -981,6 +1055,19 @@ export class SparseTileGrid {
 
   constructor(memoryManagerOptions?: TileMemoryManagerOptions) {
     this.memoryManager = new TileMemoryManager(this, memoryManagerOptions);
+  }
+
+  public getGridId(): number {
+    return this.gridId;
+  }
+
+  public hasLayerTiles(layerId: string): boolean {
+    for (const tile of this.tiles.values()) {
+      if (tile.layerId === layerId && (tile.lod ?? 0) === 0) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public getLayerVersion(layerId: string): number {
@@ -1416,14 +1503,93 @@ export class SparseTileGrid {
   }
 
   /**
-   * Generates a layer thumbnail directly from the sparse tile grid or LOD mipmaps.
-   * Completely bypasses full-size canvas allocation.
+   * Allocates a temporary HTMLCanvasElement strictly sized to `rect` and populates it from tiles.
+   * Caller must release it via `releaseTemporaryCanvas(canvas)` when finished.
+   */
+  public createRegionCanvas(
+    layerId: string,
+    rect: { x: number; y: number; width: number; height: number }
+  ): HTMLCanvasElement | null {
+    if (typeof document === 'undefined' || rect.width <= 0 || rect.height <= 0) return null;
+    const w = Math.max(1, Math.ceil(rect.width));
+    const h = Math.max(1, Math.ceil(rect.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return canvas;
+
+    if (this.hasLayerTiles(layerId)) {
+      const region = this.readImageData(layerId, Math.floor(rect.x), Math.floor(rect.y), w, h);
+      if (typeof ImageData !== 'undefined') {
+        const imgData = new ImageData(new Uint8ClampedArray(region.data.buffer as ArrayBuffer, region.data.byteOffset, region.data.byteLength), w, h);
+        ctx.putImageData(imgData, 0, 0);
+      }
+    }
+    return canvas;
+  }
+
+  /**
+   * Materializes a full-layer temporary HTMLCanvasElement from tiles (for export/filters).
+   * Caller MUST release it immediately after use via `releaseTemporaryCanvas(canvas)`.
+   */
+  public exportLayerToCanvas(layerId: string, width: number, height: number): HTMLCanvasElement | null {
+    if (typeof document === 'undefined' || width <= 0 || height <= 0) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    if (this.hasLayerTiles(layerId)) {
+      this.renderLayerToCanvas(layerId, canvas);
+    }
+    return canvas;
+  }
+
+  /**
+   * Ensures LOD 3 mipmap tiles exist and are up-to-date for all populated regions of `layerId`.
+   */
+  public getOrBuildLod3Tiles(layerId: string): TileBuffer[] {
+    const lod3Coords = new Map<string, { tx: number; ty: number }>();
+
+    for (const tile of this.tiles.values()) {
+      if (tile.layerId !== layerId) continue;
+      if ((tile.lod ?? 0) === 0) {
+        const l3x = tile.tileX >> 3;
+        const l3y = tile.tileY >> 3;
+        const k = `${l3x}:${l3y}`;
+        if (!lod3Coords.has(k)) {
+          lod3Coords.set(k, { tx: l3x, ty: l3y });
+        }
+      } else if (tile.lod === 3) {
+        const k = `${tile.tileX}:${tile.tileY}`;
+        if (!lod3Coords.has(k)) {
+          lod3Coords.set(k, { tx: tile.tileX, ty: tile.tileY });
+        }
+      }
+    }
+
+    const result: TileBuffer[] = [];
+    for (const { tx, ty } of lod3Coords.values()) {
+      let tile = this.getTile(layerId, tx, ty, 3);
+      if (!tile || tile.data === null || this.isLodTileDirty(layerId, tx, ty, 3)) {
+        tile = this.generateLodTile(layerId, tx, ty, 3);
+      }
+      if (tile && tile.data !== null) {
+        result.push(tile);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Generates a layer thumbnail directly from LOD 3 mipmap tiles (1/8 resolution: 2048px per tile).
+   * Completely bypasses full-size canvas allocation and full-resolution pixel reads.
    */
   public generateThumbnail(
     layerId: string,
     thumbWidth: number,
     thumbHeight: number,
-    docDimensions: { width: number; height: number }
+    docDimensions: { width: number; height: number },
+    preserveAlpha: boolean = true
   ): string {
     if (typeof document === 'undefined') return '';
     if (!this.thumbCanvas) {
@@ -1435,26 +1601,28 @@ export class SparseTileGrid {
     const ctx = canvas.getContext('2d');
     if (!ctx) return '';
 
-    ctx.clearRect(0, 0, thumbWidth, thumbHeight);
-
     const docW = Math.max(1, docDimensions.width);
     const docH = Math.max(1, docDimensions.height);
 
-    // Sample directly from LOD 0 tiles without flushing full mipmap pyramids
-    let renderLod = 0;
-    let tiles = this.getLayerTiles(layerId, 0);
-    if (tiles.length === 0) {
-      renderLod = 3;
-      tiles = this.getLayerTiles(layerId, 3);
-    }
+    const tiles = this.getOrBuildLod3Tiles(layerId);
 
     if (tiles.length === 0) {
-      return canvas.toDataURL('image/png');
+      if (preserveAlpha) {
+        ctx.clearRect(0, 0, thumbWidth, thumbHeight);
+        return canvas.toDataURL('image/png');
+      }
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, thumbWidth, thumbHeight);
+      return canvas.toDataURL('image/jpeg', 0.65);
     }
 
-    const lodDocSize = TILE_SIZE << renderLod;
+    const renderLod = 3;
+    const lodDocSize = TILE_SIZE << renderLod; // 2048 document pixels per LOD 3 tile
     const thumbImg = ctx.createImageData(thumbWidth, thumbHeight);
     const outData = thumbImg.data;
+    if (!preserveAlpha) {
+      outData.fill(255);
+    }
     const scaleX = docW / thumbWidth;
     const scaleY = docH / thumbHeight;
 
@@ -1490,19 +1658,29 @@ export class SparseTileGrid {
             else if (rgba[alt3 + 3] > 0) srcIdx = alt3;
           }
 
-          if (rgba[srcIdx + 3] > 0) {
+          const sa = rgba[srcIdx + 3];
+          if (sa > 0) {
             const dstIdx = (py * thumbWidth + px) * 4;
-            outData[dstIdx] = rgba[srcIdx];
-            outData[dstIdx + 1] = rgba[srcIdx + 1];
-            outData[dstIdx + 2] = rgba[srcIdx + 2];
-            outData[dstIdx + 3] = rgba[srcIdx + 3];
+            if (preserveAlpha || sa === 255) {
+              outData[dstIdx] = rgba[srcIdx];
+              outData[dstIdx + 1] = rgba[srcIdx + 1];
+              outData[dstIdx + 2] = rgba[srcIdx + 2];
+              outData[dstIdx + 3] = sa;
+            } else {
+              const a = sa / 255;
+              const inv = 1 - a;
+              outData[dstIdx] = Math.round(rgba[srcIdx] * a + 255 * inv);
+              outData[dstIdx + 1] = Math.round(rgba[srcIdx + 1] * a + 255 * inv);
+              outData[dstIdx + 2] = Math.round(rgba[srcIdx + 2] * a + 255 * inv);
+              outData[dstIdx + 3] = 255;
+            }
           }
         }
       }
     }
 
     ctx.putImageData(thumbImg, 0, 0);
-    return canvas.toDataURL('image/png');
+    return preserveAlpha ? canvas.toDataURL('image/png') : canvas.toDataURL('image/jpeg', 0.65);
   }
 
   // ==========================================================================
@@ -1645,6 +1823,113 @@ export class SparseTileGrid {
         this.generateLodTile(lId, tileX, tileY, lod);
       }
     }
+  }
+
+  public fillLayerSolidColor(
+    layerId: string,
+    width: number,
+    height: number,
+    colorCss: string,
+    format?: TileFormat
+  ): void {
+    const lower = (colorCss || '').trim().toLowerCase();
+    if (!lower || lower === 'transparent') {
+      this.clearLayer(layerId);
+      this.ingestedLayers.add(layerId);
+      if (format) this.setLayerFormat(layerId, format);
+      return;
+    }
+    if (lower === '#ffffff' || lower === '#fff' || lower === 'white') {
+      this.fillLayerSolidWhite(layerId, width, height, format);
+      return;
+    }
+
+    let r = 255, g = 255, b = 255, a = 255;
+    if (lower.startsWith('#')) {
+      const hex = lower.slice(1);
+      if (hex.length === 3) {
+        r = parseInt(hex[0] + hex[0], 16) || 0;
+        g = parseInt(hex[1] + hex[1], 16) || 0;
+        b = parseInt(hex[2] + hex[2], 16) || 0;
+      } else if (hex.length >= 6) {
+        r = parseInt(hex.slice(0, 2), 16) || 0;
+        g = parseInt(hex.slice(2, 4), 16) || 0;
+        b = parseInt(hex.slice(4, 6), 16) || 0;
+        if (hex.length === 8) {
+          a = parseInt(hex.slice(6, 8), 16) || 255;
+        }
+      }
+    } else if (lower === 'black') {
+      r = 0; g = 0; b = 0;
+    }
+
+    this.clearLayer(layerId);
+    this.ingestedLayers.add(layerId);
+    if (format) this.setLayerFormat(layerId, format);
+    if (width <= 0 || height <= 0) return;
+
+    const targetFormat = format || this.getLayerFormat(layerId);
+    const pixelU32 = isLittleEndian
+      ? ((a << 24) | (b << 16) | (g << 8) | r) >>> 0
+      : ((r << 24) | (g << 16) | (b << 8) | a) >>> 0;
+    const grayVal = Math.round((r * 299 + g * 587 + b * 114) / 1000);
+    const isInk1Bit = a >= 24 && grayVal < 128;
+
+    if (targetFormat === 'monochrome-1bit' && !isInk1Bit) {
+      this.notifyChange();
+      return;
+    }
+
+    const maxTileX = pixelToTileCoord(width - 1, 0);
+    const maxTileY = pixelToTileCoord(height - 1, 0);
+
+    for (let ty = 0; ty <= maxTileY; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      const validH = Math.min(TILE_SIZE, height - tileDocY);
+      for (let tx = 0; tx <= maxTileX; tx++) {
+        const tileDocX = tx * TILE_SIZE;
+        const validW = Math.min(TILE_SIZE, width - tileDocX);
+        const tile = this.getOrCreateTile(layerId, tx, ty, targetFormat, 0);
+        if (!tile.data) {
+          tile.data = new Uint8Array(getTileByteSize(tile.format));
+          this.memoryManager?.notifyTileAllocated(tile);
+        }
+        if (tile.format === 'color-32bit') {
+          const dst32 = new Uint32Array(tile.data.buffer, tile.data.byteOffset, TILE_PIXELS);
+          if (validW === TILE_SIZE && validH === TILE_SIZE) {
+            dst32.fill(pixelU32);
+          } else {
+            dst32.fill(0);
+            for (let y = 0; y < validH; y++) {
+              const rowStart = y * TILE_SIZE;
+              dst32.fill(pixelU32, rowStart, rowStart + validW);
+            }
+          }
+        } else if (tile.format === 'grayscale-8bit') {
+          if (validW === TILE_SIZE && validH === TILE_SIZE) {
+            tile.data.fill(grayVal);
+          } else {
+            tile.data.fill(0);
+            for (let y = 0; y < validH; y++) {
+              const rowStart = y * TILE_SIZE;
+              tile.data.fill(grayVal, rowStart, rowStart + validW);
+            }
+          }
+        } else {
+          tile.data.fill(0);
+          for (let y = 0; y < validH; y++) {
+            for (let x = 0; x < validW; x++) {
+              setPixel1Bit(tile.data, x, y, true);
+            }
+          }
+        }
+        tile.dirty = true;
+        tile.version++;
+        this.markLodAncestorsDirty(layerId, tx, ty);
+      }
+    }
+    this.bumpLayerVersion(layerId);
+    this.notifyChange();
   }
 
   public fillLayerSolidWhite(layerId: string, width: number, height: number, format?: TileFormat): void {
@@ -1837,6 +2122,23 @@ export class SparseTileGrid {
       formatCounts,
       lodCounts,
     };
+  }
+
+  public snapshotLayerTiles(
+    layerId: string
+  ): Map<string, { format: TileFormat; data: Uint8Array | null }> {
+    const snapshot = new Map<string, { format: TileFormat; data: Uint8Array | null }>();
+    for (const tile of this.getLayerTiles(layerId, 0)) {
+      const key = getTileKey(layerId, tile.tileX, tile.tileY, 0);
+      if (tile.data) {
+        const copy = new Uint8Array(tile.data.length);
+        copy.set(tile.data);
+        snapshot.set(key, { format: tile.format, data: copy });
+      } else {
+        snapshot.set(key, { format: tile.format, data: null });
+      }
+    }
+    return snapshot;
   }
 
   public snapshotTilesInRect(

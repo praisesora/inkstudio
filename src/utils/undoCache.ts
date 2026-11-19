@@ -61,6 +61,26 @@ export class UndoCacheManager {
     return this.sessionId;
   }
 
+  public getDocumentId(): string {
+    return this.sessionId;
+  }
+
+  public getRamStepCount(): number {
+    return this.ramItems.size;
+  }
+
+  public getDiskCachedCount(): number {
+    return this.diskCachedIds.size;
+  }
+
+  public getCompressedRamCount(): number {
+    return this.compressedRamCache.size;
+  }
+
+  public isOffloaded(itemId: string): boolean {
+    return this.diskCachedIds.has(itemId) || this.compressedRamCache.has(itemId);
+  }
+
   /**
    * Prunes orphaned history IDs evicted by redo branching or the 50-step cap.
    */
@@ -83,21 +103,43 @@ export class UndoCacheManager {
   /**
    * Register a history item and enforce the in-memory LRU budget.
    */
-  public async registerStep(item: HistoryItem, allHistory: HistoryItem[]): Promise<void> {
+  public async registerStep(
+    item: HistoryItem,
+    allHistory: HistoryItem[],
+    maxRamSteps: number = MAX_RAM_UNDO_STEPS
+  ): Promise<void> {
     this.pruneOrphanedIds(allHistory);
     if (!item.tileDeltas || item.tileDeltas.length === 0) return;
 
     this.ramItems.add(item.id);
 
-    if (this.ramItems.size > MAX_RAM_UNDO_STEPS) {
+    if (this.ramItems.size > maxRamSteps) {
       for (const oldItem of allHistory) {
         if (oldItem.id !== item.id && this.ramItems.has(oldItem.id) && oldItem.tileDeltas) {
           await this.offloadToDisk(oldItem);
           this.ramItems.delete(oldItem.id);
-          if (this.ramItems.size <= MAX_RAM_UNDO_STEPS) break;
+          if (this.ramItems.size <= maxRamSteps) break;
         }
       }
     }
+  }
+
+  /**
+   * Offloads all in-RAM tile deltas for this document to scratch disk (or compressed cache).
+   * Used when switching away from a document tab or when reclaiming shared RAM budget.
+   */
+  public async offloadAllToDisk(allHistory: HistoryItem[], maxCount?: number): Promise<number> {
+    this.pruneOrphanedIds(allHistory);
+    let offloaded = 0;
+    for (const item of allHistory) {
+      if (maxCount !== undefined && offloaded >= maxCount) break;
+      if (item.tileDeltas && item.tileDeltas.length > 0) {
+        await this.offloadToDisk(item);
+        this.ramItems.delete(item.id);
+        offloaded++;
+      }
+    }
+    return offloaded;
   }
 
   /**
@@ -118,6 +160,7 @@ export class UndoCacheManager {
           data: compressed,
         });
         this.diskCachedIds.add(item.id);
+        this.ramItems.delete(item.id);
         item.tileDeltas = undefined;
         return;
       } catch (err) {
@@ -126,6 +169,7 @@ export class UndoCacheManager {
     }
 
     this.compressedRamCache.set(item.id, compressed);
+    this.ramItems.delete(item.id);
     item.tileDeltas = undefined;
   }
 

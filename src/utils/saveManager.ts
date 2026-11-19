@@ -8,6 +8,8 @@ import { getCanvasCompositeOperation } from './canvasUtils';
 import { groupLayersForCompositing } from './compositor';
 import { applyAdjustment } from './tonalEngine';
 import { recoveryService } from '../services/recoveryService';
+import { SparseTileGrid, releaseTemporaryCanvas } from './tileEngine';
+import { documentStore } from './documentStore';
 
 export interface SavedFileInfo {
   handle?: any; // FileSystemFileHandle
@@ -21,6 +23,7 @@ export interface SaveDocumentData {
   colorMode: CanvasColorMode;
   layers: LayerItem[];
   layerCanvasesMap: Map<string, HTMLCanvasElement>;
+  tileGrid?: SparseTileGrid;
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   tabId?: string;
@@ -45,6 +48,27 @@ function toAgPsdBlendMode(mode: BlendMode): any {
 }
 
 /**
+ * Resolves a layer's canvas from either the map or temporarily from SparseTileGrid.
+ * Returns `{ canvas, isTemporary }` so caller immediately releases temporary canvases.
+ */
+function acquireLayerExportCanvas(
+  layerId: string,
+  dimensions: CanvasDimensions,
+  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  tileGrid?: SparseTileGrid
+): { canvas: HTMLCanvasElement | null; isTemporary: boolean } {
+  const existing = layerCanvasesMap.get(layerId);
+  if (existing) {
+    return { canvas: existing, isTemporary: false };
+  }
+  if (tileGrid && tileGrid.hasLayerTiles(layerId)) {
+    const temp = tileGrid.exportLayerToCanvas(layerId, dimensions.width, dimensions.height);
+    return { canvas: temp, isTemporary: true };
+  }
+  return { canvas: null, isTemporary: false };
+}
+
+/**
  * Composites all visible layers with their blend modes and opacities onto a single canvas.
  */
 export function compositeCanvas(
@@ -53,7 +77,8 @@ export function compositeCanvas(
   layerCanvasesMap: Map<string, HTMLCanvasElement>,
   getEffectiveOpacity: (layer: LayerItem) => number,
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean,
-  fillWhiteBackground: boolean = false
+  fillWhiteBackground: boolean = false,
+  tileGrid?: SparseTileGrid
 ): HTMLCanvasElement {
   const exportCanvas = document.createElement('canvas');
   exportCanvas.width = dimensions.width;
@@ -70,14 +95,22 @@ export function compositeCanvas(
   const renderOrder = layers.slice().reverse();
   const groups = groupLayersForCompositing(renderOrder);
 
-  const getMaskedLayerCanvas = (layer: LayerItem, srcCanvas: HTMLCanvasElement): HTMLCanvasElement => {
-    if (!layer.maskCanvas || layer.maskEnabled === false) return srcCanvas;
+  const getMaskedLayerCanvas = (
+    layer: LayerItem,
+    srcCanvas: HTMLCanvasElement
+  ): { canvas: HTMLCanvasElement; isTemporary: boolean } => {
+    if (!layer.maskCanvas || layer.maskEnabled === false) {
+      return { canvas: srcCanvas, isTemporary: false };
+    }
     const masked = document.createElement('canvas');
     masked.width = dimensions.width;
     masked.height = dimensions.height;
     const mCtx = masked.getContext('2d');
     const maskCtx = layer.maskCanvas.getContext('2d', { willReadFrequently: true });
-    if (!mCtx || !maskCtx) return srcCanvas;
+    if (!mCtx || !maskCtx) {
+      releaseTemporaryCanvas(masked);
+      return { canvas: srcCanvas, isTemporary: false };
+    }
     mCtx.drawImage(srcCanvas, 0, 0);
     const imgData = mCtx.getImageData(0, 0, dimensions.width, dimensions.height);
     const maskData = maskCtx.getImageData(0, 0, dimensions.width, dimensions.height).data;
@@ -88,7 +121,7 @@ export function compositeCanvas(
       d[i + 3] = Math.round(d[i + 3] * maskLum);
     }
     mCtx.putImageData(imgData, 0, 0);
-    return masked;
+    return { canvas: masked, isTemporary: true };
   };
 
   for (const group of groups) {
@@ -107,9 +140,9 @@ export function compositeCanvas(
       continue;
     }
 
-    const rawBaseCanvas = layerCanvasesMap.get(baseLayer.id);
-    if (!rawBaseCanvas) continue;
-    const baseCanvas = getMaskedLayerCanvas(baseLayer, rawBaseCanvas);
+    const baseAcq = acquireLayerExportCanvas(baseLayer.id, dimensions, layerCanvasesMap, tileGrid);
+    if (!baseAcq.canvas) continue;
+    const maskedBase = getMaskedLayerCanvas(baseLayer, baseAcq.canvas);
 
     const activeClipped = group.clippedLayers.filter(
       (cl) => cl.type !== 'folder' && cl.type !== 'adjustment' && isLayerEffectivelyVisible(cl)
@@ -119,7 +152,7 @@ export function compositeCanvas(
       ctx.save();
       ctx.globalAlpha = getEffectiveOpacity(baseLayer);
       ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
-      ctx.drawImage(baseCanvas, 0, 0);
+      ctx.drawImage(maskedBase.canvas, 0, 0);
       ctx.restore();
     } else {
       // Group isolated offscreen canvas for base + clipped layers
@@ -127,31 +160,38 @@ export function compositeCanvas(
       groupCanvas.width = dimensions.width;
       groupCanvas.height = dimensions.height;
       const gCtx = groupCanvas.getContext('2d');
-      if (!gCtx) continue;
-
-      gCtx.save();
-      gCtx.globalAlpha = getEffectiveOpacity(baseLayer);
-      gCtx.drawImage(baseCanvas, 0, 0);
-      gCtx.restore();
-
-      for (const clipped of activeClipped) {
-        const rawClippedCanvas = layerCanvasesMap.get(clipped.id);
-        if (!rawClippedCanvas) continue;
-        const cCanvas = getMaskedLayerCanvas(clipped, rawClippedCanvas);
-
+      if (gCtx) {
         gCtx.save();
-        gCtx.globalAlpha = getEffectiveOpacity(clipped);
-        gCtx.globalCompositeOperation = 'source-atop';
-        gCtx.drawImage(cCanvas, 0, 0);
+        gCtx.globalAlpha = getEffectiveOpacity(baseLayer);
+        gCtx.drawImage(maskedBase.canvas, 0, 0);
         gCtx.restore();
-      }
 
-      ctx.save();
-      ctx.globalAlpha = 1.0;
-      ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
-      ctx.drawImage(groupCanvas, 0, 0);
-      ctx.restore();
+        for (const clipped of activeClipped) {
+          const clipAcq = acquireLayerExportCanvas(clipped.id, dimensions, layerCanvasesMap, tileGrid);
+          if (!clipAcq.canvas) continue;
+          const maskedClip = getMaskedLayerCanvas(clipped, clipAcq.canvas);
+
+          gCtx.save();
+          gCtx.globalAlpha = getEffectiveOpacity(clipped);
+          gCtx.globalCompositeOperation = 'source-atop';
+          gCtx.drawImage(maskedClip.canvas, 0, 0);
+          gCtx.restore();
+
+          if (maskedClip.isTemporary) releaseTemporaryCanvas(maskedClip.canvas);
+          if (clipAcq.isTemporary) releaseTemporaryCanvas(clipAcq.canvas);
+        }
+
+        ctx.save();
+        ctx.globalAlpha = 1.0;
+        ctx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
+        ctx.drawImage(groupCanvas, 0, 0);
+        ctx.restore();
+      }
+      releaseTemporaryCanvas(groupCanvas);
     }
+
+    if (maskedBase.isTemporary) releaseTemporaryCanvas(maskedBase.canvas);
+    if (baseAcq.isTemporary) releaseTemporaryCanvas(baseAcq.canvas);
   }
 
   return exportCanvas;
@@ -185,46 +225,55 @@ export async function serializeDocument(
   extension: string
 ): Promise<{ data: Blob | ArrayBuffer; mimeType: string }> {
   const ext = extension.toLowerCase();
+  const tileGrid = data.tileGrid ?? (data.tabId ? documentStore.getSession(data.tabId)?.tileGrid : documentStore.getActiveTileGrid());
 
   // 1. PSD format with layers (ag-psd expects bottom-to-top order and opacity 0..255)
   if (ext === '.psd' || ext === '.psb') {
-    const children = data.layers
-      .slice()
-      .reverse()
-      .filter((l) => l.type === 'raster' || l.type === 'vector' || l.type === 'frame')
-      .map((layer) => {
-        const c = data.layerCanvasesMap.get(layer.id);
-        return {
-          name: layer.name,
-          hidden: !layer.visible,
-          opacity: Math.round(Math.max(0, Math.min(1, layer.opacity ?? 1)) * 255),
-          blendMode: toAgPsdBlendMode(layer.blendMode),
-          canvas: c || undefined,
-        };
+    const tempCanvases: HTMLCanvasElement[] = [];
+    try {
+      const children = data.layers
+        .slice()
+        .reverse()
+        .filter((l) => l.type === 'raster' || l.type === 'vector' || l.type === 'frame')
+        .map((layer) => {
+          const acq = acquireLayerExportCanvas(layer.id, data.dimensions, data.layerCanvasesMap, tileGrid);
+          if (acq.isTemporary && acq.canvas) tempCanvases.push(acq.canvas);
+          return {
+            name: layer.name,
+            hidden: !layer.visible,
+            opacity: Math.round(Math.max(0, Math.min(1, layer.opacity ?? 1)) * 255),
+            blendMode: toAgPsdBlendMode(layer.blendMode),
+            canvas: acq.canvas || undefined,
+          };
+        });
+
+      const dpi = data.dimensions.dpi || 300;
+      const { writePsd } = await import('ag-psd');
+      const psdBuffer = writePsd({
+        width: data.dimensions.width,
+        height: data.dimensions.height,
+        children,
+        imageResources: {
+          resolutionInfo: {
+            horizontalResolution: dpi,
+            horizontalResolutionUnit: 'PPI',
+            widthUnit: 'Inches',
+            verticalResolution: dpi,
+            verticalResolutionUnit: 'PPI',
+            heightUnit: 'Inches',
+          },
+        },
       });
 
-    const dpi = data.dimensions.dpi || 300;
-    const { writePsd } = await import('ag-psd');
-    const psdBuffer = writePsd({
-      width: data.dimensions.width,
-      height: data.dimensions.height,
-      children,
-      imageResources: {
-        resolutionInfo: {
-          horizontalResolution: dpi,
-          horizontalResolutionUnit: 'PPI',
-          widthUnit: 'Inches',
-          verticalResolution: dpi,
-          verticalResolutionUnit: 'PPI',
-          heightUnit: 'Inches',
-        },
-      },
-    });
-
-    return {
-      data: psdBuffer,
-      mimeType: 'image/vnd.adobe.photoshop',
-    };
+      return {
+        data: psdBuffer,
+        mimeType: 'image/vnd.adobe.photoshop',
+      };
+    } finally {
+      for (const temp of tempCanvases) {
+        releaseTemporaryCanvas(temp);
+      }
+    }
   }
 
   // 2. Native Ink Studio Project (.ink, .sora) format
@@ -233,9 +282,10 @@ export async function serializeDocument(
     const maskImages: Record<string, string> = {};
     const serializableLayers = data.layers.map((l) => {
       if (l.type === 'raster' || l.type === 'vector' || l.type === 'frame') {
-        const c = data.layerCanvasesMap.get(l.id);
-        if (c) {
-          layerImages[l.id] = c.toDataURL('image/png');
+        const acq = acquireLayerExportCanvas(l.id, data.dimensions, data.layerCanvasesMap, tileGrid);
+        if (acq.canvas) {
+          layerImages[l.id] = acq.canvas.toDataURL('image/png');
+          if (acq.isTemporary) releaseTemporaryCanvas(acq.canvas);
         }
       }
       if (l.maskCanvas && typeof l.maskCanvas.toDataURL === 'function') {
@@ -271,10 +321,15 @@ export async function serializeDocument(
       data.layerCanvasesMap,
       data.getEffectiveOpacity,
       data.isLayerEffectivelyVisible,
-      true // white background for JPEG
+      true, // white background for JPEG
+      tileGrid
     );
-    const blob = await canvasToBlob(compCanvas, 'image/jpeg', 0.92);
-    return { data: blob, mimeType: 'image/jpeg' };
+    try {
+      const blob = await canvasToBlob(compCanvas, 'image/jpeg', 0.92);
+      return { data: blob, mimeType: 'image/jpeg' };
+    } finally {
+      releaseTemporaryCanvas(compCanvas);
+    }
   }
 
   // 4. WebP format
@@ -285,10 +340,15 @@ export async function serializeDocument(
       data.layerCanvasesMap,
       data.getEffectiveOpacity,
       data.isLayerEffectivelyVisible,
-      false
+      false,
+      tileGrid
     );
-    const blob = await canvasToBlob(compCanvas, 'image/webp', 0.92);
-    return { data: blob, mimeType: 'image/webp' };
+    try {
+      const blob = await canvasToBlob(compCanvas, 'image/webp', 0.92);
+      return { data: blob, mimeType: 'image/webp' };
+    } finally {
+      releaseTemporaryCanvas(compCanvas);
+    }
   }
 
   // 5. Default: PNG format
@@ -298,10 +358,15 @@ export async function serializeDocument(
     data.layerCanvasesMap,
     data.getEffectiveOpacity,
     data.isLayerEffectivelyVisible,
-    false
+    false,
+    tileGrid
   );
-  const blob = await canvasToBlob(compCanvas, 'image/png');
-  return { data: blob, mimeType: 'image/png' };
+  try {
+    const blob = await canvasToBlob(compCanvas, 'image/png');
+    return { data: blob, mimeType: 'image/png' };
+  } finally {
+    releaseTemporaryCanvas(compCanvas);
+  }
 }
 
 /**

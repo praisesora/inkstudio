@@ -265,16 +265,37 @@ export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalComposi
   }
 }
 
+import type { SparseTileGrid } from './tileEngine';
+
+export interface TileThumbnailSource {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: { width: number; height: number };
+}
+
 /**
  * Generates an efficient mini thumbnail (60px wide) for layer and history preview.
+ * Supports direct LOD 3 sampling from SparseTileGrid without reading full-size canvases.
  */
-export function createCanvasThumbnail(canvas: HTMLCanvasElement, preserveAlpha: boolean = false): string {
+export function createCanvasThumbnail(
+  source: HTMLCanvasElement | TileThumbnailSource,
+  preserveAlpha: boolean = false
+): string {
   try {
+    if (source && 'grid' in source && 'layerId' in source) {
+      const targetW = 60;
+      const docW = Math.max(1, source.dimensions.width);
+      const docH = Math.max(1, source.dimensions.height);
+      const targetH = Math.max(38, Math.round((docH / docW) * targetW));
+      return source.grid.generateThumbnail(source.layerId, targetW, targetH, source.dimensions, preserveAlpha);
+    }
+
+    const canvas = source;
     if (!_sharedThumbCanvas) {
       _sharedThumbCanvas = document.createElement('canvas');
     }
     const targetW = 60;
-    const targetH = Math.max(38, Math.round((canvas.height / canvas.width) * targetW));
+    const targetH = Math.max(38, Math.round((canvas.height / Math.max(1, canvas.width)) * targetW));
     _sharedThumbCanvas.width = targetW;
     _sharedThumbCanvas.height = targetH;
     const tCtx = _sharedThumbCanvas.getContext('2d');
