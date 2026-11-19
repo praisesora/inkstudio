@@ -234,7 +234,7 @@ export function App() {
   const drawing = useCanvasDrawing({
     dimensions,
     colorMode,
-    disabled: !hasOpenDocument || nav.isSpaceDown || nav.isPanning || nav.isRotating,
+    disabled: !hasOpenDocument || nav.isSpaceDown || nav.isPanning || nav.isRotating || nav.isZoomDragging,
     viewportRef: nav.viewportRef,
     pan: nav.pan,
     zoom: nav.zoom,
@@ -572,8 +572,14 @@ export function App() {
       isRotateModifier: nav.isRotateModifier,
       isPanning: nav.isPanning,
       isRotating: nav.isRotating,
+      isZoomDragging: nav.isZoomDragging,
       startPan: nav.startPan,
       startRotate: nav.startRotate,
+      startZoomDrag: nav.startZoomDrag,
+      onSampleColor: shapeFillTools.handleSampleColor,
+      onUndo: handleUndo,
+      onRedo: drawing.redo,
+      onFlipHorizontal: nav.toggleFlipHorizontal,
       isHovering: drawing.isHovering,
       cursorPos: drawing.cursorPos,
       onPointerDown: handlePointerDown,
@@ -656,6 +662,9 @@ export function App() {
       shapeFillTools.setActiveBalloon,
       shapeFillTools.handleConfirmBalloon,
       shapeFillTools.handleDeleteBalloon,
+      shapeFillTools.handleSampleColor,
+      handleUndo,
+      drawing.redo,
       activeAnimationTimeline,
       handleUpdateAnimationTimeline,
       handleAddAnimationCel,
@@ -791,6 +800,10 @@ export function App() {
         handleOpenTonalModal={tonalActions.handleOpenTonalModal}
         handleUpdateAnimationTimeline={handleUpdateAnimationTimeline}
         handleAddAnimationCel={handleAddAnimationCel}
+        zoomIn={nav.zoomIn}
+        zoomOut={nav.zoomOut}
+        resetZoomAndCenter={nav.resetZoomAndCenter}
+        resetRotation={nav.resetRotation}
         toggleFlipHorizontal={nav.toggleFlipHorizontal}
         toggleFlipVertical={nav.toggleFlipVertical}
         handleClearSelection={selectionTools.handleClearSelection}

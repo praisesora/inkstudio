@@ -25,6 +25,7 @@ import {
   saveCustomBrush,
 } from '../utils/brushStorage';
 import { documentStore } from '../utils/documentStore';
+import { shortcutManager } from '../utils/shortcutManager';
 import { recoveryService, CrashedSessionInfo } from '../services/recoveryService';
 import {
   documentStoreActions,
@@ -287,13 +288,23 @@ export function useDocumentLifecycle({
   );
 
   const handleUpdateSettings = useCallback((newSettings: AppSettings) => {
+    const prev = useUiStore.getState().appSettings;
     uiStoreActions.updateAppSettings(newSettings);
-    documentStore.setTileBudgetMb(newSettings.tileMemoryBudgetMb || 1024);
-    toolStoreActions.updateBrushSettings({
-      stabilization: newSettings.defaultStabilization,
-      usePressure: newSettings.usePressureByDefault,
-      smoothing: newSettings.smoothingEnabled,
-    });
+    shortcutManager.setOverrides(newSettings.shortcuts);
+    if (prev.tileMemoryBudgetMb !== newSettings.tileMemoryBudgetMb) {
+      documentStore.setTileBudgetMb(newSettings.tileMemoryBudgetMb || 1024);
+    }
+    if (
+      prev.defaultStabilization !== newSettings.defaultStabilization ||
+      prev.usePressureByDefault !== newSettings.usePressureByDefault ||
+      prev.smoothingEnabled !== newSettings.smoothingEnabled
+    ) {
+      toolStoreActions.updateBrushSettings({
+        stabilization: newSettings.defaultStabilization,
+        usePressure: newSettings.usePressureByDefault,
+        smoothing: newSettings.smoothingEnabled,
+      });
+    }
   }, []);
 
   const handleProcessFile = useCallback(

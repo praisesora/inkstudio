@@ -30,6 +30,13 @@ import { AnimationTimeline } from './AnimationTimeline';
 import { AnimationTimeline as AnimationTimelineType } from '../types/editor';
 import { getOnionSkinFrames } from '../utils/animationEngine';
 import { FloatingBrushPill } from './FloatingBrushPill';
+import { screenToCanvas } from '../utils/canvasUtils';
+import {
+  resolveHeldKeyModifierAction,
+  resolvePointerModifierAction,
+} from '../utils/shortcutManager';
+import { toolStoreActions, useToolStore, useUiStore } from '../stores';
+import { ModifierAction } from '../types/settings';
 
 const PIPETTE_CURSOR_CSS = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cg stroke='%23000000' stroke-width='3.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3Cg stroke='%23ffffff' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' fill='none'%3E%3Cpath d='m14 7 3 3'/%3E%3Cpath d='M16.6 5.6a2.12 2.12 0 0 1 3 3L7 20.6 2 22l1.4-5L16.6 5.6z'/%3E%3C/g%3E%3C/svg%3E") 2 22, crosshair`;
 
@@ -49,8 +56,14 @@ interface CanvasAreaProps {
   isRotateModifier: boolean;
   isPanning: boolean;
   isRotating: boolean;
+  isZoomDragging?: boolean;
   onStartPan: (e: React.PointerEvent) => void;
   onStartRotate: (e: React.PointerEvent) => void;
+  onStartZoomDrag?: (e: React.PointerEvent) => void;
+  onSampleColor?: (pt: { x: number; y: number }) => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  onFlipHorizontal?: () => void;
   isHovering: boolean;
   cursorPos: { x: number; y: number } | null;
   onPointerDown: (e: React.PointerEvent<HTMLElement>, coalesced?: PointerEvent[]) => void;
@@ -210,8 +223,14 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   isRotateModifier,
   isPanning,
   isRotating,
+  isZoomDragging = false,
   onStartPan,
   onStartRotate,
+  onStartZoomDrag,
+  onSampleColor,
+  onUndo,
+  onRedo,
+  onFlipHorizontal,
   isWebtoonMode = false,
   onToggleWebtoonMode,
   onOpenWebtoonExport,
@@ -391,9 +410,11 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   };
   const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
 
-  // Dynamic on-canvas brush resizing via Ctrl + Alt + Drag
-  const [isCtrlAltDown, setIsCtrlAltDown] = useState(false);
+  // Dynamic on-canvas brush resizing via configured modifier (default Ctrl + Alt + Drag or Shift + Alt + Drag)
+  const [heldModifierAction, setHeldModifierAction] = useState<ModifierAction>('none');
   const [isResizingBrush, setIsResizingBrush] = useState(false);
+  const [quickPalettePos, setQuickPalettePos] = useState<{ x: number; y: number } | null>(null);
+  const tempEraserPrevToolRef = useRef<ToolType | null>(null);
   const resizeOriginRef = useRef<{ clientX: number; clientY: number }>({ clientX: 0, clientY: 0 });
   const resizeStartSettingsRef = useRef<{ size: number; hardness: number }>({
     size: brushSettings.size,
@@ -470,8 +491,13 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         isSpaceDown ||
         isPanning ||
         isRotating ||
+        isZoomDragging ||
         isRotateModifier ||
         isResizingBrush ||
+        heldModifierAction === 'brush-size' ||
+        heldModifierAction === 'pan' ||
+        heldModifierAction === 'rotate' ||
+        heldModifierAction === 'zoom-drag' ||
         (tool !== 'brush' && tool !== 'eraser' && tool !== 'liquify' && tool !== 'select-pen' && tool !== 'select-eraser')
       ) {
         ring.style.display = 'none';
@@ -533,7 +559,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       viewport.removeEventListener('pointerenter', handleViewportPointerEnterOrDown);
       viewport.removeEventListener('pointerleave', handlePointerLeave);
     };
-  }, [isSpaceDown, isPanning, isRotating, isRotateModifier, isResizingBrush, viewportRef, tool, hasOpenDocument]);
+  }, [isSpaceDown, isPanning, isRotating, isZoomDragging, isRotateModifier, isResizingBrush, heldModifierAction, viewportRef, tool, hasOpenDocument]);
 
   // Compute colored onion skin frames and active cel isolation for animation
   const onionSkinFrames = useMemo(() => {
@@ -899,23 +925,36 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
   }, []);
 
-  // Track Ctrl + Alt key combinations globally
+  // Track held modifier key combinations globally according to Modifier Key Settings
   useEffect(() => {
+    const syncHeldAction = (e: KeyboardEvent, spaceOverride?: boolean) => {
+      const action = resolveHeldKeyModifierAction(
+        {
+          ctrl: e.ctrlKey || e.metaKey,
+          shift: e.shiftKey,
+          alt: e.altKey,
+          space: spaceOverride !== undefined ? spaceOverride : isSpaceDown,
+        },
+        useUiStore.getState().appSettings.modifierKeys
+      );
+      setHeldModifierAction(action);
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.altKey) {
-        setIsCtrlAltDown(true);
+      if (e.key === 'Escape' && quickPalettePos) {
+        setQuickPalettePos(null);
       }
+      syncHeldAction(e, e.code === 'Space' ? true : undefined);
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (!((e.ctrlKey || e.metaKey) && e.altKey)) {
-        setIsCtrlAltDown(false);
-      }
+      syncHeldAction(e, e.code === 'Space' ? false : undefined);
     };
 
     const handleBlur = () => {
-      setIsCtrlAltDown(false);
+      setHeldModifierAction('none');
       setIsResizingBrush(false);
+      setQuickPalettePos(null);
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -926,7 +965,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
     };
-  }, []);
+  }, [isSpaceDown, quickPalettePos]);
 
   // Handle active brush resizing window drag listeners
   useEffect(() => {
@@ -1005,26 +1044,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     }
   };
 
-  // Viewport background pointer down (clicking gray area to pan or rotate)
-  const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    releaseExternalFocus();
-    if (e.button === 1) {
-      onStartPan(e);
-      return;
-    }
-    if (e.button === 0) {
-      if ((e.ctrlKey || e.metaKey) && e.altKey) {
-        startBrushResize(e);
-        return;
-      }
-      if (isRotateModifier) {
-        onStartRotate(e);
-      } else if (isSpaceDown) {
-        onStartPan(e);
-      }
-    }
-  };
-
   // Start brush resizing drag
   const startBrushResize = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -1037,29 +1056,177 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
   };
 
-  // Canvas pointer down: check for resize, rotate, pan, or normal draw
-  const handleCanvasPointerDown = (e: React.PointerEvent<HTMLElement>) => {
+  // Start continuous eyedropper sampling for modifier buttons (e.g. Right Click / Barrel Button)
+  const startModifierEyedropper = (e: React.PointerEvent) => {
+    if (!onSampleColor || !viewportRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const sampleAtClient = (clientX: number, clientY: number) => {
+      const vp = viewportRef.current;
+      if (!vp) return;
+      const rect = vp.getBoundingClientRect();
+      const cam = navigation
+        ? navigation.getCameraState()
+        : { pan, zoom, rotation, flipX, flipY };
+      const pt = screenToCanvas(
+        clientX,
+        clientY,
+        rect,
+        cam.pan,
+        cam.zoom,
+        cam.rotation,
+        dimensions,
+        cam.flipX,
+        cam.flipY
+      );
+      onSampleColor(pt);
+    };
+
+    sampleAtClient(e.clientX, e.clientY);
+
+    const handleMove = (ev: PointerEvent) => {
+      sampleAtClient(ev.clientX, ev.clientY);
+    };
+    const handleUp = () => {
+      window.removeEventListener('pointermove', handleMove);
+      window.removeEventListener('pointerup', handleUp);
+      window.removeEventListener('pointercancel', handleUp);
+    };
+    window.addEventListener('pointermove', handleMove, { passive: true });
+    window.addEventListener('pointerup', handleUp);
+    window.addEventListener('pointercancel', handleUp);
+  };
+
+  // Open floating Quick Palette near cursor when mapped to 'quick-palette'
+  const openQuickPaletteAt = (e: React.PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const rect = vp.getBoundingClientRect();
+    const x = Math.max(12, Math.min(rect.width - 210, e.clientX - rect.left));
+    const y = Math.max(12, Math.min(rect.height - 150, e.clientY - rect.top));
+    setQuickPalettePos({ x, y });
+  };
+
+  // Dispatch a resolved ModifierAction; returns true if the event was consumed
+  const dispatchModifierAction = (
+    action: ModifierAction,
+    e: React.PointerEvent<HTMLElement>,
+    allowDrawingPassThrough: boolean
+  ): boolean => {
+    switch (action) {
+      case 'pan':
+        onStartPan(e);
+        return true;
+      case 'rotate':
+        onStartRotate(e);
+        return true;
+      case 'zoom-drag':
+        if (onStartZoomDrag) {
+          onStartZoomDrag(e);
+          return true;
+        }
+        return false;
+      case 'brush-size':
+        startBrushResize(e);
+        return true;
+      case 'eyedropper':
+        if (e.button !== 0 || !allowDrawingPassThrough) {
+          startModifierEyedropper(e);
+          return true;
+        }
+        // When button 0 + Alt is held, GlobalShortcutListener already switched tool to pipette,
+        // or if not, sample directly via startModifierEyedropper
+        if (tool !== 'pipette') {
+          startModifierEyedropper(e);
+          return true;
+        }
+        return false;
+      case 'temp-eraser': {
+        if (!allowDrawingPassThrough) return false;
+        const cur = useToolStore.getState().tool;
+        if (cur !== 'eraser') {
+          tempEraserPrevToolRef.current = cur;
+          toolStoreActions.selectTool('eraser');
+        }
+        return false; // let stroke begin on eraser
+      }
+      case 'undo':
+        e.preventDefault();
+        e.stopPropagation();
+        onUndo?.();
+        return true;
+      case 'swap-colors':
+        e.preventDefault();
+        e.stopPropagation();
+        onSwapColors?.();
+        return true;
+      case 'quick-palette':
+        openQuickPaletteAt(e);
+        return true;
+      case 'straight-line':
+      case 'none':
+      default:
+        return false;
+    }
+  };
+
+  // Viewport background pointer down (clicking gray area to pan, rotate, zoom, resize, or quick palette)
+  const handleViewportPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     releaseExternalFocus();
-    if (e.button === 1) {
-      onStartPan(e);
+    if (quickPalettePos) setQuickPalettePos(null);
+
+    const modSettings = useUiStore.getState().appSettings.modifierKeys;
+    const resolved = resolvePointerModifierAction(
+      {
+        button: e.button,
+        pointerType: e.pointerType,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey,
+        altKey: e.altKey,
+        isSpaceDown,
+      },
+      modSettings
+    );
+    if (resolved && dispatchModifierAction(resolved.action, e, false)) {
       return;
     }
-    if (e.button === 0) {
-      // Dynamic Brush Resizing shortcut: Ctrl + Alt + Left Click Drag
-      if ((e.ctrlKey || e.metaKey) && e.altKey) {
-        startBrushResize(e);
+  };
+
+  // Canvas pointer down: resolve Modifier Key Settings first, otherwise dispatch drawing/tool stroke
+  const handleCanvasPointerDown = (e: React.PointerEvent<HTMLElement>) => {
+    releaseExternalFocus();
+    if (quickPalettePos) setQuickPalettePos(null);
+
+    const modSettings = useUiStore.getState().appSettings.modifierKeys;
+    const resolved = resolvePointerModifierAction(
+      {
+        button: e.button,
+        pointerType: e.pointerType,
+        ctrlKey: e.ctrlKey,
+        metaKey: e.metaKey,
+        shiftKey: e.shiftKey,
+        altKey: e.altKey,
+        isSpaceDown,
+      },
+      modSettings
+    );
+
+    if (resolved) {
+      if (dispatchModifierAction(resolved.action, e, true)) {
         return;
       }
-      if (isRotateModifier) {
-        onStartRotate(e);
-        return;
-      }
-      if (isSpaceDown) {
-        onStartPan(e);
-        return;
-      }
-      e.preventDefault();
     }
+
+    if (e.button === 0) {
+      e.preventDefault();
+    } else {
+      return;
+    }
+
     const coalesced = extractCoalescedEvents(e);
     (e as any).coalescedEvents = coalesced;
     if (e.nativeEvent) {
@@ -1080,22 +1247,40 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     onPointerMove(e, coalesced, predicted);
   };
 
+  const handleCanvasPointerUp = (e: React.PointerEvent<HTMLElement>) => {
+    onPointerUp(e);
+    if (tempEraserPrevToolRef.current !== null) {
+      const prev = tempEraserPrevToolRef.current;
+      tempEraserPrevToolRef.current = null;
+      toolStoreActions.selectTool(prev);
+    }
+  };
+
+  const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
+    const modSettings = useUiStore.getState().appSettings.modifierKeys;
+    if (modSettings.rightClick !== 'none' || modSettings.stylusButton1 !== 'none') {
+      e.preventDefault();
+    }
+  };
 
   // Determine cursor based on active mode
   const getCursorStyle = (isOverCanvas: boolean): React.CSSProperties => {
-    if (isResizingBrush || isCtrlAltDown) {
+    if (isResizingBrush || heldModifierAction === 'brush-size') {
       return { cursor: 'ew-resize' };
     }
-    if (isRotating || isRotateModifier) {
+    if (isZoomDragging || heldModifierAction === 'zoom-drag') {
+      return { cursor: 'zoom-in' };
+    }
+    if (isRotating || isRotateModifier || heldModifierAction === 'rotate') {
       return { cursor: ROTATE_CURSOR_CSS };
     }
     if (isPanning) {
       return { cursor: 'grabbing' };
     }
-    if (isSpaceDown) {
+    if (isSpaceDown || heldModifierAction === 'pan') {
       return { cursor: 'grab' };
     }
-    if (tool === 'pipette') {
+    if (tool === 'pipette' || heldModifierAction === 'eyedropper') {
       return { cursor: PIPETTE_CURSOR_CSS };
     }
     if (tool === 'text') {
@@ -1146,6 +1331,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     <main
       ref={viewportRef}
       onPointerDown={handleViewportPointerDown}
+      onContextMenu={handleContextMenu}
       className="flex-1 bg-[#161616] overflow-hidden relative select-none canvas-viewport"
       style={{
         touchAction: 'none',
@@ -1362,9 +1548,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           ref={interactionRef}
           onPointerDown={handleCanvasPointerDown}
           onPointerMove={handleCanvasPointerMove}
-          onPointerUp={onPointerUp}
+          onPointerUp={handleCanvasPointerUp}
           onPointerEnter={onPointerEnter}
           onPointerLeave={onPointerLeave}
+          onContextMenu={handleContextMenu}
           className="absolute inset-0 block touch-none z-20"
           style={{
             ...getCursorStyle(true),
@@ -1590,6 +1777,88 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
               <span className="text-[#8a8a8a]">·</span>
               <span>Hard {Math.round((brushSettings.hardness ?? 1.0) * 100)}%</span>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Quick Palette Popover (triggered by modifier mapped to 'quick-palette') */}
+      {quickPalettePos && (
+        <div
+          onPointerDown={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+          className="absolute z-50 bg-[#202020] border border-white/10 rounded-md shadow-[0_12px_32px_rgba(0,0,0,0.75)] p-2.5 w-48 space-y-2 text-[11px] text-[#e5e5e5] select-none"
+          style={{ left: `${quickPalettePos.x}px`, top: `${quickPalettePos.y}px` }}
+        >
+          <div className="flex items-center justify-between text-[10px] text-[#8a8a8a] uppercase tracking-wider">
+            <span>Quick Palette</span>
+            <button
+              type="button"
+              onClick={() => setQuickPalettePos(null)}
+              className="hover:text-[#e5e5e5] cursor-pointer px-1"
+            >
+              ×
+            </button>
+          </div>
+          <div className="grid grid-cols-6 gap-1">
+            {useToolStore.getState().recentColors.slice(0, 12).map((hex) => (
+              <button
+                key={hex}
+                type="button"
+                onClick={() => {
+                  toolStoreActions.setPrimaryColor(hex);
+                  setQuickPalettePos(null);
+                }}
+                className="w-6 h-6 rounded border border-white/15 cursor-pointer"
+                style={{ backgroundColor: hex }}
+                title={hex}
+              />
+            ))}
+          </div>
+          <div className="space-y-1">
+            <div className="flex items-center justify-between text-[10px] text-[#8a8a8a]">
+              <span>Size</span>
+              <span className="font-mono text-[#e5e5e5]">{brushSettings.size}px</span>
+            </div>
+            <input
+              type="range"
+              min="1"
+              max="300"
+              value={Math.round(brushSettings.size)}
+              onChange={(e) => onUpdateBrushSettings({ size: Number(e.target.value) })}
+              className="w-full"
+            />
+          </div>
+          <div className="grid grid-cols-3 gap-1 pt-0.5">
+            <button
+              type="button"
+              onClick={() => {
+                onUndo?.();
+                setQuickPalettePos(null);
+              }}
+              className="px-1.5 py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] cursor-pointer"
+            >
+              Undo
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onRedo?.();
+                setQuickPalettePos(null);
+              }}
+              className="px-1.5 py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] cursor-pointer"
+            >
+              Redo
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                onFlipHorizontal?.();
+                setQuickPalettePos(null);
+              }}
+              className="px-1.5 py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] cursor-pointer"
+            >
+              Flip H
+            </button>
           </div>
         </div>
       )}

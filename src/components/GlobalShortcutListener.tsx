@@ -7,6 +7,7 @@ import {
   ToolType,
   TransformSession,
 } from '../types/editor';
+import { ModifierAction } from '../types/settings';
 import { createDefaultAnimationTimeline } from '../utils/animationEngine';
 import { createDefaultPerspectiveRuler } from '../utils/perspectiveMath';
 import {
@@ -21,6 +22,11 @@ import {
   saveCustomBrush,
 } from '../utils/brushStorage';
 import { TonalCorrectionType } from '../utils/tonalEngine';
+import {
+  SPRING_LOADED_HOLD_MS,
+  SpringLoadedToolController,
+  shortcutManager,
+} from '../utils/shortcutManager';
 import {
   documentStoreActions,
   selectIsAnyModalOpen,
@@ -65,6 +71,10 @@ export interface GlobalShortcutListenerProps {
   handleOpenTonalModal: (type: TonalCorrectionType) => void;
   handleUpdateAnimationTimeline: (timeline: AnimationTimeline | null) => void;
   handleAddAnimationCel: (frameIndex: number) => void;
+  zoomIn?: () => void;
+  zoomOut?: () => void;
+  resetZoomAndCenter?: () => void;
+  resetRotation?: () => void;
   toggleFlipHorizontal: () => void;
   toggleFlipVertical: () => void;
   handleClearSelection: () => void;
@@ -76,20 +86,25 @@ export interface GlobalShortcutListenerProps {
   showToast: (msg: string) => void;
 }
 
-const CODE_TO_TOOL: Record<string, ToolType> = {
-  KeyB: 'brush',
-  KeyE: 'eraser',
-  KeyI: 'pipette',
-  KeyJ: 'liquify',
-  KeyM: 'select-rect',
-  KeyL: 'select-lasso',
-  KeyW: 'select-wand',
-  KeyG: 'fill',
-  KeyT: 'text',
-  KeyF: 'frame',
-  KeyO: 'balloon',
-  KeyY: 'vector-edit',
-};
+const NON_REPEATABLE_COMMANDS = new Set<string>([
+  'color.swap',
+  'color.reset',
+  'color.transparent',
+  'view.flipHorizontal',
+  'view.flipVertical',
+  'view.togglePalettes',
+  'view.toggleLeftPanel',
+  'view.softProof',
+  'view.gamutWarning',
+  'view.perspectiveRuler',
+  'view.perspectiveSnap',
+  'anim.toggleTimeline',
+  'app.preferences',
+  'file.new',
+  'file.open',
+  'file.save',
+  'file.saveAs',
+]);
 
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -97,24 +112,27 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
 }
 
+function modifierActionToTempTool(action: ModifierAction): ToolType | null {
+  if (action === 'eyedropper') return 'pipette';
+  if (action === 'temp-eraser') return 'eraser';
+  return null;
+}
+
 /**
- * Headless listener for global hotkeys, temporary tool holds, Alt eyedropper hold,
+ * Headless listener for global hotkeys (via centralized ShortcutManager),
+ * spring-loaded temporary tool holds (> 250ms), remappable modifier-key temporary tools,
  * drag-and-drop file import, and beforeunload brush settings persistence.
- * Reads tool/UI/document stores imperatively to avoid re-renders on brush/color edits.
  */
 export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = React.memo(
   (props) => {
     const propsRef = useRef(props);
     propsRef.current = props;
 
-    const previousToolBeforeAltRef = useRef<ToolType | null>(null);
-    const isAltActiveRef = useRef<boolean>(false);
-    const tempToolHoldRef = useRef<{
-      code: string;
+    const springControllerRef = useRef(new SpringLoadedToolController(SPRING_LOADED_HOLD_MS));
+    const activeModHoldRef = useRef<{
+      modKey: 'Alt' | 'Control' | 'Shift';
       prevTool: ToolType;
-      targetTool: ToolType;
-      downAt: number;
-      usedWhileHeld: boolean;
+      tempTool: ToolType;
     } | null>(null);
 
     // Flush debounced brush settings on window close/unmount
@@ -127,8 +145,208 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
       };
     }, []);
 
-    // Global Keyboard Shortcuts (Layout-Independent e.code + CSP Hold-and-Release Temporary Tools)
+    // Register centralized command handlers once (reads propsRef imperatively)
     useEffect(() => {
+      const restoreActiveModTool = () => {
+        const mod = activeModHoldRef.current;
+        if (!mod) return;
+        activeModHoldRef.current = null;
+        propsRef.current.isPipetteSamplingRef.current = false;
+        toolStoreActions.setQuickModifiers({ isAltActive: false });
+        toolStoreActions.setToolRaw(mod.prevTool);
+      };
+
+      const stepBrush = (dir: -1 | 1) => {
+        const toolState = useToolStore.getState();
+        if (toolState.tool === 'liquify') {
+          const nextSize = Math.max(
+            4,
+            Math.min(500, Math.round(stepBrushSizePreset(toolState.liquifySettings.size, dir)))
+          );
+          toolStoreActions.updateLiquifySettings({ size: nextSize });
+        } else {
+          const nextSize = stepBrushSizePreset(toolState.brushSettings.size, dir);
+          toolStoreActions.updateBrushSettings({ size: nextSize });
+        }
+      };
+
+      shortcutManager.registerHandlers({
+        // Menu / File / App
+        'file.new': () => uiStoreActions.setNewCanvasModalOpen(true),
+        'file.open': () => propsRef.current.handleTriggerOpenFile(),
+        'file.save': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleSave();
+        },
+        'file.saveAs': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleSaveAs();
+        },
+        'app.preferences': () => uiStoreActions.setSettingsModalOpen(true),
+        'view.togglePalettes': () => {
+          if (!propsRef.current.textSession) workspaceStoreActions.togglePalettesHidden();
+        },
+        'view.toggleLeftPanel': () => {
+          if (!propsRef.current.textSession) uiStoreActions.toggleLeftPanelHidden();
+        },
+        'view.softProof': () => {
+          if (propsRef.current.hasOpenDocument) documentStoreActions.toggleSoftProof();
+        },
+        'view.gamutWarning': () => {
+          if (propsRef.current.hasOpenDocument) documentStoreActions.toggleGamutWarning();
+        },
+        'anim.toggleTimeline': () => {
+          const p = propsRef.current;
+          if (!p.hasOpenDocument) return;
+          if (p.activeAnimationTimeline) {
+            p.handleUpdateAnimationTimeline(null);
+          } else {
+            p.handleUpdateAnimationTimeline(createDefaultAnimationTimeline(p.layers));
+          }
+        },
+        'anim.addCel': () => {
+          const p = propsRef.current;
+          if (!p.hasOpenDocument || !p.activeAnimationTimeline) return;
+          restoreActiveModTool();
+          p.handleAddAnimationCel(p.activeAnimationTimeline.currentFrame);
+        },
+
+        // Edit
+        'edit.undo': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleUndo();
+        },
+        'edit.redo': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.redo();
+        },
+        'edit.copy': () => {
+          if (!propsRef.current.hasOpenDocument) return;
+          propsRef.current.handleCopySelectedLayer();
+        },
+        'edit.paste': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handlePasteSelectedLayer();
+        },
+        'edit.delete': () => {
+          const p = propsRef.current;
+          if (!p.hasOpenDocument) return;
+          if (p.selection) p.handleClearSelection();
+          else p.handleDeleteSelectedLayer();
+        },
+        'edit.transform': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleStartTransform();
+        },
+        'edit.selectAll': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleSelectAll();
+        },
+        'edit.deselect': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleDeselect();
+        },
+        'edit.invertSelection': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleInvertSelection();
+        },
+        'edit.invertColors': () => {
+          const p = propsRef.current;
+          if (
+            !p.hasOpenDocument ||
+            !p.activeLayer ||
+            p.activeLayer.locked ||
+            p.activeLayer.type !== 'raster'
+          ) {
+            return;
+          }
+          p.handleApplyReverseGradient();
+        },
+        'edit.hueSaturation': () => {
+          const p = propsRef.current;
+          if (
+            !p.hasOpenDocument ||
+            !p.activeLayer ||
+            p.activeLayer.locked ||
+            p.activeLayer.type !== 'raster'
+          ) {
+            return;
+          }
+          p.handleOpenTonalModal('hue-saturation');
+        },
+
+        // Layer
+        'layer.newRaster': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleAddLayer('raster');
+        },
+        'layer.duplicate': () => {
+          const p = propsRef.current;
+          if (p.hasOpenDocument && p.activeLayer) p.duplicateLayer(p.activeLayerId);
+        },
+        'layer.group': () => {
+          if (propsRef.current.hasOpenDocument) propsRef.current.handleGroupSelectedLayers();
+        },
+
+        // Canvas View
+        'view.zoomIn': () => propsRef.current.zoomIn?.(),
+        'view.zoomOut': () => propsRef.current.zoomOut?.(),
+        'view.resetZoom': () => propsRef.current.resetZoomAndCenter?.(),
+        'view.resetRotation': () => propsRef.current.resetRotation?.(),
+        'view.flipHorizontal': () => {
+          const p = propsRef.current;
+          if (p.hasOpenDocument && !p.isSpaceDown) p.toggleFlipHorizontal();
+        },
+        'view.flipVertical': () => {
+          const p = propsRef.current;
+          if (p.hasOpenDocument && !p.isSpaceDown) p.toggleFlipVertical();
+        },
+        'view.perspectiveRuler': () => {
+          const p = propsRef.current;
+          documentStoreActions.setPerspectiveRuler((prev) => {
+            if (!prev) {
+              const next = createDefaultPerspectiveRuler('2-point', p.dimensions);
+              p.showToast('2-Point Perspective Ruler added to canvas');
+              return next;
+            }
+            const next = { ...prev, enabled: !prev.enabled };
+            p.showToast(next.enabled ? 'Perspective Ruler: Shown' : 'Perspective Ruler: Hidden');
+            return next;
+          });
+        },
+        'view.perspectiveSnap': () => {
+          const p = propsRef.current;
+          documentStoreActions.setPerspectiveRuler((prev) => {
+            if (!prev) return null;
+            const next = { ...prev, snapEnabled: !prev.snapEnabled };
+            p.showToast(
+              next.snapEnabled ? 'Perspective Snapping: ON' : 'Perspective Snapping: OFF'
+            );
+            return next;
+          });
+        },
+
+        // Tools & Colors
+        'tool.brushSizeDown': () => stepBrush(-1),
+        'tool.brushSizeUp': () => stepBrush(1),
+        'color.swap': () => toolStoreActions.swapColors(),
+        'color.reset': () => toolStoreActions.resetDefaultColors(),
+        'color.transparent': () => {
+          const next = toolStoreActions.toggleTransparentColor();
+          propsRef.current.showToast(
+            next ? 'Transparent ink mode active' : 'Color ink mode active'
+          );
+        },
+      });
+
+      return () => {
+        shortcutManager.clearHandlers();
+      };
+    }, []);
+
+    // Global Keyboard Shortcuts via ShortcutManager + Spring-Loaded Tools + Remappable Modifier Holds
+    useEffect(() => {
+      const clearModHold = () => {
+        const mod = activeModHoldRef.current;
+        if (!mod) return;
+        activeModHoldRef.current = null;
+        propsRef.current.isPipetteSamplingRef.current = false;
+        toolStoreActions.setQuickModifiers({ isAltActive: false });
+        if (useToolStore.getState().tool === mod.tempTool) {
+          toolStoreActions.setToolRaw(mod.prevTool);
+        }
+      };
+
       const handleKeyDown = (e: KeyboardEvent) => {
         const p = propsRef.current;
         const uiState = useUiStore.getState();
@@ -137,317 +355,110 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
           return;
         }
 
-        const key = e.key.toLowerCase();
-        const code = e.code;
+        const modSettings = uiState.appSettings.modifierKeys;
 
-        // Ctrl / Cmd shortcuts
-        if (e.ctrlKey || e.metaKey) {
-          if (e.altKey && !e.shiftKey && (code === 'KeyA' || key === 'a')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            if (p.activeAnimationTimeline) {
-              p.handleUpdateAnimationTimeline(null);
-            } else {
-              p.handleUpdateAnimationTimeline(createDefaultAnimationTimeline(p.layers));
-            }
-            return;
+        // 1. Bare modifier key temporary tool holds (Alt / Ctrl / Shift remappable to Eyedropper or Temp Eraser)
+        if (
+          (e.key === 'Alt' || e.key === 'Control' || e.key === 'Shift') &&
+          !p.isDrawingRef.current &&
+          !p.isSelectionPenDrawingRef.current
+        ) {
+          const onlyAlt = e.key === 'Alt' && !e.ctrlKey && !e.metaKey && !e.shiftKey;
+          const onlyCtrl = e.key === 'Control' && !e.altKey && !e.shiftKey;
+          const onlyShift = e.key === 'Shift' && !e.ctrlKey && !e.metaKey && !e.altKey;
+
+          let action: ModifierAction = 'none';
+          let modKey: 'Alt' | 'Control' | 'Shift' | null = null;
+          if (onlyAlt) {
+            action = modSettings.alt;
+            modKey = 'Alt';
+          } else if (onlyCtrl) {
+            action = modSettings.ctrl;
+            modKey = 'Control';
+          } else if (onlyShift) {
+            action = modSettings.shift;
+            modKey = 'Shift';
           }
 
-          if (e.altKey && !e.shiftKey && (code === 'KeyY' || key === 'y')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            documentStoreActions.toggleSoftProof();
-            return;
-          }
-
-          if (e.altKey) return;
-
-          if (!e.shiftKey && (code === 'KeyZ' || key === 'z')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleUndo();
-            return;
-          }
-
-          if (
-            (e.shiftKey && (code === 'KeyZ' || key === 'z')) ||
-            (!e.shiftKey && (code === 'KeyY' || key === 'y'))
-          ) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.redo();
-            return;
-          }
-
-          if (e.shiftKey && (code === 'KeyY' || key === 'y')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            documentStoreActions.toggleGamutWarning();
-            return;
-          }
-
-          if (e.shiftKey && (code === 'KeyN' || key === 'n')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleAddLayer('raster');
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyN' || key === 'n')) {
-            e.preventDefault();
-            uiStoreActions.setNewCanvasModalOpen(true);
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyO' || key === 'o')) {
-            e.preventDefault();
-            p.handleTriggerOpenFile();
-            return;
-          }
-
-          if (e.shiftKey && (code === 'KeyS' || key === 's')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleSaveAs();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyS' || key === 's')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleSave();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyJ' || key === 'j')) {
-            if (!p.hasOpenDocument || !p.activeLayer) return;
-            e.preventDefault();
-            p.duplicateLayer(p.activeLayerId);
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyC' || key === 'c')) {
-            if (!p.hasOpenDocument) return;
-            const textSel = window.getSelection()?.toString();
-            if (!textSel || textSel.length === 0) {
-              e.preventDefault();
-              p.handleCopySelectedLayer();
-              return;
-            }
-          }
-
-          if (!e.shiftKey && (code === 'KeyV' || key === 'v')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handlePasteSelectedLayer();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyG' || key === 'g')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleGroupSelectedLayers();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyT' || key === 't')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleStartTransform();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyA' || key === 'a')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleSelectAll();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyD' || key === 'd')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleDeselect();
-            return;
-          }
-
-          if (e.shiftKey && (code === 'KeyI' || key === 'i')) {
-            if (!p.hasOpenDocument) return;
-            e.preventDefault();
-            p.handleInvertSelection();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyI' || key === 'i')) {
-            if (
-              !p.hasOpenDocument ||
-              !p.activeLayer ||
-              p.activeLayer.locked ||
-              p.activeLayer.type !== 'raster'
-            ) {
-              return;
-            }
-            e.preventDefault();
-            p.handleApplyReverseGradient();
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'KeyU' || key === 'u')) {
-            if (
-              !p.hasOpenDocument ||
-              !p.activeLayer ||
-              p.activeLayer.locked ||
-              p.activeLayer.type !== 'raster'
-            ) {
-              return;
-            }
-            e.preventDefault();
-            p.handleOpenTonalModal('hue-saturation');
-            return;
-          }
-
-          if (!e.shiftKey && (code === 'Comma' || key === ',' || key === '<')) {
-            e.preventDefault();
-            uiStoreActions.setSettingsModalOpen(true);
-            return;
-          }
-
-          if (e.shiftKey && (code === 'KeyR' || key === 'r')) {
-            e.preventDefault();
-            documentStoreActions.setPerspectiveRuler((prev) => {
-              if (!prev) {
-                const next = createDefaultPerspectiveRuler('2-point', p.dimensions);
-                p.showToast('2-Point Perspective Ruler added to canvas');
-                return next;
+          const tempTool = modifierActionToTempTool(action);
+          if (tempTool && modKey) {
+            if (modKey === 'Alt') e.preventDefault();
+            if (!activeModHoldRef.current && !e.repeat) {
+              const currentTool = useToolStore.getState().tool;
+              if (currentTool !== tempTool) {
+                activeModHoldRef.current = { modKey, prevTool: currentTool, tempTool };
+                if (modKey === 'Alt') {
+                  toolStoreActions.setQuickModifiers({ isAltActive: true });
+                }
+                toolStoreActions.setToolRaw(tempTool);
               }
-              const next = { ...prev, enabled: !prev.enabled };
-              p.showToast(next.enabled ? 'Perspective Ruler: Shown' : 'Perspective Ruler: Hidden');
-              return next;
-            });
-            return;
-          }
-
-          if (e.shiftKey && (code === 'KeyP' || key === 'p')) {
-            e.preventDefault();
-            documentStoreActions.setPerspectiveRuler((prev) => {
-              if (!prev) return null;
-              const next = { ...prev, snapEnabled: !prev.snapEnabled };
-              p.showToast(
-                next.snapEnabled ? 'Perspective Snapping: ON' : 'Perspective Snapping: OFF'
-              );
-              return next;
-            });
-            return;
-          }
-          return;
-        }
-
-        // Alt-only shortcuts: Alt+C -> Add Animation Cel
-        if (e.altKey && !e.ctrlKey && !e.metaKey) {
-          if (!e.shiftKey && (code === 'KeyC' || key === 'c')) {
-            if (!p.hasOpenDocument || !p.activeAnimationTimeline) return;
-            e.preventDefault();
-            if (isAltActiveRef.current && previousToolBeforeAltRef.current !== null) {
-              toolStoreActions.setToolRaw(previousToolBeforeAltRef.current);
-              previousToolBeforeAltRef.current = null;
-              isAltActiveRef.current = false;
-              toolStoreActions.setQuickModifiers({ isAltActive: false });
             }
-            p.handleAddAnimationCel(p.activeAnimationTimeline.currentFrame);
-          }
-          return;
-        }
-
-        // Tab / Shift+Tab: Toggle UI Panels (CSP Hide/Show Palettes)
-        if (code === 'Tab' && !p.textSession) {
-          e.preventDefault();
-          if (e.shiftKey) {
-            uiStoreActions.toggleLeftPanelHidden();
-          } else {
-            workspaceStoreActions.togglePalettesHidden();
-          }
-          return;
-        }
-
-        // Brush Size Stepper: [ and ]
-        if (!e.shiftKey && (code === 'BracketLeft' || code === 'BracketRight')) {
-          e.preventDefault();
-          const dir: -1 | 1 = code === 'BracketLeft' ? -1 : 1;
-          const toolState = useToolStore.getState();
-          if (toolState.tool === 'liquify') {
-            const nextSize = Math.max(
-              4,
-              Math.min(500, Math.round(stepBrushSizePreset(toolState.liquifySettings.size, dir)))
-            );
-            toolStoreActions.updateLiquifySettings({ size: nextSize });
-          } else {
-            const nextSize = stepBrushSizePreset(toolState.brushSettings.size, dir);
-            toolStoreActions.updateBrushSettings({ size: nextSize });
-          }
-          return;
-        }
-
-        // Non-destructive View Flip shortcuts
-        if (e.shiftKey && !p.isSpaceDown) {
-          if (code === 'KeyH' || key === 'h') {
-            if (!p.hasOpenDocument || e.repeat) return;
-            e.preventDefault();
-            p.toggleFlipHorizontal();
-            return;
-          }
-          if (code === 'KeyV' || key === 'v') {
-            if (!p.hasOpenDocument || e.repeat) return;
-            e.preventDefault();
-            p.toggleFlipVertical();
             return;
           }
         }
 
-        // Single-key tool & color shortcuts
-        if (!e.shiftKey) {
-          const mappedTool = CODE_TO_TOOL[code];
-          if (mappedTool) {
+        // Cancel temporary modifier tool if combined with another modifier/Space (e.g. Ctrl+Alt brush resize)
+        if (
+          activeModHoldRef.current &&
+          (e.code === 'Space' ||
+            (activeModHoldRef.current.modKey === 'Alt' && (e.ctrlKey || e.metaKey || e.shiftKey)) ||
+            (activeModHoldRef.current.modKey === 'Control' && (e.altKey || e.shiftKey)) ||
+            (activeModHoldRef.current.modKey === 'Shift' && (e.ctrlKey || e.metaKey || e.altKey)))
+        ) {
+          clearModHold();
+        }
+
+        // 2. Match against centralized ShortcutManager (live overrides read imperatively!)
+        const overrides = uiState.appSettings.shortcuts;
+        shortcutManager.setOverrides(overrides);
+        const matched = shortcutManager.matchEvent(e, overrides);
+
+        if (matched) {
+          // Guard special contextual exceptions before preventDefault
+          if (matched.id === 'edit.copy') {
+            const textSel = window.getSelection()?.toString();
+            if (textSel && textSel.length > 0) return;
+          }
+          if (
+            (matched.id === 'view.togglePalettes' || matched.id === 'view.toggleLeftPanel') &&
+            p.textSession
+          ) {
+            return;
+          }
+          if (
+            (matched.id === 'view.flipHorizontal' || matched.id === 'view.flipVertical') &&
+            p.isSpaceDown
+          ) {
+            return;
+          }
+
+          if (matched.springLoaded && matched.toolId) {
             if (e.repeat) return;
-            const prev = useToolStore.getState().tool;
-            if (prev !== mappedTool) {
-              tempToolHoldRef.current = {
-                code,
-                prevTool: prev,
-                targetTool: mappedTool,
-                downAt: performance.now(),
-                usedWhileHeld: false,
-              };
-              toolStoreActions.selectTool(mappedTool);
+            e.preventDefault();
+            const currentTool = useToolStore.getState().tool;
+            const nextTool = springControllerRef.current.handleToolKeyDown(
+              e.code || matched.id,
+              matched.toolId,
+              currentTool
+            );
+            if (nextTool) {
+              toolStoreActions.selectTool(nextTool);
             }
             return;
           }
 
-          if (code === 'KeyX' || key === 'x') {
-            if (!e.repeat) toolStoreActions.swapColors();
+          if (e.repeat && NON_REPEATABLE_COMMANDS.has(matched.id)) {
             return;
           }
-          if (code === 'KeyD' || key === 'd') {
-            if (!e.repeat) toolStoreActions.resetDefaultColors();
-            return;
-          }
-          if (code === 'KeyC' || key === 'c') {
-            if (!e.repeat) {
-              const next = toolStoreActions.toggleTransparentColor();
-              p.showToast(next ? 'Transparent ink mode active' : 'Color ink mode active');
-            }
-            return;
-          }
+
+          e.preventDefault();
+          shortcutManager.executeCommand(matched.id);
+          return;
         }
 
-        if (key === 'delete' || key === 'backspace') {
-          if (!p.hasOpenDocument) return;
-          e.preventDefault();
-          if (p.selection) {
-            p.handleClearSelection();
-          } else {
-            p.handleDeleteSelectedLayer();
-          }
-        } else if (key === 'escape') {
+        // 3. Contextual Escape / Enter fallbacks for active sessions
+        const key = e.key.toLowerCase();
+        if (key === 'escape') {
           if (p.transformSession?.active) {
             e.preventDefault();
             p.handleCancelTransform();
@@ -467,27 +478,39 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
       };
 
       const handleKeyUp = (e: KeyboardEvent) => {
-        const hold = tempToolHoldRef.current;
-        if (hold && e.code === hold.code) {
-          const heldMs = performance.now() - hold.downAt;
-          tempToolHoldRef.current = null;
-          if (
-            (heldMs >= 220 || hold.usedWhileHeld) &&
-            useToolStore.getState().tool === hold.targetTool
-          ) {
-            toolStoreActions.selectTool(hold.prevTool);
+        // 1. Release spring-loaded tool hold (> 250ms or used while held)
+        const restored = springControllerRef.current.handleKeyUp(
+          e.code,
+          useToolStore.getState().tool
+        );
+        if (restored) {
+          toolStoreActions.selectTool(restored);
+        }
+
+        // 2. Release temporary modifier-key tool hold
+        const mod = activeModHoldRef.current;
+        if (mod) {
+          const released =
+            (mod.modKey === 'Alt' && (e.key === 'Alt' || !e.altKey)) ||
+            (mod.modKey === 'Control' && (e.key === 'Control' || (!e.ctrlKey && !e.metaKey))) ||
+            (mod.modKey === 'Shift' && (e.key === 'Shift' || !e.shiftKey));
+          if (released) {
+            if (mod.modKey === 'Alt') e.preventDefault();
+            clearModHold();
           }
         }
       };
 
       const handlePointerDownMarkUsed = () => {
-        if (tempToolHoldRef.current) {
-          tempToolHoldRef.current.usedWhileHeld = true;
-        }
+        springControllerRef.current.markUsedWhileHeld();
       };
 
       const handleWindowBlur = () => {
-        tempToolHoldRef.current = null;
+        const restored = springControllerRef.current.cancel(useToolStore.getState().tool);
+        if (restored) {
+          toolStoreActions.selectTool(restored);
+        }
+        clearModHold();
       };
 
       window.addEventListener('keydown', handleKeyDown);
@@ -499,85 +522,6 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         window.removeEventListener('keyup', handleKeyUp);
         window.removeEventListener('pointerdown', handlePointerDownMarkUsed, true);
         window.removeEventListener('blur', handleWindowBlur);
-      };
-    }, []);
-
-    // Alt-hold temporary pipette
-    useEffect(() => {
-      const handleKeyDown = (e: KeyboardEvent) => {
-        const p = propsRef.current;
-        const uiState = useUiStore.getState();
-        const isModalOpen = selectIsAnyModalOpen(uiState, p.isHostModalOpen) || uiState.isLoadingFile;
-        if (isModalOpen || isEditableTarget(e.target)) {
-          return;
-        }
-
-        if (e.key === 'Alt') {
-          if (
-            !e.ctrlKey &&
-            !e.metaKey &&
-            !p.isDrawingRef.current &&
-            !p.isSelectionPenDrawingRef.current
-          ) {
-            e.preventDefault();
-            if (!isAltActiveRef.current && !e.repeat) {
-              isAltActiveRef.current = true;
-              toolStoreActions.setQuickModifiers({ isAltActive: true });
-              const currentTool = useToolStore.getState().tool;
-              if (currentTool !== 'pipette') {
-                previousToolBeforeAltRef.current = currentTool;
-                toolStoreActions.setToolRaw('pipette');
-              }
-            }
-          }
-          return;
-        }
-
-        if ((e.ctrlKey || e.metaKey || e.code === 'Space') && isAltActiveRef.current) {
-          if (previousToolBeforeAltRef.current !== null) {
-            toolStoreActions.setToolRaw(previousToolBeforeAltRef.current);
-            previousToolBeforeAltRef.current = null;
-          }
-          isAltActiveRef.current = false;
-          p.isPipetteSamplingRef.current = false;
-          toolStoreActions.setQuickModifiers({ isAltActive: false });
-        }
-      };
-
-      const handleKeyUp = (e: KeyboardEvent) => {
-        const p = propsRef.current;
-        if (e.key === 'Alt' || (!e.altKey && isAltActiveRef.current)) {
-          if (isAltActiveRef.current) {
-            e.preventDefault();
-            isAltActiveRef.current = false;
-            toolStoreActions.setQuickModifiers({ isAltActive: false });
-          }
-          p.isPipetteSamplingRef.current = false;
-          if (previousToolBeforeAltRef.current !== null) {
-            toolStoreActions.setToolRaw(previousToolBeforeAltRef.current);
-            previousToolBeforeAltRef.current = null;
-          }
-        }
-      };
-
-      const handleBlur = () => {
-        const p = propsRef.current;
-        isAltActiveRef.current = false;
-        p.isPipetteSamplingRef.current = false;
-        toolStoreActions.setQuickModifiers({ isAltActive: false });
-        if (previousToolBeforeAltRef.current !== null) {
-          toolStoreActions.setToolRaw(previousToolBeforeAltRef.current);
-          previousToolBeforeAltRef.current = null;
-        }
-      };
-
-      window.addEventListener('keydown', handleKeyDown);
-      window.addEventListener('keyup', handleKeyUp);
-      window.addEventListener('blur', handleBlur);
-      return () => {
-        window.removeEventListener('keydown', handleKeyDown);
-        window.removeEventListener('keyup', handleKeyUp);
-        window.removeEventListener('blur', handleBlur);
       };
     }, []);
 

@@ -72,6 +72,112 @@ export function getAccentContrastColor(hex: string): string {
   return luminance > 0.55 ? '#161616' : '#e5e5e5';
 }
 
+export type ShortcutCategory = 'Tools' | 'Menu' | 'Canvas View' | 'Layer' | 'Edit';
+
+export type ShortcutOverrides = Record<string, string>;
+
+export type ModifierKeySlot =
+  | 'space'
+  | 'shift'
+  | 'ctrl'
+  | 'alt'
+  | 'ctrlSpace'
+  | 'shiftSpace'
+  | 'ctrlAlt'
+  | 'shiftAlt'
+  | 'rightClick'
+  | 'middleClick'
+  | 'stylusButton1'
+  | 'stylusButton2';
+
+export type ModifierAction =
+  | 'none'
+  | 'pan'
+  | 'rotate'
+  | 'zoom-drag'
+  | 'eyedropper'
+  | 'brush-size'
+  | 'straight-line'
+  | 'temp-eraser'
+  | 'undo'
+  | 'swap-colors'
+  | 'quick-palette';
+
+export type MouseWheelAction = 'zoom' | 'scroll' | 'brush-size';
+
+export interface ModifierKeySettings {
+  space: ModifierAction;
+  shift: ModifierAction;
+  ctrl: ModifierAction;
+  alt: ModifierAction;
+  ctrlSpace: ModifierAction;
+  shiftSpace: ModifierAction;
+  ctrlAlt: ModifierAction;
+  shiftAlt: ModifierAction;
+  rightClick: ModifierAction;
+  middleClick: ModifierAction;
+  stylusButton1: ModifierAction;
+  stylusButton2: ModifierAction;
+  mouseWheel: MouseWheelAction;
+}
+
+export type PressureCurvePoint = [number, number];
+
+export type PressureCurvePreset = 'linear' | 'soft' | 'hard' | 'custom';
+
+export interface PressureCurveSettings {
+  enabled: boolean;
+  preset: PressureCurvePreset;
+  points: PressureCurvePoint[];
+}
+
+export const DEFAULT_MODIFIER_KEY_SETTINGS: ModifierKeySettings = {
+  space: 'pan',
+  shift: 'straight-line',
+  ctrl: 'none',
+  alt: 'eyedropper',
+  ctrlSpace: 'zoom-drag',
+  shiftSpace: 'rotate',
+  ctrlAlt: 'brush-size',
+  shiftAlt: 'brush-size',
+  rightClick: 'eyedropper',
+  middleClick: 'pan',
+  stylusButton1: 'eyedropper',
+  stylusButton2: 'pan',
+  mouseWheel: 'zoom',
+};
+
+export const PRESSURE_CURVE_PRESETS: Record<
+  Exclude<PressureCurvePreset, 'custom'>,
+  PressureCurvePoint[]
+> = {
+  linear: [
+    [0, 0],
+    [1, 1],
+  ],
+  soft: [
+    [0, 0],
+    [0.25, 0.48],
+    [0.6, 0.84],
+    [1, 1],
+  ],
+  hard: [
+    [0, 0],
+    [0.4, 0.16],
+    [0.75, 0.52],
+    [1, 1],
+  ],
+};
+
+export const DEFAULT_PRESSURE_CURVE_SETTINGS: PressureCurveSettings = {
+  enabled: true,
+  preset: 'linear',
+  points: [
+    [0, 0],
+    [1, 1],
+  ],
+};
+
 export interface AppSettings {
   // User Profile
   userName: string;
@@ -101,6 +207,11 @@ export interface AppSettings {
   smoothingEnabled: boolean;
   maxHistorySteps: number;
 
+  // Shortcuts, Modifier Keys & Pen Pressure Calibration
+  shortcuts: ShortcutOverrides;
+  modifierKeys: ModifierKeySettings;
+  pressureCurve: PressureCurveSettings;
+
   // Performance & Scratch Disk
   tileMemoryBudgetMb: number;
 }
@@ -129,13 +240,138 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   smoothingEnabled: true,
   maxHistorySteps: 50,
 
+  shortcuts: {},
+  modifierKeys: { ...DEFAULT_MODIFIER_KEY_SETTINGS },
+  pressureCurve: {
+    ...DEFAULT_PRESSURE_CURVE_SETTINGS,
+    points: DEFAULT_PRESSURE_CURVE_SETTINGS.points.map(([x, y]) => [x, y] as PressureCurvePoint),
+  },
+
   tileMemoryBudgetMb: 1024,
 };
+
+const VALID_MODIFIER_ACTIONS = new Set<ModifierAction>([
+  'none',
+  'pan',
+  'rotate',
+  'zoom-drag',
+  'eyedropper',
+  'brush-size',
+  'straight-line',
+  'temp-eraser',
+  'undo',
+  'swap-colors',
+  'quick-palette',
+]);
+
+const VALID_MOUSE_WHEEL_ACTIONS = new Set<MouseWheelAction>(['zoom', 'scroll', 'brush-size']);
+
+function sanitizeModifierKeys(raw: unknown): ModifierKeySettings {
+  const result: ModifierKeySettings = { ...DEFAULT_MODIFIER_KEY_SETTINGS };
+  if (!raw || typeof raw !== 'object') return result;
+  const obj = raw as Record<string, unknown>;
+  const slots: ModifierKeySlot[] = [
+    'space',
+    'shift',
+    'ctrl',
+    'alt',
+    'ctrlSpace',
+    'shiftSpace',
+    'ctrlAlt',
+    'shiftAlt',
+    'rightClick',
+    'middleClick',
+    'stylusButton1',
+    'stylusButton2',
+  ];
+  for (const slot of slots) {
+    if (typeof obj[slot] === 'string' && VALID_MODIFIER_ACTIONS.has(obj[slot] as ModifierAction)) {
+      result[slot] = obj[slot] as ModifierAction;
+    }
+  }
+  if (
+    typeof obj.mouseWheel === 'string' &&
+    VALID_MOUSE_WHEEL_ACTIONS.has(obj.mouseWheel as MouseWheelAction)
+  ) {
+    result.mouseWheel = obj.mouseWheel as MouseWheelAction;
+  }
+  return result;
+}
+
+function sanitizeShortcuts(raw: unknown): ShortcutOverrides {
+  const result: ShortcutOverrides = {};
+  if (!raw || typeof raw !== 'object') return result;
+  const obj = raw as Record<string, unknown>;
+  for (const [key, val] of Object.entries(obj)) {
+    if (typeof key === 'string' && typeof val === 'string') {
+      result[key] = val;
+    }
+  }
+  return result;
+}
+
+function sanitizePressureCurve(raw: unknown): PressureCurveSettings {
+  if (!raw || typeof raw !== 'object') {
+    return {
+      ...DEFAULT_PRESSURE_CURVE_SETTINGS,
+      points: DEFAULT_PRESSURE_CURVE_SETTINGS.points.map(([x, y]) => [x, y] as PressureCurvePoint),
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  const enabled = typeof obj.enabled === 'boolean' ? obj.enabled : true;
+  const preset: PressureCurvePreset =
+    obj.preset === 'linear' ||
+    obj.preset === 'soft' ||
+    obj.preset === 'hard' ||
+    obj.preset === 'custom'
+      ? obj.preset
+      : 'custom';
+  const rawPts = Array.isArray(obj.points) ? obj.points : DEFAULT_PRESSURE_CURVE_SETTINGS.points;
+  const validPts: PressureCurvePoint[] = [];
+  for (const p of rawPts) {
+    if (
+      Array.isArray(p) &&
+      p.length >= 2 &&
+      typeof p[0] === 'number' &&
+      typeof p[1] === 'number' &&
+      Number.isFinite(p[0]) &&
+      Number.isFinite(p[1])
+    ) {
+      validPts.push([
+        Math.max(0, Math.min(1, p[0])),
+        Math.max(0, Math.min(1, p[1])),
+      ]);
+    }
+  }
+  validPts.sort((a, b) => a[0] - b[0]);
+  if (validPts.length < 2) {
+    return {
+      enabled,
+      preset: 'linear',
+      points: [
+        [0, 0],
+        [1, 1],
+      ],
+    };
+  }
+  return { enabled, preset, points: validPts };
+}
 
 const SETTINGS_KEY = 'ink_studio_app_settings';
 
 export function loadAppSettings(): AppSettings {
   try {
+    if (typeof localStorage === 'undefined' || typeof localStorage.getItem !== 'function') {
+      return {
+        ...DEFAULT_APP_SETTINGS,
+        shortcuts: {},
+        modifierKeys: { ...DEFAULT_MODIFIER_KEY_SETTINGS },
+        pressureCurve: {
+          ...DEFAULT_PRESSURE_CURVE_SETTINGS,
+          points: DEFAULT_PRESSURE_CURVE_SETTINGS.points.map(([x, y]) => [x, y] as PressureCurvePoint),
+        },
+      };
+    }
     const raw = localStorage.getItem(SETTINGS_KEY);
     const legacyName = localStorage.getItem('sora_paint_nickname') || '';
     if (raw) {
@@ -173,22 +409,42 @@ export function loadAppSettings(): AppSettings {
         modernCustomColor: validCustomColor,
         uiTone: validTone,
         tileMemoryBudgetMb: validBudget,
+        shortcuts: sanitizeShortcuts(parsed.shortcuts),
+        modifierKeys: sanitizeModifierKeys(parsed.modifierKeys),
+        pressureCurve: sanitizePressureCurve(parsed.pressureCurve),
       };
     } else if (legacyName) {
       return {
         ...DEFAULT_APP_SETTINGS,
         userName: legacyName,
         hasPromptedName: true,
+        shortcuts: {},
+        modifierKeys: { ...DEFAULT_MODIFIER_KEY_SETTINGS },
+        pressureCurve: {
+          ...DEFAULT_PRESSURE_CURVE_SETTINGS,
+          points: DEFAULT_PRESSURE_CURVE_SETTINGS.points.map(([x, y]) => [x, y] as PressureCurvePoint),
+        },
       };
     }
   } catch (err) {
     console.warn('Failed to load settings from localStorage:', err);
   }
-  return { ...DEFAULT_APP_SETTINGS };
+  return {
+    ...DEFAULT_APP_SETTINGS,
+    shortcuts: {},
+    modifierKeys: { ...DEFAULT_MODIFIER_KEY_SETTINGS },
+    pressureCurve: {
+      ...DEFAULT_PRESSURE_CURVE_SETTINGS,
+      points: DEFAULT_PRESSURE_CURVE_SETTINGS.points.map(([x, y]) => [x, y] as PressureCurvePoint),
+    },
+  };
 }
 
 export function saveAppSettings(settings: AppSettings): void {
   try {
+    if (typeof localStorage === 'undefined' || typeof localStorage.setItem !== 'function') {
+      return;
+    }
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
   } catch (err) {
     console.warn('Failed to save settings to localStorage:', err);

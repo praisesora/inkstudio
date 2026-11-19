@@ -1,24 +1,41 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   X,
   Palette,
   Layers,
   Paintbrush,
   Keyboard,
+  SlidersHorizontal,
   Info,
   RotateCcw,
   Check,
   Search,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   AppSettings,
   DEFAULT_APP_SETTINGS,
+  DEFAULT_MODIFIER_KEY_SETTINGS,
+  ModifierAction,
+  ModifierKeySlot,
+  MouseWheelAction,
   ModernAccentColor,
   MODERN_ACCENTS,
+  ShortcutCategory,
   resolveModernAccentColor,
 } from '../types/settings';
 import { CanvasColorMode } from '../types/editor';
 import { DPI_PRESETS } from './NewCanvasModal';
+import { PressureCurveEditor } from './PressureCurveEditor';
+import {
+  CommandDefinition,
+  DEFAULT_COMMANDS,
+  SHORTCUT_CATEGORIES,
+  findShortcutConflicts,
+  formatShortcutFromEvent,
+  formatShortcutLabel,
+  resolveCommandShortcut,
+} from '../utils/shortcutManager';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -28,37 +45,61 @@ interface SettingsModalProps {
   onShowToast: (message: string) => void;
 }
 
-type SettingsTab = 'appearance' | 'canvas' | 'brush' | 'shortcuts' | 'about';
+type SettingsTab = 'appearance' | 'canvas' | 'brush' | 'shortcuts' | 'modifiers' | 'about';
 
-interface ShortcutRow {
-  category: string;
-  action: string;
-  shortcut: string;
+const MODIFIER_ACTION_OPTIONS: Array<{ value: ModifierAction; label: string }> = [
+  { value: 'none', label: 'None' },
+  { value: 'pan', label: 'Pan / Hand Tool' },
+  { value: 'rotate', label: 'Rotate Canvas' },
+  { value: 'zoom-drag', label: 'Scrubby Zoom Drag' },
+  { value: 'eyedropper', label: 'Eyedropper (Sample Color)' },
+  { value: 'brush-size', label: 'Brush Size & Hardness Drag' },
+  { value: 'straight-line', label: 'Straight Line / Angle Snap' },
+  { value: 'temp-eraser', label: 'Temporary Eraser' },
+  { value: 'quick-palette', label: 'Quick Palette Popover' },
+  { value: 'swap-colors', label: 'Swap Primary / Secondary Color' },
+  { value: 'undo', label: 'Undo' },
+];
+
+const MOUSE_WHEEL_OPTIONS: Array<{ value: MouseWheelAction; label: string }> = [
+  { value: 'zoom', label: 'Zoom In / Out' },
+  { value: 'scroll', label: 'Scroll / Pan Canvas' },
+  { value: 'brush-size', label: 'Adjust Brush Size' },
+];
+
+const MODIFIER_SLOTS: Array<{
+  slot: ModifierKeySlot;
+  label: string;
   desc: string;
-}
-
-const SHORTCUTS_DATA: ShortcutRow[] = [
-  { category: 'File', action: 'New Canvas', shortcut: 'Ctrl + N', desc: 'Create a new canvas' },
-  { category: 'File', action: 'Open File', shortcut: 'Ctrl + O', desc: 'Open images, PSD, or CSP files' },
-  { category: 'File', action: 'Save', shortcut: 'Ctrl + S', desc: 'Save current document' },
-  { category: 'File', action: 'Save As', shortcut: 'Ctrl + Shift + S', desc: 'Save as a new file' },
-  { category: 'Edit', action: 'Undo', shortcut: 'Ctrl + Z', desc: 'Undo last action' },
-  { category: 'Edit', action: 'Redo', shortcut: 'Ctrl + Y', desc: 'Redo undone action' },
-  { category: 'Edit', action: 'Copy Layer', shortcut: 'Ctrl + C', desc: 'Copy selected layer' },
-  { category: 'Edit', action: 'Paste Layer', shortcut: 'Ctrl + V', desc: 'Paste copied layer' },
-  { category: 'Edit', action: 'Delete Layer', shortcut: 'Del', desc: 'Delete selected layer' },
-  { category: 'Edit', action: 'Preferences', shortcut: 'Ctrl + ,', desc: 'Open preferences' },
-  { category: 'Tools', action: 'Brush Tool', shortcut: 'B', desc: 'Switch to brush' },
-  { category: 'Tools', action: 'Eraser Tool', shortcut: 'E', desc: 'Switch to eraser' },
-  { category: 'Tools', action: 'Swap Colors', shortcut: 'X', desc: 'Swap primary and secondary colors' },
-  { category: 'Tools', action: 'Brush Size & Hardness', shortcut: 'Ctrl + Alt + Drag', desc: 'Horizontal: size, Vertical: hardness' },
-  { category: 'Navigation', action: 'Pan Canvas', shortcut: 'Space + Drag', desc: 'Pan viewport' },
-  { category: 'Navigation', action: 'Rotate Canvas', shortcut: 'Shift + Space + Drag', desc: 'Rotate viewport' },
-  { category: 'Navigation', action: 'Zoom In / Out', shortcut: 'Ctrl + +/-', desc: 'Adjust magnification' },
-  { category: 'Navigation', action: 'Reset Zoom', shortcut: 'Ctrl + 0', desc: 'Fit & center canvas' },
-  { category: 'Navigation', action: 'Reset Rotation', shortcut: 'Ctrl + Alt + 0', desc: 'Reset angle to 0°' },
-  { category: 'Layers', action: 'New Raster Layer', shortcut: 'Ctrl + Shift + N', desc: 'Add transparent layer' },
-  { category: 'Layers', action: 'Duplicate Layer', shortcut: 'Ctrl + J', desc: 'Clone current layer' },
+}> = [
+  { slot: 'space', label: 'Space + Drag', desc: 'Hold Space while dragging on canvas' },
+  { slot: 'shift', label: 'Shift', desc: 'Hold Shift while clicking or dragging' },
+  { slot: 'ctrl', label: 'Ctrl', desc: 'Hold Ctrl / Cmd while clicking or dragging' },
+  { slot: 'alt', label: 'Alt', desc: 'Hold Alt while clicking or hovering' },
+  { slot: 'ctrlSpace', label: 'Ctrl + Space + Drag', desc: 'Hold Ctrl + Space and drag' },
+  { slot: 'shiftSpace', label: 'Shift + Space + Drag', desc: 'Hold Shift + Space and drag' },
+  {
+    slot: 'ctrlAlt',
+    label: 'Ctrl + Alt + Drag',
+    desc: 'Interactive brush size (horizontal) & hardness (vertical)',
+  },
+  {
+    slot: 'shiftAlt',
+    label: 'Shift + Alt + Drag',
+    desc: 'Alternate brush size / modifier drag combo',
+  },
+  { slot: 'rightClick', label: 'Right Click', desc: 'Secondary mouse button on canvas' },
+  { slot: 'middleClick', label: 'Middle Click', desc: 'Middle mouse button / wheel press' },
+  {
+    slot: 'stylusButton1',
+    label: 'Stylus Barrel Button 1',
+    desc: 'Lower stylus side button (or mouse side btn 1)',
+  },
+  {
+    slot: 'stylusButton2',
+    label: 'Stylus Barrel Button 2',
+    desc: 'Upper stylus side button (or mouse side btn 2)',
+  },
 ];
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -71,10 +112,88 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [activeTab, setActiveTab] = useState<SettingsTab>('appearance');
   const [localSettings, setLocalSettings] = useState<AppSettings>(settings);
   const [searchQuery, setSearchQuery] = useState<string>('');
+  const [selectedCategory, setSelectedCategory] = useState<'All' | ShortcutCategory>('All');
+  const [recordingCommandId, setRecordingCommandId] = useState<string | null>(null);
+  const [pendingConflict, setPendingConflict] = useState<{
+    commandId: string;
+    shortcut: string;
+    conflicts: CommandDefinition[];
+  } | null>(null);
 
   useEffect(() => {
     setLocalSettings(settings);
   }, [settings]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setRecordingCommandId(null);
+      setPendingConflict(null);
+    }
+  }, [isOpen]);
+
+  // Global capture listener while recording a shortcut keybinding
+  useEffect(() => {
+    if (!isOpen || !recordingCommandId) return;
+
+    const handleRecordKeyDown = (e: KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.key === 'Escape' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        setRecordingCommandId(null);
+        setPendingConflict(null);
+        return;
+      }
+
+      const captured = formatShortcutFromEvent(e);
+      if (!captured) return;
+
+      const conflicts = findShortcutConflicts(
+        recordingCommandId,
+        captured,
+        localSettings.shortcuts
+      );
+      if (conflicts.length > 0) {
+        setPendingConflict({
+          commandId: recordingCommandId,
+          shortcut: captured,
+          conflicts,
+        });
+        setRecordingCommandId(null);
+        return;
+      }
+
+      const nextShortcuts = {
+        ...localSettings.shortcuts,
+        [recordingCommandId]: captured,
+      };
+      const updated: AppSettings = { ...localSettings, shortcuts: nextShortcuts };
+      setLocalSettings(updated);
+      onUpdateSettings(updated);
+      setRecordingCommandId(null);
+      setPendingConflict(null);
+    };
+
+    window.addEventListener('keydown', handleRecordKeyDown, true);
+    return () => {
+      window.removeEventListener('keydown', handleRecordKeyDown, true);
+    };
+  }, [isOpen, recordingCommandId, localSettings, onUpdateSettings]);
+
+  const filteredCommands = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return DEFAULT_COMMANDS.filter((cmd) => {
+      if (selectedCategory !== 'All' && cmd.category !== selectedCategory) return false;
+      if (!q) return true;
+      const bound = formatShortcutLabel(resolveCommandShortcut(cmd, localSettings.shortcuts));
+      return (
+        cmd.label.toLowerCase().includes(q) ||
+        cmd.description.toLowerCase().includes(q) ||
+        cmd.category.toLowerCase().includes(q) ||
+        bound.toLowerCase().includes(q)
+      );
+    });
+  }, [searchQuery, selectedCategory, localSettings.shortcuts]);
 
   if (!isOpen) return null;
 
@@ -85,18 +204,71 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleResetDefaults = () => {
-    setLocalSettings(DEFAULT_APP_SETTINGS);
-    onUpdateSettings(DEFAULT_APP_SETTINGS);
+    setRecordingCommandId(null);
+    setPendingConflict(null);
+    const fresh: AppSettings = {
+      ...DEFAULT_APP_SETTINGS,
+      shortcuts: {},
+      modifierKeys: { ...DEFAULT_MODIFIER_KEY_SETTINGS },
+      pressureCurve: {
+        ...DEFAULT_APP_SETTINGS.pressureCurve,
+        points: DEFAULT_APP_SETTINGS.pressureCurve.points.map(([x, y]) => [x, y]),
+      },
+    };
+    setLocalSettings(fresh);
+    onUpdateSettings(fresh);
     onShowToast('Preferences reset to defaults');
   };
 
-  const filteredShortcuts = SHORTCUTS_DATA.filter(
-    (s) =>
-      s.action.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.shortcut.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.desc.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      s.category.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const handleConfirmConflictReplace = () => {
+    if (!pendingConflict) return;
+    const nextShortcuts = { ...localSettings.shortcuts };
+    for (const c of pendingConflict.conflicts) {
+      nextShortcuts[c.id] = '';
+    }
+    nextShortcuts[pendingConflict.commandId] = pendingConflict.shortcut;
+    const updated: AppSettings = { ...localSettings, shortcuts: nextShortcuts };
+    setLocalSettings(updated);
+    onUpdateSettings(updated);
+    setPendingConflict(null);
+    onShowToast(`Assigned ${formatShortcutLabel(pendingConflict.shortcut)}`);
+  };
+
+  const handleResetSingleShortcut = (commandId: string) => {
+    const nextShortcuts = { ...localSettings.shortcuts };
+    delete nextShortcuts[commandId];
+    handleChange('shortcuts', nextShortcuts);
+  };
+
+  const handleClearSingleShortcut = (commandId: string) => {
+    handleChange('shortcuts', { ...localSettings.shortcuts, [commandId]: '' });
+  };
+
+  const handleResetAllShortcuts = () => {
+    setRecordingCommandId(null);
+    setPendingConflict(null);
+    handleChange('shortcuts', {});
+    onShowToast('Shortcuts reset to defaults');
+  };
+
+  const handleModifierSlotChange = (slot: ModifierKeySlot, action: ModifierAction) => {
+    handleChange('modifierKeys', {
+      ...localSettings.modifierKeys,
+      [slot]: action,
+    });
+  };
+
+  const handleMouseWheelChange = (action: MouseWheelAction) => {
+    handleChange('modifierKeys', {
+      ...localSettings.modifierKeys,
+      mouseWheel: action,
+    });
+  };
+
+  const handleResetModifiers = () => {
+    handleChange('modifierKeys', { ...DEFAULT_MODIFIER_KEY_SETTINGS });
+    onShowToast('Modifier keys reset to defaults');
+  };
 
   const resolvedAccent = resolveModernAccentColor(
     localSettings.modernAccent,
@@ -108,20 +280,27 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     { id: 'canvas', label: 'Canvas', icon: <Layers className="w-3.5 h-3.5" /> },
     { id: 'brush', label: 'Brush & Stylus', icon: <Paintbrush className="w-3.5 h-3.5" /> },
     { id: 'shortcuts', label: 'Shortcuts', icon: <Keyboard className="w-3.5 h-3.5" /> },
+    {
+      id: 'modifiers',
+      label: 'Modifier Keys',
+      icon: <SlidersHorizontal className="w-3.5 h-3.5" />,
+    },
     { id: 'about', label: 'About', icon: <Info className="w-3.5 h-3.5" /> },
   ];
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 select-none"
       onClick={onClose}
       onKeyDown={(e) => {
-        if (e.key === 'Escape') onClose();
+        if (e.key === 'Escape' && !recordingCommandId) onClose();
       }}
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="bg-[#202020] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.8)] w-full max-w-2xl flex flex-col overflow-hidden text-xs text-[#e5e5e5] h-[520px]"
+        className="bg-[#202020] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.8)] w-full max-w-3xl flex flex-col overflow-hidden text-xs text-[#e5e5e5] h-[600px]"
       >
         {/* Header */}
         <div className="h-10 px-4 flex items-center justify-between bg-[#161616] shrink-0">
@@ -139,7 +318,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         {/* Body */}
         <div className="flex flex-1 overflow-hidden gap-px bg-[#161616]">
           {/* Left Navigation */}
-          <div className="w-40 bg-[#202020] p-2 flex flex-col justify-between shrink-0">
+          <div className="w-44 bg-[#202020] p-2 flex flex-col justify-between shrink-0">
             <div className="space-y-0.5">
               {tabs.map((t) => {
                 const active = activeTab === t.id;
@@ -147,7 +326,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     key={t.id}
                     type="button"
-                    onClick={() => setActiveTab(t.id)}
+                    onClick={() => {
+                      setActiveTab(t.id);
+                      setRecordingCommandId(null);
+                      setPendingConflict(null);
+                    }}
                     className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-left transition-colors cursor-pointer ${
                       active
                         ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
@@ -167,7 +350,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
             >
               <RotateCcw className="w-3 h-3" />
-              <span>Reset Defaults</span>
+              <span>Reset All Defaults</span>
             </button>
           </div>
 
@@ -175,7 +358,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div className="flex-1 p-5 overflow-y-auto bg-[#202020] space-y-5">
             {activeTab === 'appearance' && (
               <>
-                {/* Visual Theme Preset */}
                 <section className="space-y-2.5">
                   <div>
                     <h3 className="text-xs font-medium text-[#e5e5e5]">Interface Theme</h3>
@@ -210,7 +392,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </section>
 
-                {/* Accent Color Customization */}
                 <section className="space-y-2.5">
                   <div className="flex items-center justify-between">
                     <div>
@@ -272,7 +453,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     </button>
                   </div>
 
-                  {/* Custom Hex & Native Picker */}
                   <div className="flex items-center gap-2.5 p-2.5 rounded bg-[#161616]">
                     <input
                       type="color"
@@ -321,7 +501,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </section>
 
-                {/* User Profile */}
                 <section className="space-y-2">
                   <h3 className="text-xs font-medium text-[#e5e5e5]">Artist Name</h3>
                   <input
@@ -341,7 +520,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                 </section>
 
-                {/* Overlays */}
                 <section className="space-y-2">
                   <h3 className="text-xs font-medium text-[#e5e5e5]">Viewport Overlays</h3>
                   <div className="space-y-1 bg-[#161616] rounded p-2.5">
@@ -472,6 +650,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === 'brush' && (
               <>
+                <PressureCurveEditor
+                  value={localSettings.pressureCurve}
+                  onChange={(nextCurve) => handleChange('pressureCurve', nextCurve)}
+                />
+
                 <section className="space-y-2">
                   <div className="flex items-center justify-between">
                     <h3 className="text-xs font-medium text-[#e5e5e5]">Default Stabilization</h3>
@@ -535,29 +718,227 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
             {activeTab === 'shortcuts' && (
               <div className="space-y-3">
-                <div className="relative">
-                  <Search className="w-3.5 h-3.5 text-[#8a8a8a] absolute left-2.5 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    placeholder="Filter shortcuts..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    className="w-full bg-[#161616] rounded pl-8 pr-3 py-1.5 text-xs text-[#e5e5e5] placeholder-[#8a8a8a]"
-                  />
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-3.5 h-3.5 text-[#8a8a8a] absolute left-2.5 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      placeholder="Search commands or keys..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="w-full bg-[#161616] rounded pl-8 pr-3 py-1.5 text-xs text-[#e5e5e5] placeholder-[#8a8a8a]"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleResetAllShortcuts}
+                    className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer shrink-0"
+                    title="Reset all keybindings to defaults"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Reset</span>
+                  </button>
                 </div>
+
+                {/* Category Filter Pills */}
+                <div className="flex flex-wrap gap-1">
+                  {(['All', ...SHORTCUT_CATEGORIES] as const).map((cat) => {
+                    const active = selectedCategory === cat;
+                    return (
+                      <button
+                        key={cat}
+                        type="button"
+                        onClick={() => setSelectedCategory(cat)}
+                        className={`px-2.5 py-1 rounded text-[11px] transition-colors cursor-pointer ${
+                          active
+                            ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium ring-1 ring-[var(--accent-border)]'
+                            : 'bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5]'
+                        }`}
+                      >
+                        {cat}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Conflict Resolution Banner */}
+                {pendingConflict && (
+                  <div className="p-2.5 rounded bg-amber-500/10 border border-amber-500/40 flex items-center justify-between gap-2 text-[11px]">
+                    <div className="flex items-center gap-2 text-amber-200">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-amber-400" />
+                      <span>
+                        <strong className="font-mono">
+                          {formatShortcutLabel(pendingConflict.shortcut)}
+                        </strong>{' '}
+                        conflicts with{' '}
+                        <strong>
+                          {pendingConflict.conflicts.map((c) => c.label).join(', ')}
+                        </strong>
+                        . Reassign anyway?
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={handleConfirmConflictReplace}
+                        className="px-2 py-1 rounded bg-amber-500 text-black font-medium cursor-pointer"
+                      >
+                        Replace
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPendingConflict(null)}
+                        className="px-2 py-1 rounded bg-[#161616] text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="space-y-0.5">
-                  {filteredShortcuts.map((row, idx) => (
-                    <div
-                      key={idx}
-                      className="flex items-center justify-between px-2.5 py-1.5 rounded hover:bg-[#2c2c2c]/50"
-                    >
-                      <div>
-                        <div className="text-xs text-[#e5e5e5]">{row.action}</div>
-                        <div className="text-[10px] text-[#8a8a8a]">{row.desc}</div>
+                  {filteredCommands.map((cmd) => {
+                    const activeKey = resolveCommandShortcut(cmd, localSettings.shortcuts);
+                    const isRecording = recordingCommandId === cmd.id;
+                    const isOverridden = Object.prototype.hasOwnProperty.call(
+                      localSettings.shortcuts,
+                      cmd.id
+                    );
+                    return (
+                      <div
+                        key={cmd.id}
+                        className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded hover:bg-[#2c2c2c]/50"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-xs text-[#e5e5e5] truncate">{cmd.label}</span>
+                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-[#161616] text-[#8a8a8a]">
+                              {cmd.category}
+                            </span>
+                            {cmd.springLoaded && (
+                              <span
+                                className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--accent-subtle)] text-[var(--accent)]"
+                                title="Hold key > 250ms to temporarily activate and revert on release"
+                              >
+                                Hold
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-[#8a8a8a] truncate">
+                            {cmd.description}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPendingConflict(null);
+                              setRecordingCommandId(isRecording ? null : cmd.id);
+                            }}
+                            className={`px-2 py-1 rounded font-mono text-[10px] min-w-[84px] text-center transition-colors cursor-pointer ${
+                              isRecording
+                                ? 'bg-[var(--accent)] text-[var(--accent-contrast)] font-semibold'
+                                : activeKey
+                                ? 'bg-[#161616] text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                                : 'bg-[#161616] text-[#8a8a8a] italic hover:bg-[#2c2c2c]'
+                            }`}
+                            title="Click and press a key combination to rebind"
+                          >
+                            {isRecording ? 'Press keys...' : formatShortcutLabel(activeKey)}
+                          </button>
+                          {activeKey && (
+                            <button
+                              type="button"
+                              onClick={() => handleClearSingleShortcut(cmd.id)}
+                              className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#161616] cursor-pointer"
+                              title="Unbind shortcut"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                          {isOverridden && (
+                            <button
+                              type="button"
+                              onClick={() => handleResetSingleShortcut(cmd.id)}
+                              className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#161616] cursor-pointer"
+                              title={`Reset to default (${formatShortcutLabel(cmd.defaultShortcut)})`}
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <kbd className="px-2 py-0.5 rounded bg-[#161616] font-mono text-[10px] text-[#e5e5e5]">
-                        {row.shortcut}
-                      </kbd>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {activeTab === 'modifiers' && (
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-xs font-medium text-[#e5e5e5]">Modifier Key Settings</h3>
+                    <p className="text-[11px] text-[#8a8a8a]">
+                      Configure hold-to-act keys, mouse buttons, stylus barrel buttons, and scroll wheel
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleResetModifiers}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Reset</span>
+                  </button>
+                </div>
+
+                {/* Mouse Wheel */}
+                <div className="flex items-center justify-between gap-3 px-3 py-2 rounded bg-[#161616]">
+                  <div>
+                    <div className="text-xs text-[#e5e5e5] font-medium">Mouse Wheel</div>
+                    <div className="text-[10px] text-[#8a8a8a]">
+                      Action when scrolling wheel over the canvas viewport
+                    </div>
+                  </div>
+                  <select
+                    value={localSettings.modifierKeys.mouseWheel}
+                    onChange={(e) => handleMouseWheelChange(e.target.value as MouseWheelAction)}
+                    className="bg-[#202020] text-[#e5e5e5] text-xs px-2.5 py-1.5 rounded border border-white/10 cursor-pointer"
+                  >
+                    {MOUSE_WHEEL_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Keyboard, Mouse & Stylus Modifier Slots */}
+                <div className="space-y-1">
+                  {MODIFIER_SLOTS.map(({ slot, label, desc }) => (
+                    <div
+                      key={slot}
+                      className="flex items-center justify-between gap-3 px-3 py-2 rounded bg-[#161616]"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs text-[#e5e5e5] font-mono">{label}</div>
+                        <div className="text-[10px] text-[#8a8a8a] truncate">{desc}</div>
+                      </div>
+                      <select
+                        value={localSettings.modifierKeys[slot]}
+                        onChange={(e) =>
+                          handleModifierSlotChange(slot, e.target.value as ModifierAction)
+                        }
+                        className="bg-[#202020] text-[#e5e5e5] text-xs px-2.5 py-1.5 rounded border border-white/10 cursor-pointer shrink-0"
+                      >
+                        {MODIFIER_ACTION_OPTIONS.map((opt) => (
+                          <option key={opt.value} value={opt.value}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   ))}
                 </div>

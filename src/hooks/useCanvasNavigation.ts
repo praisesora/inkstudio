@@ -1,5 +1,8 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { CanvasDimensions } from '../types/editor';
+import { toolStoreActions, useToolStore, useUiStore } from '../stores';
+import { stepBrushSizePreset } from '../utils/brushPresetManager';
+import { resolveHeldKeyModifierAction } from '../utils/shortcutManager';
 
 export const MIN_ZOOM = 0.01; // 1%
 export const MAX_ZOOM = 32.0; // 3200%
@@ -143,8 +146,11 @@ export function useCanvasNavigation({
 
   const [isSpaceDown, setIsSpaceDown] = useState<boolean>(false);
   const [isShiftDown, setIsShiftDown] = useState<boolean>(false);
+  const [isCtrlDown, setIsCtrlDown] = useState<boolean>(false);
+  const [isAltDown, setIsAltDown] = useState<boolean>(false);
   const [isPanning, setIsPanning] = useState<boolean>(false);
   const [isRotating, setIsRotating] = useState<boolean>(false);
+  const [isZoomDragging, setIsZoomDragging] = useState<boolean>(false);
 
   // Synchronous refs for sub-frame precision (authoritative source of truth during active interaction)
   const zoomRef = useRef<number>(1.0);
@@ -155,8 +161,11 @@ export function useCanvasNavigation({
 
   const isSpaceDownRef = useRef<boolean>(false);
   const isShiftDownRef = useRef<boolean>(false);
+  const isCtrlDownRef = useRef<boolean>(false);
+  const isAltDownRef = useRef<boolean>(false);
   const isPanningRef = useRef<boolean>(false);
   const isRotatingRef = useRef<boolean>(false);
+  const isZoomDraggingRef = useRef<boolean>(false);
 
   const cameraSubscribersRef = useRef<Set<CameraSubscriber>>(new Set());
   const cameraBroadcastRafRef = useRef<number | null>(null);
@@ -225,7 +234,7 @@ export function useCanvasNavigation({
     }
     navCommitTimerRef.current = setTimeout(() => {
       navCommitTimerRef.current = null;
-      if (isPanningRef.current || isRotatingRef.current) return;
+      if (isPanningRef.current || isRotatingRef.current || isZoomDraggingRef.current) return;
       commitNavStateImmediate();
     }, NAV_STATE_COMMIT_DEBOUNCE_MS);
   }, [commitNavStateImmediate]);
@@ -264,6 +273,22 @@ export function useCanvasNavigation({
     totalAngleDelta: 0,
     startPan: { x: 0, y: 0 },
     center: { x: 0, y: 0 },
+  });
+
+  const zoomDragStartRef = useRef<{
+    clientX: number;
+    clientY: number;
+    anchorX: number;
+    anchorY: number;
+    startZoom: number;
+    startPan: { x: number; y: number };
+  }>({
+    clientX: 0,
+    clientY: 0,
+    anchorX: 0,
+    anchorY: 0,
+    startZoom: 1,
+    startPan: { x: 0, y: 0 },
   });
 
   const hasInitializedCenterRef = useRef<boolean>(false);
@@ -551,6 +576,23 @@ export function useCanvasNavigation({
     setIsRotating(true);
   }, []);
 
+  const startZoomDrag = useCallback((e: React.PointerEvent | PointerEvent) => {
+    e.preventDefault();
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const rect = viewport.getBoundingClientRect();
+    zoomDragStartRef.current = {
+      clientX: e.clientX,
+      clientY: e.clientY,
+      anchorX: e.clientX - rect.left,
+      anchorY: e.clientY - rect.top,
+      startZoom: zoomRef.current,
+      startPan: { ...panRef.current },
+    };
+    isZoomDraggingRef.current = true;
+    setIsZoomDragging(true);
+  }, []);
+
   useEffect(() => {
     hasInitializedCenterRef.current = false;
   }, [activeDocumentId]);
@@ -615,8 +657,34 @@ export function useCanvasNavigation({
         delta *= 500;
       }
 
-      if (isWebtoonModeRef.current && !e.ctrlKey && !e.metaKey) {
-        panRef.current = { x: panRef.current.x, y: panRef.current.y - delta };
+      const wheelAction = useUiStore.getState().appSettings.modifierKeys.mouseWheel;
+
+      if (wheelAction === 'brush-size' && !e.ctrlKey && !e.metaKey) {
+        const dir: -1 | 1 = delta < 0 ? 1 : -1;
+        const toolState = useToolStore.getState();
+        if (toolState.tool === 'liquify') {
+          const nextSize = Math.max(
+            4,
+            Math.min(500, Math.round(stepBrushSizePreset(toolState.liquifySettings.size, dir)))
+          );
+          toolStoreActions.updateLiquifySettings({ size: nextSize });
+        } else {
+          const nextSize = stepBrushSizePreset(toolState.brushSettings.size, dir);
+          toolStoreActions.updateBrushSettings({ size: nextSize });
+        }
+        return;
+      }
+
+      if ((wheelAction === 'scroll' || isWebtoonModeRef.current) && !e.ctrlKey && !e.metaKey) {
+        let deltaX = e.deltaX;
+        if (e.deltaMode === 1) deltaX *= 28;
+        else if (e.deltaMode === 2) deltaX *= 500;
+        const scrollX = e.shiftKey ? delta : deltaX;
+        const scrollY = e.shiftKey ? 0 : delta;
+        panRef.current = {
+          x: isWebtoonModeRef.current ? panRef.current.x : panRef.current.x - scrollX,
+          y: panRef.current.y - scrollY,
+        };
         scheduleCameraBroadcast();
         scheduleNavStateCommit();
         return;
@@ -644,7 +712,7 @@ export function useCanvasNavigation({
     };
   }, [activeDocumentId, scheduleCameraBroadcast, scheduleNavStateCommit]);
 
-  // Global Keyboard Shortcuts (Space, Shift, Ctrl+0, Ctrl+Alt+0, Ctrl++, Ctrl+-)
+  // Modifier state tracking (Space, Shift, Ctrl, Alt) for navigation & modifier-key drag modes
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const targetEl = e.target as HTMLElement | null;
@@ -654,50 +722,29 @@ export function useCanvasNavigation({
       ) {
         return;
       }
-      if (document.querySelector('[role="dialog"]')) {
+      if (document.querySelector('[role="dialog"]') || useUiStore.getState().isSettingsModalOpen) {
         return;
       }
 
-      if (e.key === 'Shift') {
-        if (!isShiftDownRef.current) {
-          isShiftDownRef.current = true;
-          setIsShiftDown(true);
-        }
+      if (e.key === 'Shift' && !isShiftDownRef.current) {
+        isShiftDownRef.current = true;
+        setIsShiftDown(true);
+      }
+      if ((e.key === 'Control' || e.key === 'Meta') && !isCtrlDownRef.current) {
+        isCtrlDownRef.current = true;
+        setIsCtrlDown(true);
+      }
+      if (e.key === 'Alt' && !isAltDownRef.current) {
+        isAltDownRef.current = true;
+        setIsAltDown(true);
       }
 
-      // Space key for Pan Hand Tool or Rotate with Shift+Space (skip Alt+Space so Animation playback can use it)
-      if ((e.code === 'Space' || e.key === ' ') && !e.altKey && !e.ctrlKey && !e.metaKey) {
+      // Space key for Pan / Rotate / Scrubby Zoom (skip Alt+Space so Animation playback can use it)
+      if ((e.code === 'Space' || e.key === ' ') && !e.altKey) {
         e.preventDefault();
         if (!isSpaceDownRef.current) {
           isSpaceDownRef.current = true;
           setIsSpaceDown(true);
-        }
-        return;
-      }
-
-      if (e.ctrlKey || e.metaKey) {
-        if (e.altKey && (e.code === 'Digit0' || e.code === 'Numpad0' || e.key === '0')) {
-          e.preventDefault();
-          resetRotation();
-          return;
-        }
-
-        if (!e.altKey && (e.code === 'Digit0' || e.code === 'Numpad0' || e.key === '0')) {
-          e.preventDefault();
-          resetZoomAndCenter();
-          return;
-        }
-
-        if (e.code === 'Equal' || e.code === 'NumpadAdd' || e.key === '+' || e.key === '=') {
-          e.preventDefault();
-          zoomIn();
-          return;
-        }
-
-        if (e.code === 'Minus' || e.code === 'NumpadSubtract' || e.key === '-' || e.key === '_') {
-          e.preventDefault();
-          zoomOut();
-          return;
         }
       }
     };
@@ -707,6 +754,14 @@ export function useCanvasNavigation({
         isShiftDownRef.current = false;
         setIsShiftDown(false);
       }
+      if (e.key === 'Control' || e.key === 'Meta') {
+        isCtrlDownRef.current = false;
+        setIsCtrlDown(false);
+      }
+      if (e.key === 'Alt') {
+        isAltDownRef.current = false;
+        setIsAltDown(false);
+      }
       if (e.code === 'Space' || e.key === ' ') {
         isSpaceDownRef.current = false;
         setIsSpaceDown(false);
@@ -714,15 +769,22 @@ export function useCanvasNavigation({
     };
 
     const handleBlur = () => {
-      const wasInteracting = isPanningRef.current || isRotatingRef.current;
+      const wasInteracting =
+        isPanningRef.current || isRotatingRef.current || isZoomDraggingRef.current;
       isSpaceDownRef.current = false;
       setIsSpaceDown(false);
       isShiftDownRef.current = false;
       setIsShiftDown(false);
+      isCtrlDownRef.current = false;
+      setIsCtrlDown(false);
+      isAltDownRef.current = false;
+      setIsAltDown(false);
       isPanningRef.current = false;
       setIsPanning(false);
       isRotatingRef.current = false;
       setIsRotating(false);
+      isZoomDraggingRef.current = false;
+      setIsZoomDragging(false);
       if (wasInteracting) {
         broadcastCameraImmediate();
         commitNavStateImmediate();
@@ -738,7 +800,7 @@ export function useCanvasNavigation({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
     };
-  }, [resetRotation, resetZoomAndCenter, zoomIn, zoomOut, broadcastCameraImmediate, commitNavStateImmediate]);
+  }, [broadcastCameraImmediate, commitNavStateImmediate]);
 
   // Panning pointermove: broadcasts directly to DOM/WebGL via rAF; commits React state only on pointerup
   useEffect(() => {
@@ -856,6 +918,49 @@ export function useCanvasNavigation({
     };
   }, [isRotating, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
 
+  // Scrubby Zoom pointermove (default Ctrl+Space+Drag): zero-rerender via rAF camera broadcast
+  useEffect(() => {
+    if (!isZoomDragging) return;
+
+    const handleWindowPointerMove = (e: PointerEvent) => {
+      if (!isZoomDraggingRef.current) return;
+      const dx = e.clientX - zoomDragStartRef.current.clientX;
+      const { anchorX, anchorY, startZoom, startPan } = zoomDragStartRef.current;
+      const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, startZoom * Math.exp(dx * 0.007)));
+      const ratio = nextZoom / startZoom;
+      zoomRef.current = nextZoom;
+      panRef.current = {
+        x: anchorX - (anchorX - startPan.x) * ratio,
+        y: anchorY - (anchorY - startPan.y) * ratio,
+      };
+      scheduleCameraBroadcast();
+    };
+
+    const handleWindowPointerUp = () => {
+      isZoomDraggingRef.current = false;
+      broadcastCameraImmediate();
+      setIsZoomDragging(false);
+      commitNavStateImmediate();
+    };
+
+    window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
+    window.addEventListener('pointerup', handleWindowPointerUp);
+    window.addEventListener('pointercancel', handleWindowPointerUp);
+
+    const prevCursor = document.body.style.cursor;
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = 'zoom-in';
+    document.body.style.userSelect = 'none';
+
+    return () => {
+      window.removeEventListener('pointermove', handleWindowPointerMove);
+      window.removeEventListener('pointerup', handleWindowPointerUp);
+      window.removeEventListener('pointercancel', handleWindowPointerUp);
+      document.body.style.cursor = prevCursor;
+      document.body.style.userSelect = prevUserSelect;
+    };
+  }, [isZoomDragging, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
+
   useEffect(() => {
     const handleAuxClick = (e: MouseEvent) => {
       if (e.button === 1) {
@@ -879,7 +984,11 @@ export function useCanvasNavigation({
     [getCameraState, subscribeCamera]
   );
 
-  const isRotateModifier = isSpaceDown && isShiftDown;
+  const activeHeldModifierAction = resolveHeldKeyModifierAction(
+    { ctrl: isCtrlDown, shift: isShiftDown, alt: isAltDown, space: isSpaceDown },
+    useUiStore.getState().appSettings.modifierKeys
+  );
+  const isRotateModifier = activeHeldModifierAction === 'rotate';
 
   return {
     viewportRef,
@@ -898,11 +1007,15 @@ export function useCanvasNavigation({
     subscribeCamera,
     isSpaceDown,
     isShiftDown,
+    isCtrlDown,
+    isAltDown,
     isRotateModifier,
     isPanning,
     isRotating,
+    isZoomDragging,
     startPan,
     startRotate,
+    startZoomDrag,
     zoomIn,
     zoomOut,
     resetZoomAndCenter,

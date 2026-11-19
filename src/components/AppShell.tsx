@@ -52,8 +52,14 @@ interface CanvasAreaContainerProps {
   isRotateModifier: boolean;
   isPanning: boolean;
   isRotating: boolean;
+  isZoomDragging?: boolean;
   startPan: (e: React.PointerEvent) => void;
   startRotate: (e: React.PointerEvent) => void;
+  startZoomDrag?: (e: React.PointerEvent) => void;
+  onSampleColor?: (pt: { x: number; y: number }) => void;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  onFlipHorizontal?: () => void;
   isHovering: boolean;
   cursorPos: { x: number; y: number } | null;
   onPointerDown: (e: React.PointerEvent<HTMLElement>, coalescedEvents?: PointerEvent[]) => void;
@@ -190,8 +196,14 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       isRotateModifier={props.isRotateModifier}
       isPanning={props.isPanning}
       isRotating={props.isRotating}
+      isZoomDragging={props.isZoomDragging}
       onStartPan={props.startPan}
       onStartRotate={props.startRotate}
+      onStartZoomDrag={props.startZoomDrag}
+      onSampleColor={props.onSampleColor}
+      onUndo={props.onUndo}
+      onRedo={props.onRedo}
+      onFlipHorizontal={props.onFlipHorizontal}
       isHovering={props.isHovering}
       cursorPos={props.cursorPos}
       onPointerDown={props.onPointerDown}

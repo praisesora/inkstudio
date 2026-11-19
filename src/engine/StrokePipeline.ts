@@ -11,6 +11,8 @@ import { InputStabilizer, StabilizedSample } from './InputStabilizer';
 import { SplineGenerator, SplinePoint, CubicBezierSegment } from './SplineGenerator';
 import { TaperEngine } from './TaperEngine';
 import type { DirtyRect } from '../types/editor';
+import type { PressureCurveSettings } from '../types/settings';
+import { evaluateGlobalPressureCurve, isLinearPressureCurve } from '../utils/pressureCurve';
 
 export interface ViewportTransform {
   panX: number;
@@ -43,6 +45,7 @@ export interface StrokeSamplePoint {
   y: number;
   pressure: number;
   width: number;
+  opacity: number;
   tiltX: number;
   tiltY: number;
   twist: number;
@@ -167,6 +170,7 @@ export class StrokePipeline {
     y: 0,
     pressure: 0,
     width: 1,
+    opacity: 1,
     tiltX: 0,
     tiltY: 0,
     twist: 0,
@@ -176,6 +180,7 @@ export class StrokePipeline {
     vy: 0,
     pointerType: 'pen',
   };
+  private globalPressureCurve: PressureCurveSettings | null = null;
   private scratchPredPt: SplinePoint = { x: 0, y: 0, pressure: 0, width: 0, tiltX: 0, tiltY: 0, twist: 0 };
   private scratchPrevPredPt: SplinePoint = { x: 0, y: 0, pressure: 0, width: 0, tiltX: 0, tiltY: 0, twist: 0 };
 
@@ -232,6 +237,14 @@ export class StrokePipeline {
   public setBrushParameters(size: number, color: string): void {
     this.baseBrushSize = Math.max(0.5, size);
     this.strokeColor = color;
+  }
+
+  public setGlobalPressureCurve(curve: PressureCurveSettings | null): void {
+    this.globalPressureCurve = curve;
+  }
+
+  public getGlobalPressureCurve(): PressureCurveSettings | null {
+    return this.globalPressureCurve;
   }
 
   public getTaperEngine(): TaperEngine {
@@ -314,6 +327,7 @@ export class StrokePipeline {
     brushSize?: number;
     color?: string;
     pointerId?: number;
+    globalPressureCurve?: PressureCurveSettings | null;
   }): void {
     this.stabilizer.reset();
     this.splineGen.reset();
@@ -331,6 +345,9 @@ export class StrokePipeline {
     }
     if (config?.brushSize !== undefined || config?.color !== undefined) {
       this.setBrushParameters(config.brushSize ?? this.baseBrushSize, config.color ?? this.strokeColor);
+    }
+    if (config?.globalPressureCurve !== undefined) {
+      this.globalPressureCurve = config.globalPressureCurve;
     }
 
     this.headIndex = 0;
@@ -498,13 +515,37 @@ export class StrokePipeline {
       sample.vy = vy;
       sample.pointerType = pointerType;
 
+      const calibratedStabPressure = evaluateGlobalPressureCurve(
+        stabPressure,
+        this.globalPressureCurve
+      );
+
       if (options?.resolvePoint) {
-        options.resolvePoint(rawX, rawY, rawP, stabPressure, pointerType, vx, vy, dtMs, sample);
+        sample.opacity = calibratedStabPressure;
+        options.resolvePoint(
+          rawX,
+          rawY,
+          rawP,
+          calibratedStabPressure,
+          pointerType,
+          vx,
+          vy,
+          dtMs,
+          sample
+        );
       } else {
-        const mappedPressure = this.taperEngine.mapPressure(stabPressure);
+        const hasNonLinearGlobalCurve = Boolean(
+          this.globalPressureCurve &&
+            this.globalPressureCurve.enabled &&
+            !isLinearPressureCurve(this.globalPressureCurve.points)
+        );
+        const mappedPressure = hasNonLinearGlobalCurve
+          ? calibratedStabPressure
+          : this.taperEngine.mapPressure(calibratedStabPressure);
         const smoothPressure = this.taperEngine.smoothPressure(mappedPressure);
         sample.pressure = smoothPressure;
         sample.width = Math.max(0.5, this.baseBrushSize * smoothPressure);
+        sample.opacity = Math.max(0, Math.min(1, smoothPressure));
       }
 
       this.expandDirtyRect(sample.x, sample.y, sample.width + padExtra);
@@ -626,6 +667,7 @@ export class StrokePipeline {
             sample.y = fp.y;
             sample.pressure = fp.pressure;
             sample.width = fp.width;
+            sample.opacity = fp.alpha;
             sample.tiltX = this.knotP2.tiltX ?? 0;
             sample.tiltY = this.knotP2.tiltY ?? 0;
             sample.twist = this.knotP2.twist ?? 0;

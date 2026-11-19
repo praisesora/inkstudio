@@ -48,7 +48,8 @@ import { PaintReservoir, LayerPixelSampler } from '../../utils/colorMixingEngine
 import { applyLayerEffects } from '../../utils/layerEffectsEngine';
 import { PerspectiveRuler, ConstraintAxis } from '../../types/perspective';
 import { PerspectiveSnapSession } from '../../utils/perspectiveSnapping';
-import { useToolStore } from '../../stores';
+import { useToolStore, useUiStore } from '../../stores';
+import { evaluateGlobalPressureCurve, isLinearPressureCurve } from '../../utils/pressureCurve';
 import {
   DraftCanvasElement,
   ExtendedPointerEvent,
@@ -441,8 +442,11 @@ export function useBrushStrokeSession({
       if (e.pointerType === 'mouse') {
         pressure = e.buttons & 1 ? 0.5 : 0;
       } else {
-        pressure =
-          e.pressure !== undefined ? Math.max(0, Math.min(1.0, e.pressure)) : 0;
+        const rawP = e.pressure !== undefined ? Math.max(0, Math.min(1.0, e.pressure)) : 0;
+        pressure = evaluateGlobalPressureCurve(
+          rawP,
+          useUiStore.getState().appSettings.pressureCurve
+        );
       }
 
       const width = calculateStrokeWidth(
@@ -468,6 +472,17 @@ export function useBrushStrokeSession({
       };
     },
     [dimensionsRef, flipXRef, flipYRef, getBrushSettings, getViewportRect, panRef, rotationRef, zoomRef]
+  );
+
+  const resolveEffectiveOpacitySensor = useCallback(
+    (bs: BrushSettings, isMonochrome: boolean, isEraser: boolean) => {
+      if (bs.opacitySensor) return bs.opacitySensor;
+      if (bs.usePressure && !isMonochrome && !isEraser && (bs.flow ?? 1.0) < 0.99) {
+        return { usePressure: true, pressureMin: 0.2 };
+      }
+      return undefined;
+    },
+    []
   );
 
   const buildLiveTexturedOptions = useCallback(
@@ -506,7 +521,7 @@ export function useBrushStrokeSession({
       useVelocity: bs.useVelocity,
       useTilt: Boolean(bs.useTilt),
       sizeSensor: bs.sizeSensor,
-      opacitySensor: bs.opacitySensor,
+      opacitySensor: resolveEffectiveOpacitySensor(bs, isMonochrome, isEraser),
       densitySensor: bs.densitySensor,
       subTips: bs.subTips,
       subTipOrder: bs.subTipOrder,
@@ -543,7 +558,7 @@ export function useBrushStrokeSession({
       dynamics: bs.dynamics,
       secondaryColor: bs.secondaryColor,
     }),
-    []
+    [resolveEffectiveOpacitySensor]
   );
 
   const buildLiveRadialOptions = useCallback(
@@ -589,11 +604,11 @@ export function useBrushStrokeSession({
       paperTextureScale: bs.paperTextureScale,
       paperTextureRotate: bs.paperTextureRotate,
       sizeSensor: bs.sizeSensor,
-      opacitySensor: bs.opacitySensor,
+      opacitySensor: resolveEffectiveOpacitySensor(bs, isMonochrome, false),
       densitySensor: bs.densitySensor,
       taper: bs.taper,
     }),
-    []
+    [resolveEffectiveOpacitySensor]
   );
 
   const resolveStrokeColor = useCallback(
@@ -1044,7 +1059,12 @@ export function useBrushStrokeSession({
     const strokeHardness = isMonochrome ? 1.0 : bs.hardness ?? 1.0;
     const strokeFlow = isMonochrome ? 1.0 : bs.flow ?? 1.0;
     const strokeSpacing = bs.spacing ?? 0.08;
-    const hasCustomCurve = Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
+    const globalCurve = pipeline.getGlobalPressureCurve();
+    const hasCustomGlobalCurve = Boolean(
+      globalCurve && globalCurve.enabled && !isLinearPressureCurve(globalCurve.points)
+    );
+    const hasCustomCurve =
+      hasCustomGlobalCurve || Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
     const taperEngine = pipeline.getTaperEngine();
     const scatterFactor = Math.max(0, bs.dynamics?.scatter ?? 0);
     const blurMargin = (1 - strokeHardness) * ((bs.size || 10) * 1.5);
@@ -1462,6 +1482,13 @@ export function useBrushStrokeSession({
       const strokeFlow = isMonochrome ? 1.0 : bs.flow ?? 1.0;
       const strokeSpacing = bs.spacing ?? 0.08;
 
+      const globalPressureCurve = useUiStore.getState().appSettings.pressureCurve;
+      const hasCustomGlobalCurve = Boolean(
+        globalPressureCurve &&
+          globalPressureCurve.enabled &&
+          !isLinearPressureCurve(globalPressureCurve.points)
+      );
+
       const pipeline = strokePipelineRef.current;
       pipeline.beginStroke({
         stabilizerLevel: bs.stabilization ?? 0,
@@ -1470,11 +1497,13 @@ export function useBrushStrokeSession({
         brushSize: bs.size,
         color: strokeColor,
         pointerId: e.pointerId,
+        globalPressureCurve,
       });
 
       const startNow = startPoint.timestamp ?? performance.now();
       lastPointTimeRef.current = startNow;
-      const hasCustomCurve = Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
+      const hasCustomCurve =
+        hasCustomGlobalCurve || Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
       const taperEngine = pipeline.getTaperEngine();
       if (bs.usePressure) {
         const baseStartP = hasCustomCurve
@@ -1506,9 +1535,11 @@ export function useBrushStrokeSession({
         )
       );
 
+      const shiftAction = useUiStore.getState().appSettings.modifierKeys.shift;
       const prevStrokeEnd = lastStrokeEndRef.current;
       const isShiftLine =
         Boolean(e.shiftKey) &&
+        shiftAction === 'straight-line' &&
         !isMaskModeRef.current &&
         prevStrokeEnd !== null &&
         prevStrokeEnd.layerId === currentLayerId;
@@ -1997,6 +2028,7 @@ export function useBrushStrokeSession({
         } else if (
           !isShiftLineStrokeRef.current &&
           isShiftKey &&
+          useUiStore.getState().appSettings.modifierKeys.shift === 'straight-line' &&
           !ruler?.enabled &&
           allStrokePointsRef.current.length > 0
         ) {
@@ -2520,13 +2552,23 @@ export function useBrushStrokeSession({
               rCtx.clip();
               applySelectionCanvasClip(rCtx, activeSelection);
 
-              const needsIsolatedBake = (bs.opacity ?? 1.0) < 0.999 || hasWetEdge;
+              const effectiveOpacitySensor = resolveEffectiveOpacitySensor(
+                bs,
+                isMonochrome,
+                isEraser
+              );
+              const bakeBs: BrushSettings =
+                effectiveOpacitySensor && !bs.opacitySensor
+                  ? { ...bs, opacitySensor: effectiveOpacitySensor }
+                  : bs;
+
+              const needsIsolatedBake = (bakeBs.opacity ?? 1.0) < 0.999 || hasWetEdge;
 
               if (!needsIsolatedBake) {
                 renderCompleteStroke(
                   rCtx,
                   allPoints,
-                  bs,
+                  bakeBs,
                   currentTool,
                   effectiveMode,
                   isBgEraser,
@@ -2534,8 +2576,8 @@ export function useBrushStrokeSession({
                   Boolean(activeLayer?.alphaLocked)
                 );
               } else {
-                rCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bs.opacity ?? 1.0));
-                if ((isEraser && !isBgEraser) || bs.isTransparentInk) {
+                rCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bakeBs.opacity ?? 1.0));
+                if ((isEraser && !isBgEraser) || bakeBs.isTransparentInk) {
                   rCtx.globalCompositeOperation = 'destination-out';
                 } else if (activeLayer?.alphaLocked) {
                   rCtx.globalCompositeOperation = 'source-atop';
@@ -2555,11 +2597,11 @@ export function useBrushStrokeSession({
                     bCtx,
                     allPoints,
                     {
-                      ...bs,
+                      ...bakeBs,
                       opacity: 1.0,
                       isTransparentInk: false,
                       wetEdge: 0,
-                      color: isEraser && !isBgEraser ? '#000000' : bs.color,
+                      color: isEraser && !isBgEraser ? '#000000' : bakeBs.color,
                     },
                     isEraser && !isBgEraser ? 'brush' : currentTool,
                     effectiveMode,
