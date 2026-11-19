@@ -14,6 +14,7 @@ import {
 } from '../utils/perspectiveMath';
 import { canvasToScreen, screenToCanvas } from '../utils/canvasUtils';
 import { CanvasDimensions } from '../types/editor';
+import { CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
 import {
   Lock,
   Unlock,
@@ -32,6 +33,9 @@ interface PerspectiveRulerOverlayProps {
   pan: { x: number; y: number };
   zoom: number;
   rotation: number;
+  flipX?: boolean;
+  flipY?: boolean;
+  navigation?: CanvasNavigationHandle;
   viewportRef: React.RefObject<HTMLDivElement | null>;
   activeLockedAxis?: ConstraintAxis | null;
   isDrawing?: boolean;
@@ -72,6 +76,9 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
   pan,
   zoom,
   rotation,
+  flipX = false,
+  flipY = false,
+  navigation,
   viewportRef,
   activeLockedAxis = null,
 }) => {
@@ -97,6 +104,9 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
     pan,
     zoom,
     rotation,
+    flipX,
+    flipY,
+    navigation,
     activeLockedAxis,
   });
 
@@ -106,6 +116,9 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
     pan,
     zoom,
     rotation,
+    flipX,
+    flipY,
+    navigation,
     activeLockedAxis,
   };
 
@@ -138,11 +151,23 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
     const {
       ruler: curRuler,
       dimensions: dims,
-      pan: curPan,
-      zoom: curZoom,
-      rotation: curRot,
+      pan: propPan,
+      zoom: propZoom,
+      rotation: propRot,
+      flipX: propFlipX,
+      flipY: propFlipY,
+      navigation: curNav,
       activeLockedAxis: curAxis,
     } = propsRef.current;
+
+    const liveCam = curNav
+      ? curNav.getCameraState()
+      : { pan: propPan, zoom: propZoom, rotation: propRot, flipX: propFlipX, flipY: propFlipY };
+    const curPan = liveCam.pan;
+    const curZoom = liveCam.zoom;
+    const curRot = liveCam.rotation;
+    const curFlipX = liveCam.flipX;
+    const curFlipY = liveCam.flipY;
 
     if (!curRuler.enabled) {
       ctx.restore();
@@ -152,10 +177,10 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
     const screenRect = { x: 0, y: 0, width: vRect.width, height: vRect.height };
 
     // Canvas Corners in Screen Space
-    const c0 = canvasToScreen(0, 0, curPan, curZoom, curRot, dims);
-    const c1 = canvasToScreen(dims.width, 0, curPan, curZoom, curRot, dims);
-    const c2 = canvasToScreen(dims.width, dims.height, curPan, curZoom, curRot, dims);
-    const c3 = canvasToScreen(0, dims.height, curPan, curZoom, curRot, dims);
+    const c0 = canvasToScreen(0, 0, curPan, curZoom, curRot, dims, curFlipX, curFlipY);
+    const c1 = canvasToScreen(dims.width, 0, curPan, curZoom, curRot, dims, curFlipX, curFlipY);
+    const c2 = canvasToScreen(dims.width, dims.height, curPan, curZoom, curRot, dims, curFlipX, curFlipY);
+    const c3 = canvasToScreen(0, dims.height, curPan, curZoom, curRot, dims, curFlipX, curFlipY);
 
     // 1. Draw Subtle Canvas Paper Boundary Guide
     ctx.save();
@@ -171,21 +196,21 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
     ctx.restore();
 
     // 2. Horizon Line across the scene
-    renderHorizonLine(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect);
+    renderHorizonLine(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect, curFlipX, curFlipY);
 
     // 3. Clean Sparse Guide Rays (Strictly 2 per VP for 2P/3P, 4 for 1P)
-    renderCleanGuideRays(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect, [c0, c1, c2, c3]);
+    renderCleanGuideRays(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect, [c0, c1, c2, c3], curFlipX, curFlipY);
 
     // 4. Single Upright Vertical Center Guide (for 1P and 2P)
-    renderVerticalGuide(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect, [c0, c1, c2, c3]);
+    renderVerticalGuide(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect, [c0, c1, c2, c3], curFlipX, curFlipY);
 
     // 5. Active Snapped Constraint Axis (High-contrast laser when inking)
     if (curAxis) {
-      renderActiveLockedAxis(ctx, curAxis, dims, curPan, curZoom, curRot, screenRect);
+      renderActiveLockedAxis(ctx, curAxis, dims, curPan, curZoom, curRot, screenRect, curFlipX, curFlipY);
     }
 
     // 6. Vanishing Point pivot rings
-    renderVanishingPointVisuals(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect);
+    renderVanishingPointVisuals(ctx, curRuler, dims, curPan, curZoom, curRot, screenRect, curFlipX, curFlipY);
 
     ctx.restore();
   }, [viewportRef]);
@@ -242,24 +267,32 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
     if (!viewport) return;
     const vRect = viewport.getBoundingClientRect();
 
+    const liveCam = navigation
+      ? navigation.getCameraState()
+      : { pan, zoom, rotation, flipX, flipY };
+
     if (activeDragTarget === 'horizon') {
       const pStart = screenToCanvas(
         dragStartRef.current.clientX,
         dragStartRef.current.clientY,
         vRect,
-        pan,
-        zoom,
-        rotation,
-        dimensions
+        liveCam.pan,
+        liveCam.zoom,
+        liveCam.rotation,
+        dimensions,
+        liveCam.flipX,
+        liveCam.flipY
       );
       const pCurr = screenToCanvas(
         e.clientX,
         e.clientY,
         vRect,
-        pan,
-        zoom,
-        rotation,
-        dimensions
+        liveCam.pan,
+        liveCam.zoom,
+        liveCam.rotation,
+        dimensions,
+        liveCam.flipX,
+        liveCam.flipY
       );
       const deltaY = pCurr.y - pStart.y;
 
@@ -286,10 +319,12 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
         e.clientX,
         e.clientY,
         vRect,
-        pan,
-        zoom,
-        rotation,
-        dimensions
+        liveCam.pan,
+        liveCam.zoom,
+        liveCam.rotation,
+        dimensions,
+        liveCam.flipX,
+        liveCam.flipY
       );
 
       const updatedVps = ruler.vps.map((vp) => {
@@ -341,14 +376,17 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
   };
 
   // Center coordinate of horizon line on canvas
+  const renderCam = navigation ? navigation.getCameraState() : { pan, zoom, rotation, flipX, flipY };
   const horizon = getHorizonLine(ruler);
   const horizonCenterScreen = canvasToScreen(
     dimensions.width / 2,
     (horizon.p1.y + horizon.p2.y) / 2,
-    pan,
-    zoom,
-    rotation,
-    dimensions
+    renderCam.pan,
+    renderCam.zoom,
+    renderCam.rotation,
+    dimensions,
+    renderCam.flipX,
+    renderCam.flipY
   );
 
   return (
@@ -388,7 +426,16 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
 
           {/* Draggable VP Handles (on-screen & off-screen edge tags) */}
           {ruler.vps.map((vp) => {
-            const sPos = canvasToScreen(vp.x, vp.y, pan, zoom, rotation, dimensions);
+            const sPos = canvasToScreen(
+              vp.x,
+              vp.y,
+              renderCam.pan,
+              renderCam.zoom,
+              renderCam.rotation,
+              dimensions,
+              renderCam.flipX,
+              renderCam.flipY
+            );
             const viewport = viewportRef.current;
             const vRect = viewport ? viewport.getBoundingClientRect() : { width: 1920, height: 1080 };
             const isInside =
@@ -629,11 +676,13 @@ function renderHorizonLine(
   pan: { x: number; y: number },
   zoom: number,
   rotation: number,
-  screenRect: { x: number; y: number; width: number; height: number }
+  screenRect: { x: number; y: number; width: number; height: number },
+  flipX: boolean = false,
+  flipY: boolean = false
 ) {
   const horizon = getHorizonLine(ruler);
-  const hp1 = canvasToScreen(horizon.p1.x, horizon.p1.y, pan, zoom, rotation, dims);
-  const hp2 = canvasToScreen(horizon.p2.x, horizon.p2.y, pan, zoom, rotation, dims);
+  const hp1 = canvasToScreen(horizon.p1.x, horizon.p1.y, pan, zoom, rotation, dims, flipX, flipY);
+  const hp2 = canvasToScreen(horizon.p2.x, horizon.p2.y, pan, zoom, rotation, dims, flipX, flipY);
 
   const screenDir = { x: hp2.x - hp1.x, y: hp2.y - hp1.y };
   const sLen = Math.hypot(screenDir.x, screenDir.y);
@@ -739,7 +788,9 @@ function renderCleanGuideRays(
   zoom: number,
   rotation: number,
   screenRect: { x: number; y: number; width: number; height: number },
-  canvasCorners: Vector2D[]
+  canvasCorners: Vector2D[],
+  flipX: boolean = false,
+  flipY: boolean = false
 ) {
   ctx.save();
 
@@ -756,11 +807,11 @@ function renderCleanGuideRays(
 
   for (const vp of ruler.vps) {
     const rayDirs = computeVpRayDirections(vp, dims, rayCount, ruler.horizonAngle);
-    const sVp = canvasToScreen(vp.x, vp.y, pan, zoom, rotation, dims);
+    const sVp = canvasToScreen(vp.x, vp.y, pan, zoom, rotation, dims, flipX, flipY);
 
     for (const dir of rayDirs) {
       const pFar = { x: vp.x + dir.x * 10000, y: vp.y + dir.y * 10000 };
-      const sFar = canvasToScreen(pFar.x, pFar.y, pan, zoom, rotation, dims);
+      const sFar = canvasToScreen(pFar.x, pFar.y, pan, zoom, rotation, dims, flipX, flipY);
       const sDir = { x: sFar.x - sVp.x, y: sFar.y - sVp.y };
       const sLen = Math.hypot(sDir.x, sDir.y);
       if (sLen < 1e-4) continue;
@@ -786,19 +837,21 @@ function renderVerticalGuide(
   zoom: number,
   rotation: number,
   screenRect: { x: number; y: number; width: number; height: number },
-  canvasCorners: Vector2D[]
+  canvasCorners: Vector2D[],
+  flipX: boolean = false,
+  flipY: boolean = false
 ) {
   if (ruler.type !== '1-point' && ruler.type !== '2-point') return;
 
   const horizon = getHorizonLine(ruler);
   const originDoc = { x: dims.width * 0.5, y: dims.height * 0.5 };
-  const sOrigin = canvasToScreen(originDoc.x, originDoc.y, pan, zoom, rotation, dims);
+  const sOrigin = canvasToScreen(originDoc.x, originDoc.y, pan, zoom, rotation, dims, flipX, flipY);
 
   const pNextDoc = {
     x: originDoc.x + horizon.normal.x * 1000,
     y: originDoc.y + horizon.normal.y * 1000,
   };
-  const sNext = canvasToScreen(pNextDoc.x, pNextDoc.y, pan, zoom, rotation, dims);
+  const sNext = canvasToScreen(pNextDoc.x, pNextDoc.y, pan, zoom, rotation, dims, flipX, flipY);
 
   const sDir = { x: sNext.x - sOrigin.x, y: sNext.y - sOrigin.y };
   const sLen = Math.hypot(sDir.x, sDir.y);
@@ -861,11 +914,13 @@ function renderActiveLockedAxis(
   pan: { x: number; y: number },
   zoom: number,
   rotation: number,
-  screenRect: { x: number; y: number; width: number; height: number }
+  screenRect: { x: number; y: number; width: number; height: number },
+  flipX: boolean = false,
+  flipY: boolean = false
 ) {
-  const sOrigin = canvasToScreen(axis.origin.x, axis.origin.y, pan, zoom, rotation, dims);
+  const sOrigin = canvasToScreen(axis.origin.x, axis.origin.y, pan, zoom, rotation, dims, flipX, flipY);
   const pNext = { x: axis.origin.x + axis.dir.x * 1000, y: axis.origin.y + axis.dir.y * 1000 };
-  const sNext = canvasToScreen(pNext.x, pNext.y, pan, zoom, rotation, dims);
+  const sNext = canvasToScreen(pNext.x, pNext.y, pan, zoom, rotation, dims, flipX, flipY);
 
   const sDir = { x: sNext.x - sOrigin.x, y: sNext.y - sOrigin.y };
   const sLen = Math.hypot(sDir.x, sDir.y);
@@ -907,10 +962,12 @@ function renderVanishingPointVisuals(
   pan: { x: number; y: number },
   zoom: number,
   rotation: number,
-  screenRect: { x: number; y: number; width: number; height: number }
+  screenRect: { x: number; y: number; width: number; height: number },
+  flipX: boolean = false,
+  flipY: boolean = false
 ) {
   for (const vp of ruler.vps) {
-    const sPos = canvasToScreen(vp.x, vp.y, pan, zoom, rotation, dims);
+    const sPos = canvasToScreen(vp.x, vp.y, pan, zoom, rotation, dims, flipX, flipY);
     const isInside =
       sPos.x >= 0 &&
       sPos.x <= screenRect.width &&

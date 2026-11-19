@@ -11,6 +11,7 @@ import {
   RadialMixingOptions,
 } from './stampEngine';
 import { LayerPixelSampler, PaintReservoir } from './colorMixingEngine';
+import { GpuDab } from './webglBrushEngine';
 import {
   evaluateFastSpline,
   applyCspPostCorrection,
@@ -134,7 +135,8 @@ export function drawSmoothCubicBezierSegment(
   remainderDist: number = 0,
   thickness: number = 1.0,
   angleRad: number = 0,
-  mixingOptions?: RadialMixingOptions
+  mixingOptions?: RadialMixingOptions,
+  batchGpuDabs?: GpuDab[]
 ): number {
   return drawRadialCubicBezierSegment(
     ctx,
@@ -151,7 +153,8 @@ export function drawSmoothCubicBezierSegment(
     remainderDist,
     thickness,
     angleRad,
-    mixingOptions
+    mixingOptions,
+    batchGpuDabs
   );
 }
 
@@ -197,9 +200,10 @@ export function drawDot(
   flow: number = 1.0,
   mixingOptions?: RadialMixingOptions,
   thickness: number = 1.0,
-  angleRad: number = 0
+  angleRad: number = 0,
+  batchGpuDabs?: GpuDab[]
 ) {
-  drawRadialDot(ctx, point, color, hardness, flow, isEraser, false, mixingOptions, thickness, angleRad);
+  drawRadialDot(ctx, point, color, hardness, flow, isEraser, false, mixingOptions, thickness, angleRad, batchGpuDabs);
 }
 
 let _sharedThumbCanvas: HTMLCanvasElement | null = null;
@@ -298,15 +302,18 @@ export function formatTime(timestamp: number | Date = Date.now()): string {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-export function screenToCanvas(
+export function screenToCanvasInto(
   clientX: number,
   clientY: number,
   viewportRect: DOMRect,
   pan: { x: number; y: number },
   zoom: number,
   rotation: number,
-  dimensions: CanvasDimensions
-): { x: number; y: number } {
+  dimensions: CanvasDimensions,
+  out: { x: number; y: number },
+  flipX: boolean = false,
+  flipY: boolean = false
+): void {
   const vx = clientX - viewportRect.left;
   const vy = clientY - viewportRect.top;
 
@@ -320,11 +327,30 @@ export function screenToCanvas(
   const unrotX = rx * cos + ry * sin;
   const unrotY = -rx * sin + ry * cos;
 
-  const x = dimensions.width / 2 + unrotX / zoom;
-  const y = dimensions.height / 2 + unrotY / zoom;
+  const fx = flipX ? -1 : 1;
+  const fy = flipY ? -1 : 1;
 
-  return { x, y };
+  out.x = dimensions.width / 2 + (fx * unrotX) / zoom;
+  out.y = dimensions.height / 2 + (fy * unrotY) / zoom;
 }
+
+export function screenToCanvas(
+  clientX: number,
+  clientY: number,
+  viewportRect: DOMRect,
+  pan: { x: number; y: number },
+  zoom: number,
+  rotation: number,
+  dimensions: CanvasDimensions,
+  flipX: boolean = false,
+  flipY: boolean = false
+): { x: number; y: number } {
+  const out = { x: 0, y: 0 };
+  screenToCanvasInto(clientX, clientY, viewportRect, pan, zoom, rotation, dimensions, out, flipX, flipY);
+  return out;
+}
+
+export const clientToDocument = screenToCanvas;
 
 export function canvasToScreen(
   canvasX: number,
@@ -332,10 +358,15 @@ export function canvasToScreen(
   pan: { x: number; y: number },
   zoom: number,
   rotation: number,
-  dimensions: CanvasDimensions
+  dimensions: CanvasDimensions,
+  flipX: boolean = false,
+  flipY: boolean = false
 ): { x: number; y: number } {
-  const dx = canvasX - dimensions.width / 2;
-  const dy = canvasY - dimensions.height / 2;
+  const fx = flipX ? -1 : 1;
+  const fy = flipY ? -1 : 1;
+
+  const dx = (canvasX - dimensions.width / 2) * fx;
+  const dy = (canvasY - dimensions.height / 2) * fy;
 
   const rad = (rotation * Math.PI) / 180;
   const cos = Math.cos(rad);
@@ -375,7 +406,9 @@ export function getCanvasToViewportMatrix(
   rotation: number,
   dimensions: CanvasDimensions,
   scaleX: number = 1,
-  scaleY: number = scaleX
+  scaleY: number = scaleX,
+  flipX: boolean = false,
+  flipY: boolean = false
 ): CanvasTransformMatrix {
   const rad = (rotation * Math.PI) / 180;
   const cos = Math.cos(rad);
@@ -383,13 +416,15 @@ export function getCanvasToViewportMatrix(
 
   const cx = dimensions.width / 2;
   const cy = dimensions.height / 2;
+  const sx = (flipX ? -1 : 1) * zoom;
+  const sy = (flipY ? -1 : 1) * zoom;
 
-  const a = scaleX * zoom * cos;
-  const b = scaleY * zoom * sin;
-  const c = -scaleX * zoom * sin;
-  const d = scaleY * zoom * cos;
-  const e = scaleX * (pan.x - zoom * (cx * cos - cy * sin));
-  const f = scaleY * (pan.y - zoom * (cx * sin + cy * cos));
+  const a = scaleX * sx * cos;
+  const b = scaleY * sx * sin;
+  const c = -scaleX * sy * sin;
+  const d = scaleY * sy * cos;
+  const e = scaleX * (pan.x - sx * cx * cos + sy * cy * sin);
+  const f = scaleY * (pan.y - sx * cx * sin - sy * cy * cos);
 
   return { a, b, c, d, e, f };
 }
@@ -400,12 +435,14 @@ export function getVisibleCanvasBounds(
   zoom: number,
   rotation: number,
   dimensions: CanvasDimensions,
-  margin: number = 64
+  margin: number = 64,
+  flipX: boolean = false,
+  flipY: boolean = false
 ): { minX: number; minY: number; maxX: number; maxY: number } {
-  const c1 = screenToCanvas(viewportRect.left, viewportRect.top, viewportRect, pan, zoom, rotation, dimensions);
-  const c2 = screenToCanvas(viewportRect.right, viewportRect.top, viewportRect, pan, zoom, rotation, dimensions);
-  const c3 = screenToCanvas(viewportRect.right, viewportRect.bottom, viewportRect, pan, zoom, rotation, dimensions);
-  const c4 = screenToCanvas(viewportRect.left, viewportRect.bottom, viewportRect, pan, zoom, rotation, dimensions);
+  const c1 = screenToCanvas(viewportRect.left, viewportRect.top, viewportRect, pan, zoom, rotation, dimensions, flipX, flipY);
+  const c2 = screenToCanvas(viewportRect.right, viewportRect.top, viewportRect, pan, zoom, rotation, dimensions, flipX, flipY);
+  const c3 = screenToCanvas(viewportRect.right, viewportRect.bottom, viewportRect, pan, zoom, rotation, dimensions, flipX, flipY);
+  const c4 = screenToCanvas(viewportRect.left, viewportRect.bottom, viewportRect, pan, zoom, rotation, dimensions, flipX, flipY);
 
   const rawMinX = Math.min(c1.x, c2.x, c3.x, c4.x) - margin;
   const rawMinY = Math.min(c1.y, c2.y, c3.y, c4.y) - margin;
@@ -569,9 +606,9 @@ export function renderCompleteStroke(
       dualBrush: brushSettings.dualBrush,
       dualTipImage: brushSettings.dualTipImage,
       dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
-      useGpu: Boolean(brushSettings.useGpu),
+      useGpu: brushSettings.useGpu !== false,
       underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
+      sampler: brushSettings.colorMixing && underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined,
       reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
       isEraser: isEraser && !isBgEraser,
       isBgEraser,
@@ -598,7 +635,7 @@ export function renderCompleteStroke(
     isTransparentInk,
     dynamics: brushSettings.dynamics,
     secondaryColor: brushSettings.secondaryColor,
-    useGpu: Boolean(brushSettings.useGpu),
+    useGpu: brushSettings.useGpu !== false,
     dualBrush: brushSettings.dualBrush,
     dualTipImage: brushSettings.dualTipImage,
     dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,

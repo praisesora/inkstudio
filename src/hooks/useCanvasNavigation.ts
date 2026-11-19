@@ -1,8 +1,34 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { CanvasDimensions } from '../types/editor';
 
 export const MIN_ZOOM = 0.01; // 1%
 export const MAX_ZOOM = 32.0; // 3200%
+
+/** Debounce window (ms) before committing high-frequency camera updates to React UI state. */
+export const NAV_STATE_COMMIT_DEBOUNCE_MS = 140;
+
+/** Custom DOM event name dispatched on window whenever live camera transform changes. */
+export const CAMERA_CHANGE_EVENT = 'ink-camera-change';
+
+export interface CameraTransformState {
+  pan: { x: number; y: number };
+  zoom: number;
+  rotation: number;
+  flipX: boolean;
+  flipY: boolean;
+}
+
+export type CameraSubscriber = (camera: CameraTransformState) => void;
+
+export interface CanvasNavigationHandle {
+  zoomRef: React.MutableRefObject<number>;
+  panRef: React.MutableRefObject<{ x: number; y: number }>;
+  rotationRef: React.MutableRefObject<number>;
+  flipXRef: React.MutableRefObject<boolean>;
+  flipYRef: React.MutableRefObject<boolean>;
+  getCameraState: () => CameraTransformState;
+  subscribeCamera: (listener: CameraSubscriber) => () => void;
+}
 
 export const ZOOM_PRESETS = [
   0.01,
@@ -106,6 +132,8 @@ export function useCanvasNavigation({
   const [zoom, setZoomState] = useState<number>(1.0);
   const [pan, setPanState] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [rotation, setRotationState] = useState<number>(0.0);
+  const [flipX, setFlipXState] = useState<boolean>(false);
+  const [flipY, setFlipYState] = useState<boolean>(false);
 
   const dimensionsRef = useRef<CanvasDimensions | undefined>(dimensions);
   dimensionsRef.current = dimensions;
@@ -118,33 +146,99 @@ export function useCanvasNavigation({
   const [isPanning, setIsPanning] = useState<boolean>(false);
   const [isRotating, setIsRotating] = useState<boolean>(false);
 
-  // Synchronous refs for sub-frame precision
+  // Synchronous refs for sub-frame precision (authoritative source of truth during active interaction)
   const zoomRef = useRef<number>(1.0);
   const panRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
   const rotationRef = useRef<number>(0.0);
+  const flipXRef = useRef<boolean>(false);
+  const flipYRef = useRef<boolean>(false);
 
   const isSpaceDownRef = useRef<boolean>(false);
   const isShiftDownRef = useRef<boolean>(false);
   const isPanningRef = useRef<boolean>(false);
   const isRotatingRef = useRef<boolean>(false);
 
-  // Coalesce high-frequency (240Hz) wheel/pan/rotate updates into 1 React render per animation frame
-  const navCommitRafRef = useRef<number | null>(null);
-  const scheduleNavStateCommit = useCallback(() => {
-    if (navCommitRafRef.current !== null) return;
-    navCommitRafRef.current = requestAnimationFrame(() => {
-      navCommitRafRef.current = null;
-      setZoomState(zoomRef.current);
-      setPanState({ x: panRef.current.x, y: panRef.current.y });
-      setRotationState(rotationRef.current);
-    });
+  const cameraSubscribersRef = useRef<Set<CameraSubscriber>>(new Set());
+  const cameraBroadcastRafRef = useRef<number | null>(null);
+  const navCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const getCameraState = useCallback((): CameraTransformState => {
+    return {
+      pan: { x: panRef.current.x, y: panRef.current.y },
+      zoom: zoomRef.current,
+      rotation: rotationRef.current,
+      flipX: flipXRef.current,
+      flipY: flipYRef.current,
+    };
   }, []);
+
+  const subscribeCamera = useCallback((listener: CameraSubscriber) => {
+    cameraSubscribersRef.current.add(listener);
+    return () => {
+      cameraSubscribersRef.current.delete(listener);
+    };
+  }, []);
+
+  const emitCameraToSubscribers = useCallback(() => {
+    const camera = getCameraState();
+    cameraSubscribersRef.current.forEach((listener) => {
+      listener(camera);
+    });
+    if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+      window.dispatchEvent(new CustomEvent<CameraTransformState>(CAMERA_CHANGE_EVENT, { detail: camera }));
+    }
+  }, [getCameraState]);
+
+  // Direct rAF-coalesced camera broadcast to CanvasArea DOM & ViewportCompositor (ZERO React setState calls)
+  const scheduleCameraBroadcast = useCallback(() => {
+    if (cameraBroadcastRafRef.current !== null) return;
+    cameraBroadcastRafRef.current = requestAnimationFrame(() => {
+      cameraBroadcastRafRef.current = null;
+      emitCameraToSubscribers();
+    });
+  }, [emitCameraToSubscribers]);
+
+  const broadcastCameraImmediate = useCallback(() => {
+    if (cameraBroadcastRafRef.current !== null) {
+      cancelAnimationFrame(cameraBroadcastRafRef.current);
+      cameraBroadcastRafRef.current = null;
+    }
+    emitCameraToSubscribers();
+  }, [emitCameraToSubscribers]);
+
+  const commitNavStateImmediate = useCallback(() => {
+    if (navCommitTimerRef.current !== null) {
+      clearTimeout(navCommitTimerRef.current);
+      navCommitTimerRef.current = null;
+    }
+    setZoomState(zoomRef.current);
+    setPanState({ x: panRef.current.x, y: panRef.current.y });
+    setRotationState(rotationRef.current);
+    setFlipXState(flipXRef.current);
+    setFlipYState(flipYRef.current);
+  }, []);
+
+  // Debounced commit to React state (~140ms after wheel/inertia ends; never per-rAF during motion)
+  const scheduleNavStateCommit = useCallback(() => {
+    if (navCommitTimerRef.current !== null) {
+      clearTimeout(navCommitTimerRef.current);
+    }
+    navCommitTimerRef.current = setTimeout(() => {
+      navCommitTimerRef.current = null;
+      if (isPanningRef.current || isRotatingRef.current) return;
+      commitNavStateImmediate();
+    }, NAV_STATE_COMMIT_DEBOUNCE_MS);
+  }, [commitNavStateImmediate]);
 
   useEffect(() => {
     return () => {
-      if (navCommitRafRef.current !== null) {
-        cancelAnimationFrame(navCommitRafRef.current);
-        navCommitRafRef.current = null;
+      if (cameraBroadcastRafRef.current !== null) {
+        cancelAnimationFrame(cameraBroadcastRafRef.current);
+        cameraBroadcastRafRef.current = null;
+      }
+      if (navCommitTimerRef.current !== null) {
+        clearTimeout(navCommitTimerRef.current);
+        navCommitTimerRef.current = null;
       }
     };
   }, []);
@@ -174,61 +268,68 @@ export function useCanvasNavigation({
 
   const hasInitializedCenterRef = useRef<boolean>(false);
 
-  const setZoom = useCallback((newZoomOrFn: number | ((prev: number) => number)) => {
-    setZoomState((prev) => {
-      const next = typeof newZoomOrFn === 'function' ? newZoomOrFn(prev) : newZoomOrFn;
+  const setZoom = useCallback(
+    (newZoomOrFn: number | ((prev: number) => number)) => {
+      const next = typeof newZoomOrFn === 'function' ? newZoomOrFn(zoomRef.current) : newZoomOrFn;
       const safe = Number.isFinite(next) ? next : 1.0;
       const clamped = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, safe));
       zoomRef.current = clamped;
-      return clamped;
-    });
-  }, []);
+      setZoomState(clamped);
+      broadcastCameraImmediate();
+    },
+    [broadcastCameraImmediate]
+  );
 
   const setPan = useCallback(
     (newPanOrFn: { x: number; y: number } | ((prev: { x: number; y: number }) => { x: number; y: number })) => {
-      setPanState((prev) => {
-        const next = typeof newPanOrFn === 'function' ? newPanOrFn(prev) : newPanOrFn;
-        panRef.current = next;
-        return next;
-      });
+      const next = typeof newPanOrFn === 'function' ? newPanOrFn(panRef.current) : newPanOrFn;
+      panRef.current = { x: next.x, y: next.y };
+      setPanState(panRef.current);
+      broadcastCameraImmediate();
     },
-    []
+    [broadcastCameraImmediate]
   );
 
-  const setRotation = useCallback((newRotationOrFn: number | ((prev: number) => number)) => {
-    setRotationState((prev) => {
-      const next = typeof newRotationOrFn === 'function' ? newRotationOrFn(prev) : newRotationOrFn;
+  const setRotation = useCallback(
+    (newRotationOrFn: number | ((prev: number) => number)) => {
+      const next = typeof newRotationOrFn === 'function' ? newRotationOrFn(rotationRef.current) : newRotationOrFn;
       rotationRef.current = next;
-      return next;
-    });
-  }, []);
+      setRotationState(next);
+      broadcastCameraImmediate();
+    },
+    [broadcastCameraImmediate]
+  );
 
-  const centerCanvas = useCallback((targetZoom: number = zoomRef.current) => {
-    const viewport = viewportRef.current;
-    let vw = viewport?.clientWidth ?? 0;
-    let vh = viewport?.clientHeight ?? 0;
+  const centerCanvas = useCallback(
+    (targetZoom: number = zoomRef.current) => {
+      const viewport = viewportRef.current;
+      let vw = viewport?.clientWidth ?? 0;
+      let vh = viewport?.clientHeight ?? 0;
 
-    if (vw <= 0 || vh <= 0) {
-      if (typeof window !== 'undefined') {
-        vw = Math.max(300, window.innerWidth - 300);
-        vh = Math.max(300, window.innerHeight - 80);
-      } else {
-        return;
+      if (vw <= 0 || vh <= 0) {
+        if (typeof window !== 'undefined') {
+          vw = Math.max(300, window.innerWidth - 300);
+          vh = Math.max(300, window.innerHeight - 80);
+        } else {
+          return;
+        }
       }
-    }
 
-    const newCenter = {
-      x: Math.round(vw / 2),
-      y: Math.round(vh / 2),
-    };
+      const newCenter = {
+        x: Math.round(vw / 2),
+        y: Math.round(vh / 2),
+      };
 
-    const safeZoom = Number.isFinite(targetZoom) ? targetZoom : 1.0;
-    const clampedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, safeZoom));
-    panRef.current = newCenter;
-    setPanState(newCenter);
-    zoomRef.current = clampedZoom;
-    setZoomState(clampedZoom);
-  }, []);
+      const safeZoom = Number.isFinite(targetZoom) ? targetZoom : 1.0;
+      const clampedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, safeZoom));
+      panRef.current = newCenter;
+      zoomRef.current = clampedZoom;
+      setPanState(newCenter);
+      setZoomState(clampedZoom);
+      broadcastCameraImmediate();
+    },
+    [broadcastCameraImmediate]
+  );
 
   /**
    * Reset zoom based on layer/canvas dimensions.
@@ -257,6 +358,7 @@ export function useCanvasNavigation({
     if (!viewport) {
       rotationRef.current = 0.0;
       setRotationState(0.0);
+      broadcastCameraImmediate();
       return;
     }
 
@@ -275,34 +377,118 @@ export function useCanvasNavigation({
     const newPanY = vc.y + rx * Math.sin(dRad) + ry * Math.cos(dRad);
 
     rotationRef.current = 0.0;
+    panRef.current = { x: newPanX, y: newPanY };
     setRotationState(0.0);
-    panRef.current = { x: newPanX, y: newPanY };
     setPanState({ x: newPanX, y: newPanY });
-  }, []);
+    broadcastCameraImmediate();
+  }, [broadcastCameraImmediate]);
 
-  const zoomToViewportCenter = useCallback((targetZoom: number) => {
+  /**
+   * Non-destructive horizontal view reflection across the viewport vertical midline (CSP-style).
+   * Does not modify any layer pixel buffers.
+   */
+  const toggleFlipHorizontal = useCallback(() => {
     const viewport = viewportRef.current;
-    if (!viewport) return;
+    const vw = viewport?.clientWidth ?? 0;
+    if (vw > 0) {
+      panRef.current = {
+        x: vw - panRef.current.x,
+        y: panRef.current.y,
+      };
+    }
+    if (Math.abs(rotationRef.current) > 0.0001) {
+      rotationRef.current = -rotationRef.current;
+    } else {
+      rotationRef.current = 0;
+    }
+    flipXRef.current = !flipXRef.current;
+    broadcastCameraImmediate();
+    commitNavStateImmediate();
+  }, [broadcastCameraImmediate, commitNavStateImmediate]);
 
-    const currentZoom = zoomRef.current;
-    const clampedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, targetZoom));
-    if (Math.abs(clampedZoom - currentZoom) < 0.0001) return;
+  /**
+   * Non-destructive vertical view reflection across the viewport horizontal midline (CSP-style).
+   * Does not modify any layer pixel buffers.
+   */
+  const toggleFlipVertical = useCallback(() => {
+    const viewport = viewportRef.current;
+    const vh = viewport?.clientHeight ?? 0;
+    if (vh > 0) {
+      panRef.current = {
+        x: panRef.current.x,
+        y: vh - panRef.current.y,
+      };
+    }
+    if (Math.abs(rotationRef.current) > 0.0001) {
+      rotationRef.current = -rotationRef.current;
+    } else {
+      rotationRef.current = 0;
+    }
+    flipYRef.current = !flipYRef.current;
+    broadcastCameraImmediate();
+    commitNavStateImmediate();
+  }, [broadcastCameraImmediate, commitNavStateImmediate]);
 
-    const vw = viewport.clientWidth;
-    const vh = viewport.clientHeight;
-    const centerX = vw / 2;
-    const centerY = vh / 2;
+  /**
+   * Clears both horizontal and vertical non-destructive view reflections.
+   */
+  const resetViewFlip = useCallback(() => {
+    const wasFlipX = flipXRef.current;
+    const wasFlipY = flipYRef.current;
+    if (!wasFlipX && !wasFlipY) return;
 
-    const ratio = clampedZoom / currentZoom;
-    const newPanX = centerX - (centerX - panRef.current.x) * ratio;
-    const newPanY = centerY - (centerY - panRef.current.y) * ratio;
+    const viewport = viewportRef.current;
+    const vw = viewport?.clientWidth ?? 0;
+    const vh = viewport?.clientHeight ?? 0;
 
-    zoomRef.current = clampedZoom;
-    panRef.current = { x: newPanX, y: newPanY };
+    let nextPanX = panRef.current.x;
+    let nextPanY = panRef.current.y;
+    let nextRot = rotationRef.current;
 
-    setZoomState(clampedZoom);
-    setPanState({ x: newPanX, y: newPanY });
-  }, []);
+    if (wasFlipX) {
+      if (vw > 0) nextPanX = vw - nextPanX;
+      nextRot = -nextRot;
+    }
+    if (wasFlipY) {
+      if (vh > 0) nextPanY = vh - nextPanY;
+      nextRot = -nextRot;
+    }
+
+    panRef.current = { x: nextPanX, y: nextPanY };
+    rotationRef.current = Math.abs(nextRot) > 0.0001 ? nextRot : 0;
+    flipXRef.current = false;
+    flipYRef.current = false;
+    broadcastCameraImmediate();
+    commitNavStateImmediate();
+  }, [broadcastCameraImmediate, commitNavStateImmediate]);
+
+  const zoomToViewportCenter = useCallback(
+    (targetZoom: number) => {
+      const viewport = viewportRef.current;
+      if (!viewport) return;
+
+      const currentZoom = zoomRef.current;
+      const clampedZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, targetZoom));
+      if (Math.abs(clampedZoom - currentZoom) < 0.0001) return;
+
+      const vw = viewport.clientWidth;
+      const vh = viewport.clientHeight;
+      const centerX = vw / 2;
+      const centerY = vh / 2;
+
+      const ratio = clampedZoom / currentZoom;
+      const newPanX = centerX - (centerX - panRef.current.x) * ratio;
+      const newPanY = centerY - (centerY - panRef.current.y) * ratio;
+
+      zoomRef.current = clampedZoom;
+      panRef.current = { x: newPanX, y: newPanY };
+
+      setZoomState(clampedZoom);
+      setPanState({ x: newPanX, y: newPanY });
+      broadcastCameraImmediate();
+    },
+    [broadcastCameraImmediate]
+  );
 
   const zoomIn = useCallback(() => {
     const current = zoomRef.current;
@@ -395,7 +581,9 @@ export function useCanvasNavigation({
           const dx = (width - prevWidth) / 2;
           const dy = (height - prevHeight) / 2;
           if (dx !== 0 || dy !== 0) {
-            setPan((prev) => ({ x: prev.x + dx, y: prev.y + dy }));
+            panRef.current = { x: panRef.current.x + dx, y: panRef.current.y + dy };
+            scheduleCameraBroadcast();
+            scheduleNavStateCommit();
           }
         }
 
@@ -406,9 +594,9 @@ export function useCanvasNavigation({
 
     ro.observe(viewport);
     return () => ro.disconnect();
-  }, [centerCanvas, setPan, activeDocumentId]);
+  }, [centerCanvas, scheduleCameraBroadcast, scheduleNavStateCommit, activeDocumentId]);
 
-  // Mouse wheel zoom centered on cursor position (coalesced to 1 React render per rAF)
+  // Mouse wheel zoom centered on cursor position (live camera via rAF broadcast; React state debounced after wheel/inertia)
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
@@ -429,6 +617,7 @@ export function useCanvasNavigation({
 
       if (isWebtoonModeRef.current && !e.ctrlKey && !e.metaKey) {
         panRef.current = { x: panRef.current.x, y: panRef.current.y - delta };
+        scheduleCameraBroadcast();
         scheduleNavStateCommit();
         return;
       }
@@ -444,6 +633,7 @@ export function useCanvasNavigation({
 
         zoomRef.current = nextZoom;
         panRef.current = { x: nextPanX, y: nextPanY };
+        scheduleCameraBroadcast();
         scheduleNavStateCommit();
       }
     };
@@ -452,7 +642,7 @@ export function useCanvasNavigation({
     return () => {
       viewport.removeEventListener('wheel', handleWheel);
     };
-  }, [activeDocumentId, scheduleNavStateCommit]);
+  }, [activeDocumentId, scheduleCameraBroadcast, scheduleNavStateCommit]);
 
   // Global Keyboard Shortcuts (Space, Shift, Ctrl+0, Ctrl+Alt+0, Ctrl++, Ctrl+-)
   useEffect(() => {
@@ -524,6 +714,7 @@ export function useCanvasNavigation({
     };
 
     const handleBlur = () => {
+      const wasInteracting = isPanningRef.current || isRotatingRef.current;
       isSpaceDownRef.current = false;
       setIsSpaceDown(false);
       isShiftDownRef.current = false;
@@ -532,6 +723,10 @@ export function useCanvasNavigation({
       setIsPanning(false);
       isRotatingRef.current = false;
       setIsRotating(false);
+      if (wasInteracting) {
+        broadcastCameraImmediate();
+        commitNavStateImmediate();
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -543,9 +738,9 @@ export function useCanvasNavigation({
       window.removeEventListener('keyup', handleKeyUp);
       window.removeEventListener('blur', handleBlur);
     };
-  }, [resetRotation, resetZoomAndCenter, zoomIn, zoomOut]);
+  }, [resetRotation, resetZoomAndCenter, zoomIn, zoomOut, broadcastCameraImmediate, commitNavStateImmediate]);
 
-  // Panning pointermove coalesced to rAF
+  // Panning pointermove: broadcasts directly to DOM/WebGL via rAF; commits React state only on pointerup
   useEffect(() => {
     if (!isPanning) return;
 
@@ -558,13 +753,14 @@ export function useCanvasNavigation({
         x: isWebtoonModeRef.current ? panStartRef.current.panX : panStartRef.current.panX + dx,
         y: panStartRef.current.panY + dy,
       };
-      scheduleNavStateCommit();
+      scheduleCameraBroadcast();
     };
 
     const handleWindowPointerUp = () => {
       isPanningRef.current = false;
+      broadcastCameraImmediate();
       setIsPanning(false);
-      setPanState({ x: panRef.current.x, y: panRef.current.y });
+      commitNavStateImmediate();
     };
 
     window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
@@ -583,9 +779,9 @@ export function useCanvasNavigation({
       document.body.style.cursor = prevCursor;
       document.body.style.userSelect = prevUserSelect;
     };
-  }, [isPanning, scheduleNavStateCommit]);
+  }, [isPanning, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
 
-  // Rotating pointermove coalesced to rAF
+  // Rotating pointermove: broadcasts directly to DOM/WebGL via rAF; commits React state only on pointerup
   useEffect(() => {
     if (!isRotating) return;
 
@@ -632,14 +828,14 @@ export function useCanvasNavigation({
         x: vc.x + rx * Math.cos(dRad) - ry * Math.sin(dRad),
         y: vc.y + rx * Math.sin(dRad) + ry * Math.cos(dRad),
       };
-      scheduleNavStateCommit();
+      scheduleCameraBroadcast();
     };
 
     const handleWindowPointerUp = () => {
       isRotatingRef.current = false;
+      broadcastCameraImmediate();
       setIsRotating(false);
-      setRotationState(rotationRef.current);
-      setPanState({ x: panRef.current.x, y: panRef.current.y });
+      commitNavStateImmediate();
     };
 
     window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
@@ -658,7 +854,7 @@ export function useCanvasNavigation({
       document.body.style.cursor = prevCursor;
       document.body.style.userSelect = prevUserSelect;
     };
-  }, [isRotating, scheduleNavStateCommit]);
+  }, [isRotating, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
 
   useEffect(() => {
     const handleAuxClick = (e: MouseEvent) => {
@@ -670,13 +866,36 @@ export function useCanvasNavigation({
     return () => window.removeEventListener('auxclick', handleAuxClick);
   }, []);
 
+  const navigation = useMemo<CanvasNavigationHandle>(
+    () => ({
+      zoomRef,
+      panRef,
+      rotationRef,
+      flipXRef,
+      flipYRef,
+      getCameraState,
+      subscribeCamera,
+    }),
+    [getCameraState, subscribeCamera]
+  );
+
   const isRotateModifier = isSpaceDown && isShiftDown;
 
   return {
     viewportRef,
+    navigation,
     zoom,
     pan,
     rotation,
+    flipX,
+    flipY,
+    zoomRef,
+    panRef,
+    rotationRef,
+    flipXRef,
+    flipYRef,
+    getCameraState,
+    subscribeCamera,
     isSpaceDown,
     isShiftDown,
     isRotateModifier,
@@ -688,6 +907,9 @@ export function useCanvasNavigation({
     zoomOut,
     resetZoomAndCenter,
     resetRotation,
+    toggleFlipHorizontal,
+    toggleFlipVertical,
+    resetViewFlip,
     setZoom,
     setPan,
     setRotation,

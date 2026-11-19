@@ -23,6 +23,8 @@ export interface ViewportTransform {
   pan: { x: number; y: number };
   zoom: number;
   rotation: number; // in degrees
+  flipX?: boolean;
+  flipY?: boolean;
 }
 
 export const BLEND_MODE_MAP: Record<BlendMode, number> = {
@@ -201,6 +203,7 @@ uniform vec2 u_viewportSize; // viewport width, height
 uniform vec2 u_pan;
 uniform float u_zoom;
 uniform float u_rotationRad;
+uniform vec2 u_flip;
 uniform float u_dpr;
 
 out vec2 v_texCoord;
@@ -213,8 +216,8 @@ void main() {
   vec2 docPos = u_tileOrigin + a_quadPos * u_tileSize;
   v_docCoord = docPos;
 
-  // Center document around (0, 0)
-  vec2 centered = docPos - u_docDimensions * 0.5;
+  // Center document around (0, 0) and apply non-destructive view flip
+  vec2 centered = (docPos - u_docDimensions * 0.5) * u_flip;
 
   // Rotate
   float cosR = cos(u_rotationRad);
@@ -410,15 +413,19 @@ void main() {
     finalColor.rgb = vec3(gLum);
   } else if (u_expressionMode == 2) {
     float mLum = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
+    float monoHi = clamp(0.18 * sqrt(max(0.01, u_zoom)) + 0.04, 0.06, 0.25);
+    float monoAlpha = u_zoom >= 0.99
+      ? step(0.5, finalColor.a)
+      : smoothstep(0.02, monoHi, finalColor.a);
     if (mLum < u_monoThreshold) {
       if (u_monoExpressBlack == 1) {
-        finalColor = vec4(0.0, 0.0, 0.0, step(0.1, finalColor.a));
+        finalColor = vec4(0.0, 0.0, 0.0, monoAlpha);
       } else {
         discard;
       }
     } else {
       if (u_monoExpressWhite == 1) {
-        finalColor = vec4(1.0, 1.0, 1.0, step(0.1, finalColor.a));
+        finalColor = vec4(1.0, 1.0, 1.0, monoAlpha);
       } else {
         discard;
       }
@@ -456,6 +463,320 @@ void main() {
   }
 
   fragColor = vec4(finalColor.rgb * finalColor.a, finalColor.a);
+}
+`;
+
+// Instanced Vertex Shader: Batched tile rendering via TEXTURE_2D_ARRAY + drawArraysInstanced
+export const COMPOSITOR_INSTANCED_VERTEX_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 a_quadPos; // [0, 1] x [0, 1]
+in vec3 a_instanceData; // xy = tileOrigin in document space, z = TEXTURE_2D_ARRAY slice index
+uniform vec2 u_tileSize; // tile size in document space (TILE_SIZE << lod)
+uniform vec2 u_docDimensions;
+uniform vec2 u_viewportSize;
+uniform vec2 u_pan;
+uniform float u_zoom;
+uniform float u_rotationRad;
+uniform vec2 u_flip;
+uniform float u_dpr;
+
+out vec2 v_texCoord;
+out vec2 v_docCoord;
+flat out float v_sliceIndex;
+
+void main() {
+  v_texCoord = a_quadPos;
+  v_sliceIndex = a_instanceData.z;
+
+  vec2 docPos = a_instanceData.xy + a_quadPos * u_tileSize;
+  v_docCoord = docPos;
+
+  vec2 centered = (docPos - u_docDimensions * 0.5) * u_flip;
+
+  float cosR = cos(u_rotationRad);
+  float sinR = sin(u_rotationRad);
+  vec2 rotated = vec2(
+    centered.x * cosR - centered.y * sinR,
+    centered.x * sinR + centered.y * cosR
+  );
+
+  vec2 screenPos = (u_pan + rotated * u_zoom) * u_dpr;
+
+  vec2 clipPos = vec2(
+    (2.0 * screenPos.x / u_viewportSize.x) - 1.0,
+    1.0 - (2.0 * screenPos.y / u_viewportSize.y)
+  );
+
+  gl_Position = vec4(clipPos, 0.0, 1.0);
+}
+`;
+
+// Instanced Fragment Shader: Samples TEXTURE_2D_ARRAY slice for batched single-draw-call layer rendering
+export const COMPOSITOR_INSTANCED_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+precision highp sampler2DArray;
+
+in vec2 v_texCoord;
+in vec2 v_docCoord;
+flat in float v_sliceIndex;
+
+uniform sampler2DArray u_tileArrayTexture;
+uniform sampler2D u_backdropTexture;
+uniform int u_hasBackdrop;
+uniform vec2 u_viewportSize;
+uniform float u_layerOpacity;
+uniform int u_blendMode;
+
+// Screentone Uniforms
+uniform int u_toneEnabled;
+uniform float u_toneFrequency;
+uniform float u_toneAngleRad;
+uniform float u_toneDpi;
+uniform int u_toneDotShape;
+uniform float u_toneDensity;
+uniform int u_toneDensityType;
+uniform float u_zoom;
+
+// Layer Tint Uniforms
+uniform int u_layerColorEnabled;
+uniform vec3 u_layerColor;
+uniform vec3 u_layerSubColor;
+
+// Layer Mask Uniforms
+uniform vec2 u_docDimensions;
+uniform sampler2D u_maskTexture;
+uniform int u_maskEnabled;
+
+// CSP Expression Color Uniforms (0: color, 1: gray, 2: monochrome)
+uniform int u_expressionMode;
+uniform float u_monoThreshold;
+uniform int u_monoExpressBlack;
+uniform int u_monoExpressWhite;
+
+out vec4 fragColor;
+
+float fractVal(float x) {
+  return x - floor(x);
+}
+
+float blendChannel(float b, float s, int mode) {
+  if (mode == 1) return b * s;
+  if (mode == 2) return b + s - b * s;
+  if (mode == 3) return b < 0.5 ? (2.0 * b * s) : (1.0 - 2.0 * (1.0 - b) * (1.0 - s));
+  if (mode == 4) return min(b, s);
+  if (mode == 5) return max(b, s);
+  if (mode == 6) return b <= 0.0 ? 0.0 : (s >= 1.0 ? 1.0 : min(1.0, b / max(0.0001, 1.0 - s)));
+  if (mode == 7) return b >= 1.0 ? 1.0 : (s <= 0.0 ? 0.0 : 1.0 - min(1.0, (1.0 - b) / max(0.0001, s)));
+  if (mode == 8) return s < 0.5 ? (2.0 * b * s) : (1.0 - 2.0 * (1.0 - b) * (1.0 - s));
+  if (mode == 9) {
+    float d = b <= 0.25 ? (((16.0 * b - 12.0) * b + 4.0) * b) : sqrt(max(0.0, b));
+    return s <= 0.5 ? (b - (1.0 - 2.0 * s) * b * (1.0 - b)) : (b + (2.0 * s - 1.0) * (d - b));
+  }
+  if (mode == 10) return abs(b - s);
+  if (mode == 11) return b + s - 2.0 * b * s;
+  if (mode == 13) return max(0.0, b + s - 1.0);
+  if (mode == 14) return min(1.0, b + s);
+  if (mode == 15) return s >= 1.0 ? 1.0 : min(1.0, b / max(0.0001, 1.0 - s));
+  if (mode == 16) return s <= 0.0001 ? 1.0 : clamp(b / s, 0.0, 1.0);
+  return s;
+}
+
+vec3 evaluateBlendMode(vec3 Cb, vec3 Cs, int mode) {
+  return vec3(
+    blendChannel(Cb.r, Cs.r, mode),
+    blendChannel(Cb.g, Cs.g, mode),
+    blendChannel(Cb.b, Cs.b, mode)
+  );
+}
+
+vec4 evaluateScreentone(vec4 srcColor, vec2 docCoord) {
+  if (srcColor.a < 0.0039) {
+    return vec4(0.0);
+  }
+
+  float density;
+  if (u_toneDensityType == 0) {
+    density = clamp(u_toneDensity * srcColor.a, 0.0, 1.0);
+  } else {
+    float lum = dot(srcColor.rgb, vec3(0.299, 0.587, 0.114));
+    density = clamp((1.0 - lum) * srcColor.a, 0.0, 1.0);
+  }
+
+  if (density <= 0.001) return vec4(0.0);
+  if (density >= 0.999) return vec4(0.0, 0.0, 0.0, 1.0);
+
+  float cellSize = max(3.5, u_toneDpi / max(1.0, u_toneFrequency));
+  float cosA = cos(u_toneAngleRad);
+  float sinA = sin(u_toneAngleRad);
+
+  float xr = docCoord.x * cosA - docCoord.y * sinA;
+  float yr = docCoord.x * sinA + docCoord.y * cosA;
+
+  float u = fractVal(xr / cellSize) - 0.5;
+  float v = fractVal(yr / cellSize) - 0.5;
+
+  float spot;
+  if (u_toneDotShape == 2) {
+    spot = 1.0 - 2.0 * abs(u);
+  } else if (u_toneDotShape == 3) {
+    spot = 1.0 - (abs(u) + abs(v));
+  } else {
+    float absU = abs(u);
+    float absV = abs(v);
+    if (absU + absV <= 0.5) {
+      spot = 1.0 - 2.0 * (u * u + v * v);
+    } else {
+      float uc = absU - 0.5;
+      float vc = absV - 0.5;
+      spot = 2.0 * (uc * uc + vc * vc);
+    }
+  }
+
+  float diff = spot - (1.0 - density);
+  float halfSpan = min(0.25, 0.75 / cellSize);
+  float coverage = clamp(diff / (2.0 * halfSpan) + 0.5, 0.0, 1.0);
+  vec4 halftoneColor = vec4(0.0, 0.0, 0.0, coverage);
+
+  float moireBlend = smoothstep(0.35, 0.95, u_zoom);
+  vec4 contColor = vec4(0.0, 0.0, 0.0, density);
+  return mix(contColor, halftoneColor, moireBlend);
+}
+
+vec4 applyLayerTint(vec4 color) {
+  if (u_layerColorEnabled == 0) return color;
+  float lum = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+  vec3 tinted = mix(u_layerColor, u_layerSubColor, lum);
+  return vec4(tinted, color.a);
+}
+
+vec4 sampleTileStraight(vec2 uv, int slice) {
+  if (u_zoom >= 2.0) {
+    ivec2 coord = clamp(ivec2(floor(uv * 256.0)), ivec2(0), ivec2(255));
+    return texelFetch(u_tileArrayTexture, ivec3(coord, slice), 0);
+  }
+  vec2 texCoord = uv * 256.0 - 0.5;
+  ivec2 base = ivec2(floor(texCoord));
+  vec2 f = texCoord - vec2(base);
+  ivec2 c0 = clamp(base, ivec2(0), ivec2(255));
+  ivec2 c1 = clamp(base + ivec2(1), ivec2(0), ivec2(255));
+
+  vec4 t00 = texelFetch(u_tileArrayTexture, ivec3(c0.x, c0.y, slice), 0);
+  vec4 t10 = texelFetch(u_tileArrayTexture, ivec3(c1.x, c0.y, slice), 0);
+  vec4 t01 = texelFetch(u_tileArrayTexture, ivec3(c0.x, c1.y, slice), 0);
+  vec4 t11 = texelFetch(u_tileArrayTexture, ivec3(c1.x, c1.y, slice), 0);
+
+  vec4 pm00 = vec4(t00.rgb * t00.a, t00.a);
+  vec4 pm10 = vec4(t10.rgb * t10.a, t10.a);
+  vec4 pm01 = vec4(t01.rgb * t01.a, t01.a);
+  vec4 pm11 = vec4(t11.rgb * t11.a, t11.a);
+
+  vec4 pm = mix(mix(pm00, pm10, f.x), mix(pm01, pm11, f.x), f.y);
+  if (pm.a < 0.002) {
+    return vec4(0.0);
+  }
+  return vec4(clamp(pm.rgb / pm.a, 0.0, 1.0), pm.a);
+}
+
+void main() {
+  int slice = int(v_sliceIndex + 0.5);
+  vec4 texColor = sampleTileStraight(v_texCoord, slice);
+
+  if (texColor.a < 0.002) {
+    discard;
+  }
+
+  vec4 finalColor = texColor;
+
+  if (u_expressionMode == 1) {
+    float gLum = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
+    finalColor.rgb = vec3(gLum);
+  } else if (u_expressionMode == 2) {
+    float mLum = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
+    float monoAlpha = u_zoom >= 0.99 ? step(0.5, finalColor.a) : finalColor.a;
+    if (mLum < u_monoThreshold) {
+      if (u_monoExpressBlack == 1) {
+        finalColor = vec4(0.0, 0.0, 0.0, monoAlpha);
+      } else {
+        discard;
+      }
+    } else {
+      if (u_monoExpressWhite == 1) {
+        finalColor = vec4(1.0, 1.0, 1.0, monoAlpha);
+      } else {
+        discard;
+      }
+    }
+  }
+
+  if (u_toneEnabled == 1) {
+    finalColor = evaluateScreentone(finalColor, v_docCoord);
+  }
+
+  if (u_layerColorEnabled == 1) {
+    finalColor = applyLayerTint(finalColor);
+  }
+
+  if (u_maskEnabled == 1) {
+    vec2 maskCoord = clamp(v_docCoord / u_docDimensions, 0.0, 1.0);
+    vec4 maskPixel = texture(u_maskTexture, maskCoord);
+    float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
+    finalColor.a *= maskLum;
+  }
+
+  finalColor.a *= u_layerOpacity;
+
+  if (finalColor.a < 0.002) {
+    discard;
+  }
+
+  if (u_hasBackdrop == 1 && u_blendMode != 0 && u_blendMode != 12) {
+    vec2 screenUV = clamp(gl_FragCoord.xy / max(vec2(1.0), u_viewportSize), 0.0, 1.0);
+    vec4 dstPremul = texture(u_backdropTexture, screenUV);
+    vec3 Cb = dstPremul.a > 0.001 ? clamp(dstPremul.rgb / dstPremul.a, 0.0, 1.0) : vec3(1.0);
+    vec3 Cs = clamp(finalColor.rgb, 0.0, 1.0);
+    vec3 blended = evaluateBlendMode(Cb, Cs, u_blendMode);
+    finalColor.rgb = mix(Cs, blended, dstPremul.a);
+  }
+
+  fragColor = vec4(finalColor.rgb * finalColor.a, finalColor.a);
+}
+`;
+
+// Viewport-Space Draft Vertex Shader: Maps a viewport-sized Canvas2D draft overlay 1:1 to screen
+// while reconstructing exact document coordinates for screentone & layer mask evaluation in-stack.
+export const VIEWPORT_DRAFT_VERTEX_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 a_quadPos; // [0, 1] x [0, 1] (0,0 = top-left of viewport)
+uniform vec2 u_docDimensions;
+uniform vec2 u_viewportSize;
+uniform vec2 u_pan;
+uniform float u_zoom;
+uniform float u_rotationRad;
+uniform vec2 u_flip;
+uniform float u_dpr;
+
+out vec2 v_texCoord;
+out vec2 v_docCoord;
+
+void main() {
+  v_texCoord = a_quadPos;
+
+  vec2 clipPos = vec2(a_quadPos.x * 2.0 - 1.0, 1.0 - a_quadPos.y * 2.0);
+  vec2 screenPos = a_quadPos * u_viewportSize;
+  vec2 cssScreen = screenPos / max(0.0001, u_dpr);
+  vec2 unscaled = (cssScreen - u_pan) / max(0.0001, u_zoom);
+
+  float cosR = cos(u_rotationRad);
+  float sinR = sin(u_rotationRad);
+  vec2 unrotated = vec2(
+    unscaled.x * cosR + unscaled.y * sinR,
+    -unscaled.x * sinR + unscaled.y * cosR
+  );
+
+  v_docCoord = unrotated * u_flip + u_docDimensions * 0.5;
+  gl_Position = vec4(clipPos, 0.0, 1.0);
 }
 `;
 
@@ -982,11 +1303,412 @@ export interface CompositorOptions {
   devicePixelRatio?: number;
   onionSkinFrames?: OnionSkinCompositorFrame[];
   softProof?: SoftProofSettings;
+  // Active layer identifier for Baked Layer Stack Cache partitioning (below / active / above)
+  activeLayerId?: string | null;
   // WYSIWYG In-Stack Live Stroke Compositing
   activeDraftCanvas?: HTMLCanvasElement | null;
   activeDraftLayerId?: string | null;
   activeDraftDirtyRect?: { x: number; y: number; width: number; height: number } | null;
   activeDraftVersion?: number;
+  activeDraftSpace?: 'document' | 'viewport';
+  activeDraftOpacity?: number;
+  activeDraftMonochrome?: boolean;
+}
+
+// ============================================================================
+// Baked Layer Stack Cache Partitioning & Invalidation Engine
+// ============================================================================
+
+export interface CompositingUnit {
+  /** Base node and its clipped siblings at this compositing level */
+  group: TreeNodeRenderGroup;
+  /** Accumulated opacity from enclosing pass-through folders */
+  inheritedOpacity: number;
+  /** All layer IDs contained in this unit (base, clipped siblings, and folder descendants) */
+  containedLayerIds: Set<string>;
+}
+
+export type AboveSliceStrategy = 'empty' | 'baked-normal' | 'baked-single-blend' | 'mixed';
+
+export interface LayerStackPartition {
+  /** Units strictly below the active unit (always safe to bake into belowActiveCacheFbo) */
+  belowUnits: CompositingUnit[];
+  /** The active unit containing activeLayerId, or null if none/hidden */
+  activeUnit: CompositingUnit | null;
+  /** Units above active that must render dynamically (non-associative blend modes / adjustments) */
+  aboveDynamicUnits: CompositingUnit[];
+  /** Units above activeDynamicUnits that can be baked into aboveActiveCacheFbo */
+  aboveCachedUnits: CompositingUnit[];
+  /** How aboveActiveCacheFbo should be composited over (below + active + aboveDynamic) */
+  aboveStrategy: AboveSliceStrategy;
+  /** Blend mode for aboveActiveCacheFbo when aboveStrategy === 'baked-single-blend' */
+  aboveCacheBlendMode: BlendMode;
+}
+
+export interface LayerStackCacheInput {
+  layers: LayerItem[];
+  activeLayerId?: string | null;
+  viewportW: number;
+  viewportH: number;
+  dpr: number;
+  dimensions: CanvasDimensions;
+  transform: ViewportTransform;
+  showCheckerboard?: boolean;
+  onionSkinFrames?: OnionSkinCompositorFrame[];
+  getLayerContentVersion: (layerId: string) => number;
+  getMaskInvalidationEpoch?: (layerId: string) => number;
+  gridEpoch?: number;
+}
+
+export interface LayerStackCacheEvaluation {
+  partition: LayerStackPartition;
+  belowSignature: string;
+  aboveSignature: string;
+  belowDirty: boolean;
+  aboveDirty: boolean;
+}
+
+function collectNodeLayerIds(node: LayerTreeNode, out: Set<string>): void {
+  out.add(node.layer.id);
+  for (const child of node.children) {
+    collectNodeLayerIds(child, out);
+  }
+}
+
+/**
+ * Flattens pass-through folders into a bottom-to-top sequence of atomic compositing units
+ * while keeping isolated folders and clipping-mask groups atomic.
+ */
+export function flattenLayerTreeToUnits(
+  nodes: LayerTreeNode[],
+  inheritedOpacity: number = 1.0
+): CompositingUnit[] {
+  const units: CompositingUnit[] = [];
+  const siblingsBottomToTop = nodes.slice().reverse();
+  const groups = groupTreeNodesForCompositing(siblingsBottomToTop);
+
+  for (const group of groups) {
+    const baseLayer = group.baseNode.layer;
+    if (!baseLayer.visible || baseLayer.opacity <= 0.001) {
+      continue;
+    }
+
+    if (baseLayer.type === 'folder' && baseLayer.blendMode === 'pass-through') {
+      const nested = flattenLayerTreeToUnits(
+        group.baseNode.children,
+        inheritedOpacity * baseLayer.opacity
+      );
+      for (const u of nested) {
+        units.push(u);
+      }
+      continue;
+    }
+
+    const containedLayerIds = new Set<string>();
+    collectNodeLayerIds(group.baseNode, containedLayerIds);
+    for (const cn of group.clippedNodes) {
+      collectNodeLayerIds(cn, containedLayerIds);
+    }
+
+    units.push({
+      group,
+      inheritedOpacity,
+      containedLayerIds,
+    });
+  }
+
+  return units;
+}
+
+/**
+ * Returns true if a compositing unit is strictly Porter-Duff source-over associative
+ * with respect to the backdrop below it (safe to pre-bake onto transparent FBO and composite with 'normal').
+ */
+export function isUnitNormalAssociative(unit: CompositingUnit): boolean {
+  const baseLayer = unit.group.baseNode.layer;
+  if (baseLayer.type === 'adjustment') {
+    return false;
+  }
+  if (baseLayer.type === 'folder') {
+    // Pass-through folders were flattened; an isolated folder isolates its children's blend modes,
+    // so it is normal-associative iff the folder's own blend mode is normal.
+    return baseLayer.blendMode === 'normal';
+  }
+  if (baseLayer.blendMode !== 'normal' && baseLayer.blendMode !== 'pass-through') {
+    return false;
+  }
+  for (const cn of unit.group.clippedNodes) {
+    const cl = cn.layer;
+    if (!cl.visible || cl.opacity <= 0.001 || cl.type === 'folder') continue;
+    if (cl.blendMode !== 'normal' && cl.blendMode !== 'pass-through') {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Returns the blend mode if a single non-associative unit can be baked onto transparent
+ * with 'normal' and composited over (below + active) using a single ping-pong blend pass.
+ */
+export function canSingleUnitBakeWithBlendMode(unit: CompositingUnit): BlendMode | null {
+  const baseLayer = unit.group.baseNode.layer;
+  if (baseLayer.type === 'adjustment') {
+    return null;
+  }
+  if (baseLayer.type === 'folder') {
+    if (baseLayer.blendMode !== 'normal' && baseLayer.blendMode !== 'pass-through') {
+      return baseLayer.blendMode;
+    }
+    return null;
+  }
+  const visibleClipped = unit.group.clippedNodes.filter(
+    (cn) => cn.layer.visible && cn.layer.opacity > 0.001 && cn.layer.type !== 'folder'
+  );
+  if (
+    visibleClipped.length === 0 &&
+    baseLayer.blendMode !== 'normal' &&
+    baseLayer.blendMode !== 'pass-through'
+  ) {
+    return baseLayer.blendMode;
+  }
+  return null;
+}
+
+/**
+ * Partitions the visible layer stack into `below`, `active`, and `above` slices relative to `activeLayerId`.
+ */
+export function partitionLayerStack(
+  layers: LayerItem[],
+  activeLayerId?: string | null
+): LayerStackPartition {
+  const tree = buildLayerTree(layers);
+  const units = flattenLayerTreeToUnits(tree, 1.0);
+
+  let activeIdx = -1;
+  if (activeLayerId) {
+    for (let i = 0; i < units.length; i++) {
+      if (units[i].containedLayerIds.has(activeLayerId)) {
+        activeIdx = i;
+        break;
+      }
+    }
+  }
+
+  if (activeIdx === -1) {
+    return {
+      belowUnits: units,
+      activeUnit: null,
+      aboveDynamicUnits: [],
+      aboveCachedUnits: [],
+      aboveStrategy: 'empty',
+      aboveCacheBlendMode: 'normal',
+    };
+  }
+
+  const belowUnits = units.slice(0, activeIdx);
+  const activeUnit = units[activeIdx];
+  const aboveAll = units.slice(activeIdx + 1);
+
+  if (aboveAll.length === 0) {
+    return {
+      belowUnits,
+      activeUnit,
+      aboveDynamicUnits: [],
+      aboveCachedUnits: [],
+      aboveStrategy: 'empty',
+      aboveCacheBlendMode: 'normal',
+    };
+  }
+
+  let lastNonAssocIdx = -1;
+  for (let i = 0; i < aboveAll.length; i++) {
+    if (!isUnitNormalAssociative(aboveAll[i])) {
+      lastNonAssocIdx = i;
+    }
+  }
+
+  if (lastNonAssocIdx === -1) {
+    return {
+      belowUnits,
+      activeUnit,
+      aboveDynamicUnits: [],
+      aboveCachedUnits: aboveAll,
+      aboveStrategy: 'baked-normal',
+      aboveCacheBlendMode: 'normal',
+    };
+  }
+
+  if (aboveAll.length === 1) {
+    const singleBlend = canSingleUnitBakeWithBlendMode(aboveAll[0]);
+    if (singleBlend) {
+      return {
+        belowUnits,
+        activeUnit,
+        aboveDynamicUnits: [],
+        aboveCachedUnits: aboveAll,
+        aboveStrategy: 'baked-single-blend',
+        aboveCacheBlendMode: singleBlend,
+      };
+    }
+  }
+
+  return {
+    belowUnits,
+    activeUnit,
+    aboveDynamicUnits: aboveAll.slice(0, lastNonAssocIdx + 1),
+    aboveCachedUnits: aboveAll.slice(lastNonAssocIdx + 1),
+    aboveStrategy: 'mixed',
+    aboveCacheBlendMode: 'normal',
+  };
+}
+
+function serializeLayerNodeSignature(
+  node: LayerTreeNode,
+  inheritedOpacity: number,
+  getLayerContentVersion: (layerId: string) => number,
+  getMaskInvalidationEpoch?: (layerId: string) => number
+): string {
+  const l = node.layer;
+  const contentVer = getLayerContentVersion(l.id);
+  const maskEpoch = getMaskInvalidationEpoch ? getMaskInvalidationEpoch(l.id) : 0;
+  const stylesSig = hasActiveLayerStyles(l.styles) ? JSON.stringify(l.styles) : '';
+  const adjSig = l.type === 'adjustment' && l.adjustmentData ? JSON.stringify(l.adjustmentData) : '';
+  const toneSig = l.toneEnabled
+    ? `1:${l.toneFrequency ?? 60}:${l.toneAngle ?? 45}:${l.toneDotShape ?? ''}:${l.toneDensity ?? 40}:${l.toneDensityType ?? ''}`
+    : '0';
+  const tintSig = l.layerColorEnabled
+    ? `1:${l.layerColor ?? ''}:${l.layerSubColor ?? ''}`
+    : '0';
+  const maskSig = l.maskCanvas && l.maskEnabled !== false
+    ? `1:${l.maskVersion ?? 0}:${maskEpoch}:${l.maskCanvas.width}x${l.maskCanvas.height}`
+    : '0';
+  const exprSig = `${l.expressionColor ?? 'color'}:${l.monoThreshold ?? 128}:${l.monoExpressBlack !== false ? 1 : 0}:${l.monoExpressWhite !== false ? 1 : 0}`;
+
+  let sig = `${l.id}|${l.type}|${l.visible ? 1 : 0}|${l.opacity}|${inheritedOpacity}|${l.blendMode}|${l.clipped ? 1 : 0}|v:${contentVer}|m:${maskSig}|t:${toneSig}|c:${tintSig}|e:${exprSig}|s:${stylesSig}|a:${adjSig}`;
+
+  if (node.children.length > 0) {
+    const childSigs: string[] = [];
+    for (const child of node.children) {
+      if (!child.layer.visible || child.layer.opacity <= 0.001) continue;
+      childSigs.push(
+        serializeLayerNodeSignature(child, 1.0, getLayerContentVersion, getMaskInvalidationEpoch)
+      );
+    }
+    sig += `[${childSigs.join(',')}]`;
+  }
+
+  return sig;
+}
+
+function serializeUnitSignature(
+  unit: CompositingUnit,
+  getLayerContentVersion: (layerId: string) => number,
+  getMaskInvalidationEpoch?: (layerId: string) => number
+): string {
+  let sig = serializeLayerNodeSignature(
+    unit.group.baseNode,
+    unit.inheritedOpacity,
+    getLayerContentVersion,
+    getMaskInvalidationEpoch
+  );
+  if (unit.group.clippedNodes.length > 0) {
+    const clippedSigs: string[] = [];
+    for (const cn of unit.group.clippedNodes) {
+      if (!cn.layer.visible || cn.layer.opacity <= 0.001 || cn.layer.type === 'folder') continue;
+      clippedSigs.push(
+        serializeLayerNodeSignature(cn, unit.inheritedOpacity, getLayerContentVersion, getMaskInvalidationEpoch)
+      );
+    }
+    if (clippedSigs.length > 0) {
+      sig += `{clip:${clippedSigs.join(';')}}`;
+    }
+  }
+  return sig;
+}
+
+/**
+ * Pure invalidation tracker for the Baked Layer Stack Cache (`belowActiveCacheFbo` & `aboveActiveCacheFbo`).
+ * Determines independently whether the lower or upper cached FBO needs rebuilding.
+ */
+export class LayerStackCacheTracker {
+  private lastBelowSignature: string | null = null;
+  private lastAboveSignature: string | null = null;
+
+  public evaluate(input: LayerStackCacheInput): LayerStackCacheEvaluation {
+    const partition = partitionLayerStack(input.layers, input.activeLayerId);
+
+    const { transform, dimensions } = input;
+    const viewportSig =
+      `${input.viewportW}x${input.viewportH}@${input.dpr}|` +
+      `${dimensions.width}x${dimensions.height}@${dimensions.dpi ?? 600}|` +
+      `${transform.pan.x},${transform.pan.y},${transform.zoom},${transform.rotation},` +
+      `${transform.flipX ? 1 : 0},${transform.flipY ? 1 : 0}|ep:${input.gridEpoch ?? 0}`;
+
+    // Onion skin frames are baked into the below cache right after the artboard background
+    let onionSig = '';
+    if (input.onionSkinFrames && input.onionSkinFrames.length > 0) {
+      const layerMap = new Map<string, LayerItem>();
+      for (const l of input.layers) layerMap.set(l.id, l);
+      const parts: string[] = [];
+      for (const frame of input.onionSkinFrames) {
+        const target = layerMap.get(frame.layerId);
+        if (target && target.visible) {
+          parts.push(
+            `${frame.layerId}:${frame.tint}:${frame.opacity}:v${input.getLayerContentVersion(frame.layerId)}`
+          );
+        }
+      }
+      onionSig = parts.join(',');
+    }
+
+    const belowUnitSigs = partition.belowUnits.map((u) =>
+      serializeUnitSignature(u, input.getLayerContentVersion, input.getMaskInvalidationEpoch)
+    );
+    const belowSignature = `${viewportSig}|cb:${input.showCheckerboard ? 1 : 0}|os:${onionSig}|below:[${belowUnitSigs.join('||')}]`;
+
+    let aboveSignature = '';
+    if (partition.aboveCachedUnits.length > 0) {
+      const aboveUnitSigs = partition.aboveCachedUnits.map((u) =>
+        serializeUnitSignature(u, input.getLayerContentVersion, input.getMaskInvalidationEpoch)
+      );
+      aboveSignature = `${viewportSig}|strat:${partition.aboveStrategy}:${partition.aboveCacheBlendMode}|above:[${aboveUnitSigs.join('||')}]`;
+    }
+
+    const belowDirty = belowSignature !== this.lastBelowSignature;
+    const aboveDirty =
+      partition.aboveCachedUnits.length > 0 && aboveSignature !== this.lastAboveSignature;
+
+    return {
+      partition,
+      belowSignature,
+      aboveSignature,
+      belowDirty,
+      aboveDirty,
+    };
+  }
+
+  public commit(belowSignature: string, aboveSignature: string): void {
+    this.lastBelowSignature = belowSignature;
+    this.lastAboveSignature = aboveSignature;
+  }
+
+  public invalidateAll(): void {
+    this.lastBelowSignature = null;
+    this.lastAboveSignature = null;
+  }
+
+  public invalidateBelow(): void {
+    this.lastBelowSignature = null;
+  }
+
+  public invalidateAbove(): void {
+    this.lastAboveSignature = null;
+  }
+
+  public getLastSignatures(): { below: string | null; above: string | null } {
+    return { below: this.lastBelowSignature, above: this.lastAboveSignature };
+  }
 }
 
 /**
@@ -1000,10 +1722,12 @@ export function calculateVisibleDocumentBounds(
   docW: number,
   docH: number
 ): { minX: number; minY: number; maxX: number; maxY: number } {
-  const { pan, zoom, rotation } = transform;
+  const { pan, zoom, rotation, flipX = false, flipY = false } = transform;
   const rad = (-rotation * Math.PI) / 180;
   const cosR = Math.cos(rad);
   const sinR = Math.sin(rad);
+  const fx = flipX ? -1 : 1;
+  const fy = flipY ? -1 : 1;
 
   // Screen corners relative to screen center/pan
   const corners = [
@@ -1031,9 +1755,9 @@ export function calculateVisibleDocumentBounds(
     const rx = sx * cosR - sy * sinR;
     const ry = sx * sinR + sy * cosR;
 
-    // Invert center offset
-    const docX = rx + docW * 0.5;
-    const docY = ry + docH * 0.5;
+    // Invert view flip and center offset
+    const docX = rx * fx + docW * 0.5;
+    const docY = ry * fy + docH * 0.5;
 
     if (docX < minX) minX = docX;
     if (docY < minY) minY = docY;
@@ -1049,6 +1773,57 @@ export function calculateVisibleDocumentBounds(
   };
 }
 
+interface FboSurface {
+  fbo: WebGLFramebuffer;
+  texture: WebGLTexture;
+  stencilRb: WebGLRenderbuffer | null;
+  width: number;
+  height: number;
+}
+
+interface PingPongTarget {
+  surfaces: [FboSurface, FboSurface];
+  activeIndex: 0 | 1;
+}
+
+interface LayerUniformLocs {
+  uDocDimensions: WebGLUniformLocation | null;
+  uViewportSize: WebGLUniformLocation | null;
+  uPan: WebGLUniformLocation | null;
+  uZoom: WebGLUniformLocation | null;
+  uRotationRad: WebGLUniformLocation | null;
+  uFlip: WebGLUniformLocation | null;
+  uDpr: WebGLUniformLocation | null;
+  uBackdropTexture: WebGLUniformLocation | null;
+  uHasBackdrop: WebGLUniformLocation | null;
+  uLayerOpacity: WebGLUniformLocation | null;
+  uBlendMode: WebGLUniformLocation | null;
+  uToneEnabled: WebGLUniformLocation | null;
+  uToneFrequency: WebGLUniformLocation | null;
+  uToneAngleRad: WebGLUniformLocation | null;
+  uToneDpi: WebGLUniformLocation | null;
+  uToneDotShape: WebGLUniformLocation | null;
+  uToneDensity: WebGLUniformLocation | null;
+  uToneDensityType: WebGLUniformLocation | null;
+  uLayerColorEnabled: WebGLUniformLocation | null;
+  uLayerColor: WebGLUniformLocation | null;
+  uLayerSubColor: WebGLUniformLocation | null;
+  uMaskTexture: WebGLUniformLocation | null;
+  uMaskEnabled: WebGLUniformLocation | null;
+  uExpressionMode: WebGLUniformLocation | null;
+  uMonoThreshold: WebGLUniformLocation | null;
+  uMonoExpressBlack: WebGLUniformLocation | null;
+  uMonoExpressWhite: WebGLUniformLocation | null;
+}
+
+interface ArrayPoolSlot {
+  sliceIndex: number;
+  currentKey: string | null;
+  version: number;
+  lastUsed: number;
+  lastBatchTick: number;
+}
+
 /**
  * High-performance WebGL2 Viewport Compositor
  */
@@ -1058,36 +1833,41 @@ export class ViewportCompositor {
   private program: WebGLProgram | null = null;
   private quadBuffer: WebGLBuffer | null = null;
 
-  // Uniform locations
+  // Standard compositor uniform locations
   private uTileOriginLoc: WebGLUniformLocation | null = null;
   private uTileSizeLoc: WebGLUniformLocation | null = null;
-  private uDocDimensionsLoc: WebGLUniformLocation | null = null;
-  private uViewportSizeLoc: WebGLUniformLocation | null = null;
-  private uPanLoc: WebGLUniformLocation | null = null;
-  private uZoomLoc: WebGLUniformLocation | null = null;
-  private uRotationRadLoc: WebGLUniformLocation | null = null;
-  private uDprLoc: WebGLUniformLocation | null = null;
   private uIsBackgroundLoc: WebGLUniformLocation | null = null;
   private uShowCheckerboardLoc: WebGLUniformLocation | null = null;
   private uTileTextureLoc: WebGLUniformLocation | null = null;
-  private uBackdropTextureLoc: WebGLUniformLocation | null = null;
-  private uHasBackdropLoc: WebGLUniformLocation | null = null;
-  private uLayerOpacityLoc: WebGLUniformLocation | null = null;
-  private uBlendModeLoc: WebGLUniformLocation | null = null;
+  private stdLocs: LayerUniformLocs | null = null;
 
-  // Tone uniform locations
-  private uToneEnabledLoc: WebGLUniformLocation | null = null;
-  private uToneFrequencyLoc: WebGLUniformLocation | null = null;
-  private uToneAngleRadLoc: WebGLUniformLocation | null = null;
-  private uToneDpiLoc: WebGLUniformLocation | null = null;
-  private uToneDotShapeLoc: WebGLUniformLocation | null = null;
-  private uToneDensityLoc: WebGLUniformLocation | null = null;
-  private uToneDensityTypeLoc: WebGLUniformLocation | null = null;
+  // Instanced TEXTURE_2D_ARRAY batching program, VAO, buffer, & pool
+  private static readonly DEFAULT_ARRAY_POOL_LAYERS = 256;
+  private instancedProgram: WebGLProgram | null = null;
+  private instancedLocs: LayerUniformLocs | null = null;
+  private uInstTileSizeLoc: WebGLUniformLocation | null = null;
+  private uInstTileArrayLoc: WebGLUniformLocation | null = null;
+  private aInstQuadPosLoc: number = -1;
+  private aInstDataLoc: number = -1;
+  private instancedVao: WebGLVertexArrayObject | null = null;
+  private instanceBuffer: WebGLBuffer | null = null;
+  private instanceFloatScratch: Float32Array = new Float32Array(
+    ViewportCompositor.DEFAULT_ARRAY_POOL_LAYERS * 3
+  );
+  private tileArrayTexture: WebGLTexture | null = null;
+  private arrayPoolCapacity: number = 0;
+  private arrayPoolFilterTier: number = -1;
+  private arrayPoolSlots: ArrayPoolSlot[] = [];
+  private arrayPoolByKey: Map<string, ArrayPoolSlot> = new Map();
+  private arrayAccessCounter: number = 0;
+  private arrayBatchCounter: number = 0;
 
-  // Tint uniform locations
-  private uLayerColorEnabledLoc: WebGLUniformLocation | null = null;
-  private uLayerColorLoc: WebGLUniformLocation | null = null;
-  private uLayerSubColorLoc: WebGLUniformLocation | null = null;
+  // Viewport-space draft stroke program (reuses COMPOSITOR_FRAGMENT_SHADER)
+  private viewportDraftProgram: WebGLProgram | null = null;
+  private viewportDraftLocs: LayerUniformLocs | null = null;
+  private uViewportDraftTileTexLoc: WebGLUniformLocation | null = null;
+  private uViewportDraftIsBgLoc: WebGLUniformLocation | null = null;
+  private aViewportDraftQuadPosLoc: number = -1;
 
   // Cached attribute locations (eliminates per-frame gl.getAttribLocation stalls)
   private aQuadPosLoc: number = -1;
@@ -1098,17 +1878,13 @@ export class ViewportCompositor {
   private onContextLostHandler: ((e: Event) => void) | null = null;
   private onContextRestoredHandler: (() => void) | null = null;
 
-  // Mask uniform locations & version-tracked cache
-  private uMaskTextureLoc: WebGLUniformLocation | null = null;
-  private uMaskEnabledLoc: WebGLUniformLocation | null = null;
-  private uExpressionModeLoc: WebGLUniformLocation | null = null;
-  private uMonoThresholdLoc: WebGLUniformLocation | null = null;
-  private uMonoExpressBlackLoc: WebGLUniformLocation | null = null;
-  private uMonoExpressWhiteLoc: WebGLUniformLocation | null = null;
+  // Mask version-tracked cache & invalidation epochs
   private maskTextureCache: Map<
     string,
     { texture: WebGLTexture; version: number; width: number; height: number }
   > = new Map();
+  private maskInvalidationEpochs: Map<string, number> = new Map();
+  private globalMaskEpochCounter: number = 0;
 
   // Live in-stack draft stroke texture cache
   private draftTexture: WebGLTexture | null = null;
@@ -1117,7 +1893,14 @@ export class ViewportCompositor {
   private lastDraftVersion: number = -1;
   private currentOptions: CompositorOptions | null = null;
   private currentZoom: number = 1.0;
-  private premulScratch: Uint8Array = new Uint8Array(TILE_SIZE * TILE_SIZE * 4);
+  private currentFrameState: {
+    viewportW: number;
+    viewportH: number;
+    dpr: number;
+    dimensions: CanvasDimensions;
+    transform: ViewportTransform;
+    rotRad: number;
+  } | null = null;
 
   // Adjustment program & uniforms
   private adjProgram: WebGLProgram | null = null;
@@ -1128,6 +1911,7 @@ export class ViewportCompositor {
   private uAdjPanLoc: WebGLUniformLocation | null = null;
   private uAdjZoomLoc: WebGLUniformLocation | null = null;
   private uAdjRotationRadLoc: WebGLUniformLocation | null = null;
+  private uAdjFlipLoc: WebGLUniformLocation | null = null;
   private uAdjDprLoc: WebGLUniformLocation | null = null;
   private uAdjSnapshotLoc: WebGLUniformLocation | null = null;
   private uAdjLutLoc: WebGLUniformLocation | null = null;
@@ -1136,9 +1920,6 @@ export class ViewportCompositor {
   private uAdjMaskEnabledLoc: WebGLUniformLocation | null = null;
   private uAdjMaskTextureLoc: WebGLUniformLocation | null = null;
 
-  private snapshotTexture: WebGLTexture | null = null;
-  private snapshotWidth: number = 0;
-  private snapshotHeight: number = 0;
   private lutTexture: WebGLTexture | null = null;
   private lastLutKey: string = '';
   private lastLutAdjMode: number = 0;
@@ -1150,6 +1931,7 @@ export class ViewportCompositor {
   private layerTexture: WebGLTexture | null = null;
   private layerFboWidth: number = 0;
   private layerFboHeight: number = 0;
+  private layerStylesOutFbo: FboSurface | null = null;
 
   private uStylesLayerTextureLoc: WebGLUniformLocation | null = null;
   private uStylesViewportSizeLoc: WebGLUniformLocation | null = null;
@@ -1168,33 +1950,33 @@ export class ViewportCompositor {
   private uStylesShadowBlurLoc: WebGLUniformLocation | null = null;
   private uStylesShadowSpreadLoc: WebGLUniformLocation | null = null;
 
-  // Folder compositing blit program, uniforms, & FBOs
+  // Folder / Cache blit program & uniforms
   private blitProgram: WebGLProgram | null = null;
   private uBlitTextureLoc: WebGLUniformLocation | null = null;
   private uBlitBackdropTextureLoc: WebGLUniformLocation | null = null;
   private uBlitHasBackdropLoc: WebGLUniformLocation | null = null;
   private uBlitBlendModeLoc: WebGLUniformLocation | null = null;
   private uBlitOpacityLoc: WebGLUniformLocation | null = null;
-  private folderFbos: {
-    fbo: WebGLFramebuffer;
-    texture: WebGLTexture;
-    stencilRb: WebGLRenderbuffer | null;
-    width: number;
-    height: number;
-  }[] = [];
 
-  // Soft proofing program, uniforms, & snapshot texture
+  // Ping-Pong FBOs (eliminates all gl.copyTexSubImage2D calls for custom blend modes)
+  private scenePingPong: PingPongTarget | null = null;
+  private folderPingPongs: PingPongTarget[] = [];
+
+  // Baked Layer Stack Cache FBOs (below & above active layer)
+  private belowActiveCacheFbo: FboSurface | null = null;
+  private aboveActiveCacheFbo: FboSurface | null = null;
+  private stackCache: LayerStackCacheTracker = new LayerStackCacheTracker();
+  private stackCacheStats = { belowRebuilds: 0, aboveRebuilds: 0, cacheHits: 0 };
+
+  // Soft proofing program & uniforms
   private softProofProgram: WebGLProgram | null = null;
   private uProofSceneTextureLoc: WebGLUniformLocation | null = null;
   private uProofStandardLoc: WebGLUniformLocation | null = null;
   private uProofEnabledLoc: WebGLUniformLocation | null = null;
   private uProofGamutWarningLoc: WebGLUniformLocation | null = null;
   private uProofGamutWarningColorLoc: WebGLUniformLocation | null = null;
-  private proofSnapshotTexture: WebGLTexture | null = null;
-  private proofSnapshotWidth: number = 0;
-  private proofSnapshotHeight: number = 0;
 
-  // Pre-allocated WebGL Texture Pool for dynamic texture streaming
+  // Pre-allocated WebGL2 Texture2D Pool (overflow fallback for TEXTURE_2D_ARRAY)
   private static readonly MAX_TEXTURE_POOL_SIZE = 2048;
   private textureAccessCounter: number = 0;
   private texturePool: Array<{
@@ -1228,6 +2010,15 @@ export class ViewportCompositor {
         this.contextLost = true;
         this.gl = null;
         this.program = null;
+        this.instancedProgram = null;
+        this.instancedVao = null;
+        this.instanceBuffer = null;
+        this.tileArrayTexture = null;
+        this.arrayPoolSlots = [];
+        this.arrayPoolByKey.clear();
+        this.arrayPoolCapacity = 0;
+        this.arrayPoolFilterTier = -1;
+        this.viewportDraftProgram = null;
         this.adjProgram = null;
         this.stylesProgram = null;
         this.blitProgram = null;
@@ -1235,13 +2026,16 @@ export class ViewportCompositor {
         this.texturePool = [];
         this.activePoolByKey.clear();
         this.maskTextureCache.clear();
-        this.folderFbos = [];
+        this.scenePingPong = null;
+        this.folderPingPongs = [];
+        this.belowActiveCacheFbo = null;
+        this.aboveActiveCacheFbo = null;
+        this.layerStylesOutFbo = null;
         this.layerFbo = null;
         this.layerTexture = null;
-        this.snapshotTexture = null;
         this.lutTexture = null;
         this.draftTexture = null;
-        this.proofSnapshotTexture = null;
+        this.stackCache.invalidateAll();
       };
       this.onContextRestoredHandler = () => {
         this.contextLost = false;
@@ -1258,22 +2052,41 @@ export class ViewportCompositor {
     return !this.contextLost && this.gl !== null && this.program !== null;
   }
 
+  public getCanvas(): HTMLCanvasElement {
+    return this.canvas;
+  }
+
+  public getStackCacheStats(): { belowRebuilds: number; aboveRebuilds: number; cacheHits: number } {
+    return { ...this.stackCacheStats };
+  }
+
+  /**
+   * Explicitly invalidate baked layer stack caches.
+   */
+  public invalidateStackCache(): void {
+    this.stackCache.invalidateAll();
+  }
+
   /**
    * Explicitly invalidate a cached layer mask texture (or all masks if layerId omitted).
    */
   public invalidateMaskTexture(layerId?: string): void {
+    const nextEpoch = ++this.globalMaskEpochCounter;
     if (layerId) {
       const item = this.maskTextureCache.get(layerId);
       if (item) item.version = -1;
+      this.maskInvalidationEpochs.set(layerId, nextEpoch);
     } else {
-      for (const item of this.maskTextureCache.values()) {
+      for (const [id, item] of this.maskTextureCache.entries()) {
         item.version = -1;
+        this.maskInvalidationEpochs.set(id, nextEpoch);
       }
+      this.stackCache.invalidateAll();
     }
   }
 
   /**
-   * Explicitly invalidate and clear all cached tile textures in the pool.
+   * Explicitly invalidate and clear all cached tile textures in both TEXTURE_2D and TEXTURE_2D_ARRAY pools.
    */
   public invalidateTileTextures(): void {
     if (this.gl) {
@@ -1283,6 +2096,162 @@ export class ViewportCompositor {
     }
     this.texturePool = [];
     this.activePoolByKey.clear();
+    for (const slot of this.arrayPoolSlots) {
+      slot.currentKey = null;
+      slot.version = -1;
+      slot.lastUsed = 0;
+      slot.lastBatchTick = 0;
+    }
+    this.arrayPoolByKey.clear();
+    this.stackCache.invalidateAll();
+  }
+
+  private queryLayerUniformLocs(gl: WebGL2RenderingContext, prog: WebGLProgram): LayerUniformLocs {
+    return {
+      uDocDimensions: gl.getUniformLocation(prog, 'u_docDimensions'),
+      uViewportSize: gl.getUniformLocation(prog, 'u_viewportSize'),
+      uPan: gl.getUniformLocation(prog, 'u_pan'),
+      uZoom: gl.getUniformLocation(prog, 'u_zoom'),
+      uRotationRad: gl.getUniformLocation(prog, 'u_rotationRad'),
+      uFlip: gl.getUniformLocation(prog, 'u_flip'),
+      uDpr: gl.getUniformLocation(prog, 'u_dpr'),
+      uBackdropTexture: gl.getUniformLocation(prog, 'u_backdropTexture'),
+      uHasBackdrop: gl.getUniformLocation(prog, 'u_hasBackdrop'),
+      uLayerOpacity: gl.getUniformLocation(prog, 'u_layerOpacity'),
+      uBlendMode: gl.getUniformLocation(prog, 'u_blendMode'),
+      uToneEnabled: gl.getUniformLocation(prog, 'u_toneEnabled'),
+      uToneFrequency: gl.getUniformLocation(prog, 'u_toneFrequency'),
+      uToneAngleRad: gl.getUniformLocation(prog, 'u_toneAngleRad'),
+      uToneDpi: gl.getUniformLocation(prog, 'u_toneDpi'),
+      uToneDotShape: gl.getUniformLocation(prog, 'u_toneDotShape'),
+      uToneDensity: gl.getUniformLocation(prog, 'u_toneDensity'),
+      uToneDensityType: gl.getUniformLocation(prog, 'u_toneDensityType'),
+      uLayerColorEnabled: gl.getUniformLocation(prog, 'u_layerColorEnabled'),
+      uLayerColor: gl.getUniformLocation(prog, 'u_layerColor'),
+      uLayerSubColor: gl.getUniformLocation(prog, 'u_layerSubColor'),
+      uMaskTexture: gl.getUniformLocation(prog, 'u_maskTexture'),
+      uMaskEnabled: gl.getUniformLocation(prog, 'u_maskEnabled'),
+      uExpressionMode: gl.getUniformLocation(prog, 'u_expressionMode'),
+      uMonoThreshold: gl.getUniformLocation(prog, 'u_monoThreshold'),
+      uMonoExpressBlack: gl.getUniformLocation(prog, 'u_monoExpressBlack'),
+      uMonoExpressWhite: gl.getUniformLocation(prog, 'u_monoExpressWhite'),
+    };
+  }
+
+  private initTileArrayPool(gl: WebGL2RenderingContext): void {
+    if (
+      typeof gl.texStorage3D !== 'function' ||
+      typeof gl.texSubImage3D !== 'function' ||
+      typeof gl.drawArraysInstanced !== 'function' ||
+      typeof gl.vertexAttribDivisor !== 'function' ||
+      !this.quadBuffer
+    ) {
+      return;
+    }
+
+    const instVs = gl.createShader(gl.VERTEX_SHADER);
+    const instFs = gl.createShader(gl.FRAGMENT_SHADER);
+    if (!instVs || !instFs) return;
+
+    gl.shaderSource(instVs, COMPOSITOR_INSTANCED_VERTEX_SHADER);
+    gl.compileShader(instVs);
+    gl.shaderSource(instFs, COMPOSITOR_INSTANCED_FRAGMENT_SHADER);
+    gl.compileShader(instFs);
+    if (
+      !gl.getShaderParameter(instVs, gl.COMPILE_STATUS) ||
+      !gl.getShaderParameter(instFs, gl.COMPILE_STATUS)
+    ) {
+      console.error('Instanced tile shader compile error:', gl.getShaderInfoLog(instVs), gl.getShaderInfoLog(instFs));
+      return;
+    }
+
+    const iProg = gl.createProgram();
+    if (!iProg) return;
+    gl.attachShader(iProg, instVs);
+    gl.attachShader(iProg, instFs);
+    gl.linkProgram(iProg);
+    if (!gl.getProgramParameter(iProg, gl.LINK_STATUS)) {
+      console.error('Instanced tile program link error:', gl.getProgramInfoLog(iProg));
+      return;
+    }
+
+    const maxLayersParam = Number(gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS)) || ViewportCompositor.DEFAULT_ARRAY_POOL_LAYERS;
+    const capacity = Math.max(1, Math.min(ViewportCompositor.DEFAULT_ARRAY_POOL_LAYERS, maxLayersParam));
+
+    const arrTex = gl.createTexture();
+    const instBuf = gl.createBuffer();
+    if (!arrTex || !instBuf) {
+      if (arrTex) gl.deleteTexture(arrTex);
+      if (instBuf) gl.deleteBuffer(instBuf);
+      gl.deleteProgram(iProg);
+      return;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, arrTex);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8, TILE_SIZE, TILE_SIZE, capacity);
+    gl.bindTexture(gl.TEXTURE_2D_ARRAY, null);
+
+    this.instanceFloatScratch = new Float32Array(capacity * 3);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, this.instanceFloatScratch.byteLength, gl.DYNAMIC_DRAW);
+
+    this.instancedProgram = iProg;
+    this.instancedLocs = this.queryLayerUniformLocs(gl, iProg);
+    this.uInstTileSizeLoc = gl.getUniformLocation(iProg, 'u_tileSize');
+    this.uInstTileArrayLoc = gl.getUniformLocation(iProg, 'u_tileArrayTexture');
+    this.aInstQuadPosLoc = gl.getAttribLocation(iProg, 'a_quadPos');
+    this.aInstDataLoc = gl.getAttribLocation(iProg, 'a_instanceData');
+
+    // Immediately bind distinct texture units for sampler2DArray (0) vs sampler2D (1, 2)
+    // to prevent WebGL2 GL_INVALID_OPERATION sampler-type collisions on unit 0.
+    gl.useProgram(iProg);
+    gl.uniform1i(this.uInstTileArrayLoc, 0);
+    gl.uniform1i(this.instancedLocs.uMaskTexture, 1);
+    gl.uniform1i(this.instancedLocs.uBackdropTexture, 2);
+    if (this.program) {
+      gl.useProgram(this.program);
+    }
+
+    this.tileArrayTexture = arrTex;
+    this.instanceBuffer = instBuf;
+    this.arrayPoolCapacity = capacity;
+    this.arrayPoolFilterTier = 1;
+    this.arrayPoolSlots = [];
+    this.arrayPoolByKey.clear();
+    for (let i = 0; i < capacity; i++) {
+      this.arrayPoolSlots.push({
+        sliceIndex: i,
+        currentKey: null,
+        version: -1,
+        lastUsed: 0,
+        lastBatchTick: 0,
+      });
+    }
+
+    if (typeof gl.createVertexArray === 'function') {
+      const vao = gl.createVertexArray();
+      if (vao) {
+        gl.bindVertexArray(vao);
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+        if (this.aInstQuadPosLoc >= 0) {
+          gl.enableVertexAttribArray(this.aInstQuadPosLoc);
+          gl.vertexAttribPointer(this.aInstQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+          gl.vertexAttribDivisor(this.aInstQuadPosLoc, 0);
+        }
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+        if (this.aInstDataLoc >= 0) {
+          gl.enableVertexAttribArray(this.aInstDataLoc);
+          gl.vertexAttribPointer(this.aInstDataLoc, 3, gl.FLOAT, false, 0, 0);
+          gl.vertexAttribDivisor(this.aInstDataLoc, 1);
+        }
+        gl.bindVertexArray(null);
+        this.instancedVao = vao;
+      }
+    }
   }
 
   private initGL(): boolean {
@@ -1321,7 +2290,7 @@ export class ViewportCompositor {
         return false;
       }
 
-      // Link program
+      // Link standard compositor program
       const prog = gl.createProgram();
       if (!prog) return false;
       gl.attachShader(prog, vs);
@@ -1332,43 +2301,37 @@ export class ViewportCompositor {
         return false;
       }
       this.program = prog;
+      this.stdLocs = this.queryLayerUniformLocs(gl, prog);
 
-      // Cache uniforms
+      // Cache standard-only uniforms
       this.uTileOriginLoc = gl.getUniformLocation(prog, 'u_tileOrigin');
       this.uTileSizeLoc = gl.getUniformLocation(prog, 'u_tileSize');
-      this.uDocDimensionsLoc = gl.getUniformLocation(prog, 'u_docDimensions');
-      this.uViewportSizeLoc = gl.getUniformLocation(prog, 'u_viewportSize');
-      this.uPanLoc = gl.getUniformLocation(prog, 'u_pan');
-      this.uZoomLoc = gl.getUniformLocation(prog, 'u_zoom');
-      this.uRotationRadLoc = gl.getUniformLocation(prog, 'u_rotationRad');
-      this.uDprLoc = gl.getUniformLocation(prog, 'u_dpr');
       this.uIsBackgroundLoc = gl.getUniformLocation(prog, 'u_isBackground');
       this.uShowCheckerboardLoc = gl.getUniformLocation(prog, 'u_showCheckerboard');
       this.uTileTextureLoc = gl.getUniformLocation(prog, 'u_tileTexture');
-      this.uBackdropTextureLoc = gl.getUniformLocation(prog, 'u_backdropTexture');
-      this.uHasBackdropLoc = gl.getUniformLocation(prog, 'u_hasBackdrop');
-      this.uLayerOpacityLoc = gl.getUniformLocation(prog, 'u_layerOpacity');
-      this.uBlendModeLoc = gl.getUniformLocation(prog, 'u_blendMode');
-
-      this.uToneEnabledLoc = gl.getUniformLocation(prog, 'u_toneEnabled');
-      this.uToneFrequencyLoc = gl.getUniformLocation(prog, 'u_toneFrequency');
-      this.uToneAngleRadLoc = gl.getUniformLocation(prog, 'u_toneAngleRad');
-      this.uToneDpiLoc = gl.getUniformLocation(prog, 'u_toneDpi');
-      this.uToneDotShapeLoc = gl.getUniformLocation(prog, 'u_toneDotShape');
-      this.uToneDensityLoc = gl.getUniformLocation(prog, 'u_toneDensity');
-      this.uToneDensityTypeLoc = gl.getUniformLocation(prog, 'u_toneDensityType');
-
-      this.uLayerColorEnabledLoc = gl.getUniformLocation(prog, 'u_layerColorEnabled');
-      this.uLayerColorLoc = gl.getUniformLocation(prog, 'u_layerColor');
-      this.uLayerSubColorLoc = gl.getUniformLocation(prog, 'u_layerSubColor');
-
-      this.uMaskTextureLoc = gl.getUniformLocation(prog, 'u_maskTexture');
-      this.uMaskEnabledLoc = gl.getUniformLocation(prog, 'u_maskEnabled');
-      this.uExpressionModeLoc = gl.getUniformLocation(prog, 'u_expressionMode');
-      this.uMonoThresholdLoc = gl.getUniformLocation(prog, 'u_monoThreshold');
-      this.uMonoExpressBlackLoc = gl.getUniformLocation(prog, 'u_monoExpressBlack');
-      this.uMonoExpressWhiteLoc = gl.getUniformLocation(prog, 'u_monoExpressWhite');
       this.aQuadPosLoc = gl.getAttribLocation(prog, 'a_quadPos');
+
+      // Compile Viewport-Space Draft Shader Program (shares COMPOSITOR_FRAGMENT_SHADER)
+      const draftVs = gl.createShader(gl.VERTEX_SHADER);
+      if (draftVs) {
+        gl.shaderSource(draftVs, VIEWPORT_DRAFT_VERTEX_SHADER);
+        gl.compileShader(draftVs);
+        if (gl.getShaderParameter(draftVs, gl.COMPILE_STATUS)) {
+          const dProg = gl.createProgram();
+          if (dProg) {
+            gl.attachShader(dProg, draftVs);
+            gl.attachShader(dProg, fs);
+            gl.linkProgram(dProg);
+            if (gl.getProgramParameter(dProg, gl.LINK_STATUS)) {
+              this.viewportDraftProgram = dProg;
+              this.viewportDraftLocs = this.queryLayerUniformLocs(gl, dProg);
+              this.uViewportDraftTileTexLoc = gl.getUniformLocation(dProg, 'u_tileTexture');
+              this.uViewportDraftIsBgLoc = gl.getUniformLocation(dProg, 'u_isBackground');
+              this.aViewportDraftQuadPosLoc = gl.getAttribLocation(dProg, 'a_quadPos');
+            }
+          }
+        }
+      }
 
       // Compile Adjustment Shader Program
       const adjFs = gl.createShader(gl.FRAGMENT_SHADER);
@@ -1390,6 +2353,7 @@ export class ViewportCompositor {
               this.uAdjPanLoc = gl.getUniformLocation(aProg, 'u_pan');
               this.uAdjZoomLoc = gl.getUniformLocation(aProg, 'u_zoom');
               this.uAdjRotationRadLoc = gl.getUniformLocation(aProg, 'u_rotationRad');
+              this.uAdjFlipLoc = gl.getUniformLocation(aProg, 'u_flip');
               this.uAdjDprLoc = gl.getUniformLocation(aProg, 'u_dpr');
               this.uAdjSnapshotLoc = gl.getUniformLocation(aProg, 'u_snapshotTexture');
               this.uAdjLutLoc = gl.getUniformLocation(aProg, 'u_lutTexture');
@@ -1444,7 +2408,7 @@ export class ViewportCompositor {
         }
       }
 
-      // Compile Folder Blit Shader Program
+      // Compile Folder / Cache Blit Shader Program
       const blitVs = gl.createShader(gl.VERTEX_SHADER);
       const blitFs = gl.createShader(gl.FRAGMENT_SHADER);
       if (blitVs && blitFs) {
@@ -1539,6 +2503,9 @@ export class ViewportCompositor {
       );
       this.quadBuffer = quad;
 
+      // Initialize TEXTURE_2D_ARRAY + instanced batch rendering pipeline
+      this.initTileArrayPool(gl);
+
       // Enable blending
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -1554,9 +2521,12 @@ export class ViewportCompositor {
    * Resize viewport canvas to physical screen pixels.
    */
   public resize(width: number, height: number): void {
-    if (this.canvas.width !== width || this.canvas.height !== height) {
-      this.canvas.width = Math.max(1, width);
-      this.canvas.height = Math.max(1, height);
+    const nextW = Math.max(1, width);
+    const nextH = Math.max(1, height);
+    if (this.canvas.width !== nextW || this.canvas.height !== nextH) {
+      this.canvas.width = nextW;
+      this.canvas.height = nextH;
+      this.stackCache.invalidateAll();
       if (this.gl) {
         this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
       }
@@ -1577,9 +2547,409 @@ export class ViewportCompositor {
     return calculateVisibleDocumentBounds(viewportW, viewportH, transform, docW, docH);
   }
 
+  // ============================================================================
+  // Ping-Pong FBO & Offscreen Cache Surface Management
+  // ============================================================================
+
+  private createFboSurface(gl: WebGL2RenderingContext, withStencil: boolean = true): FboSurface | null {
+    const fbo = gl.createFramebuffer();
+    const texture = gl.createTexture();
+    if (!fbo || !texture) {
+      if (fbo) gl.deleteFramebuffer(fbo);
+      if (texture) gl.deleteTexture(texture);
+      return null;
+    }
+    const stencilRb =
+      withStencil && typeof gl.createRenderbuffer === 'function' ? gl.createRenderbuffer() : null;
+    return { fbo, texture, stencilRb, width: 0, height: 0 };
+  }
+
+  private ensureFboSurfaceSize(
+    gl: WebGL2RenderingContext,
+    surface: FboSurface,
+    width: number,
+    height: number
+  ): boolean {
+    if (surface.width === width && surface.height === height) {
+      return true;
+    }
+
+    const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
+
+    gl.bindTexture(gl.TEXTURE_2D, surface.texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, surface.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, surface.texture, 0);
+
+    if (surface.stencilRb && typeof gl.bindRenderbuffer === 'function') {
+      gl.bindRenderbuffer(gl.RENDERBUFFER, surface.stencilRb);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.STENCIL_INDEX8, width, height);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.STENCIL_ATTACHMENT, gl.RENDERBUFFER, surface.stencilRb);
+    }
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
+
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      console.error('Compositor FBO surface incomplete:', status);
+      return false;
+    }
+
+    surface.width = width;
+    surface.height = height;
+    return true;
+  }
+
+  private ensurePingPongTarget(
+    gl: WebGL2RenderingContext,
+    existing: PingPongTarget | null,
+    width: number,
+    height: number
+  ): PingPongTarget | null {
+    let target = existing;
+    if (!target) {
+      const s0 = this.createFboSurface(gl, true);
+      const s1 = this.createFboSurface(gl, true);
+      if (!s0 || !s1) {
+        this.disposeFboSurface(gl, s0);
+        this.disposeFboSurface(gl, s1);
+        return null;
+      }
+      target = { surfaces: [s0, s1], activeIndex: 0 };
+    }
+    if (
+      !this.ensureFboSurfaceSize(gl, target.surfaces[0], width, height) ||
+      !this.ensureFboSurfaceSize(gl, target.surfaces[1], width, height)
+    ) {
+      return null;
+    }
+    return target;
+  }
+
+  private ensureFolderPingPong(
+    gl: WebGL2RenderingContext,
+    depth: number,
+    width: number,
+    height: number
+  ): PingPongTarget | null {
+    while (this.folderPingPongs.length <= depth) {
+      const created = this.ensurePingPongTarget(gl, null, width, height);
+      if (!created) return null;
+      this.folderPingPongs.push(created);
+    }
+    const target = this.ensurePingPongTarget(gl, this.folderPingPongs[depth], width, height);
+    if (!target) return null;
+    this.folderPingPongs[depth] = target;
+    return target;
+  }
+
+  private disposeFboSurface(gl: WebGL2RenderingContext, surface: FboSurface | null): void {
+    if (!surface) return;
+    gl.deleteFramebuffer(surface.fbo);
+    gl.deleteTexture(surface.texture);
+    if (surface.stencilRb && typeof gl.deleteRenderbuffer === 'function') {
+      gl.deleteRenderbuffer(surface.stencilRb);
+    }
+  }
+
+  private disposePingPongTarget(gl: WebGL2RenderingContext, target: PingPongTarget | null): void {
+    if (!target) return;
+    this.disposeFboSurface(gl, target.surfaces[0]);
+    this.disposeFboSurface(gl, target.surfaces[1]);
+  }
+
   /**
-   * Get or upload a WebGLTexture from the pre-allocated texture pool with adaptive zoom filtering.
-   * Only tiles currently intersecting the screen frustum are uploaded to GPU memory.
+   * Fast GPU-to-GPU FBO copy via gl.blitFramebuffer (with fullscreen quad fallback).
+   * Eliminates all gl.copyTexSubImage2D calls and preserves stencil buffer when requested.
+   */
+  private copyFboSurface(
+    gl: WebGL2RenderingContext,
+    src: FboSurface,
+    dst: FboSurface,
+    width: number,
+    height: number,
+    copyStencil: boolean = false
+  ): void {
+    if (
+      typeof gl.blitFramebuffer === 'function' &&
+      gl.READ_FRAMEBUFFER !== undefined &&
+      gl.DRAW_FRAMEBUFFER !== undefined
+    ) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fbo);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fbo);
+      const mask = copyStencil && src.stencilRb && dst.stencilRb
+        ? (gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT)
+        : gl.COLOR_BUFFER_BIT;
+      gl.blitFramebuffer(0, 0, width, height, 0, 0, width, height, mask, gl.NEAREST);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+      gl.viewport(0, 0, width, height);
+      return;
+    }
+
+    // Fallback: fullscreen quad copy using blitProgram (zero copyTexSubImage2D)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+    gl.viewport(0, 0, width, height);
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (!this.blitProgram) return;
+
+    const stencilWasEnabled = gl.isEnabled(gl.STENCIL_TEST);
+    if (stencilWasEnabled) gl.disable(gl.STENCIL_TEST);
+    gl.disable(gl.BLEND);
+
+    gl.useProgram(this.blitProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer || this.quadBuffer);
+    if (this.aBlitQuadPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aBlitQuadPosLoc);
+      gl.vertexAttribPointer(this.aBlitQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, src.texture);
+    gl.uniform1i(this.uBlitTextureLoc, 0);
+    gl.uniform1i(this.uBlitBackdropTextureLoc, 2);
+    gl.uniform1i(this.uBlitHasBackdropLoc, 0);
+    gl.uniform1i(this.uBlitBlendModeLoc, 0);
+    gl.uniform1f(this.uBlitOpacityLoc, 1.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    this.unbindSceneTextureUnits(gl);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    if (stencilWasEnabled) gl.enable(gl.STENCIL_TEST);
+    this.restoreStandardProgram(gl);
+  }
+
+  /**
+   * Unbinds offscreen FBO textures from TEXTURE0 and TEXTURE2 so no texture attached
+   * to the next bound DRAW_FRAMEBUFFER can trigger a WebGL2 feedback loop error.
+   */
+  private unbindSceneTextureUnits(gl: WebGL2RenderingContext): void {
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+  }
+
+  /**
+   * Swaps Ping-Pong FBOs for a programmable blend / adjustment pass:
+   * copies current surface -> opposite surface and returns current surface's immutable texture as backdrop.
+   * ZERO gl.copyTexSubImage2D calls!
+   */
+  private prepareBackdropFromPingPong(
+    gl: WebGL2RenderingContext,
+    target: PingPongTarget,
+    viewportW: number,
+    viewportH: number,
+    preserveStencil: boolean
+  ): WebGLTexture {
+    const src = target.surfaces[target.activeIndex];
+    const nextIdx: 0 | 1 = target.activeIndex === 0 ? 1 : 0;
+    const dst = target.surfaces[nextIdx];
+
+    this.copyFboSurface(gl, src, dst, viewportW, viewportH, preserveStencil);
+    target.activeIndex = nextIdx;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fbo);
+    gl.viewport(0, 0, viewportW, viewportH);
+
+    return src.texture;
+  }
+
+  private restoreStandardProgram(gl: WebGL2RenderingContext): void {
+    if (this.program) {
+      gl.useProgram(this.program);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      if (this.aQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(this.aQuadPosLoc);
+        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
+    }
+  }
+
+  private syncFrameUniforms(gl: WebGL2RenderingContext, locs: LayerUniformLocs): void {
+    const fs = this.currentFrameState;
+    if (!fs) return;
+    gl.uniform2f(locs.uViewportSize, fs.viewportW, fs.viewportH);
+    gl.uniform2f(locs.uDocDimensions, fs.dimensions.width, fs.dimensions.height);
+    gl.uniform2f(locs.uPan, fs.transform.pan.x, fs.transform.pan.y);
+    gl.uniform1f(locs.uZoom, fs.transform.zoom);
+    gl.uniform1f(locs.uRotationRad, fs.rotRad);
+    gl.uniform2f(locs.uFlip, fs.transform.flipX ? -1.0 : 1.0, fs.transform.flipY ? -1.0 : 1.0);
+    gl.uniform1f(locs.uDpr, fs.dpr);
+  }
+
+  private applyLayerUniforms(
+    gl: WebGL2RenderingContext,
+    locs: LayerUniformLocs,
+    layer: LayerItem,
+    dimensions: CanvasDimensions,
+    effectiveOpacity: number,
+    modeCode: number,
+    backdropTex: WebGLTexture | null,
+    maskTex: WebGLTexture | null
+  ): void {
+    gl.uniform1f(locs.uLayerOpacity, effectiveOpacity);
+    gl.uniform1i(locs.uBlendMode, modeCode);
+
+    // Always bind distinct sampler units (mask = 1, backdrop = 2) so sampler2D never
+    // collides with sampler2DArray on unit 0 in WebGL2.
+    gl.uniform1i(locs.uBackdropTexture, 2);
+    gl.uniform1i(locs.uMaskTexture, 1);
+
+    if (backdropTex && modeCode !== 0 && modeCode !== 12) {
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, backdropTex);
+      gl.uniform1i(locs.uHasBackdrop, 1);
+    } else {
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.uniform1i(locs.uHasBackdrop, 0);
+    }
+
+    // Expression Color Uniforms
+    const isBgLayer = layer.id === 'layer-bg' || layer.id.startsWith('layer-bg');
+    const exprMode = isBgLayer
+      ? 0
+      : layer.expressionColor === 'monochrome'
+      ? 2
+      : layer.expressionColor === 'gray'
+      ? 1
+      : 0;
+    gl.uniform1i(locs.uExpressionMode, exprMode);
+    if (exprMode === 2) {
+      gl.uniform1f(locs.uMonoThreshold, (layer.monoThreshold ?? 128) / 255.0);
+      gl.uniform1i(locs.uMonoExpressBlack, layer.monoExpressBlack !== false ? 1 : 0);
+      gl.uniform1i(locs.uMonoExpressWhite, layer.monoExpressWhite !== false ? 1 : 0);
+    }
+
+    // Screentone Uniforms
+    const toneEnabled = Boolean(layer.toneEnabled);
+    gl.uniform1i(locs.uToneEnabled, toneEnabled ? 1 : 0);
+    if (toneEnabled) {
+      gl.uniform1f(locs.uToneFrequency, layer.toneFrequency || 60);
+      gl.uniform1f(locs.uToneAngleRad, ((layer.toneAngle || 45) * Math.PI) / 180);
+      gl.uniform1f(locs.uToneDpi, dimensions.dpi || 600);
+      const dotShapeCode =
+        layer.toneDotShape === 'line'
+          ? 2
+          : layer.toneDotShape === 'diamond'
+          ? 3
+          : layer.toneDotShape === 'euclidean'
+          ? 1
+          : 0;
+      gl.uniform1i(locs.uToneDotShape, dotShapeCode);
+      gl.uniform1f(locs.uToneDensity, (layer.toneDensity ?? 40) / 100);
+      gl.uniform1i(locs.uToneDensityType, layer.toneDensityType === 'image' ? 1 : 0);
+    }
+
+    // Layer Tint Uniforms
+    const tintEnabled = Boolean(layer.layerColorEnabled);
+    gl.uniform1i(locs.uLayerColorEnabled, tintEnabled ? 1 : 0);
+    if (tintEnabled) {
+      const prim = this.parseHexColor(layer.layerColor || '#1c73c2');
+      const sub = this.parseHexColor(layer.layerSubColor || '#ffffff');
+      gl.uniform3f(locs.uLayerColor, prim[0], prim[1], prim[2]);
+      gl.uniform3f(locs.uLayerSubColor, sub[0], sub[1], sub[2]);
+    }
+
+    // Layer Mask Uniforms
+    if (maskTex) {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, maskTex);
+      gl.uniform1i(locs.uMaskEnabled, 1);
+    } else {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.uniform1i(locs.uMaskEnabled, 0);
+    }
+
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  // ============================================================================
+  // Tile Texture Streaming (Zero-CPU Premultiply via UNPACK_PREMULTIPLY_ALPHA_WEBGL)
+  // ============================================================================
+
+  /**
+   * Allocates or updates a slice inside the TEXTURE_2D_ARRAY pool using hardware UNPACK_PREMULTIPLY_ALPHA_WEBGL.
+   * Never evicts slices pinned by the current batchTick.
+   */
+  private getOrUploadArrayTileSlice(
+    gl: WebGL2RenderingContext,
+    tile: TileBuffer,
+    grid: SparseTileGrid,
+    batchTick: number
+  ): number {
+    const key = getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0);
+    const accessTick = ++this.arrayAccessCounter;
+    let slot = this.arrayPoolByKey.get(key);
+
+    if (!slot) {
+      let oldestSlot: ArrayPoolSlot | null = null;
+      for (let i = 0; i < this.arrayPoolSlots.length; i++) {
+        const candidate = this.arrayPoolSlots[i];
+        if (candidate.lastBatchTick === batchTick) continue;
+        if (candidate.currentKey === null) {
+          oldestSlot = candidate;
+          break;
+        }
+        if (!oldestSlot || candidate.lastUsed < oldestSlot.lastUsed) {
+          oldestSlot = candidate;
+        }
+      }
+      if (!oldestSlot) return -1;
+      slot = oldestSlot;
+      if (slot.currentKey) {
+        this.arrayPoolByKey.delete(slot.currentKey);
+      }
+      slot.currentKey = key;
+      slot.version = -1;
+      this.arrayPoolByKey.set(key, slot);
+    }
+
+    slot.lastUsed = accessTick;
+    slot.lastBatchTick = batchTick;
+
+    if (slot.version !== tile.version || tile.dirty) {
+      const rgbaData = grid.getTileAsRGBA(tile);
+      const srcBytes =
+        rgbaData instanceof Uint8Array
+          ? rgbaData
+          : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
+
+      // Upload straight-alpha RGBA bytes directly into TEXTURE_2D_ARRAY slice
+      // (UNPACK_PREMULTIPLY_ALPHA_WEBGL must be false for texSubImage3D with ArrayBufferView in WebGL2;
+      // premultiplied bilinear filtering is performed in 32-bit float inside the fragment shader.)
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.texSubImage3D(
+        gl.TEXTURE_2D_ARRAY,
+        0,
+        0,
+        0,
+        slot.sliceIndex,
+        TILE_SIZE,
+        TILE_SIZE,
+        1,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        srcBytes
+      );
+
+      slot.version = tile.version;
+      tile.dirty = false;
+    }
+
+    return slot.sliceIndex;
+  }
+
+  /**
+   * Get or upload a WebGLTexture from the fallback TEXTURE_2D pool with adaptive zoom filtering.
+   * Uses gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true) directly — zero CPU premultiply loop!
    */
   private getTileTexture(tile: TileBuffer, grid: SparseTileGrid): WebGLTexture | null {
     if (!this.gl) return null;
@@ -1628,7 +2998,7 @@ export class ViewportCompositor {
     slot.lastUsed = accessTick;
     const desiredTier = this.currentZoom < 0.99 ? 0 : this.currentZoom < 2.0 ? 1 : 2;
 
-    // Re-upload if dirty or version bumped
+    // Re-upload if dirty or version bumped (direct GPU unpack premultiplication, zero JS pixel loop)
     if (slot.version !== tile.version || tile.dirty) {
       gl.bindTexture(gl.TEXTURE_2D, slot.texture);
 
@@ -1637,28 +3007,8 @@ export class ViewportCompositor {
         rgbaData instanceof Uint8Array
           ? rgbaData
           : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
-      const uploadBytes = this.premulScratch;
-      const len = Math.min(srcBytes.length, uploadBytes.length);
-      for (let i = 0; i < len; i += 4) {
-        const a = srcBytes[i + 3];
-        if (a === 255) {
-          uploadBytes[i] = srcBytes[i];
-          uploadBytes[i + 1] = srcBytes[i + 1];
-          uploadBytes[i + 2] = srcBytes[i + 2];
-          uploadBytes[i + 3] = 255;
-        } else if (a === 0) {
-          uploadBytes[i] = 0;
-          uploadBytes[i + 1] = 0;
-          uploadBytes[i + 2] = 0;
-          uploadBytes[i + 3] = 0;
-        } else {
-          uploadBytes[i] = (srcBytes[i] * a + 127) / 255;
-          uploadBytes[i + 1] = (srcBytes[i + 1] * a + 127) / 255;
-          uploadBytes[i + 2] = (srcBytes[i + 2] * a + 127) / 255;
-          uploadBytes[i + 3] = a;
-        }
-      }
 
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       if (slot.hasStorage && typeof gl.texSubImage2D === 'function') {
         gl.texSubImage2D(
           gl.TEXTURE_2D,
@@ -1669,7 +3019,7 @@ export class ViewportCompositor {
           TILE_SIZE,
           gl.RGBA,
           gl.UNSIGNED_BYTE,
-          uploadBytes
+          srcBytes
         );
       } else {
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
@@ -1683,10 +3033,11 @@ export class ViewportCompositor {
           0,
           gl.RGBA,
           gl.UNSIGNED_BYTE,
-          uploadBytes
+          srcBytes
         );
         slot.hasStorage = true;
       }
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
 
       slot.hasMipmap = false;
       slot.version = tile.version;
@@ -1710,55 +3061,6 @@ export class ViewportCompositor {
   }
 
   /**
-   * Captures the current framebuffer into `this.snapshotTexture` for programmable GLSL blend modes.
-   */
-  private ensureBackdropSnapshot(gl: WebGL2RenderingContext, viewportW: number, viewportH: number): WebGLTexture | null {
-    if (!this.snapshotTexture || this.snapshotWidth !== viewportW || this.snapshotHeight !== viewportH) {
-      if (this.snapshotTexture) gl.deleteTexture(this.snapshotTexture);
-      this.snapshotTexture = gl.createTexture();
-      this.snapshotWidth = viewportW;
-      this.snapshotHeight = viewportH;
-      gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, viewportW, viewportH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    }
-
-    gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, viewportW, viewportH);
-    return this.snapshotTexture;
-  }
-
-  /**
-   * Set WebGL blend mode and snapshot backdrop when programmable blending is active.
-   * Because COMPOSITOR_FRAGMENT_SHADER outputs:
-   *   fragColor = vec4(mix(Cs, B(Cb, Cs), dstA) * srcA, srcA)
-   * standard premultiplied Porter-Duff (gl.ONE, gl.ONE_MINUS_SRC_ALPHA) produces the exact
-   * W3C / Clip Studio Paint composited result for all 16 blend modes!
-   */
-  private setGLBlendMode(blendMode: BlendMode): void {
-    if (!this.gl) return;
-    const gl = this.gl;
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
-    const modeCode = BLEND_MODE_MAP[blendMode] ?? 0;
-    if (modeCode !== 0 && modeCode !== 12 && this.canvas.width > 0 && this.canvas.height > 0) {
-      const backdropTex = this.ensureBackdropSnapshot(gl, this.canvas.width, this.canvas.height);
-      if (backdropTex) {
-        gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D, backdropTex);
-        gl.uniform1i(this.uBackdropTextureLoc, 2);
-        gl.uniform1i(this.uHasBackdropLoc, 1);
-        gl.activeTexture(gl.TEXTURE0);
-        return;
-      }
-    }
-    gl.uniform1i(this.uHasBackdropLoc, 0);
-  }
-
-  /**
    * Hex color parser to RGB normalized float array [r, g, b].
    */
   private parseHexColor(hex: string): [number, number, number] {
@@ -1775,8 +3077,105 @@ export class ViewportCompositor {
     ];
   }
 
+  private renderArtboardBackground(
+    gl: WebGL2RenderingContext,
+    dimensions: CanvasDimensions,
+    showCheckerboard: boolean
+  ): void {
+    if (!this.program || !this.stdLocs) return;
+    this.unbindSceneTextureUnits(gl);
+    this.restoreStandardProgram(gl);
+    this.syncFrameUniforms(gl, this.stdLocs);
+    gl.uniform1i(this.uTileTextureLoc, 0);
+    gl.uniform1i(this.stdLocs.uMaskTexture, 1);
+    gl.uniform1i(this.stdLocs.uBackdropTexture, 2);
+    gl.uniform1i(this.stdLocs.uMaskEnabled, 0);
+    gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
+    gl.blendFunc(gl.ONE, gl.ZERO);
+    gl.uniform1i(this.uIsBackgroundLoc, 1);
+    gl.uniform1i(this.stdLocs.uExpressionMode, 0);
+    gl.uniform1i(this.uShowCheckerboardLoc, showCheckerboard ? 1 : 0);
+    gl.uniform2f(this.uTileOriginLoc, 0, 0);
+    gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.uniform1i(this.uIsBackgroundLoc, 0);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  }
+
+  private renderOnionSkins(
+    gl: WebGL2RenderingContext,
+    layers: LayerItem[],
+    onionSkinFrames: OnionSkinCompositorFrame[] | undefined,
+    dimensions: CanvasDimensions,
+    grid: SparseTileGrid,
+    frustum: { minX: number; minY: number; maxX: number; maxY: number },
+    target: PingPongTarget | null
+  ): void {
+    if (!onionSkinFrames || onionSkinFrames.length === 0) return;
+    for (const onion of onionSkinFrames) {
+      const targetLayer = layers.find((l) => l.id === onion.layerId);
+      if (targetLayer && targetLayer.visible) {
+        const virtualOnionLayer: LayerItem = {
+          ...targetLayer,
+          opacity: onion.opacity,
+          layerColorEnabled: true,
+          layerColor: onion.tint,
+          layerSubColor: '#ffffff',
+          blendMode: 'normal',
+        };
+        this.renderSingleLayer(gl, virtualOnionLayer, dimensions, grid, frustum, 1.0, target, false);
+      }
+    }
+  }
+
+  private presentTextureToScreen(
+    gl: WebGL2RenderingContext,
+    texture: WebGLTexture,
+    viewportW: number,
+    viewportH: number,
+    softProof?: SoftProofSettings
+  ): void {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, viewportW, viewportH);
+    gl.disable(gl.STENCIL_TEST);
+
+    if (softProof && (softProof.enabled || softProof.gamutWarning) && this.softProofProgram) {
+      this.applySoftProofPass(gl, viewportW, viewportH, softProof, texture);
+      return;
+    }
+
+    gl.clearColor(0.0, 0.0, 0.0, 0.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    if (!this.blitProgram) return;
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.blitProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer || this.quadBuffer);
+    if (this.aBlitQuadPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aBlitQuadPosLoc);
+      gl.vertexAttribPointer(this.aBlitQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, texture);
+    gl.uniform1i(this.uBlitTextureLoc, 0);
+    gl.uniform1i(this.uBlitBackdropTextureLoc, 2);
+    gl.uniform1i(this.uBlitHasBackdropLoc, 0);
+    gl.uniform1i(this.uBlitBlendModeLoc, 0);
+    gl.uniform1f(this.uBlitOpacityLoc, 1.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    this.unbindSceneTextureUnits(gl);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.restoreStandardProgram(gl);
+  }
+
   /**
-   * Main Render Pass: Composite all visible layers onto the viewport canvas.
+   * Main Render Pass: Composite all visible layers onto the viewport canvas using:
+   * 1. Ping-Pong FBOs (zero gl.copyTexSubImage2D calls for all 16 blend modes, adjustments, & soft proof)
+   * 2. Baked Layer Stack Cache (`belowActiveCacheFbo` + `activeUnit` + `aboveActiveCacheFbo`)
+   * 3. TEXTURE_2D_ARRAY + gl.drawArraysInstanced tile batching
    */
   public render(
     layers: LayerItem[],
@@ -1789,50 +3188,24 @@ export class ViewportCompositor {
     this.currentOptions = _options;
     this.currentZoom = transform.zoom;
 
-    if (!gl || !this.program) {
+    if (!gl || !this.program || !this.stdLocs) {
       this.render2DFallback(layers, transform, dimensions, grid, _options);
       return;
     }
 
-    const viewportW = this.canvas.width;
-    const viewportH = this.canvas.height;
-    gl.viewport(0, 0, viewportW, viewportH);
-
-    // Clear viewport with transparency or dark workspace
-    gl.clearColor(0.0, 0.0, 0.0, 0.0);
-    gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
-
-    gl.useProgram(this.program);
-
+    const viewportW = Math.max(1, this.canvas.width);
+    const viewportH = Math.max(1, this.canvas.height);
     const dpr = _options.devicePixelRatio ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 1) ?? 1;
-
-    // Set Viewport and Document Uniforms
-    gl.uniform2f(this.uViewportSizeLoc, viewportW, viewportH);
-    gl.uniform2f(this.uDocDimensionsLoc, dimensions.width, dimensions.height);
-    gl.uniform2f(this.uPanLoc, transform.pan.x, transform.pan.y);
-    gl.uniform1f(this.uZoomLoc, transform.zoom);
     const rotRad = (transform.rotation * Math.PI) / 180;
-    gl.uniform1f(this.uRotationRadLoc, rotRad);
-    gl.uniform1f(this.uDprLoc, dpr);
-    gl.uniform1i(this.uTileTextureLoc, 0);
-    gl.uniform1i(this.uHasBackdropLoc, 0);
 
-    // Bind Quad Vertices using cached attribute location
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-    if (this.aQuadPosLoc >= 0) {
-      gl.enableVertexAttribArray(this.aQuadPosLoc);
-      gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
-    }
-
-    // 1. Render artboard background pass (paper white or checkerboard)
-    gl.blendFunc(gl.ONE, gl.ZERO);
-    gl.uniform1i(this.uIsBackgroundLoc, 1);
-    gl.uniform1i(this.uExpressionModeLoc, 0);
-    gl.uniform1i(this.uShowCheckerboardLoc, _options.showCheckerboard ? 1 : 0);
-    gl.uniform2f(this.uTileOriginLoc, 0, 0);
-    gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    gl.uniform1i(this.uIsBackgroundLoc, 0);
+    this.currentFrameState = {
+      viewportW,
+      viewportH,
+      dpr,
+      dimensions,
+      transform,
+      rotRad,
+    };
 
     // Calculate Frustum Culling document bounds
     const viewportCssW = viewportW / dpr;
@@ -1845,53 +3218,244 @@ export class ViewportCompositor {
       dimensions.height
     );
 
-    gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
-
     // Dynamic Frustum Culling & Memory Budget Sync
+    const activeLayerId = _options.activeLayerId ?? _options.activeDraftLayerId ?? null;
     const layerVis = new Map<string, boolean>();
     for (const l of layers) {
       layerVis.set(l.id, l.visible);
     }
-    grid.getMemoryManager()?.updateViewport(frustum, _options.activeDraftLayerId, layerVis);
+    grid.getMemoryManager()?.updateViewport(frustum, activeLayerId, layerVis);
 
-    // 2. Render colored onion skin cels if active in animation mode
-    if (_options.onionSkinFrames && _options.onionSkinFrames.length > 0) {
-      for (const onion of _options.onionSkinFrames) {
-        const targetLayer = layers.find((l) => l.id === onion.layerId);
-        if (targetLayer && targetLayer.visible) {
-          const virtualOnionLayer: LayerItem = {
-            ...targetLayer,
-            opacity: onion.opacity,
-            layerColorEnabled: true,
-            layerColor: onion.tint,
-            layerSubColor: '#ffffff',
-            blendMode: 'normal',
-          };
-          this.renderSingleLayer(gl, virtualOnionLayer, dimensions, grid, frustum);
-        }
+    // Ensure Ping-Pong Scene FBOs & Baked Layer Stack Cache FBOs
+    const scenePP = this.ensurePingPongTarget(gl, this.scenePingPong, viewportW, viewportH);
+    this.scenePingPong = scenePP;
+
+    let belowCacheReady = false;
+    let aboveCacheReady = false;
+    if (scenePP) {
+      if (!this.belowActiveCacheFbo) {
+        this.belowActiveCacheFbo = this.createFboSurface(gl, false);
+      }
+      if (this.belowActiveCacheFbo) {
+        belowCacheReady = this.ensureFboSurfaceSize(gl, this.belowActiveCacheFbo, viewportW, viewportH);
+      }
+      if (!this.aboveActiveCacheFbo) {
+        this.aboveActiveCacheFbo = this.createFboSurface(gl, false);
+      }
+      if (this.aboveActiveCacheFbo) {
+        aboveCacheReady = this.ensureFboSurfaceSize(gl, this.aboveActiveCacheFbo, viewportW, viewportH);
       }
     }
 
-    // 3. Render layer hierarchy: Folders support 'pass-through' and isolated blend modes
-    const tree = buildLayerTree(layers);
-    this.renderNodeList(
-      gl,
-      tree,
-      dimensions,
-      grid,
-      frustum,
-      viewportW,
-      viewportH,
-      transform,
-      dpr,
-      null,
-      0,
-      1.0
-    );
+    if (scenePP && belowCacheReady && aboveCacheReady && this.belowActiveCacheFbo && this.aboveActiveCacheFbo) {
+      // Evaluate Baked Layer Stack Cache invalidation (below / active / above)
+      const cacheEval = this.stackCache.evaluate({
+        layers,
+        activeLayerId,
+        viewportW,
+        viewportH,
+        dpr,
+        dimensions,
+        transform,
+        showCheckerboard: Boolean(_options.showCheckerboard),
+        onionSkinFrames: _options.onionSkinFrames,
+        getLayerContentVersion: (id) =>
+          typeof grid.getLayerVersion === 'function' ? grid.getLayerVersion(id) : 0,
+        getMaskInvalidationEpoch: (id) => this.maskInvalidationEpochs.get(id) ?? 0,
+        gridEpoch: typeof grid.getGridEpoch === 'function' ? grid.getGridEpoch() : 0,
+      });
 
-    // 4. CMYK Soft Proofing and Gamut Warning post-processing pass
-    if (_options.softProof && (_options.softProof.enabled || _options.softProof.gamutWarning)) {
-      this.applySoftProofPass(gl, viewportW, viewportH, _options.softProof);
+      const { partition } = cacheEval;
+      this.restoreStandardProgram(gl);
+      this.syncFrameUniforms(gl, this.stdLocs);
+      gl.uniform1i(this.uTileTextureLoc, 0);
+      gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
+
+      // Step 1: Rebuild aboveActiveCacheFbo ONLY when upper slice metadata/content/camera changed
+      if (cacheEval.aboveDirty && partition.aboveCachedUnits.length > 0) {
+        scenePP.activeIndex = 0;
+        const surf = scenePP.surfaces[0];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, surf.fbo);
+        gl.viewport(0, 0, viewportW, viewportH);
+        gl.disable(gl.STENCIL_TEST);
+        gl.clearColor(0.0, 0.0, 0.0, 0.0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+        const overrideRootBlend = partition.aboveStrategy === 'baked-single-blend';
+        for (const unit of partition.aboveCachedUnits) {
+          this.renderCompositingUnit(
+            gl,
+            unit,
+            dimensions,
+            grid,
+            frustum,
+            viewportW,
+            viewportH,
+            transform,
+            dpr,
+            scenePP,
+            0,
+            overrideRootBlend
+          );
+        }
+
+        this.copyFboSurface(
+          gl,
+          scenePP.surfaces[scenePP.activeIndex],
+          this.aboveActiveCacheFbo,
+          viewportW,
+          viewportH,
+          false
+        );
+        this.stackCacheStats.aboveRebuilds++;
+      }
+
+      // Step 2: Populate scenePP with below slice (either rebuild belowActiveCacheFbo or fast GPU blit)
+      if (cacheEval.belowDirty) {
+        scenePP.activeIndex = 0;
+        const surf = scenePP.surfaces[0];
+        gl.bindFramebuffer(gl.FRAMEBUFFER, surf.fbo);
+        gl.viewport(0, 0, viewportW, viewportH);
+        gl.disable(gl.STENCIL_TEST);
+        gl.clearColor(0.0, 0.0, 0.0, 0.0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+        this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard));
+        this.renderOnionSkins(gl, layers, _options.onionSkinFrames, dimensions, grid, frustum, scenePP);
+
+        for (const unit of partition.belowUnits) {
+          this.renderCompositingUnit(
+            gl,
+            unit,
+            dimensions,
+            grid,
+            frustum,
+            viewportW,
+            viewportH,
+            transform,
+            dpr,
+            scenePP,
+            0,
+            false
+          );
+        }
+
+        this.copyFboSurface(
+          gl,
+          scenePP.surfaces[scenePP.activeIndex],
+          this.belowActiveCacheFbo,
+          viewportW,
+          viewportH,
+          false
+        );
+        // Ensure scenePP's current surface remains bound for activeUnit
+        gl.bindFramebuffer(gl.FRAMEBUFFER, scenePP.surfaces[scenePP.activeIndex].fbo);
+        gl.viewport(0, 0, viewportW, viewportH);
+        this.stackCacheStats.belowRebuilds++;
+      } else {
+        scenePP.activeIndex = 0;
+        this.copyFboSurface(
+          gl,
+          this.belowActiveCacheFbo,
+          scenePP.surfaces[0],
+          viewportW,
+          viewportH,
+          false
+        );
+        if (!cacheEval.aboveDirty) {
+          this.stackCacheStats.cacheHits++;
+        }
+      }
+
+      // Step 3: Render active unit (+ live activeDraftCanvas in-stack!)
+      if (partition.activeUnit) {
+        this.renderCompositingUnit(
+          gl,
+          partition.activeUnit,
+          dimensions,
+          grid,
+          frustum,
+          viewportW,
+          viewportH,
+          transform,
+          dpr,
+          scenePP,
+          0,
+          false
+        );
+      }
+
+      // Step 4: Render any dynamic non-associative upper units (via Ping-Pong FBOs, zero copyTexSubImage2D)
+      for (const unit of partition.aboveDynamicUnits) {
+        this.renderCompositingUnit(
+          gl,
+          unit,
+          dimensions,
+          grid,
+          frustum,
+          viewportW,
+          viewportH,
+          transform,
+          dpr,
+          scenePP,
+          0,
+          false
+        );
+      }
+
+      // Step 5: Composite baked aboveActiveCacheFbo (1 single quad / 1 ping-pong blend pass)
+      if (partition.aboveCachedUnits.length > 0) {
+        const aboveBlend: BlendMode =
+          partition.aboveStrategy === 'baked-single-blend'
+            ? partition.aboveCacheBlendMode
+            : 'normal';
+        this.blitFolderTexture(
+          gl,
+          this.aboveActiveCacheFbo.texture,
+          aboveBlend,
+          1.0,
+          viewportW,
+          viewportH,
+          scenePP,
+          false
+        );
+      }
+
+      this.stackCache.commit(cacheEval.belowSignature, cacheEval.aboveSignature);
+
+      // Step 6: Present final composited Ping-Pong surface to screen (with optional CMYK soft proofing)
+      this.presentTextureToScreen(
+        gl,
+        scenePP.surfaces[scenePP.activeIndex].texture,
+        viewportW,
+        viewportH,
+        _options.softProof
+      );
+    } else {
+      // Safe fallback when offscreen FBOs are unsupported in a minimal WebGL context
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, viewportW, viewportH);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+      this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard));
+      this.renderOnionSkins(gl, layers, _options.onionSkinFrames, dimensions, grid, frustum, null);
+
+      const tree = buildLayerTree(layers);
+      this.renderNodeList(
+        gl,
+        tree,
+        dimensions,
+        grid,
+        frustum,
+        viewportW,
+        viewportH,
+        transform,
+        dpr,
+        null,
+        0,
+        1.0
+      );
     }
 
     // Prune mask textures belonging to deleted layers
@@ -1901,13 +3465,233 @@ export class ViewportCompositor {
           const entry = this.maskTextureCache.get(cachedLayerId);
           if (entry) gl.deleteTexture(entry.texture);
           this.maskTextureCache.delete(cachedLayerId);
+          this.maskInvalidationEpochs.delete(cachedLayerId);
         }
       }
     }
 
-    // Clean up stale textures if pool exceeded limit
+    // Clean up stale textures if fallback pool exceeded limit
     if (this.texturePool.length > ViewportCompositor.MAX_TEXTURE_POOL_SIZE) {
       this.evictStaleTextures();
+    }
+  }
+
+  /**
+   * Renders a single atomic CompositingUnit (an isolated folder, adjustment layer, or base + clipped group)
+   * into the active Ping-Pong target.
+   */
+  private renderCompositingUnit(
+    gl: WebGL2RenderingContext,
+    unit: CompositingUnit,
+    dimensions: CanvasDimensions,
+    grid: SparseTileGrid,
+    frustum: { minX: number; minY: number; maxX: number; maxY: number },
+    viewportW: number,
+    viewportH: number,
+    transform: ViewportTransform,
+    dpr: number,
+    target: PingPongTarget | null,
+    depth: number,
+    overrideRootBlendNormal: boolean
+  ): void {
+    const group = unit.group;
+    const baseNode = group.baseNode;
+    const baseLayer = overrideRootBlendNormal
+      ? { ...baseNode.layer, blendMode: 'normal' as BlendMode }
+      : baseNode.layer;
+
+    if (!baseLayer.visible || baseLayer.opacity <= 0.001) {
+      return;
+    }
+
+    if (baseLayer.type === 'folder') {
+      const folderTarget = this.ensureFolderPingPong(gl, depth, viewportW, viewportH);
+      if (!folderTarget) return;
+
+      folderTarget.activeIndex = 0;
+      const folderSurf = folderTarget.surfaces[0];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, folderSurf.fbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+      gl.disable(gl.STENCIL_TEST);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+      this.renderNodeList(
+        gl,
+        baseNode.children,
+        dimensions,
+        grid,
+        frustum,
+        viewportW,
+        viewportH,
+        transform,
+        dpr,
+        folderTarget,
+        depth + 1,
+        1.0
+      );
+
+      // Restore parent target framebuffer and blit isolated folder result
+      const parentFbo = target ? target.surfaces[target.activeIndex].fbo : null;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, parentFbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+
+      this.blitFolderTexture(
+        gl,
+        folderTarget.surfaces[folderTarget.activeIndex].texture,
+        baseLayer.blendMode,
+        baseLayer.opacity * unit.inheritedOpacity,
+        viewportW,
+        viewportH,
+        target,
+        false
+      );
+      return;
+    }
+
+    const activeClippedLayers = group.clippedNodes
+      .map((n) => n.layer)
+      .filter((cl) => cl.visible && cl.opacity > 0.001 && cl.type !== 'folder');
+
+    const baseEffectiveOpacity = unit.inheritedOpacity;
+
+    if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
+      this.renderAdjustmentLayer(
+        gl,
+        baseLayer,
+        transform,
+        dimensions,
+        viewportW,
+        viewportH,
+        dpr,
+        baseEffectiveOpacity,
+        target,
+        false
+      );
+      return;
+    }
+
+    const baseHasStyles = hasActiveLayerStyles(baseLayer.styles);
+
+    if (activeClippedLayers.length > 0) {
+      // Record base layer silhouette in stencil buffer of the current Ping-Pong surface
+      gl.enable(gl.STENCIL_TEST);
+      gl.clear(gl.STENCIL_BUFFER_BIT);
+      gl.stencilMask(0xFF);
+      gl.stencilFunc(gl.ALWAYS, 1, 0xFF);
+      gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
+
+      if (baseHasStyles) {
+        // Record base layer silhouette in stencil without writing colors
+        gl.colorMask(false, false, false, false);
+        this.renderSingleLayer(
+          gl,
+          { ...baseLayer, blendMode: 'normal' },
+          dimensions,
+          grid,
+          frustum,
+          baseEffectiveOpacity,
+          target,
+          true
+        );
+        gl.colorMask(true, true, true, true);
+
+        // Draw base layer with styles (do not overwrite stencil with shadow/glow)
+        gl.stencilMask(0x00);
+        this.renderLayerWithStyles(
+          gl,
+          baseLayer,
+          dimensions,
+          grid,
+          frustum,
+          viewportW,
+          viewportH,
+          transform,
+          dpr,
+          baseEffectiveOpacity,
+          target,
+          true
+        );
+        gl.stencilMask(0xFF);
+      } else {
+        this.renderSingleLayer(
+          gl,
+          baseLayer,
+          dimensions,
+          grid,
+          frustum,
+          baseEffectiveOpacity,
+          target,
+          true
+        );
+      }
+
+      // Render clipped layers: only draw over opaque pixels of base layer (stencil == 1)
+      gl.stencilMask(0x00);
+      gl.stencilFunc(gl.EQUAL, 1, 0xFF);
+      gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+
+      for (const clippedLayer of activeClippedLayers) {
+        if (hasActiveLayerStyles(clippedLayer.styles)) {
+          this.renderLayerWithStyles(
+            gl,
+            clippedLayer,
+            dimensions,
+            grid,
+            frustum,
+            viewportW,
+            viewportH,
+            transform,
+            dpr,
+            baseEffectiveOpacity,
+            target,
+            true
+          );
+        } else {
+          this.renderSingleLayer(
+            gl,
+            clippedLayer,
+            dimensions,
+            grid,
+            frustum,
+            baseEffectiveOpacity,
+            target,
+            true
+          );
+        }
+      }
+
+      gl.stencilMask(0xFF);
+      gl.disable(gl.STENCIL_TEST);
+    } else {
+      gl.disable(gl.STENCIL_TEST);
+      if (baseHasStyles) {
+        this.renderLayerWithStyles(
+          gl,
+          baseLayer,
+          dimensions,
+          grid,
+          frustum,
+          viewportW,
+          viewportH,
+          transform,
+          dpr,
+          baseEffectiveOpacity,
+          target,
+          false
+        );
+      } else {
+        this.renderSingleLayer(
+          gl,
+          baseLayer,
+          dimensions,
+          grid,
+          frustum,
+          baseEffectiveOpacity,
+          target,
+          false
+        );
+      }
     }
   }
 
@@ -1924,181 +3708,26 @@ export class ViewportCompositor {
     viewportH: number,
     transform: ViewportTransform,
     dpr: number,
-    currentFbo: WebGLFramebuffer | null,
+    target: PingPongTarget | null,
     depth: number,
     inheritedOpacity: number
   ): void {
-    const siblingsBottomToTop = nodes.slice().reverse();
-    const groups = groupTreeNodesForCompositing(siblingsBottomToTop);
-
-    for (const group of groups) {
-      const baseNode = group.baseNode;
-      const baseLayer = baseNode.layer;
-      if (!baseLayer.visible || baseLayer.opacity <= 0.001) {
-        continue;
-      }
-
-      if (baseLayer.type === 'folder') {
-        const isPassThrough = baseLayer.blendMode === 'pass-through';
-        if (isPassThrough) {
-          // Pass-through: children blend directly with background layers below using their own individual blend modes
-          this.renderNodeList(
-            gl,
-            baseNode.children,
-            dimensions,
-            grid,
-            frustum,
-            viewportW,
-            viewportH,
-            transform,
-            dpr,
-            currentFbo,
-            depth,
-            inheritedOpacity * baseLayer.opacity
-          );
-        } else {
-          // Isolated: children render into isolated offscreen texture, then blend with folder's blend mode
-          const folderFboItem = this.ensureFolderFbo(depth, viewportW, viewportH);
-          if (!folderFboItem) continue;
-
-          gl.bindFramebuffer(gl.FRAMEBUFFER, folderFboItem.fbo);
-          gl.viewport(0, 0, viewportW, viewportH);
-          gl.clearColor(0.0, 0.0, 0.0, 0.0);
-          gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
-
-          this.renderNodeList(
-            gl,
-            baseNode.children,
-            dimensions,
-            grid,
-            frustum,
-            viewportW,
-            viewportH,
-            transform,
-            dpr,
-            folderFboItem.fbo,
-            depth + 1,
-            1.0
-          );
-
-          // Restore previous framebuffer and blit isolated folder texture
-          gl.bindFramebuffer(gl.FRAMEBUFFER, currentFbo);
-          gl.viewport(0, 0, viewportW, viewportH);
-
-          this.blitFolderTexture(
-            gl,
-            folderFboItem.texture,
-            baseLayer.blendMode,
-            baseLayer.opacity * inheritedOpacity,
-            viewportW,
-            viewportH
-          );
-        }
-        continue;
-      }
-
-      const activeClippedLayers = group.clippedNodes
-        .map((n) => n.layer)
-        .filter((cl) => cl.visible && cl.opacity > 0.001 && cl.type !== 'folder');
-
-      const baseEffectiveOpacity = inheritedOpacity;
-
-      if (baseLayer.type === 'adjustment' && baseLayer.adjustmentData) {
-        this.renderAdjustmentLayer(
-          gl,
-          baseLayer,
-          transform,
-          dimensions,
-          viewportW,
-          viewportH,
-          dpr,
-          baseEffectiveOpacity
-        );
-        continue;
-      }
-
-      const baseHasStyles = hasActiveLayerStyles(baseLayer.styles);
-
-      if (activeClippedLayers.length > 0) {
-        // Group successive clipped layers: record base silhouette in stencil buffer
-        gl.enable(gl.STENCIL_TEST);
-        gl.clear(gl.STENCIL_BUFFER_BIT);
-        gl.stencilMask(0xFF);
-        gl.stencilFunc(gl.ALWAYS, 1, 0xFF);
-        gl.stencilOp(gl.KEEP, gl.KEEP, gl.REPLACE);
-
-        if (baseHasStyles) {
-          // Record base layer silhouette in stencil without writing colors to canvas
-          gl.colorMask(false, false, false, false);
-          this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum, baseEffectiveOpacity);
-          gl.colorMask(true, true, true, true);
-
-          // Draw base layer with styles (don't overwrite stencil with shadow/glow)
-          gl.stencilMask(0x00);
-          this.renderLayerWithStyles(
-            gl,
-            baseLayer,
-            dimensions,
-            grid,
-            frustum,
-            viewportW,
-            viewportH,
-            transform,
-            dpr,
-            baseEffectiveOpacity,
-            currentFbo
-          );
-          gl.stencilMask(0xFF);
-        } else {
-          this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum, baseEffectiveOpacity);
-        }
-
-        // Render clipped layers: only draw over the opaque pixels of the base layer
-        gl.stencilMask(0x00);
-        gl.stencilFunc(gl.EQUAL, 1, 0xFF);
-        gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
-
-        for (const clippedLayer of activeClippedLayers) {
-          if (hasActiveLayerStyles(clippedLayer.styles)) {
-            this.renderLayerWithStyles(
-              gl,
-              clippedLayer,
-              dimensions,
-              grid,
-              frustum,
-              viewportW,
-              viewportH,
-              transform,
-              dpr,
-              baseEffectiveOpacity,
-              currentFbo
-            );
-          } else {
-            this.renderSingleLayer(gl, clippedLayer, dimensions, grid, frustum, baseEffectiveOpacity);
-          }
-        }
-
-        gl.disable(gl.STENCIL_TEST);
-      } else {
-        gl.disable(gl.STENCIL_TEST);
-        if (baseHasStyles) {
-          this.renderLayerWithStyles(
-            gl,
-            baseLayer,
-            dimensions,
-            grid,
-            frustum,
-            viewportW,
-            viewportH,
-            transform,
-            dpr,
-            baseEffectiveOpacity,
-            currentFbo
-          );
-        } else {
-          this.renderSingleLayer(gl, baseLayer, dimensions, grid, frustum, baseEffectiveOpacity);
-        }
-      }
+    const units = flattenLayerTreeToUnits(nodes, inheritedOpacity);
+    for (const unit of units) {
+      this.renderCompositingUnit(
+        gl,
+        unit,
+        dimensions,
+        grid,
+        frustum,
+        viewportW,
+        viewportH,
+        transform,
+        dpr,
+        target,
+        depth,
+        false
+      );
     }
   }
 
@@ -2146,7 +3775,7 @@ export class ViewportCompositor {
   }
 
   /**
-   * Evaluates non-destructive adjustment layers via GPU snapshot and version-cached LUT evaluation.
+   * Evaluates non-destructive adjustment layers via Ping-Pong FBO backdrop and version-cached LUT evaluation.
    */
   private renderAdjustmentLayer(
     gl: WebGL2RenderingContext,
@@ -2156,12 +3785,14 @@ export class ViewportCompositor {
     viewportW: number,
     viewportH: number,
     dpr: number,
-    opacityMultiplier: number = 1.0
+    opacityMultiplier: number = 1.0,
+    target: PingPongTarget | null = null,
+    preserveStencil: boolean = false
   ): void {
-    if (!this.adjProgram || !layer.adjustmentData) return;
+    if (!this.adjProgram || !layer.adjustmentData || !target) return;
 
-    // 1. Snapshot lower composite
-    this.ensureBackdropSnapshot(gl, viewportW, viewportH);
+    // 1. Ping-Pong swap to sample accumulated backdrop texture without copyTexSubImage2D
+    const backdropTex = this.prepareBackdropFromPingPong(gl, target, viewportW, viewportH, preserveStencil);
 
     // 2. Prepare 256x1 LUT (Cached by AdjustmentLayerData signature)
     if (!this.lutTexture) {
@@ -2200,7 +3831,7 @@ export class ViewportCompositor {
           lutData[off + 2] = ch === 'rgb' || ch === 'b' ? lLut[i] : i;
           lutData[off + 3] = 255;
         }
-      } else { // color-balance
+      } else {
         lutData = new Uint8Array(256 * 4);
         for (let i = 0; i < 256; i++) {
           const [r, g, b] = evaluateColorBalancePixel(i, i, i, adj);
@@ -2218,6 +3849,7 @@ export class ViewportCompositor {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 256, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, lutData);
 
       this.lastLutKey = lutKey;
@@ -2226,21 +3858,26 @@ export class ViewportCompositor {
 
     // 3. Switch to Adjustment Program
     gl.useProgram(this.adjProgram);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+    if (this.aQuadPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aQuadPosLoc);
+      gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+    }
 
-    // Uniforms
     gl.uniform2f(this.uAdjViewportSizeLoc, viewportW, viewportH);
     gl.uniform2f(this.uAdjDocDimensionsLoc, dimensions.width, dimensions.height);
     gl.uniform2f(this.uAdjPanLoc, transform.pan.x, transform.pan.y);
     gl.uniform1f(this.uAdjZoomLoc, transform.zoom);
     const rotRad = (transform.rotation * Math.PI) / 180;
     gl.uniform1f(this.uAdjRotationRadLoc, rotRad);
+    gl.uniform2f(this.uAdjFlipLoc, transform.flipX ? -1.0 : 1.0, transform.flipY ? -1.0 : 1.0);
     gl.uniform1f(this.uAdjDprLoc, dpr);
 
     gl.uniform2f(this.uAdjTileOriginLoc, 0, 0);
     gl.uniform2f(this.uAdjTileSizeLoc, dimensions.width, dimensions.height);
 
     gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, this.snapshotTexture);
+    gl.bindTexture(gl.TEXTURE_2D, backdropTex);
     gl.uniform1i(this.uAdjSnapshotLoc, 2);
 
     gl.activeTexture(gl.TEXTURE3);
@@ -2250,7 +3887,6 @@ export class ViewportCompositor {
     gl.uniform1i(this.uAdjModeLoc, this.lastLutAdjMode);
     gl.uniform1f(this.uAdjOpacityLoc, layer.opacity * opacityMultiplier);
 
-    // Mask for adjustment layer
     const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
     gl.uniform1i(this.uAdjMaskEnabledLoc, hasMask ? 1 : 0);
     if (hasMask && layer.maskCanvas) {
@@ -2262,19 +3898,23 @@ export class ViewportCompositor {
       }
     }
 
-    // Blend: overwrite lower composite with filtered result
+    // Overwrite document region with filtered result
     gl.blendFunc(gl.ONE, gl.ZERO);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // Revert program and blend func
-    gl.useProgram(this.program);
+    // Revert program, unbind backdrop texture to avoid feedback loops, and restore blend func
+    this.unbindSceneTextureUnits(gl);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.restoreStandardProgram(gl);
   }
 
   /**
-   * Renders all visible tiles of a single layer onto WebGL2 context.
-   * Also composites any in-progress WYSIWYG draft stroke targeting this layer.
+   * Renders all visible tiles of a single layer onto WebGL2 context using:
+   * - TEXTURE_2D_ARRAY + gl.drawArraysInstanced batching when all visible tiles fit in the pool
+   * - Safe per-tile TEXTURE_2D fallback on pool overflow
+   * - Ping-Pong FBO backdrop sampling for custom blend modes (zero gl.copyTexSubImage2D)
+   * - In-stack WYSIWYG live draft stroke compositing
    */
   private renderSingleLayer(
     gl: WebGL2RenderingContext,
@@ -2282,75 +3922,13 @@ export class ViewportCompositor {
     dimensions: CanvasDimensions,
     grid: SparseTileGrid,
     frustum: { minX: number; minY: number; maxX: number; maxY: number },
-    opacityMultiplier: number = 1.0
+    opacityMultiplier: number = 1.0,
+    target: PingPongTarget | null = null,
+    preserveStencil: boolean = false
   ): void {
-    // Configure Layer Blend Mode & Opacity
-    this.setGLBlendMode(layer.blendMode);
-    gl.uniform1f(this.uLayerOpacityLoc, layer.opacity * opacityMultiplier);
-    gl.uniform1i(this.uBlendModeLoc, BLEND_MODE_MAP[layer.blendMode] ?? 0);
+    if (!this.stdLocs) return;
 
-    // Configure Expression Color Uniforms
-    const isBgLayer = layer.id === 'layer-bg' || layer.id.startsWith('layer-bg');
-    const exprMode = isBgLayer
-      ? 0
-      : layer.expressionColor === 'monochrome'
-      ? 2
-      : layer.expressionColor === 'gray'
-      ? 1
-      : 0;
-    gl.uniform1i(this.uExpressionModeLoc, exprMode);
-    if (exprMode === 2) {
-      gl.uniform1f(this.uMonoThresholdLoc, (layer.monoThreshold ?? 128) / 255.0);
-      gl.uniform1i(this.uMonoExpressBlackLoc, layer.monoExpressBlack !== false ? 1 : 0);
-      gl.uniform1i(this.uMonoExpressWhiteLoc, layer.monoExpressWhite !== false ? 1 : 0);
-    }
-
-    // Configure Screentone Uniforms
-    const toneEnabled = Boolean(layer.toneEnabled);
-    gl.uniform1i(this.uToneEnabledLoc, toneEnabled ? 1 : 0);
-    if (toneEnabled) {
-      gl.uniform1f(this.uToneFrequencyLoc, layer.toneFrequency || 60);
-      gl.uniform1f(this.uToneAngleRadLoc, ((layer.toneAngle || 45) * Math.PI) / 180);
-      gl.uniform1f(this.uToneDpiLoc, dimensions.dpi || 600);
-      const dotShapeCode =
-        layer.toneDotShape === 'line'
-          ? 2
-          : layer.toneDotShape === 'diamond'
-          ? 3
-          : layer.toneDotShape === 'euclidean'
-          ? 1
-          : 0;
-      gl.uniform1i(this.uToneDotShapeLoc, dotShapeCode);
-      gl.uniform1f(this.uToneDensityLoc, (layer.toneDensity ?? 40) / 100);
-      gl.uniform1i(this.uToneDensityTypeLoc, layer.toneDensityType === 'image' ? 1 : 0);
-    }
-
-    // Configure Layer Tint Uniforms
-    const tintEnabled = Boolean(layer.layerColorEnabled);
-    gl.uniform1i(this.uLayerColorEnabledLoc, tintEnabled ? 1 : 0);
-    if (tintEnabled) {
-      const prim = this.parseHexColor(layer.layerColor || '#1c73c2');
-      const sub = this.parseHexColor(layer.layerSubColor || '#ffffff');
-      gl.uniform3f(this.uLayerColorLoc, prim[0], prim[1], prim[2]);
-      gl.uniform3f(this.uLayerSubColorLoc, sub[0], sub[1], sub[2]);
-    }
-
-    // Configure Layer Mask
-    const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
-    gl.uniform1i(this.uMaskEnabledLoc, hasMask ? 1 : 0);
-    if (hasMask && layer.maskCanvas) {
-      const maskTex = this.getMaskTexture(layer);
-      if (maskTex) {
-        gl.activeTexture(gl.TEXTURE1);
-        gl.bindTexture(gl.TEXTURE_2D, maskTex);
-        gl.uniform1i(this.uMaskTextureLoc, 1);
-      } else {
-        gl.uniform1i(this.uMaskEnabledLoc, 0);
-      }
-    }
-
-    // Adaptive LOD Selection & Frustum Culling:
-    // Select LOD 1 when zoom <= 50%, LOD 2 when zoom <= 25%, LOD 3 when zoom <= 12.5%
+    // Adaptive LOD Selection & Frustum Culling
     const targetLod =
       this.currentZoom <= 0.125 ? 3 :
       this.currentZoom <= 0.25 ? 2 :
@@ -2359,7 +3937,6 @@ export class ViewportCompositor {
     const lodScale = 1 << targetLod;
     const lodTileDocSize = TILE_SIZE * lodScale;
 
-    // Convert screen viewport bounding box in canvas coordinates to intersecting tile ranges
     const startTileX = Math.floor(frustum.minX / lodTileDocSize);
     const endTileX = Math.floor(frustum.maxX / lodTileDocSize);
     const startTileY = Math.floor(frustum.minY / lodTileDocSize);
@@ -2378,45 +3955,338 @@ export class ViewportCompositor {
       }
     }
 
+    const opts = this.currentOptions;
+    const draftCanvas = opts?.activeDraftLayerId === layer.id ? opts.activeDraftCanvas : null;
+    const hasDraft = Boolean(
+      draftCanvas &&
+      draftCanvas.width > 0 &&
+      draftCanvas.height > 0 &&
+      (draftCanvas as any).__draftHasContent !== false
+    );
+    const draftOp = hasDraft && draftCanvas
+      ? ((draftCanvas as any).__draftCompositeOp as GlobalCompositeOperation | undefined)
+      : undefined;
+    const needsIsolatedDraftFbo =
+      hasDraft &&
+      draftCanvas !== null &&
+      (draftOp === 'destination-out' || draftOp === 'source-atop');
+
+    if (visibleTiles.length === 0 && !hasDraft) {
+      return;
+    }
+
+    const fs = this.currentFrameState;
+    const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
+    const maskTex = hasMask && layer.maskCanvas ? this.getMaskTexture(layer) : null;
+    const effectiveOpacity = layer.opacity * opacityMultiplier;
+
+    // Isolated GPU FBO path for WYSIWYG live Eraser (destination-out) and Alpha Lock (source-atop)
+    // Erases/paints strictly against this layer's tiles without affecting underlying layers and with zero getImageData!
+    if (
+      needsIsolatedDraftFbo &&
+      draftCanvas &&
+      target &&
+      fs &&
+      fs.viewportW > 0 &&
+      fs.viewportH > 0 &&
+      this.ensureLayerFbo(fs.viewportW, fs.viewportH) &&
+      this.layerFbo &&
+      this.layerTexture &&
+      this.blitProgram
+    ) {
+      const stencilWasEnabled = gl.isEnabled(gl.STENCIL_TEST);
+      if (stencilWasEnabled) gl.disable(gl.STENCIL_TEST);
+
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
+      gl.viewport(0, 0, fs.viewportW, fs.viewportH);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+      if (visibleTiles.length > 0) {
+        this.drawTilesFallback2D(
+          gl,
+          visibleTiles,
+          grid,
+          layer,
+          dimensions,
+          lodTileDocSize,
+          1.0,
+          0,
+          null,
+          maskTex
+        );
+      }
+
+      if (draftOp === 'destination-out') {
+        gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
+      } else {
+        gl.blendFunc(gl.DST_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      }
+
+      this.renderActiveDraftForLayer(
+        gl,
+        draftCanvas,
+        layer,
+        dimensions,
+        opts?.activeDraftOpacity ?? 1.0,
+        0,
+        null,
+        maskTex,
+        opts?.activeDraftVersion,
+        opts?.activeDraftSpace ?? 'document'
+      );
+
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.surfaces[target.activeIndex].fbo);
+      gl.viewport(0, 0, fs.viewportW, fs.viewportH);
+      if (stencilWasEnabled) gl.enable(gl.STENCIL_TEST);
+
+      this.blitFolderTexture(
+        gl,
+        this.layerTexture,
+        layer.blendMode,
+        effectiveOpacity,
+        fs.viewportW,
+        fs.viewportH,
+        target,
+        preserveStencil
+      );
+
+      if (this.stdLocs) {
+        if (maskTex) {
+          gl.uniform1i(this.stdLocs.uMaskEnabled, 0);
+        }
+        gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
+      }
+      this.unbindSceneTextureUnits(gl);
+      return;
+    }
+
+    // Prepare Ping-Pong backdrop if custom blend mode is active (zero copyTexSubImage2D)
+    const modeCode = BLEND_MODE_MAP[layer.blendMode] ?? 0;
+    let backdropTex: WebGLTexture | null = null;
+    if (modeCode !== 0 && modeCode !== 12 && target && fs && fs.viewportW > 0 && fs.viewportH > 0) {
+      backdropTex = this.prepareBackdropFromPingPong(
+        gl,
+        target,
+        fs.viewportW,
+        fs.viewportH,
+        preserveStencil
+      );
+    }
+
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+    // Batched TEXTURE_2D_ARRAY + gl.drawArraysInstanced fast path when all visible tiles fit in pool
+    const canBatch =
+      visibleTiles.length > 0 &&
+      this.instancedProgram !== null &&
+      this.instancedLocs !== null &&
+      this.tileArrayTexture !== null &&
+      this.instanceBuffer !== null &&
+      visibleTiles.length <= this.arrayPoolCapacity;
+
+    if (canBatch && this.instancedProgram && this.instancedLocs && this.tileArrayTexture && this.instanceBuffer) {
+      const batchTick = ++this.arrayBatchCounter;
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.tileArrayTexture);
+
+      // Adaptive filter mode for the entire array texture
+      const desiredTier = this.currentZoom < 0.99 ? 0 : this.currentZoom < 2.0 ? 1 : 2;
+      if (this.arrayPoolFilterTier !== desiredTier) {
+        const filter = desiredTier <= 1 ? gl.LINEAR : gl.NEAREST;
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, filter);
+        gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, filter);
+        this.arrayPoolFilterTier = desiredTier;
+      }
+
+      let instanceCount = 0;
+      let overflowed = false;
+      for (let i = 0; i < visibleTiles.length; i++) {
+        const tile = visibleTiles[i];
+        const sliceIdx = this.getOrUploadArrayTileSlice(gl, tile, grid, batchTick);
+        if (sliceIdx < 0) {
+          overflowed = true;
+          break;
+        }
+        const off = instanceCount * 3;
+        this.instanceFloatScratch[off] = tile.tileX * lodTileDocSize;
+        this.instanceFloatScratch[off + 1] = tile.tileY * lodTileDocSize;
+        this.instanceFloatScratch[off + 2] = sliceIdx;
+        instanceCount++;
+      }
+
+      if (!overflowed && instanceCount > 0) {
+        gl.useProgram(this.instancedProgram);
+        this.syncFrameUniforms(gl, this.instancedLocs);
+        gl.uniform2f(this.uInstTileSizeLoc, lodTileDocSize, lodTileDocSize);
+        gl.uniform1i(this.uInstTileArrayLoc, 0);
+        this.applyLayerUniforms(
+          gl,
+          this.instancedLocs,
+          layer,
+          dimensions,
+          effectiveOpacity,
+          modeCode,
+          backdropTex,
+          maskTex
+        );
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.tileArrayTexture);
+
+        if (this.instancedVao) {
+          gl.bindVertexArray(this.instancedVao);
+        } else {
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+          if (this.aInstQuadPosLoc >= 0) {
+            gl.enableVertexAttribArray(this.aInstQuadPosLoc);
+            gl.vertexAttribPointer(this.aInstQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribDivisor(this.aInstQuadPosLoc, 0);
+          }
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+          if (this.aInstDataLoc >= 0) {
+            gl.enableVertexAttribArray(this.aInstDataLoc);
+            gl.vertexAttribPointer(this.aInstDataLoc, 3, gl.FLOAT, false, 0, 0);
+            gl.vertexAttribDivisor(this.aInstDataLoc, 1);
+          }
+        }
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.instanceFloatScratch.subarray(0, instanceCount * 3));
+        gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, instanceCount);
+
+        if (this.instancedVao) {
+          gl.bindVertexArray(null);
+        } else if (this.aInstDataLoc >= 0) {
+          gl.vertexAttribDivisor(this.aInstDataLoc, 0);
+          gl.disableVertexAttribArray(this.aInstDataLoc);
+        }
+        this.restoreStandardProgram(gl);
+      } else if (overflowed) {
+        this.drawTilesFallback2D(
+          gl,
+          visibleTiles,
+          grid,
+          layer,
+          dimensions,
+          lodTileDocSize,
+          effectiveOpacity,
+          modeCode,
+          backdropTex,
+          maskTex
+        );
+      }
+    } else if (visibleTiles.length > 0) {
+      // Safe fallback to per-tile TEXTURE_2D pool on overflow or missing WebGL2 array APIs
+      this.drawTilesFallback2D(
+        gl,
+        visibleTiles,
+        grid,
+        layer,
+        dimensions,
+        lodTileDocSize,
+        effectiveOpacity,
+        modeCode,
+        backdropTex,
+        maskTex
+      );
+    }
+
+    // WYSIWYG In-Stack Live Stroke Compositing
+    if (hasDraft && draftCanvas) {
+      if (draftOp === 'destination-out') {
+        gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
+      } else if (draftOp === 'source-atop') {
+        gl.blendFunc(gl.DST_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      }
+      this.renderActiveDraftForLayer(
+        gl,
+        draftCanvas,
+        layer,
+        dimensions,
+        effectiveOpacity * (opts?.activeDraftOpacity ?? 1.0),
+        modeCode,
+        backdropTex,
+        maskTex,
+        opts?.activeDraftVersion,
+        opts?.activeDraftSpace ?? 'document'
+      );
+      if (draftOp === 'destination-out' || draftOp === 'source-atop') {
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      }
+    }
+
+    if (this.stdLocs) {
+      if (maskTex) {
+        gl.uniform1i(this.stdLocs.uMaskEnabled, 0);
+      }
+      gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
+    }
+    this.unbindSceneTextureUnits(gl);
+  }
+
+  /**
+   * Fallback per-tile TEXTURE_2D draw loop when visible tile count exceeds TEXTURE_2D_ARRAY pool capacity.
+   */
+  private drawTilesFallback2D(
+    gl: WebGL2RenderingContext,
+    visibleTiles: TileBuffer[],
+    grid: SparseTileGrid,
+    layer: LayerItem,
+    dimensions: CanvasDimensions,
+    lodTileDocSize: number,
+    effectiveOpacity: number,
+    modeCode: number,
+    backdropTex: WebGLTexture | null,
+    maskTex: WebGLTexture | null
+  ): void {
+    if (!this.stdLocs) return;
+    this.restoreStandardProgram(gl);
+    this.syncFrameUniforms(gl, this.stdLocs);
+    gl.uniform1i(this.uTileTextureLoc, 0);
+    gl.uniform1i(this.uIsBackgroundLoc, 0);
+    this.applyLayerUniforms(
+      gl,
+      this.stdLocs,
+      layer,
+      dimensions,
+      effectiveOpacity,
+      modeCode,
+      backdropTex,
+      maskTex
+    );
     gl.uniform2f(this.uTileSizeLoc, lodTileDocSize, lodTileDocSize);
 
-    // Draw each visible intersecting tile with 1 draw call per tile
     for (const tile of visibleTiles) {
       const tex = this.getTileTexture(tile, grid);
       if (!tex) continue;
-
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex);
-
       gl.uniform2f(this.uTileOriginLoc, tile.tileX * lodTileDocSize, tile.tileY * lodTileDocSize);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
-
-    // WYSIWYG In-Stack Live Stroke Compositing:
-    // If an active brush stroke is targeting this exact layer, composite it right here in the stack
-    // so upper layers, blend modes, clipping masks, screentones, and layer tinting apply in real time!
-    const opts = this.currentOptions;
-    if (opts?.activeDraftLayerId === layer.id && opts.activeDraftCanvas) {
-      this.renderActiveDraftForLayer(gl, opts.activeDraftCanvas, dimensions, opts.activeDraftVersion);
-      gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
-    }
-
-    if (hasMask) {
-      gl.uniform1i(this.uMaskEnabledLoc, 0);
-    }
-    gl.uniform1i(this.uHasBackdropLoc, 0);
   }
 
   /**
    * Uploads and renders the active draft canvas in-stack for the active layer.
+   * Supports both viewport-space overlays (from CanvasArea) and document-space draft canvases.
    */
   private renderActiveDraftForLayer(
     gl: WebGL2RenderingContext,
     draftCanvas: HTMLCanvasElement,
+    layer: LayerItem,
     dimensions: CanvasDimensions,
-    draftVersion?: number
+    effectiveOpacity: number,
+    modeCode: number,
+    backdropTex: WebGLTexture | null,
+    maskTex: WebGLTexture | null,
+    draftVersion?: number,
+    draftSpace: 'document' | 'viewport' = 'document'
   ): void {
     if (draftCanvas.width <= 0 || draftCanvas.height <= 0) return;
+    if ((draftCanvas as any).__draftHasContent === false) return;
     if (!this.draftTexture) {
       this.draftTexture = gl.createTexture();
     }
@@ -2426,6 +4296,7 @@ export class ViewportCompositor {
     gl.bindTexture(gl.TEXTURE_2D, this.draftTexture);
 
     const ver = draftVersion ?? -1;
+    const hasGenerateMipmap = typeof gl.generateMipmap === 'function';
     if (
       ver === -1 ||
       ver !== this.lastDraftVersion ||
@@ -2434,19 +4305,80 @@ export class ViewportCompositor {
     ) {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
+      gl.texParameteri(
+        gl.TEXTURE_2D,
+        gl.TEXTURE_MIN_FILTER,
+        hasGenerateMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
+      );
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      if (hasGenerateMipmap) {
+        gl.generateMipmap(gl.TEXTURE_2D);
+      }
       this.draftTexWidth = draftCanvas.width;
       this.draftTexHeight = draftCanvas.height;
       this.lastDraftVersion = ver;
     }
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
 
-    gl.uniform2f(this.uTileOriginLoc, 0, 0);
-    gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    const effectiveDraftLayer: LayerItem =
+      this.currentOptions?.activeDraftMonochrome && layer.expressionColor !== 'monochrome'
+        ? { ...layer, expressionColor: 'monochrome' }
+        : layer;
+
+    if (draftSpace === 'viewport' && this.viewportDraftProgram && this.viewportDraftLocs) {
+      gl.useProgram(this.viewportDraftProgram);
+      this.syncFrameUniforms(gl, this.viewportDraftLocs);
+      gl.uniform1i(this.uViewportDraftTileTexLoc, 0);
+      gl.uniform1i(this.uViewportDraftIsBgLoc, 0);
+      this.applyLayerUniforms(
+        gl,
+        this.viewportDraftLocs,
+        effectiveDraftLayer,
+        dimensions,
+        effectiveOpacity,
+        modeCode,
+        backdropTex,
+        maskTex
+      );
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
+      if (this.aViewportDraftQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(this.aViewportDraftQuadPosLoc);
+        gl.vertexAttribPointer(this.aViewportDraftQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.draftTexture);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      this.restoreStandardProgram(gl);
+    } else if (this.stdLocs) {
+      const docRect = this.currentOptions?.activeDraftDirtyRect;
+      const originX = docRect ? docRect.x : 0;
+      const originY = docRect ? docRect.y : 0;
+      const spanW = docRect ? docRect.width : dimensions.width;
+      const spanH = docRect ? docRect.height : dimensions.height;
+
+      this.restoreStandardProgram(gl);
+      this.syncFrameUniforms(gl, this.stdLocs);
+      gl.uniform1i(this.uTileTextureLoc, 0);
+      gl.uniform1i(this.uIsBackgroundLoc, 0);
+      this.applyLayerUniforms(
+        gl,
+        this.stdLocs,
+        effectiveDraftLayer,
+        dimensions,
+        effectiveOpacity,
+        modeCode,
+        backdropTex,
+        maskTex
+      );
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, this.draftTexture);
+      gl.uniform2f(this.uTileOriginLoc, originX, originY);
+      gl.uniform2f(this.uTileSizeLoc, spanW, spanH);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      gl.uniform2f(this.uTileSizeLoc, TILE_SIZE, TILE_SIZE);
+    }
   }
 
   /**
@@ -2477,6 +4409,7 @@ export class ViewportCompositor {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
@@ -2494,58 +4427,8 @@ export class ViewportCompositor {
   }
 
   /**
-   * Ensures an offscreen framebuffer and texture exist for isolated folder compositing.
-   */
-  private ensureFolderFbo(depth: number, width: number, height: number): { fbo: WebGLFramebuffer; texture: WebGLTexture } | null {
-    if (!this.gl) return null;
-    const gl = this.gl;
-
-    while (this.folderFbos.length <= depth) {
-      const fbo = gl.createFramebuffer();
-      const texture = gl.createTexture();
-      const stencilRb = typeof gl.createRenderbuffer === 'function' ? gl.createRenderbuffer() : null;
-      if (!fbo || !texture) return null;
-      this.folderFbos.push({ fbo, texture, stencilRb, width: 0, height: 0 });
-    }
-
-    const item = this.folderFbos[depth];
-    if (item.width !== width || item.height !== height) {
-      const prevFbo = gl.getParameter(gl.FRAMEBUFFER_BINDING) as WebGLFramebuffer | null;
-
-      gl.bindTexture(gl.TEXTURE_2D, item.texture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-
-      gl.bindFramebuffer(gl.FRAMEBUFFER, item.fbo);
-      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, item.texture, 0);
-
-      if (item.stencilRb && typeof gl.bindRenderbuffer === 'function') {
-        gl.bindRenderbuffer(gl.RENDERBUFFER, item.stencilRb);
-        gl.renderbufferStorage(gl.RENDERBUFFER, gl.STENCIL_INDEX8, width, height);
-        gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.STENCIL_ATTACHMENT, gl.RENDERBUFFER, item.stencilRb);
-      }
-
-      const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, prevFbo);
-
-      if (status !== gl.FRAMEBUFFER_COMPLETE) {
-        console.error('Folder FBO incomplete:', status);
-        return null;
-      }
-
-      item.width = width;
-      item.height = height;
-    }
-
-    return item;
-  }
-
-  /**
-   * Blits an isolated folder offscreen texture back to the current framebuffer
-   * with the folder's blend mode and opacity.
+   * Blits an isolated folder or baked cache texture onto the active Ping-Pong target
+   * with full programmable blend mode support and zero gl.copyTexSubImage2D calls.
    */
   private blitFolderTexture(
     gl: WebGL2RenderingContext,
@@ -2553,26 +4436,32 @@ export class ViewportCompositor {
     blendMode: BlendMode,
     opacity: number,
     viewportW: number,
-    viewportH: number
+    viewportH: number,
+    target: PingPongTarget | null = null,
+    preserveStencil: boolean = false
   ): void {
     if (!this.blitProgram) return;
+
+    const modeCode = BLEND_MODE_MAP[blendMode] ?? 0;
+    let hasBackdrop = 0;
+    if (modeCode !== 0 && modeCode !== 12 && target && viewportW > 0 && viewportH > 0) {
+      const backdropTex = this.prepareBackdropFromPingPong(
+        gl,
+        target,
+        viewportW,
+        viewportH,
+        preserveStencil
+      );
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, backdropTex);
+      hasBackdrop = 1;
+    }
 
     gl.viewport(0, 0, viewportW, viewportH);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-    const modeCode = BLEND_MODE_MAP[blendMode] ?? 0;
-    let hasBackdrop = 0;
-    if (modeCode !== 0 && modeCode !== 12 && viewportW > 0 && viewportH > 0) {
-      const backdropTex = this.ensureBackdropSnapshot(gl, viewportW, viewportH);
-      if (backdropTex) {
-        gl.activeTexture(gl.TEXTURE2);
-        gl.bindTexture(gl.TEXTURE_2D, backdropTex);
-        hasBackdrop = 1;
-      }
-    }
-
     gl.useProgram(this.blitProgram);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer || this.quadBuffer);
     if (this.aBlitQuadPosLoc >= 0) {
       gl.enableVertexAttribArray(this.aBlitQuadPosLoc);
       gl.vertexAttribPointer(this.aBlitQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
@@ -2588,50 +4477,25 @@ export class ViewportCompositor {
 
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // Restore standard program and quad buffer
-    if (this.program) {
-      gl.useProgram(this.program);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-      if (this.aQuadPosLoc >= 0) {
-        gl.enableVertexAttribArray(this.aQuadPosLoc);
-        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
-      }
-    }
+    this.unbindSceneTextureUnits(gl);
+    this.restoreStandardProgram(gl);
   }
 
   /**
    * Post-processing pass: CMYK Soft Proofing and Gamut Warning.
+   * Samples directly from the Ping-Pong scene FBO texture into the default framebuffer (zero copyTexSubImage2D).
    */
   private applySoftProofPass(
     gl: WebGL2RenderingContext,
     viewportW: number,
     viewportH: number,
-    settings: SoftProofSettings
+    settings: SoftProofSettings,
+    sceneTexture: WebGLTexture
   ): void {
     if (!this.softProofProgram) return;
 
-    // 1. Prepare snapshot texture for current viewport
-    if (!this.proofSnapshotTexture || this.proofSnapshotWidth !== viewportW || this.proofSnapshotHeight !== viewportH) {
-      if (this.proofSnapshotTexture) gl.deleteTexture(this.proofSnapshotTexture);
-      this.proofSnapshotTexture = gl.createTexture();
-      this.proofSnapshotWidth = viewportW;
-      this.proofSnapshotHeight = viewportH;
-      gl.bindTexture(gl.TEXTURE_2D, this.proofSnapshotTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, viewportW, viewportH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    }
-
-    // 2. Snapshot rendered viewport backbuffer into texture
-    gl.bindTexture(gl.TEXTURE_2D, this.proofSnapshotTexture);
-    gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 0, 0, viewportW, viewportH);
-
-    // 3. Switch to Soft Proof Post-Processing Program
     gl.useProgram(this.softProofProgram);
 
-    // 4. Set uniforms
     const standardIndex = settings.standard === 'japan-color-2001' ? 0 : settings.standard === 'us-web-coated-swop' ? 1 : 2;
     gl.uniform1i(this.uProofStandardLoc, standardIndex);
     gl.uniform1i(this.uProofEnabledLoc, settings.enabled ? 1 : 0);
@@ -2641,10 +4505,9 @@ export class ViewportCompositor {
     gl.uniform3f(this.uProofGamutWarningColorLoc, warnRgb[0], warnRgb[1], warnRgb[2]);
 
     gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.proofSnapshotTexture);
+    gl.bindTexture(gl.TEXTURE_2D, sceneTexture);
     gl.uniform1i(this.uProofSceneTextureLoc, 0);
 
-    // 5. Draw fullscreen quad to replace backbuffer with proofed output
     gl.disable(gl.STENCIL_TEST);
     gl.disable(gl.BLEND);
 
@@ -2660,16 +4523,10 @@ export class ViewportCompositor {
       gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
 
-    // 6. Reset state back to compositor defaults
+    this.unbindSceneTextureUnits(gl);
     gl.enable(gl.BLEND);
-    if (this.program) {
-      gl.useProgram(this.program);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-      if (this.aQuadPosLoc >= 0) {
-        gl.enableVertexAttribArray(this.aQuadPosLoc);
-        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
-      }
-    }
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.restoreStandardProgram(gl);
   }
 
   /**
@@ -2687,16 +4544,17 @@ export class ViewportCompositor {
     transform: ViewportTransform,
     dpr: number,
     opacityMultiplier: number = 1.0,
-    currentFbo: WebGLFramebuffer | null = null
+    target: PingPongTarget | null = null,
+    preserveStencil: boolean = false
   ): void {
     if (!this.ensureLayerFbo(viewportW, viewportH) || !this.stylesProgram) {
-      this.renderSingleLayer(gl, layer, dimensions, grid, frustum, opacityMultiplier);
+      this.renderSingleLayer(gl, layer, dimensions, grid, frustum, opacityMultiplier, target, preserveStencil);
       return;
     }
 
     const styles = layer.styles;
     if (!styles) {
-      this.renderSingleLayer(gl, layer, dimensions, grid, frustum, opacityMultiplier);
+      this.renderSingleLayer(gl, layer, dimensions, grid, frustum, opacityMultiplier, target, preserveStencil);
       return;
     }
 
@@ -2719,22 +4577,47 @@ export class ViewportCompositor {
     };
 
     // 1. Render layer into isolated FBO with opacity 1.0 (opacity is modulated by stylesProgram)
+    const stencilWasEnabled = gl.isEnabled(gl.STENCIL_TEST);
+    if (stencilWasEnabled) gl.disable(gl.STENCIL_TEST);
+
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerFbo);
     gl.viewport(0, 0, viewportW, viewportH);
     gl.clearColor(0.0, 0.0, 0.0, 0.0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     const virtualLayer: LayerItem = { ...layer, opacity: 1.0, blendMode: 'normal' };
-    this.renderSingleLayer(gl, virtualLayer, dimensions, grid, expandedFrustum, 1.0);
+    this.renderSingleLayer(gl, virtualLayer, dimensions, grid, expandedFrustum, 1.0, null, false);
 
-    // 2. Restore active target framebuffer (folder FBO or default screen canvas)
-    gl.bindFramebuffer(gl.FRAMEBUFFER, currentFbo);
-    gl.viewport(0, 0, viewportW, viewportH);
+    // 2. Determine whether custom blend mode requires routing styled output through Ping-Pong blit
+    const modeCode = BLEND_MODE_MAP[layer.blendMode] ?? 0;
+    const needsCustomBlend = modeCode !== 0 && modeCode !== 12 && target !== null;
 
-    // 3. Set layer blend mode
-    this.setGLBlendMode(layer.blendMode);
+    if (needsCustomBlend) {
+      if (!this.layerStylesOutFbo) {
+        this.layerStylesOutFbo = this.createFboSurface(gl, false);
+      }
+      if (this.layerStylesOutFbo && this.ensureFboSurfaceSize(gl, this.layerStylesOutFbo, viewportW, viewportH)) {
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.layerStylesOutFbo.fbo);
+        gl.viewport(0, 0, viewportW, viewportH);
+        gl.clearColor(0.0, 0.0, 0.0, 0.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.blendFunc(gl.ONE, gl.ZERO);
+      } else {
+        const parentFbo = target ? target.surfaces[target.activeIndex].fbo : null;
+        gl.bindFramebuffer(gl.FRAMEBUFFER, parentFbo);
+        gl.viewport(0, 0, viewportW, viewportH);
+        if (stencilWasEnabled) gl.enable(gl.STENCIL_TEST);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      }
+    } else {
+      const parentFbo = target ? target.surfaces[target.activeIndex].fbo : null;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, parentFbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+      if (stencilWasEnabled) gl.enable(gl.STENCIL_TEST);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
 
-    // 4. Activate styles program and bind uniforms
+    // 3. Activate styles program and bind uniforms
     gl.useProgram(this.stylesProgram);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.stylesQuadBuffer);
@@ -2750,7 +4633,6 @@ export class ViewportCompositor {
     gl.uniform2f(this.uStylesViewportSizeLoc, viewportW, viewportH);
     gl.uniform1f(this.uStylesLayerOpacityLoc, layer.opacity * opacityMultiplier);
 
-    // Stroke uniforms
     const stroke = styles.stroke;
     const strokeActive = Boolean(stroke?.enabled && stroke.size > 0 && stroke.opacity > 0);
     gl.uniform1i(this.uStylesStrokeEnabledLoc, strokeActive ? 1 : 0);
@@ -2763,7 +4645,6 @@ export class ViewportCompositor {
       gl.uniform1i(this.uStylesStrokePositionLoc, posCode);
     }
 
-    // Outer Glow uniforms
     const glow = styles.outerGlow;
     const glowActive = Boolean(glow?.enabled && glow.opacity > 0 && glow.blur > 0);
     gl.uniform1i(this.uStylesGlowEnabledLoc, glowActive ? 1 : 0);
@@ -2775,15 +4656,14 @@ export class ViewportCompositor {
       gl.uniform1f(this.uStylesGlowSpreadLoc, (glow.spread || 0) / 100);
     }
 
-    // Drop Shadow uniforms
     const shadow = styles.dropShadow;
     const shadowActive = Boolean(shadow?.enabled && shadow.opacity > 0);
     gl.uniform1i(this.uStylesShadowEnabledLoc, shadowActive ? 1 : 0);
     if (shadowActive && shadow) {
       const rad = ((shadow.angle || 0) * Math.PI) / 180;
       const distPx = (shadow.distance || 0) * transform.zoom * dpr;
-      const dx = Math.cos(rad) * distPx;
-      const dy = Math.sin(rad) * distPx;
+      const dx = Math.cos(rad) * distPx * (transform.flipX ? -1 : 1);
+      const dy = Math.sin(rad) * distPx * (transform.flipY ? -1 : 1);
       gl.uniform2f(this.uStylesShadowOffsetLoc, dx, -dy);
       const shadowBlurPx = (shadow.blur || 0) * transform.zoom * dpr;
       gl.uniform1f(this.uStylesShadowBlurLoc, shadowBlurPx);
@@ -2792,18 +4672,31 @@ export class ViewportCompositor {
       gl.uniform1f(this.uStylesShadowSpreadLoc, (shadow.spread || 0) / 100);
     }
 
-    // 5. Draw fullscreen quad
+    // 4. Draw fullscreen quad
     gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // 6. Restore standard program and quad buffer
-    if (this.program) {
-      gl.useProgram(this.program);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuffer);
-      if (this.aQuadPosLoc >= 0) {
-        gl.enableVertexAttribArray(this.aQuadPosLoc);
-        gl.vertexAttribPointer(this.aQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
-      }
+    // 5. If custom blend mode was routed to layerStylesOutFbo, composite onto parent Ping-Pong target
+    if (needsCustomBlend && this.layerStylesOutFbo && target) {
+      const parentFbo = target.surfaces[target.activeIndex].fbo;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, parentFbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+      if (stencilWasEnabled) gl.enable(gl.STENCIL_TEST);
+      this.blitFolderTexture(
+        gl,
+        this.layerStylesOutFbo.texture,
+        layer.blendMode,
+        1.0,
+        viewportW,
+        viewportH,
+        target,
+        preserveStencil
+      );
+      return;
     }
+
+    // 6. Restore standard program and quad buffer
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    this.restoreStandardProgram(gl);
   }
 
 
@@ -2893,13 +4786,86 @@ export class ViewportCompositor {
       targetCtx.restore();
     }
 
+    // WYSIWYG 2D fallback in-stack live draft compositing
+    const opts = this.currentOptions;
+    const has2DDraft = Boolean(
+      opts?.activeDraftLayerId === layer.id &&
+      opts.activeDraftCanvas &&
+      (opts.activeDraftCanvas as any).__draftHasContent !== false
+    );
+    const draftOp2D = has2DDraft && opts?.activeDraftCanvas
+      ? ((opts.activeDraftCanvas as any).__draftCompositeOp as GlobalCompositeOperation | undefined)
+      : undefined;
+
+    if (
+      has2DDraft &&
+      opts?.activeDraftCanvas &&
+      (draftOp2D === 'destination-out' || draftOp2D === 'source-atop') &&
+      typeof document !== 'undefined' &&
+      targetCtx.canvas
+    ) {
+      const iso = document.createElement('canvas');
+      iso.width = targetCtx.canvas.width;
+      iso.height = targetCtx.canvas.height;
+      const isoCtx = iso.getContext('2d');
+      if (isoCtx) {
+        if (typeof targetCtx.getTransform === 'function' && typeof isoCtx.setTransform === 'function') {
+          isoCtx.setTransform(targetCtx.getTransform());
+        }
+        drawTiles(isoCtx);
+        isoCtx.save();
+        isoCtx.globalAlpha = opts.activeDraftOpacity ?? 1.0;
+        isoCtx.globalCompositeOperation = draftOp2D;
+        if (opts.activeDraftSpace === 'viewport' && typeof isoCtx.setTransform === 'function') {
+          isoCtx.setTransform(1, 0, 0, 1, 0, 0);
+          isoCtx.drawImage(opts.activeDraftCanvas, 0, 0);
+        } else if (opts.activeDraftDirtyRect) {
+          const dr = opts.activeDraftDirtyRect;
+          isoCtx.drawImage(opts.activeDraftCanvas, dr.x, dr.y, dr.width, dr.height);
+        } else {
+          isoCtx.drawImage(
+            opts.activeDraftCanvas,
+            0,
+            0,
+            opts.dimensions?.width ?? opts.activeDraftCanvas.width,
+            opts.dimensions?.height ?? opts.activeDraftCanvas.height
+          );
+        }
+        isoCtx.restore();
+
+        targetCtx.save();
+        if (typeof targetCtx.setTransform === 'function') {
+          targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+        }
+        targetCtx.drawImage(iso, 0, 0);
+        targetCtx.restore();
+        targetCtx.restore();
+        return;
+      }
+    }
+
     // Draw main layer content
     drawTiles(targetCtx);
 
-    // WYSIWYG 2D fallback in-stack live draft compositing
-    const opts = this.currentOptions;
-    if (opts?.activeDraftLayerId === layer.id && opts.activeDraftCanvas) {
-      targetCtx.drawImage(opts.activeDraftCanvas, 0, 0);
+    if (has2DDraft && opts?.activeDraftCanvas) {
+      targetCtx.save();
+      targetCtx.globalAlpha *= opts.activeDraftOpacity ?? 1.0;
+      if (opts.activeDraftSpace === 'viewport' && typeof targetCtx.setTransform === 'function') {
+        targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+        targetCtx.drawImage(opts.activeDraftCanvas, 0, 0);
+      } else if (opts.activeDraftDirtyRect) {
+        const dr = opts.activeDraftDirtyRect;
+        targetCtx.drawImage(opts.activeDraftCanvas, dr.x, dr.y, dr.width, dr.height);
+      } else {
+        targetCtx.drawImage(
+          opts.activeDraftCanvas,
+          0,
+          0,
+          opts.dimensions?.width ?? opts.activeDraftCanvas.width,
+          opts.dimensions?.height ?? opts.activeDraftCanvas.height
+        );
+      }
+      targetCtx.restore();
     }
 
     targetCtx.restore();
@@ -3046,7 +5012,10 @@ export class ViewportCompositor {
     ctx.scale(dpr, dpr);
     ctx.translate(transform.pan.x, transform.pan.y);
     ctx.rotate((transform.rotation * Math.PI) / 180);
-    ctx.scale(transform.zoom, transform.zoom);
+    ctx.scale(
+      (transform.flipX ? -1 : 1) * transform.zoom,
+      (transform.flipY ? -1 : 1) * transform.zoom
+    );
     ctx.translate(-dimensions.width / 2, -dimensions.height / 2);
 
     if (_options.showCheckerboard) {
@@ -3070,76 +5039,95 @@ export class ViewportCompositor {
   }
 
   /**
-   * Clear all allocated WebGL textures.
+   * Clear all allocated WebGL textures, FBOs, buffers, and programs.
    */
   public dispose(): void {
     if (this.gl) {
+      const gl = this.gl;
       this.invalidateTileTextures();
       for (const item of this.maskTextureCache.values()) {
-        this.gl.deleteTexture(item.texture);
+        gl.deleteTexture(item.texture);
       }
       this.maskTextureCache.clear();
+      this.maskInvalidationEpochs.clear();
       if (this.draftTexture) {
-        this.gl.deleteTexture(this.draftTexture);
+        gl.deleteTexture(this.draftTexture);
         this.draftTexture = null;
       }
-      if (this.snapshotTexture) {
-        this.gl.deleteTexture(this.snapshotTexture);
-        this.snapshotTexture = null;
-      }
       if (this.lutTexture) {
-        this.gl.deleteTexture(this.lutTexture);
+        gl.deleteTexture(this.lutTexture);
         this.lutTexture = null;
       }
+      if (this.tileArrayTexture) {
+        gl.deleteTexture(this.tileArrayTexture);
+        this.tileArrayTexture = null;
+      }
+      if (this.instanceBuffer) {
+        gl.deleteBuffer(this.instanceBuffer);
+        this.instanceBuffer = null;
+      }
+      if (this.instancedVao && typeof gl.deleteVertexArray === 'function') {
+        gl.deleteVertexArray(this.instancedVao);
+        this.instancedVao = null;
+      }
       if (this.quadBuffer) {
-        this.gl.deleteBuffer(this.quadBuffer);
+        gl.deleteBuffer(this.quadBuffer);
         this.quadBuffer = null;
       }
       if (this.program) {
-        this.gl.deleteProgram(this.program);
+        gl.deleteProgram(this.program);
         this.program = null;
       }
+      if (this.instancedProgram) {
+        gl.deleteProgram(this.instancedProgram);
+        this.instancedProgram = null;
+      }
+      if (this.viewportDraftProgram) {
+        gl.deleteProgram(this.viewportDraftProgram);
+        this.viewportDraftProgram = null;
+      }
       if (this.adjProgram) {
-        this.gl.deleteProgram(this.adjProgram);
+        gl.deleteProgram(this.adjProgram);
         this.adjProgram = null;
       }
       if (this.stylesProgram) {
-        this.gl.deleteProgram(this.stylesProgram);
+        gl.deleteProgram(this.stylesProgram);
         this.stylesProgram = null;
       }
       if (this.blitProgram) {
-        this.gl.deleteProgram(this.blitProgram);
+        gl.deleteProgram(this.blitProgram);
         this.blitProgram = null;
       }
       if (this.softProofProgram) {
-        this.gl.deleteProgram(this.softProofProgram);
+        gl.deleteProgram(this.softProofProgram);
         this.softProofProgram = null;
       }
-      if (this.proofSnapshotTexture) {
-        this.gl.deleteTexture(this.proofSnapshotTexture);
-        this.proofSnapshotTexture = null;
+      this.disposePingPongTarget(gl, this.scenePingPong);
+      this.scenePingPong = null;
+      for (const fpp of this.folderPingPongs) {
+        this.disposePingPongTarget(gl, fpp);
       }
-      for (const item of this.folderFbos) {
-        this.gl.deleteFramebuffer(item.fbo);
-        this.gl.deleteTexture(item.texture);
-        if (item.stencilRb && typeof this.gl.deleteRenderbuffer === 'function') {
-          this.gl.deleteRenderbuffer(item.stencilRb);
-        }
-      }
-      this.folderFbos = [];
+      this.folderPingPongs = [];
+      this.disposeFboSurface(gl, this.belowActiveCacheFbo);
+      this.belowActiveCacheFbo = null;
+      this.disposeFboSurface(gl, this.aboveActiveCacheFbo);
+      this.aboveActiveCacheFbo = null;
+      this.disposeFboSurface(gl, this.layerStylesOutFbo);
+      this.layerStylesOutFbo = null;
       if (this.layerFbo) {
-        this.gl.deleteFramebuffer(this.layerFbo);
+        gl.deleteFramebuffer(this.layerFbo);
         this.layerFbo = null;
       }
       if (this.layerTexture) {
-        this.gl.deleteTexture(this.layerTexture);
+        gl.deleteTexture(this.layerTexture);
         this.layerTexture = null;
       }
       if (this.stylesQuadBuffer) {
-        this.gl.deleteBuffer(this.stylesQuadBuffer);
+        gl.deleteBuffer(this.stylesQuadBuffer);
         this.stylesQuadBuffer = null;
       }
     }
+    this.stackCache.invalidateAll();
     if (this.fallbackTileCanvas) {
       this.fallbackTileCanvas = null;
     }

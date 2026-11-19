@@ -13,6 +13,9 @@ import { getBalloonHandles, BalloonHandle } from '../utils/balloonEngine';
 interface SpeechBalloonOverlayProps {
   balloon: SpeechBalloon | null;
   zoom: number;
+  rotation?: number;
+  flipX?: boolean;
+  flipY?: boolean;
   onUpdateBalloon: (updater: (prev: SpeechBalloon) => SpeechBalloon) => void;
   onConfirmBalloon: () => void;
   onDeleteBalloon: () => void;
@@ -21,6 +24,9 @@ interface SpeechBalloonOverlayProps {
 export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
   balloon,
   zoom,
+  rotation = 0,
+  flipX = false,
+  flipY = false,
   onUpdateBalloon,
   onConfirmBalloon,
   onDeleteBalloon,
@@ -67,8 +73,13 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
     const { activeHandle, startX, startY, initialBounds, initialTail } = dragRef.current;
     if (!activeHandle) return;
 
-    const dx = (e.clientX - startX) / zoom;
-    const dy = (e.clientY - startY) / zoom;
+    const dxScreen = e.clientX - startX;
+    const dyScreen = e.clientY - startY;
+    const rad = (-rotation * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const dx = ((dxScreen * cos - dyScreen * sin) * (flipX ? -1 : 1)) / zoom;
+    const dy = ((dxScreen * sin + dyScreen * cos) * (flipY ? -1 : 1)) / zoom;
 
     onUpdateBalloon((prev) => {
       if (activeHandle === 'tail-tip') {
@@ -242,7 +253,7 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
         style={{
           left: `${bounds.x + bounds.width + 15}px`,
           top: `${bounds.y}px`,
-          transform: `scale(${zoom > 0 ? 1 / zoom : 1})`,
+          transform: `scale(${(flipX ? -1 : 1) * (zoom > 0 ? 1 / zoom : 1)}, ${(flipY ? -1 : 1) * (zoom > 0 ? 1 / zoom : 1)})`,
           transformOrigin: 'top left',
         }}
         onPointerDown={(e) => e.stopPropagation()}

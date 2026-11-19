@@ -8,6 +8,8 @@ import {
   Users,
   Settings,
   RotateCcw,
+  FlipHorizontal,
+  FlipVertical,
 } from 'lucide-react';
 import {
   CanvasDimensions,
@@ -33,6 +35,11 @@ interface HeaderProps {
   onResetZoom: () => void;
   rotation: number;
   onResetRotation: () => void;
+  flipX?: boolean;
+  flipY?: boolean;
+  onToggleFlipHorizontal?: () => void;
+  onToggleFlipVertical?: () => void;
+  onResetViewFlip?: () => void;
   dimensions?: CanvasDimensions;
   colorMode?: CanvasColorMode;
   menuSections?: MenuSection[];
@@ -64,6 +71,11 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   onResetZoom,
   rotation,
   onResetRotation,
+  flipX = false,
+  flipY = false,
+  onToggleFlipHorizontal,
+  onToggleFlipVertical,
+  onResetViewFlip,
   colorMode = 'color',
   menuSections,
   hasOpenDocument = true,
@@ -224,6 +236,20 @@ export const Header: React.FC<HeaderProps> = React.memo(({
           </span>
         )}
 
+        {hasOpenDocument && (flipX || flipY) && (
+          <button
+            type="button"
+            onClick={onResetViewFlip}
+            data-testid="view-flip-badge"
+            title="Non-destructive View Mirror active (display only — layer pixels unchanged). Click to reset view flip."
+            className="h-6 px-1.5 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[10px] font-mono uppercase text-[var(--accent)] border border-[var(--accent)]/40 flex items-center gap-1 transition-colors cursor-pointer"
+          >
+            <span>
+              {flipX && flipY ? 'View Flip H+V' : flipX ? 'View Flip H' : 'View Flip V'}
+            </span>
+          </button>
+        )}
+
         {hasOpenDocument && isRotated && (
           <button
             type="button"
@@ -297,6 +323,48 @@ export const Header: React.FC<HeaderProps> = React.memo(({
             <Plus className="w-3 h-3" />
           </button>
         </div>
+
+        {/* Non-Destructive View Flip Controls (CSP-style Mirror View) */}
+        {(onToggleFlipHorizontal || onToggleFlipVertical) && (
+          <div
+            className={`h-6 flex items-center bg-[#161616] rounded px-0.5 gap-0.5 ${
+              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
+            }`}
+          >
+            {onToggleFlipHorizontal && (
+              <button
+                type="button"
+                onClick={onToggleFlipHorizontal}
+                aria-label="Flip View Horizontal"
+                aria-pressed={flipX}
+                title="Flip View Horizontal (Shift+H) — non-destructive view mirror"
+                className={`w-5 h-5 rounded flex items-center justify-center transition-colors cursor-pointer ${
+                  flipX
+                    ? 'bg-[#2c2c2c] text-[var(--accent)]'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                }`}
+              >
+                <FlipHorizontal className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {onToggleFlipVertical && (
+              <button
+                type="button"
+                onClick={onToggleFlipVertical}
+                aria-label="Flip View Vertical"
+                aria-pressed={flipY}
+                title="Flip View Vertical (Shift+V) — non-destructive view mirror"
+                className={`w-5 h-5 rounded flex items-center justify-center transition-colors cursor-pointer ${
+                  flipY
+                    ? 'bg-[#2c2c2c] text-[var(--accent)]'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                }`}
+              >
+                <FlipVertical className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        )}
 
         {/* Collab Session Button */}
         {onOpenCollabModal && (

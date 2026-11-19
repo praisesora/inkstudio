@@ -23,6 +23,8 @@ interface TransformOverlayProps {
   session: TransformSession;
   zoom: number;
   rotation: number; // canvas viewport rotation
+  flipX?: boolean;
+  flipY?: boolean;
   onUpdateSession: (updater: (prev: TransformSession) => TransformSession) => void;
   onApply: () => void;
   onCancel: () => void;
@@ -32,6 +34,8 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
   session,
   zoom,
   rotation: canvasRotation,
+  flipX = false,
+  flipY = false,
   onUpdateSession,
   onApply,
   onCancel,
@@ -217,14 +221,16 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
     });
   };
 
-  // Convert screen delta to un-rotated canvas coordinates
+  // Convert screen delta to un-rotated, un-flipped canvas coordinates
   const screenDeltaToCanvas = (dxScreen: number, dyScreen: number): { dx: number; dy: number } => {
     const canvasRotRad = (-canvasRotation * Math.PI) / 180;
     const cCos = Math.cos(canvasRotRad);
     const cSin = Math.sin(canvasRotRad);
+    const fx = flipX ? -1 : 1;
+    const fy = flipY ? -1 : 1;
     return {
-      dx: (dxScreen * cCos - dyScreen * cSin) / zoom,
-      dy: (dxScreen * cSin + dyScreen * cCos) / zoom,
+      dx: ((dxScreen * cCos - dyScreen * cSin) * fx) / zoom,
+      dy: ((dxScreen * cSin + dyScreen * cCos) * fy) / zoom,
     };
   };
 
@@ -649,7 +655,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         style={{
           left: `${nonAffineBounds.minX + nonAffineBounds.width / 2}px`,
           top: `${nonAffineBounds.maxY}px`,
-          transform: `translateX(-50%) translateY(${16 * invZoom}px) scale(${invZoom})`,
+          transform: `translateX(-50%) translateY(${16 * invZoom}px) scale(${(flipX ? -1 : 1) * invZoom}, ${(flipY ? -1 : 1) * invZoom})`,
           transformOrigin: 'top center',
         }}
         onPointerDown={(e) => e.stopPropagation()}

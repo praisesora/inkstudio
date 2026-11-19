@@ -6,6 +6,7 @@ import {
 import { binarizeCanvasRect } from '../colorUtils';
 import { TaperEngine } from '../../engine/TaperEngine';
 import { COMPOSITOR_FRAGMENT_SHADER } from '../compositor';
+import { extractCoalescedEvents } from '../../components/CanvasArea';
 import { LayerPixelSampler } from '../colorMixingEngine';
 import {
   drawRadialDot,
@@ -366,5 +367,44 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
     // And touched tiles (0,0) and (1,1) must be restored to their pre-stroke CARBON pixels without the red stroke
     expect(grid.readImageData(layerId, 10, 10, 1, 1).data[3]).toBe(255);
     expect(grid.readImageData(layerId, 50, 50, 1, 1).data[3]).toBe(0);
+  });
+
+  it('guards against Windows Ink/WebView2 coalesced pointer coordinate drift on pointerdown and pointermove', () => {
+    const downNative = {
+      type: 'pointerdown',
+      clientX: 257,
+      clientY: 55,
+      getCoalescedEvents: () => [{ clientX: 282, clientY: 88 }],
+    } as unknown as PointerEvent;
+    expect(extractCoalescedEvents({ nativeEvent: downNative } as React.PointerEvent<HTMLElement>)).toEqual([
+      downNative,
+    ]);
+
+    const offsetMoveNative = {
+      type: 'pointermove',
+      clientX: 257,
+      clientY: 55,
+      getCoalescedEvents: () => [
+        { clientX: 278, clientY: 82 },
+        { clientX: 282, clientY: 88 },
+      ],
+    } as unknown as PointerEvent;
+    expect(extractCoalescedEvents({ nativeEvent: offsetMoveNative } as React.PointerEvent<HTMLElement>)).toEqual([
+      offsetMoveNative,
+    ]);
+
+    const validCoalesced = [
+      { clientX: 254, clientY: 53 },
+      { clientX: 257.4, clientY: 55.2 },
+    ];
+    const alignedMoveNative = {
+      type: 'pointermove',
+      clientX: 257,
+      clientY: 55,
+      getCoalescedEvents: () => validCoalesced,
+    } as unknown as PointerEvent;
+    expect(extractCoalescedEvents({ nativeEvent: alignedMoveNative } as React.PointerEvent<HTMLElement>)).toEqual(
+      validCoalesced
+    );
   });
 });

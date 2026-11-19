@@ -777,6 +777,7 @@ export class TileMemoryManager {
           tile.version++;
           this.touchTile(tile);
           void this.checkBudgetAndEvict();
+          this.grid.bumpLayerVersion(tile.layerId);
           this.grid.notifyChange();
           return tile.data;
         } finally {
@@ -974,9 +975,24 @@ export class SparseTileGrid {
   private thumbCanvas: HTMLCanvasElement | null = null;
   private listeners: Set<(immediate?: boolean) => void> = new Set();
   private memoryManager: TileMemoryManager | null = null;
+  private layerVersions: Map<string, number> = new Map();
+  private globalVersionCounter: number = 1;
+  private gridEpoch: number = 0;
 
   constructor(memoryManagerOptions?: TileMemoryManagerOptions) {
     this.memoryManager = new TileMemoryManager(this, memoryManagerOptions);
+  }
+
+  public getLayerVersion(layerId: string): number {
+    return this.layerVersions.get(layerId) ?? 0;
+  }
+
+  public bumpLayerVersion(layerId: string): void {
+    this.layerVersions.set(layerId, ++this.globalVersionCounter);
+  }
+
+  public getGridEpoch(): number {
+    return this.gridEpoch;
   }
 
   public setMemoryManager(manager: TileMemoryManager | null): void {
@@ -1061,6 +1077,7 @@ export class SparseTileGrid {
     if (tile.lod === 0) {
       this.setLayerFormat(layerId, tile.format);
       this.markLodAncestorsDirty(layerId, tileX, tileY);
+      this.bumpLayerVersion(layerId);
     }
     this.notifyChange();
   }
@@ -1075,6 +1092,7 @@ export class SparseTileGrid {
       this.tiles.delete(key);
       if (lod === 0) {
         this.markLodAncestorsDirty(layerId, tileX, tileY);
+        this.bumpLayerVersion(layerId);
       }
     }
   }
@@ -1292,6 +1310,7 @@ export class SparseTileGrid {
       }
     }
 
+    this.bumpLayerVersion(layerId);
     if (!suppressNotify) {
       this.notifyChange();
     }
@@ -1677,6 +1696,7 @@ export class SparseTileGrid {
         this.markLodAncestorsDirty(layerId, tx, ty);
       }
     }
+    this.bumpLayerVersion(layerId);
     this.notifyChange();
   }
 
@@ -1737,6 +1757,7 @@ export class SparseTileGrid {
       this.tiles.delete(key);
       this.dirtyLodTiles.delete(key);
     }
+    this.bumpLayerVersion(layerId);
     this.notifyChange();
   }
 
@@ -1935,6 +1956,7 @@ export class SparseTileGrid {
         tile.dirty = true;
         tile.version++;
         this.markLodAncestorsDirty(layerId, tileX, tileY);
+        this.bumpLayerVersion(layerId);
       }
     }
     this.notifyChange();
@@ -1950,6 +1972,8 @@ export class SparseTileGrid {
     this.layerFormats.clear();
     this.ingestedLayers.clear();
     this.dirtyLodTiles.clear();
+    this.layerVersions.clear();
+    this.gridEpoch++;
     this.notifyChange(true);
   }
 
@@ -1972,6 +1996,9 @@ export class SparseTileGrid {
       this.tiles.set(getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0), tile);
       if (this.memoryManager) {
         this.memoryManager.notifyTileAllocated(tile);
+      }
+      if ((tile.lod ?? 0) === 0) {
+        this.bumpLayerVersion(tile.layerId);
       }
     }
     this.notifyChange(true);

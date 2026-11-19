@@ -12,6 +12,11 @@ export interface SplinePoint {
   y: number;
   pressure: number;
   width: number;
+  tiltX?: number;
+  tiltY?: number;
+  twist?: number;
+  timestamp?: number;
+  isCorner?: boolean;
 }
 
 export interface CubicBezierSegment {
@@ -24,10 +29,10 @@ export interface CubicBezierSegment {
 export class SplineGenerator {
   // Reusable Bézier segment object to prevent GC churn
   private segment: CubicBezierSegment = {
-    p0: { x: 0, y: 0, pressure: 0, width: 0 },
-    c1: { x: 0, y: 0, pressure: 0, width: 0 },
-    c2: { x: 0, y: 0, pressure: 0, width: 0 },
-    p3: { x: 0, y: 0, pressure: 0, width: 0 },
+    p0: { x: 0, y: 0, pressure: 0, width: 0, tiltX: 0, tiltY: 0, twist: 0, timestamp: 0, isCorner: false },
+    c1: { x: 0, y: 0, pressure: 0, width: 0, tiltX: 0, tiltY: 0, twist: 0, timestamp: 0, isCorner: false },
+    c2: { x: 0, y: 0, pressure: 0, width: 0, tiltX: 0, tiltY: 0, twist: 0, timestamp: 0, isCorner: false },
+    p3: { x: 0, y: 0, pressure: 0, width: 0, tiltX: 0, tiltY: 0, twist: 0, timestamp: 0, isCorner: false },
   };
 
   // Reusable exit tangent for Hermite continuity
@@ -63,6 +68,9 @@ export class SplineGenerator {
     this.segment.p0.y = pPrev.y;
     this.segment.p0.pressure = pPrev.pressure;
     this.segment.p0.width = pPrev.width;
+    this.segment.p0.tiltX = pPrev.tiltX ?? 0;
+    this.segment.p0.tiltY = pPrev.tiltY ?? 0;
+    this.segment.p0.twist = pPrev.twist ?? 0;
 
     this.segment.c1.x = pPrev.x + dx * 0.333;
     this.segment.c1.y = pPrev.y + dy * 0.333;
@@ -78,6 +86,9 @@ export class SplineGenerator {
     this.segment.p3.y = pCorner.y;
     this.segment.p3.pressure = pCorner.pressure;
     this.segment.p3.width = pCorner.width;
+    this.segment.p3.tiltX = pCorner.tiltX ?? 0;
+    this.segment.p3.tiltY = pCorner.tiltY ?? 0;
+    this.segment.p3.twist = pCorner.twist ?? 0;
 
     this.hasLastTangent = false;
     this.lastTangentX = 0;
@@ -104,11 +115,17 @@ export class SplineGenerator {
     this.segment.p0.y = pPrev.y;
     this.segment.p0.pressure = pPrev.pressure;
     this.segment.p0.width = pPrev.width;
+    this.segment.p0.tiltX = pPrev.tiltX ?? 0;
+    this.segment.p0.tiltY = pPrev.tiltY ?? 0;
+    this.segment.p0.twist = pPrev.twist ?? 0;
 
     this.segment.p3.x = pCurr.x;
     this.segment.p3.y = pCurr.y;
     this.segment.p3.pressure = pCurr.pressure;
     this.segment.p3.width = pCurr.width;
+    this.segment.p3.tiltX = pCurr.tiltX ?? 0;
+    this.segment.p3.tiltY = pCurr.tiltY ?? 0;
+    this.segment.p3.twist = pCurr.twist ?? 0;
 
     if (chordLen < 1e-4) {
       this.segment.c1.x = pPrev.x;
@@ -213,6 +230,9 @@ export class SplineGenerator {
     this.segment.p0.y = p1.y;
     this.segment.p0.pressure = p1.pressure;
     this.segment.p0.width = p1.width;
+    this.segment.p0.tiltX = p1.tiltX ?? 0;
+    this.segment.p0.tiltY = p1.tiltY ?? 0;
+    this.segment.p0.twist = p1.twist ?? 0;
 
     this.segment.c1.x = p1.x + dx1;
     this.segment.c1.y = p1.y + dy1;
@@ -228,6 +248,9 @@ export class SplineGenerator {
     this.segment.p3.y = p2.y;
     this.segment.p3.pressure = p2.pressure;
     this.segment.p3.width = p2.width;
+    this.segment.p3.tiltX = p2.tiltX ?? 0;
+    this.segment.p3.tiltY = p2.tiltY ?? 0;
+    this.segment.p3.twist = p2.twist ?? 0;
 
     // Cache tangent at P2 for subsequent Hermite provisional segment stitching
     if (Math.hypot(dx2, dy2) > 1e-4) {

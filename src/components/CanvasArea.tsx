@@ -12,7 +12,7 @@ import {
   SoftProofSettings,
   CanvasColorMode,
 } from '../types/editor';
-import { ROTATE_CURSOR_CSS } from '../hooks/useCanvasNavigation';
+import { ROTATE_CURSOR_CSS, CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
 import { SelectionOverlay } from './SelectionOverlay';
 import { TransformOverlay } from './TransformOverlay';
 import { TextEditorOverlay } from './TextEditorOverlay';
@@ -41,6 +41,9 @@ interface CanvasAreaProps {
   zoom: number;
   pan: { x: number; y: number };
   rotation: number;
+  flipX?: boolean;
+  flipY?: boolean;
+  navigation?: CanvasNavigationHandle;
   isSpaceDown: boolean;
   isShiftDown: boolean;
   isRotateModifier: boolean;
@@ -122,13 +125,29 @@ interface CanvasAreaProps {
   colorMode?: CanvasColorMode;
 }
 
-function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
+export function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
   const native = e.nativeEvent;
-  if (native && typeof native.getCoalescedEvents === 'function') {
+  if (!native) return [];
+  // Per W3C Pointer Events spec, pointerdown represents a single contact event;
+  // some Windows/WebView2 stylus drivers emit stale or DPI-offset coalesced packets on pointerdown.
+  if (native.type === 'pointerdown') {
+    return [native];
+  }
+  if (typeof native.getCoalescedEvents === 'function') {
     try {
       const coalesced = native.getCoalescedEvents();
       if (coalesced && coalesced.length > 0) {
-        return coalesced as unknown as PointerEvent[];
+        const last = coalesced[coalesced.length - 1];
+        // Guard against Chromium/WebView2 Windows Ink DPI coordinate-space mismatch where
+        // getCoalescedEvents() diverges from the dispatching PointerEvent's clientX/clientY.
+        if (
+          last &&
+          Number.isFinite(last.clientX) &&
+          Number.isFinite(last.clientY) &&
+          Math.hypot(last.clientX - native.clientX, last.clientY - native.clientY) <= 1.5
+        ) {
+          return coalesced as unknown as PointerEvent[];
+        }
       }
     } catch {}
   }
@@ -148,6 +167,32 @@ function extractPredictedEvents(e: React.PointerEvent<HTMLElement>): PointerEven
   return [];
 }
 
+function formatArtboardTransform(
+  pan: { x: number; y: number },
+  zoom: number,
+  rotation: number,
+  flipX: boolean,
+  flipY: boolean,
+  dimensions: CanvasDimensions
+): string {
+  const sx = (flipX ? -1 : 1) * zoom;
+  const sy = (flipY ? -1 : 1) * zoom;
+  return `translate3d(${pan.x}px, ${pan.y}px, 0) rotate(${rotation}deg) scale(${sx}, ${sy}) translate3d(${-dimensions.width / 2}px, ${-dimensions.height / 2}px, 0)`;
+}
+
+function formatCursorRingTransform(
+  x: number,
+  y: number,
+  rotation: number,
+  flipX: boolean,
+  flipY: boolean,
+  tipAngleDeg: number
+): string {
+  const fx = flipX ? -1 : 1;
+  const fy = flipY ? -1 : 1;
+  return `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%) rotate(${rotation}deg) scale(${fx}, ${fy}) rotate(${tipAngleDeg}deg)`;
+}
+
 export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   viewportRef,
   onViewportReady,
@@ -157,6 +202,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   zoom,
   pan,
   rotation,
+  flipX = false,
+  flipY = false,
+  navigation,
   isSpaceDown,
   isRotateModifier,
   isPanning,
@@ -289,25 +337,54 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   }, [activeTipImage, brushSettings.customTipDataUrl, brushSettings.preset]);
 
   // Dynamic cursor dimensions according to brush tip shape, aspect ratio, and thickness
+  const liveCamera = navigation
+    ? navigation.getCameraState()
+    : { pan, zoom, rotation, flipX, flipY };
+  const liveZoom = liveCamera.zoom;
+  const livePan = liveCamera.pan;
+  const liveRotation = liveCamera.rotation;
+  const liveFlipX = liveCamera.flipX;
+  const liveFlipY = liveCamera.flipY;
+
   const isCustomTip = Boolean(tipOutline && (tool === 'brush' || tool === 'eraser'));
   const isSquare = brushSettings.preset === 'square-digital' && !tipOutline;
   const tipAspect = isCustomTip && tipOutline ? tipOutline.height / tipOutline.width : 1.0;
 
   const activeToolSize = tool === 'liquify' && liquifySettings ? liquifySettings.size : brushSettings.size;
-  const cursorBaseWidth = Math.max(4, activeToolSize * zoom);
+  const cursorBaseWidth = Math.max(4, activeToolSize * liveZoom);
   const thicknessRatio = tool === 'brush' ? (brushSettings.thickness ?? 1.0) : 1.0;
+  const thicknessVertical = Boolean(brushSettings.thicknessVertical && tool === 'brush');
+  const tipAngleDeg = tool === 'brush' ? (brushSettings.customTipAngle ?? 0) : 0;
 
-  const cursorWidth = brushSettings.thicknessVertical && tool === 'brush'
+  const cursorWidth = thicknessVertical
     ? Math.max(2, cursorBaseWidth * thicknessRatio)
     : cursorBaseWidth;
-  const cursorHeight = brushSettings.thicknessVertical && tool === 'brush'
+  const cursorHeight = thicknessVertical
     ? Math.max(2, cursorBaseWidth * tipAspect)
     : Math.max(2, cursorBaseWidth * tipAspect * thicknessRatio);
 
   // Brush tip rotation: tip angle relative to canvas + viewport canvas rotation
-  const totalAngleDeg = (tool === 'brush' ? (brushSettings.customTipAngle ?? 0) : 0) + rotation;
-  const totalAngleRef = useRef(totalAngleDeg);
-  totalAngleRef.current = totalAngleDeg;
+  const totalAngleDeg = tipAngleDeg + liveRotation;
+  const cursorConfigRef = useRef({
+    activeToolSize,
+    tipAspect,
+    thicknessRatio,
+    thicknessVertical,
+    tipAngleDeg,
+    rotation: liveRotation,
+    flipX: liveFlipX,
+    flipY: liveFlipY,
+  });
+  cursorConfigRef.current = {
+    activeToolSize,
+    tipAspect,
+    thicknessRatio,
+    thicknessVertical,
+    tipAngleDeg,
+    rotation: liveRotation,
+    flipX: liveFlipX,
+    flipY: liveFlipY,
+  };
   const lastPointerPosRef = useRef<{ x: number; y: number } | null>(null);
 
   // Dynamic on-canvas brush resizing via Ctrl + Alt + Drag
@@ -319,7 +396,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     hardness: brushSettings.hardness ?? 1.0,
   });
 
-  // Zero-latency direct DOM cursor preview element
+  // Zero-latency direct DOM cursor preview element & artboard container
+  const artboardRef = useRef<HTMLDivElement | null>(null);
   const cursorRingRef = useRef<HTMLDivElement | null>(null);
   const pointerStatRef = useRef<HTMLDivElement | null>(null);
 
@@ -349,14 +427,22 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
   }, [showCursorCoordinates, showPressureInStatusBar]);
 
-  // Update cursor rotation in-place when viewport rotates or brush tip angle changes while hovering
+  // Update cursor rotation/flip in-place when viewport rotates/flips or brush tip angle changes while hovering
   useEffect(() => {
     const ring = cursorRingRef.current;
     const pos = lastPointerPosRef.current;
     if (ring && pos && ring.style.display !== 'none') {
-      ring.style.transform = `translate3d(${pos.x}px, ${pos.y}px, 0) translate(-50%, -50%) rotate(${totalAngleDeg}deg)`;
+      const cfg = cursorConfigRef.current;
+      ring.style.transform = formatCursorRingTransform(
+        pos.x,
+        pos.y,
+        cfg.rotation,
+        cfg.flipX,
+        cfg.flipY,
+        cfg.tipAngleDeg
+      );
     }
-  }, [totalAngleDeg]);
+  }, [tipAngleDeg, liveRotation, liveFlipX, liveFlipY]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -368,10 +454,11 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
 
     window.addEventListener('resize', updateRect);
+    window.addEventListener('scroll', updateRect, true);
     const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(updateRect) : null;
     ro?.observe(viewport);
 
-    const handleWindowPointerMove = (e: PointerEvent) => {
+    const updateCursorRingPos = (e: PointerEvent, forceRefreshRect: boolean = false) => {
       const ring = cursorRingRef.current;
       if (!ring) return;
 
@@ -387,7 +474,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         return;
       }
 
-      if (!cachedRect) updateRect();
+      if (forceRefreshRect || !cachedRect) updateRect();
       if (!cachedRect) return;
 
       const x = e.clientX - cachedRect.left;
@@ -399,11 +486,26 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
       }
 
       lastPointerPosRef.current = { x, y };
-      const currentAngle = totalAngleRef.current;
-      ring.style.transform = `translate3d(${x}px, ${y}px, 0) translate(-50%, -50%) rotate(${currentAngle}deg)`;
+      const cfg = cursorConfigRef.current;
+      ring.style.transform = formatCursorRingTransform(
+        x,
+        y,
+        cfg.rotation,
+        cfg.flipX,
+        cfg.flipY,
+        cfg.tipAngleDeg
+      );
       if (ring.style.display !== 'block') {
         ring.style.display = 'block';
       }
+    };
+
+    const handleWindowPointerMove = (e: PointerEvent) => {
+      updateCursorRingPos(e, false);
+    };
+
+    const handleViewportPointerEnterOrDown = (e: PointerEvent) => {
+      updateCursorRingPos(e, true);
     };
 
     const handlePointerLeave = () => {
@@ -414,15 +516,20 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     };
 
     viewport.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
+    viewport.addEventListener('pointerdown', handleViewportPointerEnterOrDown, { passive: true });
+    viewport.addEventListener('pointerenter', handleViewportPointerEnterOrDown, { passive: true });
     viewport.addEventListener('pointerleave', handlePointerLeave, { passive: true });
 
     return () => {
       window.removeEventListener('resize', updateRect);
+      window.removeEventListener('scroll', updateRect, true);
       ro?.disconnect();
       viewport.removeEventListener('pointermove', handleWindowPointerMove);
+      viewport.removeEventListener('pointerdown', handleViewportPointerEnterOrDown);
+      viewport.removeEventListener('pointerenter', handleViewportPointerEnterOrDown);
       viewport.removeEventListener('pointerleave', handlePointerLeave);
     };
-  }, [isSpaceDown, isPanning, isRotating, isRotateModifier, isResizingBrush, viewportRef, tool]);
+  }, [isSpaceDown, isPanning, isRotating, isRotateModifier, isResizingBrush, viewportRef, tool, hasOpenDocument]);
 
   // Compute colored onion skin frames and active cel isolation for animation
   const onionSkinFrames = useMemo(() => {
@@ -448,65 +555,175 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   // Unified GPU Viewport Compositor
   const viewportCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositorRef = useRef<ViewportCompositor | null>(null);
+  const viewportCssSizeRef = useRef<{ width: number; height: number } | null>(null);
   const renderParamsRef = useRef({
     effectiveLayers,
-    pan,
-    zoom,
-    rotation,
+    pan: livePan,
+    zoom: liveZoom,
+    rotation: liveRotation,
+    flipX: liveFlipX,
+    flipY: liveFlipY,
     dimensions,
     showCheckerboard,
     onionSkinFrames,
     softProofSettings,
+    activeLayerId,
+    brushOpacity: brushSettings.opacity ?? 1.0,
+    effectiveDraftCanvasRef,
   });
   renderParamsRef.current = {
     effectiveLayers,
-    pan,
-    zoom,
-    rotation,
+    pan: livePan,
+    zoom: liveZoom,
+    rotation: liveRotation,
+    flipX: liveFlipX,
+    flipY: liveFlipY,
     dimensions,
     showCheckerboard,
     onionSkinFrames,
     softProofSettings,
+    activeLayerId,
+    brushOpacity: brushSettings.opacity ?? 1.0,
+    effectiveDraftCanvasRef,
   };
+
+  const buildCompositorOptions = (rp: typeof renderParamsRef.current, dpr: number) => {
+    const vCanvas = viewportCanvasRef.current;
+    const cssSize = viewportCssSizeRef.current;
+    if (vCanvas && compositorRef.current && cssSize && cssSize.width > 0 && cssSize.height > 0) {
+      const expectedW = Math.max(1, Math.round(cssSize.width * dpr));
+      const expectedH = Math.max(1, Math.round(cssSize.height * dpr));
+      if (vCanvas.width !== expectedW || vCanvas.height !== expectedH) {
+        compositorRef.current.resize(expectedW, expectedH);
+        const predCanvas = rp.effectiveDraftCanvasRef ? effectivePredictedCanvasRef?.current : null;
+        if (predCanvas && (predCanvas.width !== expectedW || predCanvas.height !== expectedH)) {
+          predCanvas.width = expectedW;
+          predCanvas.height = expectedH;
+        }
+      }
+    }
+    const draftCanvas = rp.effectiveDraftCanvasRef?.current ?? null;
+    const draftVersion = draftCanvas ? ((draftCanvas as any).__draftVersion ?? 0) : 0;
+    const draftSpace = ((draftCanvas as any)?.__draftSpace as 'document' | 'viewport' | undefined) ?? 'viewport';
+    const draftDocRect = (draftCanvas as any)?.__draftDocRect ?? null;
+    const draftMonochrome = Boolean((draftCanvas as any)?.__draftMonochrome);
+    return {
+      dimensions: rp.dimensions,
+      showCheckerboard: rp.showCheckerboard,
+      devicePixelRatio: dpr,
+      onionSkinFrames: rp.onionSkinFrames,
+      softProof: rp.softProofSettings,
+      activeLayerId: rp.activeLayerId ?? null,
+      activeDraftLayerId: rp.activeLayerId ?? null,
+      activeDraftCanvas: draftCanvas,
+      activeDraftDirtyRect: draftSpace === 'document' ? draftDocRect : null,
+      activeDraftVersion: draftVersion,
+      activeDraftSpace: draftSpace,
+      activeDraftOpacity: rp.brushOpacity,
+      activeDraftMonochrome: draftMonochrome,
+    };
+  };
+
+  // Direct zero-React-rerender camera subscription for smooth 60-240Hz pan, zoom, rotation, and view flip
+  useEffect(() => {
+    if (!navigation) return;
+    return navigation.subscribeCamera((cam) => {
+      const rp = renderParamsRef.current;
+      rp.pan = cam.pan;
+      rp.zoom = cam.zoom;
+      rp.rotation = cam.rotation;
+      rp.flipX = cam.flipX;
+      rp.flipY = cam.flipY;
+
+      const cfg = cursorConfigRef.current;
+      cfg.rotation = cam.rotation;
+      cfg.flipX = cam.flipX;
+      cfg.flipY = cam.flipY;
+
+      const artboard = artboardRef.current;
+      if (artboard) {
+        artboard.style.transform = formatArtboardTransform(
+          cam.pan,
+          cam.zoom,
+          cam.rotation,
+          cam.flipX,
+          cam.flipY,
+          rp.dimensions
+        );
+        artboard.style.imageRendering = cam.zoom > 1 ? 'pixelated' : 'auto';
+      }
+
+      const ring = cursorRingRef.current;
+      if (ring) {
+        const baseW = Math.max(4, cfg.activeToolSize * cam.zoom);
+        const cW = cfg.thicknessVertical
+          ? Math.max(2, baseW * cfg.thicknessRatio)
+          : baseW;
+        const cH = cfg.thicknessVertical
+          ? Math.max(2, baseW * cfg.tipAspect)
+          : Math.max(2, baseW * cfg.tipAspect * cfg.thicknessRatio);
+        ring.style.width = `${cW}px`;
+        ring.style.height = `${cH}px`;
+        const pos = lastPointerPosRef.current;
+        if (pos && ring.style.display !== 'none') {
+          ring.style.transform = formatCursorRingTransform(
+            pos.x,
+            pos.y,
+            cam.rotation,
+            cam.flipX,
+            cam.flipY,
+            cfg.tipAngleDeg
+          );
+        }
+      }
+
+      if (viewportCanvasRef.current && !compositorRef.current) {
+        compositorRef.current = new ViewportCompositor(viewportCanvasRef.current);
+      }
+      if (compositorRef.current) {
+        const dpr = window.devicePixelRatio || 1;
+        compositorRef.current.render(
+          rp.effectiveLayers,
+          {
+            pan: cam.pan,
+            zoom: cam.zoom,
+            rotation: cam.rotation,
+            flipX: cam.flipX,
+            flipY: cam.flipY,
+          },
+          rp.dimensions,
+          globalTileGrid,
+          buildCompositorOptions(rp, dpr)
+        );
+      }
+    });
+  }, [navigation]);
 
   // Synchronize viewport and draft overlay canvas resolution with the screen viewport
   useEffect(() => {
+    let dprMql: MediaQueryList | null = null;
+
     const updateCanvasSizes = () => {
       const viewport = viewportRef.current;
       if (!viewport) return;
       const rect = viewport.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      const w = Math.max(1, Math.ceil(rect.width * dpr));
-      const h = Math.max(1, Math.ceil(rect.height * dpr));
-
-      const vCanvas = viewportCanvasRef.current;
-      if (vCanvas && (vCanvas.width !== w || vCanvas.height !== h)) {
-        vCanvas.width = w;
-        vCanvas.height = h;
-        if (!compositorRef.current) {
-          compositorRef.current = new ViewportCompositor(vCanvas);
-        }
-        compositorRef.current.resize(w, h);
-        const rp = renderParamsRef.current;
-        compositorRef.current.render(
-          rp.effectiveLayers,
-          { pan: rp.pan, zoom: rp.zoom, rotation: rp.rotation },
-          rp.dimensions,
-          globalTileGrid,
-          {
-            dimensions: rp.dimensions,
-            showCheckerboard: rp.showCheckerboard,
-            devicePixelRatio: dpr,
-            onionSkinFrames: rp.onionSkinFrames,
-            softProof: rp.softProofSettings,
-          }
-        );
+      if (rect.width > 0 && rect.height > 0) {
+        viewportCssSizeRef.current = { width: rect.width, height: rect.height };
       }
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.round(rect.width * dpr));
+      const h = Math.max(1, Math.round(rect.height * dpr));
 
       const draftCanvas = effectiveDraftCanvasRef?.current;
-      if (draftCanvas && (draftCanvas.width !== w || draftCanvas.height !== h)) {
+      if (
+        draftCanvas &&
+        (draftCanvas as any).__draftSpace !== 'document' &&
+        (draftCanvas.width !== w || draftCanvas.height !== h)
+      ) {
         draftCanvas.width = w;
         draftCanvas.height = h;
+        (draftCanvas as any).__draftHasContent = false;
+        (draftCanvas as any).__draftVersion = ((draftCanvas as any).__draftVersion || 0) + 1;
       }
 
       const predCanvas = effectivePredictedCanvasRef?.current;
@@ -514,9 +731,59 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         predCanvas.width = w;
         predCanvas.height = h;
       }
+
+      const vCanvas = viewportCanvasRef.current;
+      if (vCanvas) {
+        if (compositorRef.current && compositorRef.current.getCanvas() !== vCanvas) {
+          compositorRef.current.dispose();
+          compositorRef.current = null;
+        }
+        const sizeChanged = vCanvas.width !== w || vCanvas.height !== h;
+        if (sizeChanged || !compositorRef.current) {
+          if (!compositorRef.current) {
+            vCanvas.width = w;
+            vCanvas.height = h;
+            compositorRef.current = new ViewportCompositor(vCanvas);
+          } else {
+            compositorRef.current.resize(w, h);
+          }
+          const rp = renderParamsRef.current;
+          compositorRef.current.render(
+            rp.effectiveLayers,
+            {
+              pan: rp.pan,
+              zoom: rp.zoom,
+              rotation: rp.rotation,
+              flipX: rp.flipX,
+              flipY: rp.flipY,
+            },
+            rp.dimensions,
+            globalTileGrid,
+            buildCompositorOptions(rp, dpr)
+          );
+        }
+      }
+    };
+
+    const handleDprChange = () => {
+      updateCanvasSizes();
+      attachDprListener();
+    };
+
+    const attachDprListener = () => {
+      if (dprMql) {
+        dprMql.removeEventListener?.('change', handleDprChange);
+        dprMql = null;
+      }
+      if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+        const curDpr = window.devicePixelRatio || 1;
+        dprMql = window.matchMedia(`(resolution: ${curDpr}dppx)`);
+        dprMql.addEventListener?.('change', handleDprChange);
+      }
     };
 
     updateCanvasSizes();
+    attachDprListener();
     window.addEventListener('resize', updateCanvasSizes);
     const ro = typeof ResizeObserver !== 'undefined' && viewportRef.current
       ? new ResizeObserver(updateCanvasSizes)
@@ -526,9 +793,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     }
     return () => {
       window.removeEventListener('resize', updateCanvasSizes);
+      dprMql?.removeEventListener?.('change', handleDprChange);
       ro?.disconnect();
     };
-  }, [viewportRef, effectiveDraftCanvasRef, effectivePredictedCanvasRef]);
+  }, [viewportRef, effectiveDraftCanvasRef, effectivePredictedCanvasRef, hasOpenDocument]);
 
   useEffect(() => {
     if (viewportRef.current) {
@@ -544,9 +812,14 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
 
   // Render scene using Unified GPU Viewport Compositor
   useEffect(() => {
-    if (!viewportCanvasRef.current) return;
+    const vCanvas = viewportCanvasRef.current;
+    if (!vCanvas) return;
+    if (compositorRef.current && compositorRef.current.getCanvas() !== vCanvas) {
+      compositorRef.current.dispose();
+      compositorRef.current = null;
+    }
     if (!compositorRef.current) {
-      compositorRef.current = new ViewportCompositor(viewportCanvasRef.current);
+      compositorRef.current = new ViewportCompositor(vCanvas);
     }
 
     // Ingest unindexed layer canvases into globalTileGrid
@@ -570,14 +843,21 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     }
 
     const dpr = window.devicePixelRatio || 1;
+    const rp = renderParamsRef.current;
     compositorRef.current.render(
       effectiveLayers,
-      { pan, zoom, rotation },
+      {
+        pan: rp.pan,
+        zoom: rp.zoom,
+        rotation: rp.rotation,
+        flipX: rp.flipX,
+        flipY: rp.flipY,
+      },
       dimensions,
       globalTileGrid,
-      { dimensions, showCheckerboard, devicePixelRatio: dpr, onionSkinFrames, softProof: softProofSettings }
+      buildCompositorOptions(rp, dpr)
     );
-  }, [effectiveLayers, layers, pan, zoom, rotation, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas, onionSkinFrames, softProofSettings]);
+  }, [effectiveLayers, layers, pan, zoom, rotation, flipX, flipY, dimensions, showCheckerboard, layerCanvasesRef, registerLayerCanvas, onionSkinFrames, softProofSettings, activeLayerId, brushSettings.opacity, colorMode]);
 
   // Event-Driven Compositor Invalidation via SparseTileGrid subscription
   useEffect(() => {
@@ -588,16 +868,16 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         const rp = renderParamsRef.current;
         compositorRef.current.render(
           rp.effectiveLayers,
-          { pan: rp.pan, zoom: rp.zoom, rotation: rp.rotation },
+          {
+            pan: rp.pan,
+            zoom: rp.zoom,
+            rotation: rp.rotation,
+            flipX: rp.flipX,
+            flipY: rp.flipY,
+          },
           rp.dimensions,
           globalTileGrid,
-          {
-            dimensions: rp.dimensions,
-            showCheckerboard: rp.showCheckerboard,
-            devicePixelRatio: dpr,
-            onionSkinFrames: rp.onionSkinFrames,
-            softProof: rp.softProofSettings,
-          }
+          buildCompositorOptions(rp, dpr)
         );
       }
     };
@@ -911,17 +1191,25 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         }}
       />
 
-      {/* Artboard Container with 2D Affine Transformation (Pan, Zoom, and Rotation) */}
+      {/* Artboard Container with 2D Affine Transformation (Pan, Zoom, Rotation, and Non-Destructive View Flip) */}
       <div
+        ref={artboardRef}
         className="absolute origin-top-left select-none z-20"
         style={{
           width: dimensions.width,
           height: dimensions.height,
-          transform: `translate3d(${pan.x}px, ${pan.y}px, 0) rotate(${rotation}deg) scale(${zoom}) translate3d(${-dimensions.width / 2}px, ${-dimensions.height / 2}px, 0)`,
+          transform: formatArtboardTransform(
+            livePan,
+            liveZoom,
+            liveRotation,
+            liveFlipX,
+            liveFlipY,
+            dimensions
+          ),
           transformOrigin: '0 0',
           boxShadow: '0 0 0 1px #161616, 0 10px 40px rgba(0, 0, 0, 0.55)',
           willChange: 'transform',
-          imageRendering: zoom > 1 ? 'pixelated' : 'auto',
+          imageRendering: liveZoom > 1 ? 'pixelated' : 'auto',
           backgroundColor: 'transparent',
           backgroundImage: 'none',
         }}
@@ -963,7 +1251,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
               {/* Floating Nametag Pill */}
               <div
                 className="absolute top-4 left-2 px-1.5 py-0.5 rounded text-[10px] font-semibold text-white shadow-lg whitespace-nowrap flex items-center space-x-1 pointer-events-none"
-                style={{ backgroundColor: peer.color }}
+                style={{
+                  backgroundColor: peer.color,
+                  transform: `scale(${liveFlipX ? -1 : 1}, ${liveFlipY ? -1 : 1})`,
+                }}
               >
                 <span>{peer.name}</span>
                 {peer.isDrawing && <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />}
@@ -989,7 +1280,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             />
             <div
               className="absolute top-5 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded text-[10px] font-bold text-white whitespace-nowrap shadow-md"
-              style={{ backgroundColor: ping.color }}
+              style={{
+                backgroundColor: ping.color,
+                transform: `scale(${liveFlipX ? -1 : 1}, ${liveFlipY ? -1 : 1})`,
+              }}
             >
               {ping.name}
             </div>
@@ -1001,7 +1295,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           <SelectionOverlay
             selection={selection}
             dimensions={dimensions}
-            zoom={zoom}
+            zoom={liveZoom}
+            flipX={liveFlipX}
+            flipY={liveFlipY}
             onDeselect={onDeselect || (() => {})}
             onTransformSelection={onTransformSelection || (() => {})}
             onFillScreentone={onFillScreentone || (() => {})}
@@ -1018,8 +1314,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         {transformSession?.active && (
           <TransformOverlay
             session={transformSession}
-            zoom={zoom}
-            rotation={rotation}
+            zoom={liveZoom}
+            rotation={liveRotation}
+            flipX={liveFlipX}
+            flipY={liveFlipY}
             onUpdateSession={onUpdateTransformSession || (() => {})}
             onApply={onApplyTransform || (() => {})}
             onCancel={onCancelTransform || (() => {})}
@@ -1032,7 +1330,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             x={textSession.x}
             y={textSession.y}
             settings={textSession.settings}
-            zoom={zoom}
+            zoom={liveZoom}
+            rotation={liveRotation}
+            flipX={liveFlipX}
+            flipY={liveFlipY}
             onUpdateSettings={onUpdateTextSettings || (() => {})}
             onMove={onMoveTextSession || (() => {})}
             onConfirm={onConfirmText || (() => {})}
@@ -1044,7 +1345,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         {activeBalloon && (
           <SpeechBalloonOverlay
             balloon={activeBalloon}
-            zoom={zoom}
+            zoom={liveZoom}
+            rotation={liveRotation}
+            flipX={liveFlipX}
+            flipY={liveFlipY}
             onUpdateBalloon={onUpdateBalloon || (() => {})}
             onConfirmBalloon={onConfirmBalloon || (() => {})}
             onDeleteBalloon={onDeleteBalloon || (() => {})}
@@ -1083,16 +1387,16 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
         />
       </div>
 
-      {/* Active Draft/Stroke Overlay Canvas matching the Screen Viewport (Clip Studio Paint style) */}
+      {/* Offscreen Active Draft/Stroke Backing Canvas (composited in-stack inside ViewportCompositor at activeLayerId) */}
       <canvas
         ref={effectiveDraftCanvasRef}
         className="absolute inset-0 pointer-events-none z-25"
         style={{
           width: '100%',
           height: '100%',
-          opacity: brushSettings.opacity ?? 1.0,
+          opacity: 0,
+          visibility: 'hidden',
           display: 'block',
-          filter: isMonochromeActive ? 'url(#ink-monochrome-threshold)' : undefined,
         }}
       />
 
@@ -1105,7 +1409,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           height: '100%',
           opacity: brushSettings.opacity ?? 1.0,
           display: 'block',
-          filter: isMonochromeActive ? 'url(#ink-monochrome-threshold)' : undefined,
+          filter: isMonochromeActive && liveZoom >= 0.99 ? 'url(#ink-monochrome-threshold)' : undefined,
         }}
       />
 
@@ -1127,9 +1431,12 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           onUpdateRuler={onUpdatePerspectiveRuler}
           onRemoveRuler={() => onUpdatePerspectiveRuler(null)}
           dimensions={dimensions}
-          pan={pan}
-          zoom={zoom}
-          rotation={rotation}
+          pan={livePan}
+          zoom={liveZoom}
+          rotation={liveRotation}
+          flipX={liveFlipX}
+          flipY={liveFlipY}
+          navigation={navigation}
           viewportRef={viewportRef}
           activeLockedAxis={activeLockedAxis}
           isDrawing={isDrawing}

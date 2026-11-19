@@ -150,6 +150,8 @@ import {
   ZoomIn,
   ZoomOut,
   RotateCcw,
+  FlipHorizontal,
+  FlipVertical,
   Plus,
   Loader2,
   Info as InfoIcon,
@@ -923,9 +925,12 @@ export function App() {
 
   const {
     viewportRef,
+    navigation,
     zoom,
     pan,
     rotation,
+    flipX,
+    flipY,
     isSpaceDown,
     isShiftDown,
     isRotateModifier,
@@ -937,6 +942,9 @@ export function App() {
     zoomOut,
     resetZoomAndCenter,
     resetRotation,
+    toggleFlipHorizontal,
+    toggleFlipVertical,
+    resetViewFlip,
   } = useCanvasNavigation({
     dimensions,
     isWebtoonMode,
@@ -1538,6 +1546,9 @@ export function App() {
     pan,
     zoom,
     rotation,
+    flipX,
+    flipY,
+    navigation,
     activeLayerId,
     activeSessionId: activeDocumentId,
     activeLayerLocked: activeLayer?.locked ?? false,
@@ -1701,9 +1712,19 @@ export function App() {
     (e: React.PointerEvent<HTMLElement> | PointerEvent) => {
       if (!viewportRef.current) return { x: 0, y: 0 };
       const vRect = viewportRef.current.getBoundingClientRect();
-      return screenToCanvas(e.clientX, e.clientY, vRect, pan, zoom, rotation, dimensions);
+      return screenToCanvas(
+        e.clientX,
+        e.clientY,
+        vRect,
+        navigation.panRef.current,
+        navigation.zoomRef.current,
+        navigation.rotationRef.current,
+        dimensions,
+        navigation.flipXRef.current,
+        navigation.flipYRef.current
+      );
     },
-    [viewportRef, pan, zoom, rotation, dimensions]
+    [viewportRef, navigation, dimensions]
   );
 
   const handleSampleColor = useCallback(
@@ -5183,6 +5204,22 @@ export function App() {
         return;
       }
 
+      // Non-destructive View Flip shortcuts: Shift+H (Horizontal), Shift+V (Vertical)
+      if (e.shiftKey && !isSpaceDown) {
+        if (code === 'KeyH' || key === 'h') {
+          if (!hasOpenDocument || e.repeat) return;
+          e.preventDefault();
+          toggleFlipHorizontal();
+          return;
+        }
+        if (code === 'KeyV' || key === 'v') {
+          if (!hasOpenDocument || e.repeat) return;
+          e.preventDefault();
+          toggleFlipVertical();
+          return;
+        }
+      }
+
       // Single-key tool & color shortcuts (no modifiers)
       if (!e.shiftKey) {
         const mappedTool = CODE_TO_TOOL[code];
@@ -6275,6 +6312,35 @@ export function App() {
           onClick: resetRotation,
         },
         {
+          id: 'view-div-flip',
+          label: '',
+          divider: true,
+        },
+        {
+          id: 'view-flip-horizontal',
+          label: 'Flip View Horizontal',
+          shortcut: 'Shift+H',
+          icon: <FlipHorizontal className="w-3.5 h-3.5" />,
+          checked: flipX,
+          disabled: !hasOpenDocument,
+          onClick: toggleFlipHorizontal,
+        },
+        {
+          id: 'view-flip-vertical',
+          label: 'Flip View Vertical',
+          shortcut: 'Shift+V',
+          icon: <FlipVertical className="w-3.5 h-3.5" />,
+          checked: flipY,
+          disabled: !hasOpenDocument,
+          onClick: toggleFlipVertical,
+        },
+        {
+          id: 'view-reset-flip',
+          label: 'Reset View Flip',
+          disabled: !hasOpenDocument || (!flipX && !flipY),
+          onClick: resetViewFlip,
+        },
+        {
           id: 'view-div-ruler',
           label: '',
           divider: true,
@@ -6652,6 +6718,11 @@ export function App() {
         onResetZoom={resetZoomAndCenter}
         rotation={rotation}
         onResetRotation={resetRotation}
+        flipX={flipX}
+        flipY={flipY}
+        onToggleFlipHorizontal={toggleFlipHorizontal}
+        onToggleFlipVertical={toggleFlipVertical}
+        onResetViewFlip={resetViewFlip}
         dimensions={dimensions}
         colorMode={colorMode}
         menuSections={menuSections}
@@ -6744,6 +6815,9 @@ export function App() {
                 zoom={zoom}
                 pan={pan}
                 rotation={rotation}
+                flipX={flipX}
+                flipY={flipY}
+                navigation={navigation}
                 isSpaceDown={isSpaceDown}
                 isShiftDown={isShiftDown}
                 isRotateModifier={isRotateModifier}

@@ -453,6 +453,12 @@ export class WebGlBrushEngine {
   private builtinPaperTexture: WebGLTexture | null = null;
   private canvasLayerTexture: WebGLTexture | null = null;
 
+  // Offscreen GPU FBO for instanced dab rendering (WebGL2 fast path)
+  private dabFbo: WebGLFramebuffer | null = null;
+  private dabFboTex: WebGLTexture | null = null;
+  private dabFboWidth: number = 0;
+  private dabFboHeight: number = 0;
+
   // Dab geometry & instancing buffers (stride 14 floats)
   private quadVertexBuffer: WebGLBuffer | null = null;
   private extInstanced: {
@@ -479,6 +485,10 @@ export class WebGlBrushEngine {
           this.tipTexturesMap.clear();
           this.builtinPaperTexture = null;
           this.canvasLayerTexture = null;
+          this.dabFbo = null;
+          this.dabFboTex = null;
+          this.dabFboWidth = 0;
+          this.dabFboHeight = 0;
         });
         c.addEventListener('webglcontextrestored', () => {
           this.initGl();
@@ -727,6 +737,44 @@ export class WebGlBrushEngine {
       this.isGpuAvailable = false;
       return false;
     }
+    return true;
+  }
+
+  private ensureDabFbo(width: number, height: number): boolean {
+    const gl = this.gl;
+    if (!gl || !('blitFramebuffer' in gl)) return false;
+    if (this.dabFbo && this.dabFboTex && this.dabFboWidth === width && this.dabFboHeight === height) {
+      return true;
+    }
+    if (!this.dabFbo) {
+      this.dabFbo = gl.createFramebuffer();
+    }
+    if (!this.dabFboTex) {
+      this.dabFboTex = gl.createTexture();
+    }
+    if (!this.dabFbo || !this.dabFboTex) return false;
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.dabFboTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.dabFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.dabFboTex, 0);
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    if (!complete) {
+      this.dabFboWidth = 0;
+      this.dabFboHeight = 0;
+      return false;
+    }
+    this.dabFboWidth = width;
+    this.dabFboHeight = height;
     return true;
   }
 
@@ -980,7 +1028,7 @@ export class WebGlBrushEngine {
   public renderDabsToContext(
     targetCtx: CanvasRenderingContext2D,
     dabs: GpuDab[],
-    settings: BrushSettings & { alphaLocked?: boolean },
+    settings: BrushSettings & { alphaLocked?: boolean; isBgEraser?: boolean },
     tool: ToolType,
     _canvasWidth: number,
     _canvasHeight: number,
@@ -994,7 +1042,7 @@ export class WebGlBrushEngine {
     const gl = this.gl;
     const isTransparentInk = Boolean(settings.isTransparentInk);
     const isEraser = tool === 'eraser' || isTransparentInk;
-    const isBgEraser = tool === 'eraser' && targetCtx.fillStyle === '#ffffff';
+    const isBgEraser = Boolean(settings.isBgEraser) || (tool === 'eraser' && targetCtx.fillStyle === '#ffffff');
     const isAlphaLocked = Boolean(settings.alphaLocked);
 
     let minX = Infinity;
@@ -1021,6 +1069,15 @@ export class WebGlBrushEngine {
     if (totalW <= 0 || totalH <= 0) {
       return false;
     }
+
+    const chunkWMax = Math.min(MAX_TILE_CHUNK, totalW);
+    const chunkHMax = Math.min(MAX_TILE_CHUNK, totalH);
+    if (canvas.width < chunkWMax || canvas.height < chunkHMax) {
+      canvas.width = Math.max(canvas.width, chunkWMax, 512);
+      canvas.height = Math.max(canvas.height, chunkHMax, 512);
+    }
+
+    const useOffscreenFbo = this.ensureDabFbo(canvas.width, canvas.height);
 
     // Pack instance buffer once across all dabs (stride 14 floats)
     const stride = 14;
@@ -1227,13 +1284,6 @@ export class WebGlBrushEngine {
       }
     }
 
-    const chunkWMax = Math.min(MAX_TILE_CHUNK, totalW);
-    const chunkHMax = Math.min(MAX_TILE_CHUNK, totalH);
-    if (canvas.width < chunkWMax || canvas.height < chunkHMax) {
-      canvas.width = Math.max(canvas.width, chunkWMax, 512);
-      canvas.height = Math.max(canvas.height, chunkHMax, 512);
-    }
-
     const compositeOp: GlobalCompositeOperation = isBgEraser
       ? 'source-over'
       : isEraser
@@ -1255,6 +1305,10 @@ export class WebGlBrushEngine {
       for (let cx = fullDirtyX; cx < fullDirtyMaxX; cx += MAX_TILE_CHUNK) {
         const dw = Math.min(MAX_TILE_CHUNK, fullDirtyMaxX - cx);
         const viewY = Math.max(0, canvas.height - dh);
+
+        if (useOffscreenFbo && this.dabFbo) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.dabFbo);
+        }
 
         gl.viewport(0, viewY, dw, dh);
         if (typeof gl.scissor === 'function') {
@@ -1290,6 +1344,25 @@ export class WebGlBrushEngine {
 
         if (typeof gl.scissor === 'function') {
           gl.disable(gl.SCISSOR_TEST);
+        }
+
+        if (useOffscreenFbo && this.dabFbo) {
+          const gl2 = gl as WebGL2RenderingContext;
+          gl2.bindFramebuffer(gl2.READ_FRAMEBUFFER, this.dabFbo);
+          gl2.bindFramebuffer(gl2.DRAW_FRAMEBUFFER, null);
+          gl2.blitFramebuffer(
+            0,
+            viewY,
+            dw,
+            viewY + dh,
+            0,
+            viewY,
+            dw,
+            viewY + dh,
+            gl2.COLOR_BUFFER_BIT,
+            gl2.NEAREST
+          );
+          gl2.bindFramebuffer(gl2.FRAMEBUFFER, null);
         }
 
         targetCtx.drawImage(canvas, 0, 0, dw, dh, cx, cy, dw, dh);

@@ -21,6 +21,8 @@ interface SelectionOverlayProps {
   selection: CanvasSelection | null;
   dimensions: CanvasDimensions;
   zoom: number;
+  flipX?: boolean;
+  flipY?: boolean;
   onDeselect: () => void;
   onTransformSelection: () => void;
   onFillScreentone: () => void;
@@ -36,6 +38,8 @@ export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
   selection,
   dimensions,
   zoom,
+  flipX = false,
+  flipY = false,
   onDeselect,
   onTransformSelection,
   onFillScreentone,
@@ -81,6 +85,8 @@ export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
   if (!selection || !bounds) return null;
 
   const invZoom = zoom > 0 ? 1 / zoom : 1;
+  const fx = flipX ? -1 : 1;
+  const fy = flipY ? -1 : 1;
 
   return (
     <>
@@ -141,7 +147,7 @@ export const SelectionOverlay: React.FC<SelectionOverlayProps> = ({
         style={{
           left: `${bounds.x + bounds.width / 2}px`,
           top: `${bounds.y}px`,
-          transform: `translate(-50%, calc(-100% - ${8 * invZoom}px)) scale(${invZoom})`,
+          transform: `translate(-50%, calc(-100% - ${8 * invZoom}px)) scale(${fx * invZoom}, ${fy * invZoom})`,
           transformOrigin: 'bottom center',
         }}
         onPointerDown={(e) => e.stopPropagation()}

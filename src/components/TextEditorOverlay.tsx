@@ -15,6 +15,9 @@ interface TextEditorOverlayProps {
   y: number;
   settings: TextSettings;
   zoom: number;
+  rotation?: number;
+  flipX?: boolean;
+  flipY?: boolean;
   onUpdateSettings: (updater: (prev: TextSettings) => TextSettings) => void;
   onMove: (newX: number, newY: number) => void;
   onConfirm: () => void;
@@ -36,6 +39,9 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
   y,
   settings,
   zoom,
+  rotation = 0,
+  flipX = false,
+  flipY = false,
   onUpdateSettings,
   onMove,
   onConfirm,
@@ -65,8 +71,13 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
 
   const handleDragMove = (e: React.PointerEvent) => {
     if (!isDraggingRef.current) return;
-    const dx = (e.clientX - dragStartRef.current.clientX) / zoom;
-    const dy = (e.clientY - dragStartRef.current.clientY) / zoom;
+    const dxScreen = e.clientX - dragStartRef.current.clientX;
+    const dyScreen = e.clientY - dragStartRef.current.clientY;
+    const rad = (-rotation * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const dx = ((dxScreen * cos - dyScreen * sin) * (flipX ? -1 : 1)) / zoom;
+    const dy = ((dxScreen * sin + dyScreen * cos) * (flipY ? -1 : 1)) / zoom;
     onMove(Math.round(dragStartRef.current.initX + dx), Math.round(dragStartRef.current.initY + dy));
   };
 
@@ -121,7 +132,7 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
       <div
         className="w-80 bg-[#1e1f22] border border-[#383a40] rounded-md shadow-2xl overflow-hidden flex flex-col"
         style={{
-          transform: `scale(${zoom > 0 ? 1 / zoom : 1})`,
+          transform: `scale(${(flipX ? -1 : 1) * (zoom > 0 ? 1 / zoom : 1)}, ${(flipY ? -1 : 1) * (zoom > 0 ? 1 / zoom : 1)})`,
           transformOrigin: 'top left',
         }}
       >

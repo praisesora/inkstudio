@@ -305,6 +305,11 @@ export class LayerPixelSampler {
         this.lazyTiles.set(key, buf);
         return buf;
       }
+      if (this.tileGrid.isLayerIngested(this.layerId)) {
+        buf = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+        this.lazyTiles.set(key, buf);
+        return buf;
+      }
     }
 
     buf = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
