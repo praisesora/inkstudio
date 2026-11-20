@@ -2,13 +2,13 @@
 
 Desktop digital painting, illustration, and manga application with real-time multiplayer collaboration, built with Tauri, React, TypeScript, and Rust.
 
-[Releases](https://github.com/praisesora/inkstudio/releases) · [Latest Download](https://github.com/praisesora/inkstudio/releases/latest) · [Issues](https://github.com/praisesora/inkstudio/issues) · [License](./LICENSE)
+[Releases](https://github.com/praisesora/inkstudio/releases) · [Latest Download](https://github.com/praisesora/inkstudio/releases/latest) · [Issues](https://github.com/praisesora/inkstudio/issues) · [Privacy](./PRIVACY.md) · [Code Signing](./CODE_SIGNING_POLICY.md) · [License](./LICENSE)
 
 ## Download
 
 Prebuilt Windows installers with automatic in-app updates are published on the [Releases](https://github.com/praisesora/inkstudio/releases) page. macOS and Linux binaries can be built from source using the instructions below.
 
-> **Note (Windows SmartScreen):** Because Ink Studio is a new open-source app and is not yet signed with a Windows Code Signing certificate, Windows may display *"Windows protected your PC"*. Click **More info → Run anyway** to install. The full source code is open and verifiable right here on GitHub.
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). See our [Code Signing Policy](./CODE_SIGNING_POLICY.md) and [Privacy Policy](./PRIVACY.md).
 
 ## Features
 
