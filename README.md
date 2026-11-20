@@ -8,6 +8,8 @@ Desktop digital painting, illustration, and manga application with real-time mul
 
 Prebuilt Windows installers with automatic in-app updates are published on the [Releases](https://github.com/praisesora/inkstudio/releases) page. macOS and Linux binaries can be built from source using the instructions below.
 
+> **Note (Windows SmartScreen):** Because Ink Studio is a new open-source app and is not yet signed with a Windows Code Signing certificate, Windows may display *"Windows protected your PC"*. Click **More info → Run anyway** to install. The full source code is open and verifiable right here on GitHub.
+
 ## Features
 
 - **Brush & Drawing Engine**: WebGL-accelerated brush engine supporting pressure, tilt, velocity, taper, dual brush tips, paper textures, color mixing, wet edges, stroke stabilization, and custom pressure curves. Ships with built-in Pen, Sketch, and Brush presets and supports importing Clip Studio Paint `.sut` brushes.
