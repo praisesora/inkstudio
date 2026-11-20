@@ -435,6 +435,25 @@ vec4 applyLayerTint(vec4 color) {
 
 void main() {
   if (u_isBackground == 1) {
+    vec2 outsideDoc = max(vec2(0.0) - v_docCoord, v_docCoord - u_docDimensions);
+    if (outsideDoc.x > 0.0 || outsideDoc.y > 0.0) {
+      float safeZoom = max(0.01, u_zoom);
+      vec2 outsidePx = outsideDoc * safeZoom;
+      float borderDist = max(outsidePx.x, outsidePx.y);
+      if (borderDist <= 1.0) {
+        fragColor = vec4(0.086, 0.086, 0.086, 1.0);
+        return;
+      }
+      vec2 shadowCoord = v_docCoord - vec2(0.0, 10.0 / safeZoom);
+      vec2 shadowOutside = max(vec2(0.0) - shadowCoord, shadowCoord - u_docDimensions);
+      float shadowDist = length(shadowOutside * safeZoom);
+      float shadowA = 0.55 * exp(-shadowDist * shadowDist / 520.0) * smoothstep(48.0, 0.0, shadowDist);
+      if (shadowA < 0.002) {
+        discard;
+      }
+      fragColor = vec4(0.0, 0.0, 0.0, shadowA);
+      return;
+    }
     if (u_showCheckerboard == 1) {
       vec2 checkCoord = floor(v_docCoord / 16.0);
       float check = mod(checkCoord.x + checkCoord.y, 2.0);
@@ -460,10 +479,7 @@ void main() {
     finalColor.rgb = vec3(gLum);
   } else if (u_expressionMode == 2) {
     float mLum = dot(finalColor.rgb, vec3(0.299, 0.587, 0.114));
-    float monoHi = clamp(0.18 * sqrt(max(0.01, u_zoom)) + 0.04, 0.06, 0.25);
-    float monoAlpha = u_zoom >= 0.99
-      ? step(0.5, finalColor.a)
-      : smoothstep(0.02, monoHi, finalColor.a);
+    float monoAlpha = u_zoom >= 0.99 ? step(0.5, finalColor.a) : finalColor.a;
     if (mLum < u_monoThreshold) {
       if (u_monoExpressBlack == 1) {
         finalColor = vec4(0.0, 0.0, 0.0, monoAlpha);
@@ -697,42 +713,15 @@ vec4 applyLayerTint(vec4 color) {
   return vec4(tinted, color.a);
 }
 
-vec4 sampleTileStraight(vec2 uv, int slice) {
-  if (u_zoom >= 2.0) {
-    ivec2 coord = clamp(ivec2(floor(uv * 256.0)), ivec2(0), ivec2(255));
-    return texelFetch(u_tileArrayTexture, ivec3(coord, slice), 0);
-  }
-  vec2 texCoord = uv * 256.0 - 0.5;
-  ivec2 base = ivec2(floor(texCoord));
-  vec2 f = texCoord - vec2(base);
-  ivec2 c0 = clamp(base, ivec2(0), ivec2(255));
-  ivec2 c1 = clamp(base + ivec2(1), ivec2(0), ivec2(255));
-
-  vec4 t00 = texelFetch(u_tileArrayTexture, ivec3(c0.x, c0.y, slice), 0);
-  vec4 t10 = texelFetch(u_tileArrayTexture, ivec3(c1.x, c0.y, slice), 0);
-  vec4 t01 = texelFetch(u_tileArrayTexture, ivec3(c0.x, c1.y, slice), 0);
-  vec4 t11 = texelFetch(u_tileArrayTexture, ivec3(c1.x, c1.y, slice), 0);
-
-  vec4 pm00 = vec4(t00.rgb * t00.a, t00.a);
-  vec4 pm10 = vec4(t10.rgb * t10.a, t10.a);
-  vec4 pm01 = vec4(t01.rgb * t01.a, t01.a);
-  vec4 pm11 = vec4(t11.rgb * t11.a, t11.a);
-
-  vec4 pm = mix(mix(pm00, pm10, f.x), mix(pm01, pm11, f.x), f.y);
-  if (pm.a < 0.002) {
-    return vec4(0.0);
-  }
-  return vec4(clamp(pm.rgb / pm.a, 0.0, 1.0), pm.a);
-}
-
 void main() {
-  int slice = int(v_sliceIndex + 0.5);
-  vec4 texColor = sampleTileStraight(v_texCoord, slice);
+  // Single hardware TMU fetch on premultiplied RGBA8 TEXTURE_2D_ARRAY
+  vec4 rawTex = texture(u_tileArrayTexture, vec3(v_texCoord, v_sliceIndex));
 
-  if (texColor.a < 0.002) {
+  if (rawTex.a < 0.002) {
     discard;
   }
 
+  vec4 texColor = vec4(clamp(rawTex.rgb / rawTex.a, 0.0, 1.0), rawTex.a);
   vec4 finalColor = texColor;
 
   if (u_expressionMode == 1) {
@@ -1347,6 +1336,8 @@ export interface CompositorOptions {
   dimensions: CanvasDimensions;
   colorMode?: CanvasColorMode;
   showCheckerboard?: boolean;
+  transparentBackground?: boolean;
+  bypassStackCache?: boolean;
   devicePixelRatio?: number;
   onionSkinFrames?: OnionSkinCompositorFrame[];
   softProof?: SoftProofSettings;
@@ -1401,6 +1392,8 @@ export interface LayerStackCacheInput {
   dimensions: CanvasDimensions;
   transform: ViewportTransform;
   showCheckerboard?: boolean;
+  transparentBackground?: boolean;
+  colorMode?: CanvasColorMode;
   onionSkinFrames?: OnionSkinCompositorFrame[];
   getLayerContentVersion: (layerId: string) => number;
   getMaskInvalidationEpoch?: (layerId: string) => number;
@@ -1711,17 +1704,18 @@ export class LayerStackCacheTracker {
       onionSig = parts.join(',');
     }
 
+    const modeTag = input.colorMode ?? 'color';
     const belowUnitSigs = partition.belowUnits.map((u) =>
       serializeUnitSignature(u, input.getLayerContentVersion, input.getMaskInvalidationEpoch)
     );
-    const belowSignature = `${viewportSig}|cb:${input.showCheckerboard ? 1 : 0}|os:${onionSig}|below:[${belowUnitSigs.join('||')}]`;
+    const belowSignature = `${viewportSig}|cm:${modeTag}|cb:${input.showCheckerboard ? 1 : 0}|tb:${input.transparentBackground ? 1 : 0}|os:${onionSig}|below:[${belowUnitSigs.join('||')}]`;
 
     let aboveSignature = '';
     if (partition.aboveCachedUnits.length > 0) {
       const aboveUnitSigs = partition.aboveCachedUnits.map((u) =>
         serializeUnitSignature(u, input.getLayerContentVersion, input.getMaskInvalidationEpoch)
       );
-      aboveSignature = `${viewportSig}|strat:${partition.aboveStrategy}:${partition.aboveCacheBlendMode}|above:[${aboveUnitSigs.join('||')}]`;
+      aboveSignature = `${viewportSig}|cm:${modeTag}|strat:${partition.aboveStrategy}:${partition.aboveCacheBlendMode}|above:[${aboveUnitSigs.join('||')}]`;
     }
 
     const belowDirty = belowSignature !== this.lastBelowSignature;
@@ -1891,7 +1885,7 @@ export class ViewportCompositor {
   private stdLocs: LayerUniformLocs | null = null;
 
   // Instanced TEXTURE_2D_ARRAY batching program, VAO, buffer, & pool
-  private static readonly DEFAULT_ARRAY_POOL_LAYERS = 256;
+  private static readonly DEFAULT_ARRAY_POOL_LAYERS = 512;
   private instancedProgram: WebGLProgram | null = null;
   private instancedLocs: LayerUniformLocs | null = null;
   private uInstTileSizeLoc: WebGLUniformLocation | null = null;
@@ -1907,9 +1901,12 @@ export class ViewportCompositor {
   private arrayPoolCapacity: number = 0;
   private arrayPoolFilterTier: number = -1;
   private arrayPoolSlots: ArrayPoolSlot[] = [];
+  private freeArraySlots: ArrayPoolSlot[] = [];
   private arrayPoolByKey: Map<string, ArrayPoolSlot> = new Map();
   private arrayAccessCounter: number = 0;
   private arrayBatchCounter: number = 0;
+  private uploadPremulScratch: Uint8Array = new Uint8Array(TILE_SIZE * TILE_SIZE * 4);
+  private readonly preserveDrawingBuffer: boolean;
 
   // Viewport-space draft stroke program (reuses COMPOSITOR_FRAGMENT_SHADER)
   private viewportDraftProgram: WebGLProgram | null = null;
@@ -2064,8 +2061,9 @@ export class ViewportCompositor {
   > = new Map();
   private fallbackTileCanvas: HTMLCanvasElement | null = null;
 
-  constructor(canvas: HTMLCanvasElement) {
+  constructor(canvas: HTMLCanvasElement, options?: { preserveDrawingBuffer?: boolean }) {
     this.canvas = canvas;
+    this.preserveDrawingBuffer = Boolean(options?.preserveDrawingBuffer);
     if (typeof canvas.addEventListener === 'function') {
       this.onContextLostHandler = (e: Event) => {
         e.preventDefault();
@@ -2077,6 +2075,7 @@ export class ViewportCompositor {
         this.instanceBuffer = null;
         this.tileArrayTexture = null;
         this.arrayPoolSlots = [];
+        this.freeArraySlots = [];
         this.arrayPoolByKey.clear();
         this.arrayPoolCapacity = 0;
         this.arrayPoolFilterTier = -1;
@@ -2116,6 +2115,13 @@ export class ViewportCompositor {
 
   public getCanvas(): HTMLCanvasElement {
     return this.canvas;
+  }
+
+  public getMaxTextureSize(): number {
+    if (!this.gl) return 2048;
+    const maxTex = Number(this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE)) || 2048;
+    const maxRb = Number(this.gl.getParameter(this.gl.MAX_RENDERBUFFER_SIZE)) || maxTex;
+    return Math.max(256, Math.min(maxTex, maxRb));
   }
 
   public getStackCacheStats(): { belowRebuilds: number; aboveRebuilds: number; cacheHits: number } {
@@ -2158,11 +2164,14 @@ export class ViewportCompositor {
     }
     this.texturePool = [];
     this.activePoolByKey.clear();
-    for (const slot of this.arrayPoolSlots) {
+    this.freeArraySlots = [];
+    for (let i = this.arrayPoolSlots.length - 1; i >= 0; i--) {
+      const slot = this.arrayPoolSlots[i];
       slot.currentKey = null;
       slot.version = -1;
       slot.lastUsed = 0;
       slot.lastBatchTick = 0;
+      this.freeArraySlots.push(slot);
     }
     this.arrayPoolByKey.clear();
     this.stackCache.invalidateAll();
@@ -2283,15 +2292,20 @@ export class ViewportCompositor {
     this.arrayPoolCapacity = capacity;
     this.arrayPoolFilterTier = 1;
     this.arrayPoolSlots = [];
+    this.freeArraySlots = [];
     this.arrayPoolByKey.clear();
     for (let i = 0; i < capacity; i++) {
-      this.arrayPoolSlots.push({
+      const slot: ArrayPoolSlot = {
         sliceIndex: i,
         currentKey: null,
         version: -1,
         lastUsed: 0,
         lastBatchTick: 0,
-      });
+      };
+      this.arrayPoolSlots.push(slot);
+    }
+    for (let i = capacity - 1; i >= 0; i--) {
+      this.freeArraySlots.push(this.arrayPoolSlots[i]);
     }
 
     if (typeof gl.createVertexArray === 'function') {
@@ -2326,7 +2340,8 @@ export class ViewportCompositor {
         antialias: false,
         depth: false,
         stencil: true,
-        preserveDrawingBuffer: true,
+        preserveDrawingBuffer: this.preserveDrawingBuffer,
+        powerPreference: 'high-performance',
       });
 
       if (!gl) return false;
@@ -2906,11 +2921,12 @@ export class ViewportCompositor {
 
     // Expression Color Uniforms
     const isBgLayer = layer.id === 'layer-bg' || layer.id.startsWith('layer-bg');
+    const docColorMode = this.currentOptions?.colorMode;
     const exprMode = isBgLayer
       ? 0
-      : layer.expressionColor === 'monochrome'
+      : layer.expressionColor === 'monochrome' || docColorMode === 'monochrome'
       ? 2
-      : layer.expressionColor === 'gray'
+      : layer.expressionColor === 'gray' || docColorMode === 'grayscale'
       ? 1
       : 0;
     gl.uniform1i(locs.uExpressionMode, exprMode);
@@ -2972,6 +2988,38 @@ export class ViewportCompositor {
    * Allocates or updates a slice inside the TEXTURE_2D_ARRAY pool using hardware UNPACK_PREMULTIPLY_ALPHA_WEBGL.
    * Never evicts slices pinned by the current batchTick.
    */
+  private premultiplyTileBytes(srcBytes: Uint8Array, tile: TileBuffer): Uint8Array {
+    // 1-bit monochrome, 8-bit grayscale, and opaque solid-fill tiles only contain alpha 0 or 255
+    // so straight-alpha bytes are already premultiplied (zero-copy fast path).
+    if (
+      tile.format === 'monochrome-1bit' ||
+      tile.format === 'grayscale-8bit' ||
+      (tile.solidColorU32 !== undefined && srcBytes[3] === 255)
+    ) {
+      return srcBytes;
+    }
+
+    const dst = this.uploadPremulScratch;
+    const len = srcBytes.byteLength;
+    const src32 = new Uint32Array(srcBytes.buffer, srcBytes.byteOffset, len >> 2);
+    const dst32 = new Uint32Array(dst.buffer, dst.byteOffset, len >> 2);
+
+    for (let p = 0, i = 0; i < len; p++, i += 4) {
+      const a = srcBytes[i + 3];
+      if (a === 255) {
+        dst32[p] = src32[p];
+      } else if (a === 0) {
+        dst32[p] = 0;
+      } else {
+        dst[i] = ((srcBytes[i] * a + 128) * 257) >> 16;
+        dst[i + 1] = ((srcBytes[i + 1] * a + 128) * 257) >> 16;
+        dst[i + 2] = ((srcBytes[i + 2] * a + 128) * 257) >> 16;
+        dst[i + 3] = a;
+      }
+    }
+    return dst;
+  }
+
   private getOrUploadArrayTileSlice(
     gl: WebGL2RenderingContext,
     tile: TileBuffer,
@@ -2983,23 +3031,25 @@ export class ViewportCompositor {
     const accessTick = ++this.arrayAccessCounter;
     let slot = this.arrayPoolByKey.get(key);
 
-    if (!slot) {
-      let oldestSlot: ArrayPoolSlot | null = null;
-      for (let i = 0; i < this.arrayPoolSlots.length; i++) {
-        const candidate = this.arrayPoolSlots[i];
-        if (candidate.lastBatchTick === batchTick) continue;
-        if (candidate.currentKey === null) {
-          oldestSlot = candidate;
-          break;
+    if (slot) {
+      // O(1) LRU promotion via JS Map insertion order
+      this.arrayPoolByKey.delete(key);
+      this.arrayPoolByKey.set(key, slot);
+    } else {
+      if (this.freeArraySlots.length > 0) {
+        slot = this.freeArraySlots.pop()!;
+      } else {
+        // Evict oldest unpinned slot from front of Map (O(1) amortized)
+        for (const candidate of this.arrayPoolByKey.values()) {
+          if (candidate.lastBatchTick !== batchTick) {
+            slot = candidate;
+            break;
+          }
         }
-        if (!oldestSlot || candidate.lastUsed < oldestSlot.lastUsed) {
-          oldestSlot = candidate;
+        if (!slot) return -1;
+        if (slot.currentKey) {
+          this.arrayPoolByKey.delete(slot.currentKey);
         }
-      }
-      if (!oldestSlot) return -1;
-      slot = oldestSlot;
-      if (slot.currentKey) {
-        this.arrayPoolByKey.delete(slot.currentKey);
       }
       slot.currentKey = key;
       slot.version = -1;
@@ -3016,9 +3066,9 @@ export class ViewportCompositor {
           ? rgbaData
           : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
 
-      // Upload straight-alpha RGBA bytes directly into TEXTURE_2D_ARRAY slice
-      // (UNPACK_PREMULTIPLY_ALPHA_WEBGL must be false for texSubImage3D with ArrayBufferView in WebGL2;
-      // premultiplied bilinear filtering is performed in 32-bit float inside the fragment shader.)
+      // Premultiply once on upload into reusable scratch buffer (TileBuffer remains straight-alpha;
+      // UNPACK_PREMULTIPLY_ALPHA_WEBGL stays false for WebGL2 spec compliance on texSubImage3D).
+      const uploadBytes = this.premultiplyTileBytes(srcBytes, tile);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texSubImage3D(
         gl.TEXTURE_2D_ARRAY,
@@ -3031,7 +3081,7 @@ export class ViewportCompositor {
         1,
         gl.RGBA,
         gl.UNSIGNED_BYTE,
-        srcBytes
+        uploadBytes
       );
 
       slot.version = tile.version;
@@ -3054,7 +3104,11 @@ export class ViewportCompositor {
 
     let slot = this.activePoolByKey.get(key);
 
-    if (!slot) {
+    if (slot) {
+      // O(1) LRU promotion via JS Map insertion order
+      this.activePoolByKey.delete(key);
+      this.activePoolByKey.set(key, slot);
+    } else {
       if (this.texturePool.length < ViewportCompositor.MAX_TEXTURE_POOL_SIZE) {
         const tex = gl.createTexture();
         if (!tex) return null;
@@ -3070,16 +3124,13 @@ export class ViewportCompositor {
         this.texturePool.push(slot);
         this.activePoolByKey.set(key, slot);
       } else {
-        // Reuse least recently used texture slot from pool
-        let oldestSlot = this.texturePool[0];
-        for (let i = 1; i < this.texturePool.length; i++) {
-          if (this.texturePool[i].lastUsed < oldestSlot.lastUsed) {
-            oldestSlot = this.texturePool[i];
-          }
-        }
-        slot = oldestSlot;
-        if (slot.currentKey) {
-          this.activePoolByKey.delete(slot.currentKey);
+        // O(1) LRU eviction from front of activePoolByKey Map
+        const oldestEntry = this.activePoolByKey.entries().next();
+        if (!oldestEntry.done) {
+          slot = oldestEntry.value[1];
+          this.activePoolByKey.delete(oldestEntry.value[0]);
+        } else {
+          slot = this.texturePool[0];
         }
         slot.currentKey = key;
         slot.version = -1;
@@ -3175,7 +3226,8 @@ export class ViewportCompositor {
   private renderArtboardBackground(
     gl: WebGL2RenderingContext,
     dimensions: CanvasDimensions,
-    showCheckerboard: boolean
+    showCheckerboard: boolean,
+    drawShadow: boolean = true
   ): void {
     if (!this.program || !this.stdLocs) return;
     this.unbindSceneTextureUnits(gl);
@@ -3186,12 +3238,22 @@ export class ViewportCompositor {
     gl.uniform1i(this.stdLocs.uBackdropTexture, 2);
     gl.uniform1i(this.stdLocs.uMaskEnabled, 0);
     gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
-    gl.blendFunc(gl.ONE, gl.ZERO);
+    gl.blendFunc(gl.ONE, drawShadow ? gl.ONE_MINUS_SRC_ALPHA : gl.ZERO);
     gl.uniform1i(this.uIsBackgroundLoc, 1);
     gl.uniform1i(this.stdLocs.uExpressionMode, 0);
     gl.uniform1i(this.uShowCheckerboardLoc, showCheckerboard ? 1 : 0);
-    gl.uniform2f(this.uTileOriginLoc, 0, 0);
-    gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
+    if (drawShadow) {
+      const marginDoc = 56 / Math.max(0.01, this.currentZoom);
+      gl.uniform2f(this.uTileOriginLoc, -marginDoc, -marginDoc);
+      gl.uniform2f(
+        this.uTileSizeLoc,
+        dimensions.width + marginDoc * 2,
+        dimensions.height + marginDoc * 2
+      );
+    } else {
+      gl.uniform2f(this.uTileOriginLoc, 0, 0);
+      gl.uniform2f(this.uTileSizeLoc, dimensions.width, dimensions.height);
+    }
     gl.drawArrays(gl.TRIANGLES, 0, 6);
     gl.uniform1i(this.uIsBackgroundLoc, 0);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -3328,9 +3390,10 @@ export class ViewportCompositor {
     const scenePP = this.ensurePingPongTarget(gl, this.scenePingPong, viewportW, viewportH);
     this.scenePingPong = scenePP;
 
+    const bypassStackCache = Boolean(_options.bypassStackCache);
     let belowCacheReady = false;
     let aboveCacheReady = false;
-    if (scenePP) {
+    if (scenePP && !bypassStackCache) {
       if (!this.belowActiveCacheFbo) {
         this.belowActiveCacheFbo = this.createFboSurface(gl, false);
       }
@@ -3345,7 +3408,49 @@ export class ViewportCompositor {
       }
     }
 
-    if (scenePP && belowCacheReady && aboveCacheReady && this.belowActiveCacheFbo && this.aboveActiveCacheFbo) {
+    if (bypassStackCache && scenePP) {
+      this.restoreStandardProgram(gl);
+      this.syncFrameUniforms(gl, this.stdLocs);
+      gl.uniform1i(this.uTileTextureLoc, 0);
+      gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
+
+      scenePP.activeIndex = 0;
+      const surf = scenePP.surfaces[0];
+      gl.bindFramebuffer(gl.FRAMEBUFFER, surf.fbo);
+      gl.viewport(0, 0, viewportW, viewportH);
+      gl.disable(gl.STENCIL_TEST);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
+
+      if (!_options.transparentBackground) {
+        this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard), false);
+      }
+      this.renderOnionSkins(gl, layers, _options.onionSkinFrames, dimensions, grid, frustum, scenePP);
+
+      const tree = buildLayerTree(layers);
+      this.renderNodeList(
+        gl,
+        tree,
+        dimensions,
+        grid,
+        frustum,
+        viewportW,
+        viewportH,
+        transform,
+        dpr,
+        scenePP,
+        0,
+        1.0
+      );
+
+      this.presentTextureToScreen(
+        gl,
+        scenePP.surfaces[scenePP.activeIndex].texture,
+        viewportW,
+        viewportH,
+        _options.softProof
+      );
+    } else if (scenePP && belowCacheReady && aboveCacheReady && this.belowActiveCacheFbo && this.aboveActiveCacheFbo) {
       // Evaluate Baked Layer Stack Cache invalidation (below / active / above)
       const cacheEval = this.stackCache.evaluate({
         layers,
@@ -3356,6 +3461,8 @@ export class ViewportCompositor {
         dimensions,
         transform,
         showCheckerboard: Boolean(_options.showCheckerboard),
+        transparentBackground: Boolean(_options.transparentBackground),
+        colorMode: _options.colorMode,
         onionSkinFrames: _options.onionSkinFrames,
         getLayerContentVersion: (id) =>
           typeof grid.getLayerVersion === 'function' ? grid.getLayerVersion(id) : 0,
@@ -3419,7 +3526,9 @@ export class ViewportCompositor {
         gl.clearColor(0.0, 0.0, 0.0, 0.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
 
-        this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard));
+        if (!_options.transparentBackground) {
+          this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard));
+        }
         this.renderOnionSkins(gl, layers, _options.onionSkinFrames, dimensions, grid, frustum, scenePP);
 
         for (const unit of partition.belowUnits) {
@@ -3537,7 +3646,9 @@ export class ViewportCompositor {
       gl.clearColor(0.0, 0.0, 0.0, 0.0);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.STENCIL_BUFFER_BIT);
 
-      this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard));
+      if (!_options.transparentBackground) {
+        this.renderArtboardBackground(gl, dimensions, Boolean(_options.showCheckerboard), false);
+      }
       this.renderOnionSkins(gl, layers, _options.onionSkinFrames, dimensions, grid, frustum, null);
 
       const tree = buildLayerTree(layers);
@@ -4184,14 +4295,23 @@ export class ViewportCompositor {
     const endTileY = Math.floor(frustum.maxY / lodTileDocSize);
 
     const visibleTiles: TileBuffer[] = [];
-    for (let ty = startTileY; ty <= endTileY; ty++) {
-      for (let tx = startTileX; tx <= endTileX; tx++) {
-        let tile = grid.getTile(layer.id, tx, ty, targetLod);
-        if (targetLod > 0 && (!tile || grid.isLodTileDirty(layer.id, tx, ty, targetLod))) {
-          tile = grid.generateLodTile(layer.id, tx, ty, targetLod);
-        }
-        if (tile) {
-          visibleTiles.push(tile);
+    const hasLayerTiles =
+      typeof grid.hasLayerTiles === 'function' ? grid.hasLayerTiles(layer.id) : true;
+    const hasOccCheck = typeof grid.hasPopulatedLodTile === 'function';
+
+    if (hasLayerTiles) {
+      for (let ty = startTileY; ty <= endTileY; ty++) {
+        for (let tx = startTileX; tx <= endTileX; tx++) {
+          if (targetLod > 0 && hasOccCheck && !grid.hasPopulatedLodTile(layer.id, tx, ty, targetLod)) {
+            continue;
+          }
+          let tile = grid.getTile(layer.id, tx, ty, targetLod);
+          if (targetLod > 0 && (!tile || tile.data === null || grid.isLodTileDirty(layer.id, tx, ty, targetLod))) {
+            tile = grid.generateLodTile(layer.id, tx, ty, targetLod);
+          }
+          if (tile) {
+            visibleTiles.push(tile);
+          }
         }
       }
     }
@@ -4538,28 +4658,37 @@ export class ViewportCompositor {
 
     const ver = draftVersion ?? -1;
     const hasGenerateMipmap = typeof gl.generateMipmap === 'function';
-    if (
-      ver === -1 ||
-      ver !== this.lastDraftVersion ||
-      this.draftTexWidth !== draftCanvas.width ||
-      this.draftTexHeight !== draftCanvas.height
-    ) {
+    const needsMipmap = hasGenerateMipmap && draftSpace === 'document' && this.currentZoom < 0.99;
+    const sizeChanged =
+      this.draftTexWidth !== draftCanvas.width || this.draftTexHeight !== draftCanvas.height;
+
+    if (ver === -1 || ver !== this.lastDraftVersion || sizeChanged) {
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texParameteri(
         gl.TEXTURE_2D,
         gl.TEXTURE_MIN_FILTER,
-        hasGenerateMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
+        needsMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
       );
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+      if (!sizeChanged && this.draftTexWidth > 0 && typeof gl.texSubImage2D === 'function') {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+      } else {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+      }
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-      if (hasGenerateMipmap) {
+      if (needsMipmap) {
         gl.generateMipmap(gl.TEXTURE_2D);
       }
       this.draftTexWidth = draftCanvas.width;
       this.draftTexHeight = draftCanvas.height;
       this.lastDraftVersion = ver;
+    } else {
+      gl.texParameteri(
+        gl.TEXTURE_2D,
+        gl.TEXTURE_MIN_FILTER,
+        needsMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
+      );
     }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
 
@@ -5362,6 +5491,7 @@ export class ViewportCompositor {
   }
 
   private static previewTileCanvas: HTMLCanvasElement | null = null;
+  private static previewTileImgData: ImageData | null = null;
   private static previewScratchCanvas: HTMLCanvasElement | null = null;
 
   /**
@@ -5441,11 +5571,15 @@ export class ViewportCompositor {
       dstCtx.globalCompositeOperation = compositeOverride ?? getCanvasCompositeOperation(layer.blendMode);
       dstCtx.imageSmoothingEnabled = true;
 
+      if (!ViewportCompositor.previewTileImgData) {
+        ViewportCompositor.previewTileImgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
+      }
+      const reusedImgData = ViewportCompositor.previewTileImgData;
+
       for (const tile of tiles) {
         const rgba = grid.getTileAsRGBA(tile);
-        const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
-        imgData.data.set(rgba);
-        tileCtx.putImageData(imgData, 0, 0);
+        reusedImgData.data.set(rgba);
+        tileCtx.putImageData(reusedImgData, 0, 0);
 
         const dx = tile.tileX * lodDocSize * scaleX;
         const dy = tile.tileY * lodDocSize * scaleY;

@@ -486,7 +486,15 @@ export function getReusableBakeCanvas(minWidth: number, minHeight: number): HTML
   }
   const targetW = Math.max(256, Math.ceil(minWidth));
   const targetH = Math.max(256, Math.ceil(minHeight));
-  if (_reusableBakeCanvas.width < targetW || _reusableBakeCanvas.height < targetH) {
+  const MAX_PERSISTENT_BAKE_PIXELS = 2048 * 2048;
+  const currentPixels = _reusableBakeCanvas.width * _reusableBakeCanvas.height;
+  if (
+    currentPixels > MAX_PERSISTENT_BAKE_PIXELS &&
+    targetW * targetH <= MAX_PERSISTENT_BAKE_PIXELS
+  ) {
+    _reusableBakeCanvas.width = targetW;
+    _reusableBakeCanvas.height = targetH;
+  } else if (_reusableBakeCanvas.width < targetW || _reusableBakeCanvas.height < targetH) {
     _reusableBakeCanvas.width = Math.max(_reusableBakeCanvas.width, targetW);
     _reusableBakeCanvas.height = Math.max(_reusableBakeCanvas.height, targetH);
   }
@@ -550,7 +558,8 @@ export function renderCompleteStroke(
   isBgEraser: boolean = false,
   underlyingCanvas?: HTMLCanvasElement,
   alphaLocked: boolean = false,
-  explicitSampler?: LayerPixelSampler
+  explicitSampler?: LayerPixelSampler,
+  allowGpuForMonochrome: boolean = false
 ) {
   if (!points || points.length === 0) return;
 
@@ -561,9 +570,11 @@ export function renderCompleteStroke(
       ? applyCspPostCorrection(points, postCorrLevel, brushSettings.sharpCorners !== false)
       : points;
 
-  const effectivePoints = isMono
-    ? postCorrectedPoints.map((p) => (p.width < 1.25 ? { ...p, width: 1.25 } : p))
-    : postCorrectedPoints;
+  const hasTaper = Boolean(brushSettings.taper?.useOut || brushSettings.taper?.useIn);
+  const effectivePoints =
+    isMono && !hasTaper
+      ? postCorrectedPoints.map((p) => (p.width < 1.25 ? { ...p, width: 1.25 } : p))
+      : postCorrectedPoints;
 
   const isEraser = tool === 'eraser';
   const isPencil = !isEraser && !brushSettings.customTipImage && (brushSettings.preset?.startsWith('pencil') ?? false);
@@ -573,6 +584,11 @@ export function renderCompleteStroke(
   const strokeSpacing = brushSettings.spacing ?? 0.08;
   const isTransparentInk = Boolean(brushSettings.isTransparentInk);
   const useTilt = Boolean(brushSettings.useTilt);
+  const effectiveAntiAlias = isMono
+    ? allowGpuForMonochrome && (brushSettings.antiAlias ?? 2) !== 0 && brushSettings.useGpu !== false
+      ? (brushSettings.antiAlias ?? 2)
+      : 0
+    : brushSettings.antiAlias;
 
   // Textured Custom Tip (Clip Studio Paint SUT Brush & Procedural Tip Presets)
   if (brushSettings.customTipImage) {
@@ -593,7 +609,7 @@ export function renderCompleteStroke(
       angleDynamics: brushSettings.customTipAngleDynamics,
       rotationRandomScale: brushSettings.customTipRotationRandomScale,
       hardness: strokeHardness,
-      antiAlias: isMono ? 0 : brushSettings.antiAlias,
+      antiAlias: effectiveAntiAlias,
       pressureCurve: brushSettings.pressureCurve,
       velocityCurve: brushSettings.velocityCurve,
       usePressure: brushSettings.usePressure,
@@ -671,7 +687,7 @@ export function renderCompleteStroke(
     thicknessVertical: brushSettings.thicknessVertical,
     flipH: brushSettings.flipH,
     flipV: brushSettings.flipV,
-    antiAlias: isMono ? 0 : brushSettings.antiAlias,
+    antiAlias: effectiveAntiAlias,
     angleDynamics: brushSettings.customTipAngleDynamics,
     rotationRandomScale: brushSettings.customTipRotationRandomScale,
     adjustDensityByGap: brushSettings.adjustDensityByGap,

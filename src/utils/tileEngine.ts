@@ -30,6 +30,7 @@ export interface TileBuffer {
   isPagedToDisk: boolean;
   lastAccessTimestamp: number;
   lod: number; // 0 = 1:1 (256x256 doc area), 1 = 1/2 (512x512), 2 = 1/4 (1024x1024), 3 = 1/8 (2048x2048)
+  solidColorU32?: number; // When defined on a color-32bit tile, all 65,536 pixels share this exact U32 RGBA value
 }
 
 export function getTileByteSize(format: TileFormat): number {
@@ -213,29 +214,48 @@ export function packRGBATo1Bit(
   dst1Bit: Uint8Array,
   threshold: number = 128
 ): void {
-  dst1Bit.fill(0);
+  const thresh1000 = threshold * 1000;
+  const src32 =
+    srcRGBA.byteOffset % 4 === 0
+      ? new Uint32Array(srcRGBA.buffer, srcRGBA.byteOffset, TILE_PIXELS)
+      : null;
   let srcOffset = 0;
-  let dstByte = 0;
 
   for (let i = 0; i < BYTES_1BIT; i++) {
+    if (src32 !== null) {
+      const p = i << 3;
+      if (
+        (src32[p] |
+          src32[p + 1] |
+          src32[p + 2] |
+          src32[p + 3] |
+          src32[p + 4] |
+          src32[p + 5] |
+          src32[p + 6] |
+          src32[p + 7]) === 0
+      ) {
+        dst1Bit[i] = 0;
+        srcOffset += 32;
+        continue;
+      }
+    }
     let byteVal = 0;
     for (let bit = 7; bit >= 0; bit--) {
-      const r = srcRGBA[srcOffset];
-      const g = srcRGBA[srcOffset + 1];
-      const b = srcRGBA[srcOffset + 2];
       const a = srcRGBA[srcOffset + 3];
-
       if (a >= 24) {
-        // Luminance: 0.299*R + 0.587*G + 0.114*B
-        const lum = (r * 299 + g * 587 + b * 114) / 1000;
+        // Luminance: 0.299*R + 0.587*G + 0.114*B (integer scaled x1000)
+        const lum1000 =
+          srcRGBA[srcOffset] * 299 +
+          srcRGBA[srcOffset + 1] * 587 +
+          srcRGBA[srcOffset + 2] * 114;
         // Dark pixels become ink (1), light pixels transparent (0)
-        if (lum < threshold) {
+        if (lum1000 < thresh1000) {
           byteVal |= 1 << bit;
         }
       }
       srcOffset += 4;
     }
-    dst1Bit[dstByte++] = byteVal;
+    dst1Bit[i] = byteVal;
   }
 }
 
@@ -397,6 +417,14 @@ const _lut1BitByteToNibble = (() => {
   return lut;
 })();
 
+// Fast 2-bit popcount and coverage RGBA LUT for box-filtering monochrome-1bit -> color-32bit LOD tiles
+const _pop2 = new Uint8Array([0, 1, 1, 2]);
+const _monoCovU32 = new Uint32Array(
+  isLittleEndian
+    ? [0x00000000, 0x40000000, 0x80000000, 0xbf000000, 0xff000000]
+    : [0x00000000, 0x00000040, 0x00000080, 0x000000bf, 0x000000ff]
+);
+
 /**
  * Downsample 4 child tiles (2x2 cluster) at LOD k-1 into a single destination tile at LOD k.
  * Reuses pre-allocated scratch buffers for zero 256KB heap allocations during zoom-out LOD builds.
@@ -405,18 +433,49 @@ export function downsample2x2ToParentTile(
   childTiles: [TileBuffer | null, TileBuffer | null, TileBuffer | null, TileBuffer | null],
   dstTile: TileBuffer
 ): boolean {
+  const c0 = childTiles[0];
+  const c1 = childTiles[1];
+  const c2 = childTiles[2];
+  const c3 = childTiles[3];
+  if (
+    (!c0 || c0.data === null) &&
+    (!c1 || c1.data === null) &&
+    (!c2 || c2.data === null) &&
+    (!c3 || c3.data === null)
+  ) {
+    dstTile.solidColorU32 = undefined;
+    return false;
+  }
+
   if (!dstTile.data) {
     dstTile.data = new Uint8Array(getTileByteSize(dstTile.format));
-  }
-  dstTile.data.fill(0);
-
-  const hasAnyChild = childTiles.some((c) => c && c.data !== null);
-  if (!hasAnyChild) {
-    return false;
   }
 
   const format = dstTile.format;
   const dst = dstTile.data;
+  dstTile.solidColorU32 = undefined;
+
+  // Fast path #1: All 4 child tiles are identical solid color-32bit tiles (e.g. solid white paper)
+  if (
+    format === 'color-32bit' &&
+    c0 && c1 && c2 && c3 &&
+    c0.solidColorU32 !== undefined &&
+    c0.solidColorU32 === c1.solidColorU32 &&
+    c0.solidColorU32 === c2.solidColorU32 &&
+    c0.solidColorU32 === c3.solidColorU32
+  ) {
+    const dst32 = new Uint32Array(dst.buffer, dst.byteOffset, TILE_PIXELS);
+    dst32.fill(c0.solidColorU32);
+    dstTile.solidColorU32 = c0.solidColorU32;
+    dstTile.dirty = false;
+    dstTile.version++;
+    return true;
+  }
+
+  dst.fill(0);
+  const dst32 = format === 'color-32bit'
+    ? new Uint32Array(dst.buffer, dst.byteOffset, TILE_PIXELS)
+    : null;
 
   for (let q = 0; q < 4; q++) {
     const child = childTiles[q];
@@ -427,7 +486,36 @@ export function downsample2x2ToParentTile(
     const yBase = (q >= 2) ? 128 : 0;
 
     if (format === 'color-32bit') {
-      if (child.format === 'monochrome-1bit') {
+      // Fast path #2: Uniform solid quadrant
+      if (child.solidColorU32 !== undefined && dst32) {
+        const fillU32 = child.solidColorU32;
+        for (let ly = 0; ly < 128; ly++) {
+          const rowStart = (yBase + ly) * TILE_SIZE + xBase;
+          dst32.fill(fillU32, rowStart, rowStart + 128);
+        }
+        continue;
+      }
+
+      if (child.format === 'monochrome-1bit' && dst32) {
+        // Fast zero-unpack 2x2 bit-counting box filter: 1-bit ink -> anti-aliased black coverage RGBA
+        for (let ly = 0; ly < 128; ly++) {
+          const sy0 = ly << 1;
+          const srcRow0 = sy0 << 5;
+          const srcRow1 = (sy0 + 1) << 5;
+          const dstRowBase = (yBase + ly) * TILE_SIZE + xBase;
+          for (let bx = 0; bx < 32; bx++) {
+            const b0 = childData[srcRow0 + bx];
+            const b1 = childData[srcRow1 + bx];
+            if ((b0 | b1) === 0) continue;
+            const outOff = dstRowBase + (bx << 2);
+            dst32[outOff] = _monoCovU32[_pop2[(b0 >> 6) & 3] + _pop2[(b1 >> 6) & 3]];
+            dst32[outOff + 1] = _monoCovU32[_pop2[(b0 >> 4) & 3] + _pop2[(b1 >> 4) & 3]];
+            dst32[outOff + 2] = _monoCovU32[_pop2[(b0 >> 2) & 3] + _pop2[(b1 >> 2) & 3]];
+            dst32[outOff + 3] = _monoCovU32[_pop2[b0 & 3] + _pop2[b1 & 3]];
+          }
+        }
+        continue;
+      } else if (child.format === 'monochrome-1bit') {
         unpack1BitToRGBA(childData, _downsampleRgbaScratch);
         childData = _downsampleRgbaView;
       } else if (child.format === 'grayscale-8bit') {
@@ -436,22 +524,17 @@ export function downsample2x2ToParentTile(
       }
       for (let ly = 0; ly < 128; ly++) {
         const sy0 = ly << 1;
-        const sy1 = sy0 + 1;
         const dy = yBase + ly;
-        const dstRowOffset = dy * TILE_SIZE;
+        const dstRowOffset = dy * TILE_SIZE + xBase;
         const srcRowOffset0 = sy0 * TILE_SIZE;
-        const srcRowOffset1 = sy1 * TILE_SIZE;
+        const srcRowOffset1 = (sy0 + 1) * TILE_SIZE;
 
         for (let lx = 0; lx < 128; lx++) {
           const sx0 = lx << 1;
-          const sx1 = sx0 + 1;
-          const dx = xBase + lx;
-
           const p00 = (srcRowOffset0 + sx0) << 2;
-          const p10 = (srcRowOffset0 + sx1) << 2;
+          const p10 = p00 + 4;
           const p01 = (srcRowOffset1 + sx0) << 2;
-          const p11 = (srcRowOffset1 + sx1) << 2;
-          const outIdx = (dstRowOffset + dx) << 2;
+          const p11 = p01 + 4;
 
           const a0 = childData[p00 + 3];
           const a1 = childData[p10 + 3];
@@ -460,26 +543,20 @@ export function downsample2x2ToParentTile(
           const sumA = a0 + a1 + a2 + a3;
 
           if (sumA === 0) {
-            dst[outIdx] = 0;
-            dst[outIdx + 1] = 0;
-            dst[outIdx + 2] = 0;
-            dst[outIdx + 3] = 0;
-          } else if (sumA === 1020) {
+            continue; // dst is already zero-initialized
+          }
+          const outIdx = (dstRowOffset + lx) << 2;
+          if (sumA === 1020) {
             dst[outIdx] = (childData[p00] + childData[p10] + childData[p01] + childData[p11] + 2) >> 2;
             dst[outIdx + 1] = (childData[p00 + 1] + childData[p10 + 1] + childData[p01 + 1] + childData[p11 + 1] + 2) >> 2;
             dst[outIdx + 2] = (childData[p00 + 2] + childData[p10 + 2] + childData[p01 + 2] + childData[p11 + 2] + 2) >> 2;
             dst[outIdx + 3] = 255;
           } else {
+            const halfA = sumA >> 1;
             dst[outIdx + 3] = sumA >> 2;
-            dst[outIdx] = Math.round(
-              (childData[p00] * a0 + childData[p10] * a1 + childData[p01] * a2 + childData[p11] * a3) / sumA
-            );
-            dst[outIdx + 1] = Math.round(
-              (childData[p00 + 1] * a0 + childData[p10 + 1] * a1 + childData[p01 + 1] * a2 + childData[p11 + 1] * a3) / sumA
-            );
-            dst[outIdx + 2] = Math.round(
-              (childData[p00 + 2] * a0 + childData[p10 + 2] * a1 + childData[p01 + 2] * a2 + childData[p11 + 2] * a3) / sumA
-            );
+            dst[outIdx] = ((childData[p00] * a0 + childData[p10] * a1 + childData[p01] * a2 + childData[p11] * a3 + halfA) / sumA) | 0;
+            dst[outIdx + 1] = ((childData[p00 + 1] * a0 + childData[p10 + 1] * a1 + childData[p01 + 1] * a2 + childData[p11 + 1] * a3 + halfA) / sumA) | 0;
+            dst[outIdx + 2] = ((childData[p00 + 2] * a0 + childData[p10 + 2] * a1 + childData[p01 + 2] * a2 + childData[p11 + 2] * a3 + halfA) / sumA) | 0;
           }
         }
       }
@@ -1143,9 +1220,26 @@ export function releaseTemporaryCanvas(canvas: HTMLCanvasElement | null | undefi
  * Sole authoritative backing store for all layer pixel data in Ink Studio.
  * Completely deprecates multi-gigabyte full-sized DOM layer canvases.
  */
+const TILE_COORD_BIAS = 32768;
+const TILE_COORD_STRIDE = 65536;
+
+function packTileCoord(tx: number, ty: number): number {
+  return (ty + TILE_COORD_BIAS) * TILE_COORD_STRIDE + (tx + TILE_COORD_BIAS);
+}
+
+function unpackTileCoordX(packed: number): number {
+  return (packed % TILE_COORD_STRIDE) - TILE_COORD_BIAS;
+}
+
+function unpackTileCoordY(packed: number): number {
+  return Math.floor(packed / TILE_COORD_STRIDE) - TILE_COORD_BIAS;
+}
+
 export class SparseTileGrid {
   private readonly gridId: number = nextSparseTileGridId++;
   private tiles: Map<string, TileBuffer> = new Map();
+  private layerLod0Tiles: Map<string, Set<TileBuffer>> = new Map();
+  private layerLodOccupancy: Map<string, [Map<number, number>, Map<number, number>, Map<number, number>]> = new Map();
   private layerFormats: Map<string, TileFormat> = new Map();
   private ingestedLayers: Set<string> = new Set();
   private dirtyLodTiles: Set<string> = new Set();
@@ -1156,10 +1250,64 @@ export class SparseTileGrid {
   private memoryManager: TileMemoryManager | null = null;
   private layerVersions: Map<string, number> = new Map();
   private globalVersionCounter: number = 1;
+  private contentVersion: number = 1;
   private gridEpoch: number = 0;
 
   constructor(memoryManagerOptions?: TileMemoryManagerOptions) {
     this.memoryManager = new TileMemoryManager(this, memoryManagerOptions);
+  }
+
+  private registerLod0Tile(tile: TileBuffer): void {
+    if ((tile.lod ?? 0) !== 0) return;
+    let set = this.layerLod0Tiles.get(tile.layerId);
+    if (!set) {
+      set = new Set<TileBuffer>();
+      this.layerLod0Tiles.set(tile.layerId, set);
+    }
+    if (set.has(tile)) return;
+    set.add(tile);
+
+    let occ = this.layerLodOccupancy.get(tile.layerId);
+    if (!occ) {
+      occ = [new Map<number, number>(), new Map<number, number>(), new Map<number, number>()];
+      this.layerLodOccupancy.set(tile.layerId, occ);
+    }
+    let tx = tile.tileX;
+    let ty = tile.tileY;
+    for (let i = 0; i < 3; i++) {
+      tx = tx >> 1;
+      ty = ty >> 1;
+      const pk = packTileCoord(tx, ty);
+      occ[i].set(pk, (occ[i].get(pk) ?? 0) + 1);
+    }
+  }
+
+  private unregisterLod0Tile(tile: TileBuffer): void {
+    if ((tile.lod ?? 0) !== 0) return;
+    const set = this.layerLod0Tiles.get(tile.layerId);
+    if (!set || !set.delete(tile)) return;
+    if (set.size === 0) {
+      this.layerLod0Tiles.delete(tile.layerId);
+    }
+
+    const occ = this.layerLodOccupancy.get(tile.layerId);
+    if (!occ) return;
+    let tx = tile.tileX;
+    let ty = tile.tileY;
+    for (let i = 0; i < 3; i++) {
+      tx = tx >> 1;
+      ty = ty >> 1;
+      const pk = packTileCoord(tx, ty);
+      const next = (occ[i].get(pk) ?? 0) - 1;
+      if (next <= 0) {
+        occ[i].delete(pk);
+      } else {
+        occ[i].set(pk, next);
+      }
+    }
+    if (set.size === 0) {
+      this.layerLodOccupancy.delete(tile.layerId);
+    }
   }
 
   public getGridId(): number {
@@ -1167,12 +1315,22 @@ export class SparseTileGrid {
   }
 
   public hasLayerTiles(layerId: string): boolean {
-    for (const tile of this.tiles.values()) {
-      if (tile.layerId === layerId && (tile.lod ?? 0) === 0) {
-        return true;
-      }
+    const set = this.layerLod0Tiles.get(layerId);
+    return set !== undefined && set.size > 0;
+  }
+
+  public hasPopulatedLodTile(layerId: string, tileX: number, tileY: number, lod: number): boolean {
+    if (lod <= 0) {
+      return this.tiles.has(getTileKey(layerId, tileX, tileY, 0));
     }
-    return false;
+    const idx = lod - 1;
+    if (idx < 0 || idx > 2) return false;
+    const occ = this.layerLodOccupancy.get(layerId);
+    return occ !== undefined && (occ[idx].get(packTileCoord(tileX, tileY)) ?? 0) > 0;
+  }
+
+  public getContentVersion(): number {
+    return this.contentVersion;
   }
 
   public getLayerVersion(layerId: string): number {
@@ -1181,6 +1339,7 @@ export class SparseTileGrid {
 
   public bumpLayerVersion(layerId: string): void {
     this.layerVersions.set(layerId, ++this.globalVersionCounter);
+    this.contentVersion++;
   }
 
   public getGridEpoch(): number {
@@ -1245,6 +1404,9 @@ export class SparseTileGrid {
       const fmt = format || this.getLayerFormat(layerId);
       tile = createTileBuffer(layerId, tileX, tileY, fmt, lod);
       this.tiles.set(key, tile);
+      if (lod === 0) {
+        this.registerLod0Tile(tile);
+      }
       if (this.memoryManager) {
         this.memoryManager.notifyTileAllocated(tile);
       }
@@ -1259,10 +1421,18 @@ export class SparseTileGrid {
   public setTile(layerId: string, tileX: number, tileY: number, tile: TileBuffer): void {
     const key = getTileKey(layerId, tileX, tileY, tile.lod);
     const existing = this.tiles.get(key);
-    if (existing && this.memoryManager) {
-      this.memoryManager.notifyTileFreed(existing);
+    if (existing) {
+      if ((existing.lod ?? 0) === 0) {
+        this.unregisterLod0Tile(existing);
+      }
+      if (this.memoryManager) {
+        this.memoryManager.notifyTileFreed(existing);
+      }
     }
     this.tiles.set(key, tile);
+    if ((tile.lod ?? 0) === 0) {
+      this.registerLod0Tile(tile);
+    }
     if (this.memoryManager) {
       this.memoryManager.notifyTileAllocated(tile);
     }
@@ -1278,6 +1448,9 @@ export class SparseTileGrid {
     const key = getTileKey(layerId, tileX, tileY, lod);
     const tile = this.tiles.get(key);
     if (tile) {
+      if ((tile.lod ?? 0) === 0) {
+        this.unregisterLod0Tile(tile);
+      }
       if (this.memoryManager) {
         this.memoryManager.notifyTileFreed(tile);
       }
@@ -1290,6 +1463,10 @@ export class SparseTileGrid {
   }
 
   public getLayerTiles(layerId: string, lod: number = 0): TileBuffer[] {
+    if (lod === 0) {
+      const set = this.layerLod0Tiles.get(layerId);
+      return set ? Array.from(set) : [];
+    }
     const result: TileBuffer[] = [];
     for (const tile of this.tiles.values()) {
       if (tile.layerId === layerId && (tile.lod ?? 0) === lod) {
@@ -1307,6 +1484,9 @@ export class SparseTileGrid {
     maxY: number,
     lod: number = 0
   ): TileBuffer[] {
+    if (lod === 0 && !this.hasLayerTiles(layerId)) {
+      return [];
+    }
     const minTileX = pixelToTileCoord(minX, lod);
     const minTileY = pixelToTileCoord(minY, lod);
     const maxTileX = pixelToTileCoord(maxX, lod);
@@ -1315,6 +1495,11 @@ export class SparseTileGrid {
     const result: TileBuffer[] = [];
     for (let ty = minTileY; ty <= maxTileY; ty++) {
       for (let tx = minTileX; tx <= maxTileX; tx++) {
+        if (lod > 0 && !this.hasPopulatedLodTile(layerId, tx, ty, lod)) {
+          const direct = this.getTile(layerId, tx, ty, lod);
+          if (direct) result.push(direct);
+          continue;
+        }
         let tile = this.getTile(layerId, tx, ty, lod);
         if (lod > 0 && (!tile || this.isLodTileDirty(layerId, tx, ty, lod))) {
           tile = this.generateLodTile(layerId, tx, ty, lod);
@@ -1403,6 +1588,10 @@ export class SparseTileGrid {
 
     const tileScratch = this.writeScratchRGBA;
     const srcData = imgData.data;
+    const src32 =
+      srcData.byteOffset % 4 === 0 && srcData.byteLength >= w * h * 4
+        ? new Uint32Array(srcData.buffer, srcData.byteOffset, w * h)
+        : null;
 
     for (let ty = minTileY; ty <= maxTileY; ty++) {
       const tileDocY = ty * TILE_SIZE;
@@ -1419,13 +1608,25 @@ export class SparseTileGrid {
         let existingTile = this.getTile(layerId, tx, ty, 0);
         if (!existingTile) {
           let hasNonZero = false;
-          outer: for (let sy = srcStartY; sy < srcEndY; sy++) {
-            let idx = (sy * w + srcStartX) * 4;
-            const endIdx = (sy * w + srcEndX) * 4;
-            for (; idx < endIdx; idx += 4) {
-              if (srcData[idx + 3] !== 0 || srcData[idx] !== 0 || srcData[idx + 1] !== 0 || srcData[idx + 2] !== 0) {
-                hasNonZero = true;
-                break outer;
+          if (src32 !== null) {
+            outer32: for (let sy = srcStartY; sy < srcEndY; sy++) {
+              const rowOff = sy * w;
+              for (let sx = rowOff + srcStartX, end = rowOff + srcEndX; sx < end; sx++) {
+                if (src32[sx] !== 0) {
+                  hasNonZero = true;
+                  break outer32;
+                }
+              }
+            }
+          } else {
+            outer: for (let sy = srcStartY; sy < srcEndY; sy++) {
+              let idx = (sy * w + srcStartX) * 4;
+              const endIdx = (sy * w + srcEndX) * 4;
+              for (; idx < endIdx; idx += 4) {
+                if (srcData[idx + 3] !== 0 || srcData[idx] !== 0 || srcData[idx + 1] !== 0 || srcData[idx + 2] !== 0) {
+                  hasNonZero = true;
+                  break outer;
+                }
               }
             }
           }
@@ -1461,23 +1662,98 @@ export class SparseTileGrid {
             );
           }
         } else if (tile.format === 'monochrome-1bit') {
-          unpack1BitToRGBA(tile.data, tileScratch);
+          const dst = tile.data;
+          const localStartX = destX + srcStartX - tileDocX;
+          const copyWidth = srcEndX - srcStartX;
+          const localEndX = localStartX + copyWidth;
 
           for (let sy = srcStartY; sy < srcEndY; sy++) {
             const tileLocalY = destY + sy - tileDocY;
-            const tileLocalX = destX + srcStartX - tileDocX;
-            const copyWidth = srcEndX - srcStartX;
+            const rowByteBase = tileLocalY << 5; // TILE_SIZE / 8 = 32
+            let lx = localStartX;
+            let srcPixIdx = sy * w + srcStartX;
+            let srcOff = srcPixIdx << 2;
 
-            const srcByteOffset = (sy * w + srcStartX) * 4;
-            const tileByteOffset = (tileLocalY * TILE_SIZE + tileLocalX) * 4;
+            // Leading unaligned pixels before an 8-pixel boundary
+            if ((lx & 7) !== 0) {
+              const byteIdx = rowByteBase + (lx >> 3);
+              let byteVal = dst[byteIdx];
+              const stop = Math.min(localEndX, (lx + 7) & ~7);
+              while (lx < stop) {
+                const mask = 1 << (7 - (lx & 7));
+                const a = srcData[srcOff + 3];
+                if (
+                  a >= 24 &&
+                  srcData[srcOff] * 299 + srcData[srcOff + 1] * 587 + srcData[srcOff + 2] * 114 < 128000
+                ) {
+                  byteVal |= mask;
+                } else {
+                  byteVal &= ~mask;
+                }
+                lx++;
+                srcPixIdx++;
+                srcOff += 4;
+              }
+              dst[byteIdx] = byteVal;
+            }
 
-            tileScratch.set(
-              srcData.subarray(srcByteOffset, srcByteOffset + copyWidth * 4),
-              tileByteOffset
-            );
+            // Full 8-pixel aligned bytes
+            while (lx + 8 <= localEndX) {
+              const byteIdx = rowByteBase + (lx >> 3);
+              if (
+                src32 !== null &&
+                (src32[srcPixIdx] |
+                  src32[srcPixIdx + 1] |
+                  src32[srcPixIdx + 2] |
+                  src32[srcPixIdx + 3] |
+                  src32[srcPixIdx + 4] |
+                  src32[srcPixIdx + 5] |
+                  src32[srcPixIdx + 6] |
+                  src32[srcPixIdx + 7]) === 0
+              ) {
+                dst[byteIdx] = 0;
+                lx += 8;
+                srcPixIdx += 8;
+                srcOff += 32;
+                continue;
+              }
+              let byteVal = 0;
+              for (let bit = 7; bit >= 0; bit--) {
+                const a = srcData[srcOff + 3];
+                if (
+                  a >= 24 &&
+                  srcData[srcOff] * 299 + srcData[srcOff + 1] * 587 + srcData[srcOff + 2] * 114 < 128000
+                ) {
+                  byteVal |= 1 << bit;
+                }
+                srcOff += 4;
+              }
+              dst[byteIdx] = byteVal;
+              lx += 8;
+              srcPixIdx += 8;
+            }
+
+            // Trailing unaligned pixels
+            if (lx < localEndX) {
+              const byteIdx = rowByteBase + (lx >> 3);
+              let byteVal = dst[byteIdx];
+              while (lx < localEndX) {
+                const mask = 1 << (7 - (lx & 7));
+                const a = srcData[srcOff + 3];
+                if (
+                  a >= 24 &&
+                  srcData[srcOff] * 299 + srcData[srcOff + 1] * 587 + srcData[srcOff + 2] * 114 < 128000
+                ) {
+                  byteVal |= mask;
+                } else {
+                  byteVal &= ~mask;
+                }
+                lx++;
+                srcOff += 4;
+              }
+              dst[byteIdx] = byteVal;
+            }
           }
-
-          packRGBATo1Bit(tileScratch, tile.data);
         } else {
           unpack8BitToRGBA(tile.data, tileScratch);
           for (let sy = srcStartY; sy < srcEndY; sy++) {
@@ -1496,6 +1772,7 @@ export class SparseTileGrid {
           packRGBATo8Bit(tileScratch, tile.data);
         }
 
+        tile.solidColorU32 = undefined;
         tile.dirty = true;
         tile.version++;
         this.markLodAncestorsDirty(layerId, tx, ty);
@@ -1507,6 +1784,374 @@ export class SparseTileGrid {
       this.notifyChange();
     }
     return { minTileX, minTileY, maxTileX, maxTileY };
+  }
+
+  /**
+   * Composites an isolated stroke RGBA buffer directly onto LOD 0 tiles in-place,
+   * avoiding full-region canvas allocation, existing-tile unpacking, and separate
+   * binarization passes. Records pre-edit tile snapshots into `snapshotOut` only
+   * for tiles with non-zero stroke pixels.
+   */
+  public compositeStrokeToTiles(options: {
+    layerId: string;
+    strokeData: { data: Uint8ClampedArray | Uint8Array; width: number; height: number };
+    destX: number;
+    destY: number;
+    format: TileFormat;
+    compositeOp: 'source-over' | 'destination-out' | 'source-atop';
+    opacity: number;
+    monochrome?: {
+      threshold: number;
+      expressBlack: boolean;
+      expressWhite: boolean;
+    };
+    selectionMask?: {
+      mask: Uint8Array;
+      bounds: { x: number; y: number; width: number; height: number };
+    } | null;
+    snapshotOut?: Map<string, { format: TileFormat; data: Uint8Array | null }>;
+    suppressNotify?: boolean;
+  }): boolean {
+    const {
+      layerId,
+      strokeData,
+      destX,
+      destY,
+      format: targetFormat,
+      compositeOp,
+      monochrome,
+      selectionMask,
+      snapshotOut,
+      suppressNotify = false,
+    } = options;
+    const opacity = Math.max(0, Math.min(1, options.opacity));
+    const w = strokeData.width;
+    const h = strokeData.height;
+    if (w <= 0 || h <= 0 || opacity <= 0.001) return false;
+
+    this.ingestedLayers.add(layerId);
+    this.setLayerFormat(layerId, targetFormat);
+
+    const minTileX = pixelToTileCoord(destX, 0);
+    const minTileY = pixelToTileCoord(destY, 0);
+    const maxTileX = pixelToTileCoord(destX + w - 1, 0);
+    const maxTileY = pixelToTileCoord(destY + h - 1, 0);
+
+    const srcData = strokeData.data;
+    const src32 =
+      srcData.byteOffset % 4 === 0 && srcData.byteLength >= w * h * 4
+        ? new Uint32Array(srcData.buffer, srcData.byteOffset, w * h)
+        : null;
+
+    const monoThresh = Math.max(1, Math.min(255, monochrome?.threshold ?? 128));
+    const monoExpressBlack = monochrome?.expressBlack !== false;
+    const hasSelMask = Boolean(selectionMask?.mask);
+    const selMask = selectionMask?.mask ?? null;
+    const selBx = selectionMask ? Math.floor(selectionMask.bounds.x) : 0;
+    const selBy = selectionMask ? Math.floor(selectionMask.bounds.y) : 0;
+    const selBw = selectionMask ? Math.ceil(selectionMask.bounds.width) : 0;
+    const selBh = selectionMask ? Math.ceil(selectionMask.bounds.height) : 0;
+    const fullOpacity = opacity >= 0.999;
+
+    let anyModified = false;
+
+    for (let ty = minTileY; ty <= maxTileY; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      for (let tx = minTileX; tx <= maxTileX; tx++) {
+        const tileDocX = tx * TILE_SIZE;
+
+        const srcStartX = Math.max(0, tileDocX - destX);
+        const srcStartY = Math.max(0, tileDocY - destY);
+        const srcEndX = Math.min(w, tileDocX + TILE_SIZE - destX);
+        const srcEndY = Math.min(h, tileDocY + TILE_SIZE - destY);
+        if (srcStartX >= srcEndX || srcStartY >= srcEndY) continue;
+
+        let existingTile = this.getTile(layerId, tx, ty, 0);
+
+        // Erasing or alpha-locking against an empty tile is a no-op
+        if ((compositeOp === 'destination-out' || compositeOp === 'source-atop') && (!existingTile || !existingTile.data)) {
+          continue;
+        }
+
+        // Fast zero-scan: skip tiles where the stroke overlap is completely transparent
+        let hasNonZero = false;
+        if (src32 !== null) {
+          outerZero32: for (let sy = srcStartY; sy < srcEndY; sy++) {
+            const rowOff = sy * w;
+            for (let sx = rowOff + srcStartX, end = rowOff + srcEndX; sx < end; sx++) {
+              if ((src32[sx] >>> 24) !== 0) {
+                hasNonZero = true;
+                break outerZero32;
+              }
+            }
+          }
+        } else {
+          outerZero8: for (let sy = srcStartY; sy < srcEndY; sy++) {
+            let off = (sy * w + srcStartX) << 2;
+            const endOff = (sy * w + srcEndX) << 2;
+            for (; off < endOff; off += 4) {
+              if (srcData[off + 3] !== 0) {
+                hasNonZero = true;
+                break outerZero8;
+              }
+            }
+          }
+        }
+        if (!hasNonZero) continue;
+
+        // Snapshot pre-edit tile state before mutating
+        if (snapshotOut) {
+          const tileKey = getTileKey(layerId, tx, ty, 0);
+          if (!snapshotOut.has(tileKey)) {
+            snapshotOut.set(tileKey, {
+              format: existingTile ? existingTile.format : targetFormat,
+              data: existingTile?.data ? new Uint8Array(existingTile.data) : null,
+            });
+          }
+        }
+
+        const tile = existingTile ?? this.getOrCreateTile(layerId, tx, ty, targetFormat, 0);
+        if (tile.format !== targetFormat) {
+          const prevRGBA = tile.data ? new Uint8Array(this.getTileAsRGBA(tile)) : null;
+          if (tile.data !== null) {
+            this.memoryManager?.notifyTileFreed(tile);
+          }
+          tile.format = targetFormat;
+          tile.data = new Uint8Array(getTileByteSize(targetFormat));
+          if (prevRGBA) {
+            if (targetFormat === 'color-32bit') {
+              tile.data.set(prevRGBA);
+            } else if (targetFormat === 'monochrome-1bit') {
+              packRGBATo1Bit(prevRGBA, tile.data, monoThresh);
+            } else {
+              packRGBATo8Bit(prevRGBA, tile.data);
+            }
+          }
+          this.memoryManager?.notifyTileAllocated(tile);
+        } else if (tile.data === null) {
+          tile.data = new Uint8Array(getTileByteSize(tile.format));
+          this.memoryManager?.notifyTileAllocated(tile);
+        }
+
+        const localStartX = destX + srcStartX - tileDocX;
+        const copyWidth = srcEndX - srcStartX;
+
+        if (tile.format === 'monochrome-1bit') {
+          const dst = tile.data;
+          for (let sy = srcStartY; sy < srcEndY; sy++) {
+            const tileLocalY = destY + sy - tileDocY;
+            const docY = destY + sy;
+            const rowByteBase = tileLocalY << 5;
+            let srcOff = (sy * w + srcStartX) << 2;
+            const selRowValid = hasSelMask && docY >= selBy && docY < selBy + selBh;
+            const selRowOff = selRowValid ? (docY - selBy) * selBw : 0;
+
+            for (let dx = 0; dx < copyWidth; dx++, srcOff += 4) {
+              const sa = srcData[srcOff + 3];
+              if (sa === 0) continue;
+
+              let effA = fullOpacity ? sa : Math.round(sa * opacity);
+              if (hasSelMask) {
+                const docX = destX + srcStartX + dx;
+                if (!selRowValid || docX < selBx || docX >= selBx + selBw) continue;
+                const ma = selMask![selRowOff + (docX - selBx)];
+                if (ma === 0) continue;
+                if (ma < 255) {
+                  effA = Math.round((effA * ma) / 255);
+                }
+              }
+
+              const lx = localStartX + dx;
+              const byteIdx = rowByteBase + (lx >> 3);
+              const mask = 1 << (7 - (lx & 7));
+
+              if (compositeOp === 'destination-out') {
+                if (effA >= 128) {
+                  dst[byteIdx] &= ~mask;
+                }
+              } else if (compositeOp === 'source-atop') {
+                if ((dst[byteIdx] & mask) === 0) continue;
+                const r = srcData[srcOff];
+                const g = srcData[srcOff + 1];
+                const b = srcData[srcOff + 2];
+                const lum = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+                const outLum = (lum * effA) / 255;
+                if (outLum < monoThresh && monoExpressBlack) {
+                  dst[byteIdx] |= mask;
+                } else {
+                  dst[byteIdx] &= ~mask;
+                }
+              } else {
+                const hadInk = (dst[byteIdx] & mask) !== 0;
+                const r = srcData[srcOff];
+                const g = srcData[srcOff + 1];
+                const b = srcData[srcOff + 2];
+                const lum = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+                if (!hadInk) {
+                  if (effA >= 128 && lum < monoThresh && monoExpressBlack) {
+                    dst[byteIdx] |= mask;
+                  }
+                } else {
+                  const outLum = (lum * effA) / 255;
+                  if (outLum >= monoThresh || !monoExpressBlack) {
+                    dst[byteIdx] &= ~mask;
+                  }
+                }
+              }
+            }
+          }
+        } else if (tile.format === 'color-32bit') {
+          const dst = tile.data;
+          for (let sy = srcStartY; sy < srcEndY; sy++) {
+            const tileLocalY = destY + sy - tileDocY;
+            const docY = destY + sy;
+            let srcOff = (sy * w + srcStartX) << 2;
+            let dstOff = (tileLocalY * TILE_SIZE + localStartX) << 2;
+            const selRowValid = hasSelMask && docY >= selBy && docY < selBy + selBh;
+            const selRowOff = selRowValid ? (docY - selBy) * selBw : 0;
+
+            for (let dx = 0; dx < copyWidth; dx++, srcOff += 4, dstOff += 4) {
+              const sa = srcData[srcOff + 3];
+              if (sa === 0) continue;
+
+              let effA = fullOpacity ? sa : Math.round(sa * opacity);
+              if (effA === 0) continue;
+
+              let maskFrac = 1.0;
+              if (hasSelMask) {
+                const docX = destX + srcStartX + dx;
+                if (!selRowValid || docX < selBx || docX >= selBx + selBw) continue;
+                const ma = selMask![selRowOff + (docX - selBx)];
+                if (ma === 0) continue;
+                if (ma < 255) maskFrac = ma / 255;
+              }
+
+              const sr = srcData[srcOff];
+              const sg = srcData[srcOff + 1];
+              const sb = srcData[srcOff + 2];
+              const da = dst[dstOff + 3];
+
+              let outR = dst[dstOff];
+              let outG = dst[dstOff + 1];
+              let outB = dst[dstOff + 2];
+              let outA = da;
+
+              if (compositeOp === 'destination-out') {
+                if (da === 0) continue;
+                if (effA === 255) {
+                  outR = 0;
+                  outG = 0;
+                  outB = 0;
+                  outA = 0;
+                } else {
+                  outA = Math.round(da * (1 - effA / 255));
+                  if (outA === 0) {
+                    outR = 0;
+                    outG = 0;
+                    outB = 0;
+                  }
+                }
+              } else if (compositeOp === 'source-atop') {
+                if (da === 0) continue;
+                if (effA === 255) {
+                  outR = sr;
+                  outG = sg;
+                  outB = sb;
+                } else {
+                  const sA = effA / 255;
+                  const inv = 1 - sA;
+                  outR = Math.round(sr * sA + outR * inv);
+                  outG = Math.round(sg * sA + outG * inv);
+                  outB = Math.round(sb * sA + outB * inv);
+                }
+              } else {
+                if (effA === 255 || da === 0) {
+                  outR = sr;
+                  outG = sg;
+                  outB = sb;
+                  outA = effA;
+                } else {
+                  const sA = effA / 255;
+                  const dA = da / 255;
+                  const invSA = 1 - sA;
+                  const compA = sA + dA * invSA;
+                  if (compA > 0) {
+                    const invOut = 1 / compA;
+                    outR = Math.round((sr * sA + outR * dA * invSA) * invOut);
+                    outG = Math.round((sg * sA + outG * dA * invSA) * invOut);
+                    outB = Math.round((sb * sA + outB * dA * invSA) * invOut);
+                    outA = Math.round(compA * 255);
+                  }
+                }
+              }
+
+              if (maskFrac < 1.0) {
+                const invM = 1 - maskFrac;
+                const bA = da / 255;
+                const aA = outA / 255;
+                const mixA = bA * invM + aA * maskFrac;
+                if (mixA <= 0.0001) {
+                  dst[dstOff] = 0;
+                  dst[dstOff + 1] = 0;
+                  dst[dstOff + 2] = 0;
+                  dst[dstOff + 3] = 0;
+                } else {
+                  const invMixA = 1 / mixA;
+                  dst[dstOff] = Math.round((dst[dstOff] * bA * invM + outR * aA * maskFrac) * invMixA);
+                  dst[dstOff + 1] = Math.round((dst[dstOff + 1] * bA * invM + outG * aA * maskFrac) * invMixA);
+                  dst[dstOff + 2] = Math.round((dst[dstOff + 2] * bA * invM + outB * aA * maskFrac) * invMixA);
+                  dst[dstOff + 3] = Math.round(mixA * 255);
+                }
+              } else {
+                dst[dstOff] = outR;
+                dst[dstOff + 1] = outG;
+                dst[dstOff + 2] = outB;
+                dst[dstOff + 3] = outA;
+              }
+            }
+          }
+        } else {
+          // grayscale-8bit fallback
+          const tileScratch = this.writeScratchRGBA;
+          unpack8BitToRGBA(tile.data, tileScratch);
+          for (let sy = srcStartY; sy < srcEndY; sy++) {
+            const tileLocalY = destY + sy - tileDocY;
+            let srcOff = (sy * w + srcStartX) << 2;
+            let dstOff = (tileLocalY * TILE_SIZE + localStartX) << 2;
+            for (let dx = 0; dx < copyWidth; dx++, srcOff += 4, dstOff += 4) {
+              const sa = srcData[srcOff + 3];
+              if (sa === 0) continue;
+              const effA = fullOpacity ? sa : Math.round(sa * opacity);
+              if (compositeOp === 'destination-out') {
+                tileScratch[dstOff + 3] = Math.round(tileScratch[dstOff + 3] * (1 - effA / 255));
+              } else if (effA > 0) {
+                const sA = effA / 255;
+                const inv = 1 - sA;
+                tileScratch[dstOff] = Math.round(srcData[srcOff] * sA + tileScratch[dstOff] * inv);
+                tileScratch[dstOff + 1] = Math.round(srcData[srcOff + 1] * sA + tileScratch[dstOff + 1] * inv);
+                tileScratch[dstOff + 2] = Math.round(srcData[srcOff + 2] * sA + tileScratch[dstOff + 2] * inv);
+                tileScratch[dstOff + 3] = Math.min(255, Math.round(tileScratch[dstOff + 3] * inv + effA));
+              }
+            }
+          }
+          packRGBATo8Bit(tileScratch, tile.data);
+        }
+
+        tile.solidColorU32 = undefined;
+        tile.dirty = true;
+        tile.version++;
+        this.markLodAncestorsDirty(layerId, tx, ty);
+        anyModified = true;
+      }
+    }
+
+    if (anyModified) {
+      this.bumpLayerVersion(layerId);
+      if (!suppressNotify) {
+        this.notifyChange();
+      }
+    }
+    return anyModified;
   }
 
   public readImageData(
@@ -1608,27 +2253,67 @@ export class SparseTileGrid {
   }
 
   /**
-   * Allocates a temporary HTMLCanvasElement strictly sized to `rect` and populates it from tiles.
-   * Caller must release it via `releaseTemporaryCanvas(canvas)` when finished.
+   * Populates a temporary (or caller-supplied pooled) HTMLCanvasElement strictly sized to `rect` from tiles.
+   * When `targetCanvas` is omitted, caller must release the returned canvas via `releaseTemporaryCanvas(canvas)`.
    */
   public createRegionCanvas(
     layerId: string,
-    rect: { x: number; y: number; width: number; height: number }
+    rect: { x: number; y: number; width: number; height: number },
+    targetCanvas?: HTMLCanvasElement | null
   ): HTMLCanvasElement | null {
     if (typeof document === 'undefined' || rect.width <= 0 || rect.height <= 0) return null;
     const w = Math.max(1, Math.ceil(rect.width));
     const h = Math.max(1, Math.ceil(rect.height));
-    const canvas = document.createElement('canvas');
-    canvas.width = w;
-    canvas.height = h;
+    const canvas = targetCanvas || document.createElement('canvas');
+    const resized = canvas.width !== w || canvas.height !== h;
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return canvas;
+    if (!resized) {
+      ctx.clearRect(0, 0, w, h);
+    }
 
-    if (this.hasLayerTiles(layerId)) {
-      const region = this.readImageData(layerId, Math.floor(rect.x), Math.floor(rect.y), w, h);
-      if (typeof ImageData !== 'undefined') {
-        const imgData = new ImageData(new Uint8ClampedArray(region.data.buffer as ArrayBuffer, region.data.byteOffset, region.data.byteLength), w, h);
-        ctx.putImageData(imgData, 0, 0);
+    if (this.hasLayerTiles(layerId) && typeof ImageData !== 'undefined') {
+      const originX = Math.floor(rect.x);
+      const originY = Math.floor(rect.y);
+      const minTileX = pixelToTileCoord(originX, 0);
+      const minTileY = pixelToTileCoord(originY, 0);
+      const maxTileX = pixelToTileCoord(originX + w - 1, 0);
+      const maxTileY = pixelToTileCoord(originY + h - 1, 0);
+
+      for (let ty = minTileY; ty <= maxTileY; ty++) {
+        const tileDocY = ty * TILE_SIZE;
+        const interStartY = Math.max(originY, tileDocY);
+        const interEndY = Math.min(originY + h, tileDocY + TILE_SIZE);
+        const dirtyH = interEndY - interStartY;
+        if (dirtyH <= 0) continue;
+        const dirtyY = interStartY - tileDocY;
+
+        for (let tx = minTileX; tx <= maxTileX; tx++) {
+          const tile = this.getTile(layerId, tx, ty, 0);
+          if (!tile) continue;
+
+          const tileDocX = tx * TILE_SIZE;
+          const interStartX = Math.max(originX, tileDocX);
+          const interEndX = Math.min(originX + w, tileDocX + TILE_SIZE);
+          const dirtyW = interEndX - interStartX;
+          if (dirtyW <= 0) continue;
+          const dirtyX = interStartX - tileDocX;
+
+          const rgba = this.getTileAsRGBA(tile);
+          const clamped = new Uint8ClampedArray(rgba.buffer as ArrayBuffer, rgba.byteOffset, BYTES_32BIT);
+          const imgData = new ImageData(clamped, TILE_SIZE, TILE_SIZE);
+          ctx.putImageData(
+            imgData,
+            tileDocX - originX,
+            tileDocY - originY,
+            dirtyX,
+            dirtyY,
+            dirtyW,
+            dirtyH
+          );
+        }
       }
     }
     return canvas;
@@ -1658,27 +2343,16 @@ export class SparseTileGrid {
       return this.getLayerTiles(layerId);
     }
 
-    const lodCoords = new Map<string, { tx: number; ty: number }>();
-
-    for (const tile of this.tiles.values()) {
-      if (tile.layerId !== layerId) continue;
-      if ((tile.lod ?? 0) === 0) {
-        const ltx = tile.tileX >> lod;
-        const lty = tile.tileY >> lod;
-        const k = `${ltx}:${lty}`;
-        if (!lodCoords.has(k)) {
-          lodCoords.set(k, { tx: ltx, ty: lty });
-        }
-      } else if (tile.lod === lod) {
-        const k = `${tile.tileX}:${tile.tileY}`;
-        if (!lodCoords.has(k)) {
-          lodCoords.set(k, { tx: tile.tileX, ty: tile.tileY });
-        }
-      }
+    const occ = this.layerLodOccupancy.get(layerId);
+    const lodOccMap = occ ? occ[lod - 1] : null;
+    if (!lodOccMap || lodOccMap.size === 0) {
+      return this.getLayerTiles(layerId, lod);
     }
 
     const result: TileBuffer[] = [];
-    for (const { tx, ty } of lodCoords.values()) {
+    for (const packed of lodOccMap.keys()) {
+      const tx = unpackTileCoordX(packed);
+      const ty = unpackTileCoordY(packed);
       let tile = this.getTile(layerId, tx, ty, lod);
       if (!tile || tile.data === null || this.isLodTileDirty(layerId, tx, ty, lod)) {
         tile = this.generateLodTile(layerId, tx, ty, lod);
@@ -1832,6 +2506,20 @@ export class SparseTileGrid {
       return this.getTile(layerId, lodTx, lodTy, 0);
     }
 
+    const key = getTileKey(layerId, lodTx, lodTy, targetLod);
+
+    // O(1) empty-region fast-out: if no LOD 0 tile exists anywhere under this LOD node,
+    // never recurse or allocate a temporary 256KB TileBuffer.
+    if (!this.hasPopulatedLodTile(layerId, lodTx, lodTy, targetLod)) {
+      const stale = this.tiles.get(key);
+      if (stale) {
+        this.memoryManager?.notifyTileFreed(stale);
+        this.tiles.delete(key);
+      }
+      this.dirtyLodTiles.delete(key);
+      return null;
+    }
+
     const childLod = targetLod - 1;
     const cX0 = lodTx << 1;
     const cY0 = lodTy << 1;
@@ -1842,25 +2530,56 @@ export class SparseTileGrid {
     let c11 = this.getTile(layerId, cX0 + 1, cY0 + 1, childLod);
 
     if (childLod > 0) {
-      if (!c00 || this.isLodTileDirty(layerId, cX0, cY0, childLod)) {
-        c00 = this.generateLodTile(layerId, cX0, cY0, childLod);
+      if (this.hasPopulatedLodTile(layerId, cX0, cY0, childLod)) {
+        if (!c00 || c00.data === null || this.isLodTileDirty(layerId, cX0, cY0, childLod)) {
+          c00 = this.generateLodTile(layerId, cX0, cY0, childLod);
+        }
+      } else {
+        c00 = null;
       }
-      if (!c10 || this.isLodTileDirty(layerId, cX0 + 1, cY0, childLod)) {
-        c10 = this.generateLodTile(layerId, cX0 + 1, cY0, childLod);
+      if (this.hasPopulatedLodTile(layerId, cX0 + 1, cY0, childLod)) {
+        if (!c10 || c10.data === null || this.isLodTileDirty(layerId, cX0 + 1, cY0, childLod)) {
+          c10 = this.generateLodTile(layerId, cX0 + 1, cY0, childLod);
+        }
+      } else {
+        c10 = null;
       }
-      if (!c01 || this.isLodTileDirty(layerId, cX0, cY0 + 1, childLod)) {
-        c01 = this.generateLodTile(layerId, cX0, cY0 + 1, childLod);
+      if (this.hasPopulatedLodTile(layerId, cX0, cY0 + 1, childLod)) {
+        if (!c01 || c01.data === null || this.isLodTileDirty(layerId, cX0, cY0 + 1, childLod)) {
+          c01 = this.generateLodTile(layerId, cX0, cY0 + 1, childLod);
+        }
+      } else {
+        c01 = null;
       }
-      if (!c11 || this.isLodTileDirty(layerId, cX0 + 1, cY0 + 1, childLod)) {
-        c11 = this.generateLodTile(layerId, cX0 + 1, cY0 + 1, childLod);
+      if (this.hasPopulatedLodTile(layerId, cX0 + 1, cY0 + 1, childLod)) {
+        if (!c11 || c11.data === null || this.isLodTileDirty(layerId, cX0 + 1, cY0 + 1, childLod)) {
+          c11 = this.generateLodTile(layerId, cX0 + 1, cY0 + 1, childLod);
+        }
+      } else {
+        c11 = null;
       }
     }
 
-    const firstChild = c00 || c10 || c01 || c11;
-    const format = firstChild ? firstChild.format : this.getLayerFormat(layerId);
+    const firstChild =
+      (c00 && c00.data !== null ? c00 : null) ||
+      (c10 && c10.data !== null ? c10 : null) ||
+      (c01 && c01.data !== null ? c01 : null) ||
+      (c11 && c11.data !== null ? c11 : null);
 
-    const key = getTileKey(layerId, lodTx, lodTy, targetLod);
     let tile = this.tiles.get(key);
+    if (!firstChild) {
+      if (tile) {
+        this.memoryManager?.notifyTileFreed(tile);
+        this.tiles.delete(key);
+      }
+      this.dirtyLodTiles.delete(key);
+      return null;
+    }
+
+    // Ephemeral display LOD > 0 tiles for monochrome-1bit layers use box-filtered color-32bit
+    // coverage instead of bitwise-OR dilation so zoomed-out lines match live mipmapped drafts.
+    const format: TileFormat =
+      firstChild.format === 'monochrome-1bit' ? 'color-32bit' : firstChild.format;
 
     let allocatedNew = false;
     if (!tile) {
@@ -2015,7 +2734,9 @@ export class SparseTileGrid {
           const dst32 = new Uint32Array(tile.data.buffer, tile.data.byteOffset, TILE_PIXELS);
           if (validW === TILE_SIZE && validH === TILE_SIZE) {
             dst32.fill(pixelU32);
+            tile.solidColorU32 = pixelU32;
           } else {
+            tile.solidColorU32 = undefined;
             dst32.fill(0);
             for (let y = 0; y < validH; y++) {
               const rowStart = y * TILE_SIZE;
@@ -2023,6 +2744,7 @@ export class SparseTileGrid {
             }
           }
         } else if (tile.format === 'grayscale-8bit') {
+          tile.solidColorU32 = undefined;
           if (validW === TILE_SIZE && validH === TILE_SIZE) {
             tile.data.fill(grayVal);
           } else {
@@ -2033,6 +2755,7 @@ export class SparseTileGrid {
             }
           }
         } else {
+          tile.solidColorU32 = undefined;
           tile.data.fill(0);
           for (let y = 0; y < validH; y++) {
             for (let x = 0; x < validW; x++) {
@@ -2079,14 +2802,23 @@ export class SparseTileGrid {
           this.memoryManager?.notifyTileAllocated(tile);
         }
         if (validW === TILE_SIZE && validH === TILE_SIZE) {
-          tile.data.fill(255);
+          if (tile.format === 'color-32bit') {
+            new Uint32Array(tile.data.buffer, tile.data.byteOffset, TILE_PIXELS).fill(PAPER_WHITE_U32);
+            tile.solidColorU32 = PAPER_WHITE_U32;
+          } else {
+            tile.data.fill(255);
+            tile.solidColorU32 = undefined;
+          }
         } else if (tile.format === 'color-32bit') {
-          tile.data.fill(0);
+          tile.solidColorU32 = undefined;
+          const dst32 = new Uint32Array(tile.data.buffer, tile.data.byteOffset, TILE_PIXELS);
+          dst32.fill(0);
           for (let y = 0; y < validH; y++) {
-            const rowStart = y * TILE_SIZE * 4;
-            tile.data.fill(255, rowStart, rowStart + validW * 4);
+            const rowStart = y * TILE_SIZE;
+            dst32.fill(PAPER_WHITE_U32, rowStart, rowStart + validW);
           }
         } else {
+          tile.solidColorU32 = undefined;
           tile.data.fill(0);
           for (let y = 0; y < validH; y++) {
             const rowStart = y * TILE_SIZE;
@@ -2145,6 +2877,8 @@ export class SparseTileGrid {
 
   public clearLayer(layerId: string): void {
     this.ingestedLayers.delete(layerId);
+    this.layerLod0Tiles.delete(layerId);
+    this.layerLodOccupancy.delete(layerId);
     const prefix = `${layerId}:`;
     const toDelete: string[] = [];
     for (const [key, tile] of this.tiles.entries()) {
@@ -2186,6 +2920,7 @@ export class SparseTileGrid {
         isPagedToDisk: false,
         lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
         lod: 0,
+        solidColorU32: srcTile.solidColorU32,
       };
       this.setTile(dstLayerId, srcTile.tileX, srcTile.tileY, clonedTile);
     }
@@ -2316,20 +3051,34 @@ export class SparseTileGrid {
       const currentTile = this.getTile(layerId, tileX, tileY, 0);
 
       const beforeData = before ? before.data : null;
-      const afterData = currentTile && currentTile.data ? new Uint8Array(currentTile.data) : null;
+      const currentData = currentTile && currentTile.data ? currentTile.data : null;
       const format = currentTile ? currentTile.format : (before ? before.format : this.getLayerFormat(layerId));
 
-      if (beforeData === null && afterData === null) continue;
+      if (beforeData === null && currentData === null) continue;
 
       let changed = false;
-      if ((beforeData === null) !== (afterData === null)) {
+      if ((beforeData === null) !== (currentData === null)) {
         changed = true;
-      } else if (beforeData && afterData) {
-        if (beforeData.byteLength !== afterData.byteLength) {
+      } else if (beforeData && currentData) {
+        if (beforeData.byteLength !== currentData.byteLength) {
           changed = true;
+        } else if (
+          beforeData.byteLength % 4 === 0 &&
+          beforeData.byteOffset % 4 === 0 &&
+          currentData.byteOffset % 4 === 0
+        ) {
+          const len32 = beforeData.byteLength >>> 2;
+          const b32 = new Uint32Array(beforeData.buffer, beforeData.byteOffset, len32);
+          const c32 = new Uint32Array(currentData.buffer, currentData.byteOffset, len32);
+          for (let i = 0; i < len32; i++) {
+            if (b32[i] !== c32[i]) {
+              changed = true;
+              break;
+            }
+          }
         } else {
           for (let i = 0; i < beforeData.byteLength; i++) {
-            if (beforeData[i] !== afterData[i]) {
+            if (beforeData[i] !== currentData[i]) {
               changed = true;
               break;
             }
@@ -2342,7 +3091,7 @@ export class SparseTileGrid {
           key,
           format,
           beforeData,
-          afterData,
+          afterData: currentData ? new Uint8Array(currentData) : null,
         });
       }
     }
@@ -2370,6 +3119,7 @@ export class SparseTileGrid {
           this.memoryManager?.notifyTileAllocated(tile);
         }
         tile.data.set(targetData);
+        tile.solidColorU32 = undefined;
         tile.format = delta.format;
         this.setLayerFormat(layerId, delta.format);
         tile.dirty = true;
@@ -2388,11 +3138,14 @@ export class SparseTileGrid {
       }
     }
     this.tiles.clear();
+    this.layerLod0Tiles.clear();
+    this.layerLodOccupancy.clear();
     this.layerFormats.clear();
     this.ingestedLayers.clear();
     this.dirtyLodTiles.clear();
     this.layerVersions.clear();
     this.gridEpoch++;
+    this.contentVersion++;
     this.notifyChange(true);
   }
 
@@ -2413,6 +3166,9 @@ export class SparseTileGrid {
     }
     for (const tile of tiles) {
       this.tiles.set(getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0), tile);
+      if ((tile.lod ?? 0) === 0) {
+        this.registerLod0Tile(tile);
+      }
       if (this.memoryManager) {
         this.memoryManager.notifyTileAllocated(tile);
       }

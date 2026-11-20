@@ -1390,6 +1390,102 @@ describe('Unified GPU Viewport Compositor', () => {
       expect(COMPOSITOR_FRAGMENT_SHADER).toContain('step(0.5, finalColor.a)');
       expect(COMPOSITOR_INSTANCED_FRAGMENT_SHADER).toContain('step(0.5, finalColor.a)');
     });
+
+    it('renders 6071x8598 manga canvas with zero empty-tile LOD thrashing, fast solid-tile LOD pyramid, and texSubImage2D draft updates', () => {
+      const { canvas, calls, glSpecErrors } = createMockWebGL2Context({ maxArrayLayers: 512 });
+      const compositor = new ViewportCompositor(canvas);
+      const grid = new SparseTileGrid();
+      const dims = { width: 6071, height: 8598, dpi: 600 };
+
+      // Solid white background (816 LOD 0 tiles) + completely empty ink layer
+      grid.fillLayerSolidWhite('layer-bg', dims.width, dims.height, 'color-32bit');
+      grid.setLayerFormat('layer-ink', 'monochrome-1bit');
+
+      const layers: LayerItem[] = [
+        {
+          id: 'layer-ink',
+          name: 'Ink',
+          type: 'raster',
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal',
+          locked: false,
+          parentId: null,
+          expressionColor: 'monochrome',
+        },
+        {
+          id: 'layer-bg',
+          name: 'Paper',
+          type: 'raster',
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal',
+          locked: false,
+          parentId: null,
+        },
+      ];
+
+      // Fit-to-screen zoom (~0.10 -> LOD 3)
+      const fitTransform: ViewportTransform = { pan: { x: 400, y: 300 }, zoom: 0.1, rotation: 0 };
+      const t0 = performance.now();
+      compositor.render(layers, fitTransform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-ink',
+      });
+      const firstFrameMs = performance.now() - t0;
+
+      // Empty ink layer must have 0 tiles and 0 populated LOD entries
+      expect(grid.hasLayerTiles('layer-ink')).toBe(false);
+      expect(grid.hasPopulatedLodTile('layer-ink', 0, 0, 3)).toBe(false);
+      // Solid-tile fast path should build LOD 3 for 6071x8598 rapidly
+      expect(firstFrameMs).toBeLessThan(250);
+
+      // 30 consecutive live-draft frames on empty ink layer at zoom = 1.0 must reuse texSubImage2D & skip mipmaps
+      const mockDraftCanvas = {
+        width: 512,
+        height: 512,
+        __draftHasContent: true,
+        __draftVersion: 1,
+        __draftSpace: 'document',
+        __draftDocRect: { x: 0, y: 0, width: 512, height: 512 },
+      } as unknown as HTMLCanvasElement;
+
+      const zoom1Transform: ViewportTransform = { pan: { x: 400, y: 300 }, zoom: 1.0, rotation: 0 };
+      compositor.render(layers, zoom1Transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-ink',
+        activeDraftLayerId: 'layer-ink',
+        activeDraftCanvas: mockDraftCanvas,
+        activeDraftVersion: 1,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+
+      calls.length = 0;
+      for (let v = 2; v <= 10; v++) {
+        (mockDraftCanvas as any).__draftVersion = v;
+        compositor.render(layers, zoom1Transform, dims, grid, {
+          dimensions: dims,
+          devicePixelRatio: 1,
+          activeLayerId: 'layer-ink',
+          activeDraftLayerId: 'layer-ink',
+          activeDraftCanvas: mockDraftCanvas,
+          activeDraftVersion: v,
+          activeDraftSpace: 'document',
+          activeDraftOpacity: 1.0,
+        });
+      }
+
+      expect(calls.filter((c) => c.name === 'texSubImage2D').length).toBe(9);
+      expect(calls.filter((c) => c.name === 'texImage2D').length).toBe(0);
+      expect(calls.filter((c) => c.name === 'generateMipmap').length).toBe(0);
+      expect(glSpecErrors).toEqual([]);
+      // Instanced fragment shader uses single hardware texture() fetch instead of 4x manual texelFetch
+      expect(COMPOSITOR_INSTANCED_FRAGMENT_SHADER).toContain('texture(u_tileArrayTexture, vec3(v_texCoord, v_sliceIndex))');
+      expect(COMPOSITOR_INSTANCED_FRAGMENT_SHADER).not.toContain('texelFetch');
+    });
   });
 });
 

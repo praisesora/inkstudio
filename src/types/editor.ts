@@ -860,6 +860,14 @@ export interface NewCanvasOptions {
   defaultFrequency?: number;
 }
 
+export interface SoraTimelapseMetadata {
+  enabled: boolean;
+  frameCount: number;
+  fps?: number;
+  resolution?: '720p' | '1080p';
+  aspectRatio?: 'original' | '16:9' | '9:16' | '1:1';
+}
+
 export interface LoadedDocument {
   name: string;
   dimensions: CanvasDimensions;
@@ -867,6 +875,10 @@ export interface LoadedDocument {
   layers: LayerItem[];
   layerCanvases?: Map<string, HTMLCanvasElement>;
   tileGrid?: SparseTileGrid;
+  perspectiveRuler?: PerspectiveRuler | null;
+  animationTimeline?: AnimationTimeline | null;
+  timelapse?: SoraTimelapseMetadata | null;
+  previewDataUrl?: string;
 }
 
 export type CmykStandard = 'japan-color-2001' | 'us-web-coated-swop' | 'iso-coated-v2';

@@ -682,7 +682,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           cam.flipY,
           rp.dimensions
         );
-        artboard.style.imageRendering = cam.zoom > 1 ? 'pixelated' : 'auto';
       }
 
       const ring = cursorRingRef.current;
@@ -1380,9 +1379,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             dimensions
           ),
           transformOrigin: '0 0',
-          boxShadow: '0 0 0 1px #161616, 0 10px 40px rgba(0, 0, 0, 0.55)',
           willChange: 'transform',
-          imageRendering: liveZoom > 1 ? 'pixelated' : 'auto',
           backgroundColor: 'transparent',
           backgroundImage: 'none',
         }}

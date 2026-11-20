@@ -1313,11 +1313,84 @@ export class WebGlBrushEngine {
       targetCtx.imageSmoothingEnabled = false;
     }
 
-    // Tile across dirty bounding box in <= 2048x2048 chunks so 70MP B4 600DPI strokes NEVER clip at 4096px!
-    for (let cy = fullDirtyY; cy < fullDirtyMaxY; cy += MAX_TILE_CHUNK) {
-      const dh = Math.min(MAX_TILE_CHUNK, fullDirtyMaxY - cy);
-      for (let cx = fullDirtyX; cx < fullDirtyMaxX; cx += MAX_TILE_CHUNK) {
-        const dw = Math.min(MAX_TILE_CHUNK, fullDirtyMaxX - cx);
+    // Tile across dirty bounding box in <= 2048x2048 chunks so 70MP B4 600DPI strokes NEVER clip at 4096px.
+    // For multi-chunk strokes (e.g. diagonal strokes on 6071x8598), pre-bin dab bounds per chunk so empty
+    // chunks are skipped completely and populated chunks use tightened viewports/readbacks.
+    const chunkCols = Math.ceil(totalW / MAX_TILE_CHUNK);
+    const chunkRows = Math.ceil(totalH / MAX_TILE_CHUNK);
+    const isMultiChunk = chunkCols > 1 || chunkRows > 1;
+    let cMinX: Float32Array | null = null;
+    let cMinY: Float32Array | null = null;
+    let cMaxX: Float32Array | null = null;
+    let cMaxY: Float32Array | null = null;
+
+    if (isMultiChunk) {
+      const chunkCount = chunkCols * chunkRows;
+      cMinX = new Float32Array(chunkCount);
+      cMinY = new Float32Array(chunkCount);
+      cMaxX = new Float32Array(chunkCount);
+      cMaxY = new Float32Array(chunkCount);
+      cMinX.fill(Infinity);
+      cMinY.fill(Infinity);
+      cMaxX.fill(-Infinity);
+      cMaxY.fill(-Infinity);
+
+      for (let i = 0; i < dabs.length; i++) {
+        const off = i * stride;
+        const dx = arr[off];
+        const dy = arr[off + 1];
+        const rad = Math.max(arr[off + 2], arr[off + 3]) * 0.75 + 4;
+        const x0 = dx - rad;
+        const y0 = dy - rad;
+        const x1 = dx + rad;
+        const y1 = dy + rad;
+
+        const col0 = Math.max(0, Math.floor((x0 - fullDirtyX) / MAX_TILE_CHUNK));
+        const col1 = Math.min(chunkCols - 1, Math.floor((x1 - fullDirtyX) / MAX_TILE_CHUNK));
+        const row0 = Math.max(0, Math.floor((y0 - fullDirtyY) / MAX_TILE_CHUNK));
+        const row1 = Math.min(chunkRows - 1, Math.floor((y1 - fullDirtyY) / MAX_TILE_CHUNK));
+
+        for (let r = row0; r <= row1; r++) {
+          const rowBase = r * chunkCols;
+          for (let c = col0; c <= col1; c++) {
+            const idx = rowBase + c;
+            if (x0 < cMinX[idx]) cMinX[idx] = x0;
+            if (y0 < cMinY[idx]) cMinY[idx] = y0;
+            if (x1 > cMaxX[idx]) cMaxX[idx] = x1;
+            if (y1 > cMaxY[idx]) cMaxY[idx] = y1;
+          }
+        }
+      }
+    }
+
+    for (let row = 0; row < chunkRows; row++) {
+      const cy = fullDirtyY + row * MAX_TILE_CHUNK;
+      const chunkMaxY = Math.min(fullDirtyMaxY, cy + MAX_TILE_CHUNK);
+      for (let col = 0; col < chunkCols; col++) {
+        const cx = fullDirtyX + col * MAX_TILE_CHUNK;
+        const chunkMaxX = Math.min(fullDirtyMaxX, cx + MAX_TILE_CHUNK);
+
+        let rx = cx;
+        let ry = cy;
+        let dw = chunkMaxX - cx;
+        let dh = chunkMaxY - cy;
+
+        if (isMultiChunk && cMinX && cMinY && cMaxX && cMaxY) {
+          const idx = row * chunkCols + col;
+          if (cMinX[idx] >= cMaxX[idx] || cMinY[idx] >= cMaxY[idx]) {
+            continue;
+          }
+          rx = Math.max(cx, Math.floor(cMinX[idx]));
+          ry = Math.max(cy, Math.floor(cMinY[idx]));
+          const rxEnd = Math.min(chunkMaxX, Math.ceil(cMaxX[idx]));
+          const ryEnd = Math.min(chunkMaxY, Math.ceil(cMaxY[idx]));
+          dw = rxEnd - rx;
+          dh = ryEnd - ry;
+          if (dw <= 0 || dh <= 0) {
+            continue;
+          }
+        }
+
         const viewY = Math.max(0, canvas.height - dh);
 
         if (useOffscreenFbo && this.dabFbo) {
@@ -1334,7 +1407,7 @@ export class WebGlBrushEngine {
 
         gl.uniform2f(this.uCanvasResolutionLoc, dw, dh);
         if (this.uDirtyOffsetLoc) {
-          gl.uniform2f(this.uDirtyOffsetLoc, cx, cy);
+          gl.uniform2f(this.uDirtyOffsetLoc, rx, ry);
         }
 
         if (useInstanced && this.extInstanced) {
@@ -1379,7 +1452,7 @@ export class WebGlBrushEngine {
           gl2.bindFramebuffer(gl2.FRAMEBUFFER, null);
         }
 
-        targetCtx.drawImage(canvas, 0, 0, dw, dh, cx, cy, dw, dh);
+        targetCtx.drawImage(canvas, 0, 0, dw, dh, rx, ry, dw, dh);
       }
     }
 

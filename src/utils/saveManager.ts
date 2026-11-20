@@ -3,27 +3,55 @@ import type {
   Layer as AgPsdLayer,
   LayerMaskData as AgPsdMaskData,
 } from 'ag-psd';
+import { Zip, ZipDeflate, ZipPassThrough, unzipSync } from 'fflate';
 import {
   CanvasDimensions,
   LayerItem,
   CanvasColorMode,
   BlendMode,
+  AnimationTimeline,
+  SoraTimelapseMetadata,
   isFolderLikeLayer,
   hasTileBackedLayer,
 } from '../types/editor';
+import type { PerspectiveRuler } from '../types/perspective';
 import { getCanvasCompositeOperation } from './canvasUtils';
-import { buildLayerTree, groupTreeNodesForCompositing, LayerTreeNode } from './compositor';
+import {
+  buildLayerTree,
+  groupTreeNodesForCompositing,
+  LayerTreeNode,
+  ViewportCompositor,
+  ViewportTransform,
+} from './compositor';
 import { applyAdjustment } from './tonalEngine';
 import { applyMultiFrameClip, renderFrameBorder } from './frameEngine';
+import { renderVectorLayer } from './vectorEngine';
 import { renderBalloonLayerData, renderTextLayerData } from './vectorLayerRenderer';
 import { recoveryService } from '../services/recoveryService';
-import { SparseTileGrid, TILE_SIZE, releaseTemporaryCanvas } from './tileEngine';
+import {
+  SparseTileGrid,
+  TILE_SIZE,
+  TileBuffer,
+  TileFormat,
+  getTileByteSize,
+  releaseTemporaryCanvas,
+} from './tileEngine';
 import { documentStore } from './documentStore';
 
 export interface SavedFileInfo {
   handle?: any; // FileSystemFileHandle
   name: string;
   extension: string;
+  size?: number;
+  previewDataUrl?: string;
+}
+
+export interface SaveProgress {
+  phase: 'preparing' | 'preview' | 'tiles' | 'masks' | 'compositing' | 'encoding' | 'finalizing' | 'done';
+  current: number;
+  total: number;
+  percent: number;
+  message: string;
 }
 
 export interface SaveDocumentData {
@@ -36,6 +64,218 @@ export interface SaveDocumentData {
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   tabId?: string;
+  perspectiveRuler?: PerspectiveRuler | null;
+  animationTimeline?: AnimationTimeline | null;
+  timelapse?: SoraTimelapseMetadata | null;
+  onProgress?: (progress: SaveProgress) => void;
+  compressionLevel?: 0 | 1 | 2 | 3 | 4 | 5 | 6;
+}
+
+export interface SoraV2Manifest {
+  format: 'sora-v2';
+  app: string;
+  version: '2.0';
+  tileSize: number;
+  name: string;
+  dimensions: CanvasDimensions;
+  colorMode: CanvasColorMode;
+  layers: Array<Omit<LayerItem, 'maskCanvas'>>;
+  layerFormats: Record<string, TileFormat>;
+  layerTileKeys: Record<string, string>;
+  masksMeta: Record<string, { width: number; height: number; format: 'alpha-8bit' }>;
+  perspectiveRuler?: PerspectiveRuler | null;
+  animationTimeline?: AnimationTimeline | null;
+  timelapse?: SoraTimelapseMetadata | null;
+  preview: { path: string; width: number; height: number } | null;
+  savedAt: number;
+}
+
+export interface ParsedSoraProject {
+  format: 'v2' | 'v1';
+  app: string;
+  version: string;
+  name: string;
+  dimensions: CanvasDimensions;
+  colorMode: CanvasColorMode;
+  layers: LayerItem[];
+  tileGrid?: SparseTileGrid;
+  canvases: Record<string, string>;
+  masks: Record<string, string>;
+  masksBinary?: Map<string, { width: number; height: number; data: Uint8Array }>;
+  perspectiveRuler?: PerspectiveRuler | null;
+  animationTimeline?: AnimationTimeline | null;
+  timelapse?: SoraTimelapseMetadata | null;
+  previewBytes?: Uint8Array | null;
+  previewDataUrl?: string;
+}
+
+export interface ExportImageOptions {
+  format?: 'png' | 'jpg' | 'jpeg' | 'webp';
+  quality?: number;
+  fillWhiteBackground?: boolean;
+  tileSize?: number;
+  onProgress?: (progress: SaveProgress) => void;
+}
+
+export interface ExportImageResult {
+  blob: Blob;
+  mimeType: string;
+  width: number;
+  height: number;
+  usedGpu: boolean;
+}
+
+export interface CompositeCanvasOptions {
+  tileSize?: number;
+  colorMode?: CanvasColorMode;
+  onProgress?: (progress: SaveProgress) => void;
+}
+
+export const SORA_V2_DEFAULT_TILE_EXPORT_SIZE = 2048;
+
+const SORA_V2_FORMAT_TO_BYTE: Record<TileFormat, number> = {
+  'monochrome-1bit': 0,
+  'grayscale-8bit': 1,
+  'color-32bit': 2,
+};
+
+const SORA_V2_BYTE_TO_FORMAT: Record<number, TileFormat> = {
+  0: 'monochrome-1bit',
+  1: 'grayscale-8bit',
+  2: 'color-32bit',
+};
+
+const TILE_BINARY_HEADER_BYTES = 9; // [format:u8][version:u32 LE][dataLen:u32 LE]
+const MASK_BINARY_HEADER_BYTES = 8; // [width:u32 LE][height:u32 LE]
+const MAX_MANIFEST_BYTES = 64 * 1024 * 1024;
+const MAX_DOCUMENT_DIM = 65536;
+const MAX_TILE_ENTRIES = 120000;
+const CHUNK_YIELD_INTERVAL = 8;
+const MAX_STYLE_MARGIN_PX = 256;
+const PREVIEW_MAX_DIM = 512;
+
+function yieldToMainThread(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+function bytesToBase64(bytes: Uint8Array): string {
+  if (typeof btoa === 'function') {
+    const chunkSize = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const slice = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+      binary += String.fromCharCode(...slice);
+    }
+    return btoa(binary);
+  }
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i];
+    const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    const triple = (a << 16) | (b << 8) | c;
+    out += BASE64_ALPHABET[(triple >> 18) & 63];
+    out += BASE64_ALPHABET[(triple >> 12) & 63];
+    out += i + 1 < bytes.length ? BASE64_ALPHABET[(triple >> 6) & 63] : '=';
+    out += i + 2 < bytes.length ? BASE64_ALPHABET[triple & 63] : '=';
+  }
+  return out;
+}
+
+function toPngDataUrl(bytes: Uint8Array | null | undefined): string | undefined {
+  if (!bytes || bytes.byteLength === 0) return undefined;
+  const b64 = bytesToBase64(bytes);
+  return b64 ? `data:image/png;base64,${b64}` : undefined;
+}
+
+function toSafeZipKey(rawId: string, usedKeys: Set<string>): string {
+  let base = rawId.replace(/[^a-zA-Z0-9._-]/g, '_');
+  if (!base || base === '.' || base === '..') {
+    base = 'layer';
+  }
+  // Prevent hidden or traversal-looking segments
+  base = base.replace(/\.{2,}/g, '_');
+  let candidate = base;
+  let suffix = 1;
+  while (usedKeys.has(candidate)) {
+    candidate = `${base}_${suffix++}`;
+  }
+  usedKeys.add(candidate);
+  return candidate;
+}
+
+function isSafeZipPath(path: string): boolean {
+  if (!path || path.includes('\0') || path.includes('\\') || path.startsWith('/')) {
+    return false;
+  }
+  const segments = path.split('/');
+  for (const seg of segments) {
+    if (!seg || seg === '.' || seg === '..') {
+      return false;
+    }
+  }
+  return true;
+}
+
+function sanitizeJsonLayer(raw: any): LayerItem {
+  const clean: any = Object.create(null);
+  for (const key of Object.keys(raw)) {
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    clean[key] = raw[key];
+  }
+  const normalized: LayerItem = { ...clean };
+  if (normalized.maskCanvas && typeof normalized.maskCanvas.getContext !== 'function') {
+    normalized.maskCanvas = undefined;
+  }
+  return normalized;
+}
+
+/**
+ * Checks whether binary input begins with `.sora` v2 container magic bytes:
+ * - Standard ZIP local file header (`PK\x03\x04`) or empty ZIP (`PK\x05\x06`)
+ * - Optional explicit `SORA\x00\x02` wrapper prefix
+ */
+export function isSoraV2Bytes(input: Uint8Array | ArrayBuffer): boolean {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (bytes.byteLength < 4) return false;
+  // PK\x03\x04 or PK\x05\x06 (ZIP container)
+  if (
+    bytes[0] === 0x50 &&
+    bytes[1] === 0x4b &&
+    ((bytes[2] === 0x03 && bytes[3] === 0x04) || (bytes[2] === 0x05 && bytes[3] === 0x06))
+  ) {
+    return true;
+  }
+  // Optional SORA\x00\x02 wrapper prefix
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x53 &&
+    bytes[1] === 0x4f &&
+    bytes[2] === 0x52 &&
+    bytes[3] === 0x41 &&
+    bytes[4] === 0x00 &&
+    bytes[5] === 0x02
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function unwrapZipPayload(bytes: Uint8Array): Uint8Array {
+  if (
+    bytes.byteLength >= 8 &&
+    bytes[0] === 0x53 &&
+    bytes[1] === 0x4f &&
+    bytes[2] === 0x52 &&
+    bytes[3] === 0x41 &&
+    bytes[4] === 0x00 &&
+    bytes[5] === 0x02
+  ) {
+    return bytes.subarray(8);
+  }
+  return bytes;
 }
 
 /**
@@ -119,7 +359,6 @@ function attachRasterPixelsForPsd(
   tileGrid: SparseTileGrid | undefined,
   tempCanvases: HTMLCanvasElement[]
 ): void {
-  // Prefer direct sparse tile bbox read when backed by SparseTileGrid (no full-size canvas allocation)
   const isVectorText =
     (layer.type === 'text' && Boolean(layer.textData)) ||
     (layer.type === 'balloon' && Boolean(layer.balloonData));
@@ -185,7 +424,6 @@ function buildPsdLayerTree(
 ): AgPsdLayer[] {
   const result: AgPsdLayer[] = [];
 
-  // ag-psd expects bottom-to-top order; Ink Studio layer tree is top-to-bottom
   for (let i = nodes.length - 1; i >= 0; i--) {
     const node = nodes[i];
     const layer = node.layer;
@@ -255,7 +493,6 @@ function acquireLayerExportCanvas(
   layerCanvasesMap: Map<string, HTMLCanvasElement>,
   tileGrid?: SparseTileGrid
 ): { canvas: HTMLCanvasElement | null; isTemporary: boolean } {
-  // Always render non-destructive text/balloon layers crisply from vector metadata when available
   if (layer.type === 'text' && layer.textData && typeof document !== 'undefined') {
     const temp = document.createElement('canvas');
     temp.width = dimensions.width;
@@ -283,11 +520,594 @@ function acquireLayerExportCanvas(
   return { canvas: null, isTemporary: false };
 }
 
+// ============================================================================
+// Pixel-Accurate GPU Tiled Export Engine (ViewportCompositor FBO Pipeline)
+// ============================================================================
+
 /**
- * Composites all visible layers with their blend modes, opacities, frame-folder polygon clipping,
- * and non-destructive vector text/balloon layers onto a single canvas.
+ * Computes the maximum pixel halo margin required around export tiles so GPU
+ * Layer Styles (Stroke, Drop Shadow, Outer Glow) render seamlessly across tile seams.
  */
-export function compositeCanvas(
+export function computeMaxLayerStyleMargin(layers: LayerItem[]): number {
+  let maxMargin = 0;
+  for (const layer of layers) {
+    if (!layer.visible || layer.opacity <= 0.001 || !layer.styles) continue;
+    const { stroke, dropShadow, outerGlow } = layer.styles;
+    if (stroke?.enabled && stroke.size > 0 && stroke.opacity > 0) {
+      maxMargin = Math.max(maxMargin, Math.ceil(stroke.size) + 2);
+    }
+    if (dropShadow?.enabled && dropShadow.opacity > 0) {
+      const extent = Math.ceil((dropShadow.distance || 0) + (dropShadow.blur || 0) * 1.5) + 2;
+      maxMargin = Math.max(maxMargin, extent);
+    }
+    if (outerGlow?.enabled && outerGlow.opacity > 0 && outerGlow.blur > 0) {
+      const extent = Math.ceil(outerGlow.blur * 1.5) + 2;
+      maxMargin = Math.max(maxMargin, extent);
+    }
+  }
+  return Math.min(MAX_STYLE_MARGIN_PX, Math.max(0, maxMargin));
+}
+
+function inferLayerTileFormat(layer: LayerItem): TileFormat {
+  if (layer.expressionColor === 'monochrome') return 'monochrome-1bit';
+  if (layer.expressionColor === 'gray') return 'grayscale-8bit';
+  return 'color-32bit';
+}
+
+/**
+ * Prepares a SparseTileGrid containing all visible tile-backed layers for GPU compositing.
+ * Zero-copy fast path when `tileGrid` already holds all visible raster/vector/text/balloon layers.
+ */
+function prepareExportTileGrid(
+  dimensions: CanvasDimensions,
+  layers: LayerItem[],
+  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  tileGrid?: SparseTileGrid
+): { grid: SparseTileGrid; isTemporary: boolean } {
+  const missingLayers: LayerItem[] = [];
+
+  for (const layer of layers) {
+    if (!layer.visible || layer.opacity <= 0.001) continue;
+    if (!hasTileBackedLayer(layer)) continue;
+    const hasTiles = Boolean(tileGrid && tileGrid.hasLayerTiles(layer.id));
+    if (hasTiles) continue;
+
+    const hasVectorSource =
+      (layer.type === 'text' && Boolean(layer.textData)) ||
+      (layer.type === 'balloon' && Boolean(layer.balloonData)) ||
+      (layer.type === 'vector' && Boolean(layer.vectorStrokes && layer.vectorStrokes.length > 0));
+    if (hasVectorSource || layerCanvasesMap.has(layer.id)) {
+      missingLayers.push(layer);
+    }
+  }
+
+  if (tileGrid && missingLayers.length === 0) {
+    return { grid: tileGrid, isTemporary: false };
+  }
+
+  const tempGrid = new SparseTileGrid();
+  if (tileGrid) {
+    // Share existing TileBuffer references without duplicating pixel buffers
+    for (const [layerId, fmt] of tileGrid.getAllLayerFormats().entries()) {
+      tempGrid.setLayerFormat(layerId, fmt);
+    }
+    for (const tile of tileGrid.getAllTiles()) {
+      if ((tile.lod ?? 0) === 0) {
+        tempGrid.setTile(tile.layerId, tile.tileX, tile.tileY, tile);
+      }
+    }
+  }
+
+  if (typeof document !== 'undefined') {
+    for (const layer of missingLayers) {
+      const fmt = inferLayerTileFormat(layer);
+      if (layer.type === 'text' && layer.textData) {
+        const temp = document.createElement('canvas');
+        temp.width = dimensions.width;
+        temp.height = dimensions.height;
+        const ctx = temp.getContext('2d');
+        if (ctx) renderTextLayerData(ctx, layer.textData);
+        tempGrid.ingestCanvas(layer.id, temp, fmt);
+        releaseTemporaryCanvas(temp);
+      } else if (layer.type === 'balloon' && layer.balloonData) {
+        const temp = document.createElement('canvas');
+        temp.width = dimensions.width;
+        temp.height = dimensions.height;
+        const ctx = temp.getContext('2d');
+        if (ctx) renderBalloonLayerData(ctx, layer.balloonData);
+        tempGrid.ingestCanvas(layer.id, temp, fmt);
+        releaseTemporaryCanvas(temp);
+      } else {
+        const existingCanvas = layerCanvasesMap.get(layer.id);
+        if (existingCanvas) {
+          tempGrid.ingestCanvas(layer.id, existingCanvas, fmt);
+        } else if (layer.type === 'vector' && layer.vectorStrokes && layer.vectorStrokes.length > 0) {
+          const temp = document.createElement('canvas');
+          temp.width = dimensions.width;
+          temp.height = dimensions.height;
+          const ctx = temp.getContext('2d');
+          if (ctx) renderVectorLayer(ctx, layer.vectorStrokes);
+          tempGrid.ingestCanvas(layer.id, temp, fmt);
+          releaseTemporaryCanvas(temp);
+        }
+      }
+    }
+  }
+
+  return { grid: tempGrid, isTemporary: true };
+}
+
+/**
+ * Ensures any tiles paged out to SSD scratch disk for visible layers are hydrated in RAM
+ * before GPU or CPU export begins.
+ */
+async function hydratePagedTilesForLayers(
+  tileGrid: SparseTileGrid | undefined,
+  layers: LayerItem[],
+  visibleOnly: boolean
+): Promise<void> {
+  if (!tileGrid) return;
+  const mm = tileGrid.getMemoryManager();
+  if (!mm) return;
+
+  for (const layer of layers) {
+    if (visibleOnly && (!layer.visible || layer.opacity <= 0.001)) continue;
+    if (!hasTileBackedLayer(layer)) continue;
+    const tiles = tileGrid.getLayerTiles(layer.id, 0);
+    for (const tile of tiles) {
+      if (tile.data === null && tile.isPagedToDisk) {
+        await mm.requestTileData(tile);
+      }
+    }
+  }
+}
+
+export interface GpuTilePlanEntry {
+  tileX: number;
+  tileY: number;
+  width: number;
+  height: number;
+  padLeft: number;
+  padTop: number;
+  padRight: number;
+  padBottom: number;
+  originX: number;
+  originY: number;
+  fboWidth: number;
+  fboHeight: number;
+}
+
+/**
+ * Pure geometry planner for tiled GPU FBO export with seam-free Layer Style halo padding.
+ */
+export function buildGpuExportTilePlan(
+  docWidth: number,
+  docHeight: number,
+  maxTileSize: number = SORA_V2_DEFAULT_TILE_EXPORT_SIZE,
+  styleMargin: number = 0
+): { fboWidth: number; fboHeight: number; tiles: GpuTilePlanEntry[] } {
+  const safeMaxTile = Math.max(256, Math.floor(maxTileSize));
+  const clampedMargin = Math.max(0, Math.min(styleMargin, Math.floor((safeMaxTile - 256) / 2)));
+  const innerStep = Math.max(256, safeMaxTile - clampedMargin * 2);
+
+  const tiles: GpuTilePlanEntry[] = [];
+  let maxFboW = 1;
+  let maxFboH = 1;
+
+  for (let tileY = 0; tileY < docHeight; tileY += innerStep) {
+    const height = Math.min(innerStep, docHeight - tileY);
+    const padTop = Math.min(clampedMargin, tileY);
+    const padBottom = Math.min(clampedMargin, docHeight - (tileY + height));
+    const fboHeight = height + padTop + padBottom;
+    if (fboHeight > maxFboH) maxFboH = fboHeight;
+
+    for (let tileX = 0; tileX < docWidth; tileX += innerStep) {
+      const width = Math.min(innerStep, docWidth - tileX);
+      const padLeft = Math.min(clampedMargin, tileX);
+      const padRight = Math.min(clampedMargin, docWidth - (tileX + width));
+      const fboWidth = width + padLeft + padRight;
+      if (fboWidth > maxFboW) maxFboW = fboWidth;
+
+      tiles.push({
+        tileX,
+        tileY,
+        width,
+        height,
+        padLeft,
+        padTop,
+        padRight,
+        padBottom,
+        originX: tileX - padLeft,
+        originY: tileY - padTop,
+        fboWidth,
+        fboHeight,
+      });
+    }
+  }
+
+  return { fboWidth: maxFboW, fboHeight: maxFboH, tiles };
+}
+
+function tryCompositeCanvasGpuSync(
+  dimensions: CanvasDimensions,
+  layers: LayerItem[],
+  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  fillWhiteBackground: boolean,
+  tileGrid?: SparseTileGrid,
+  options?: CompositeCanvasOptions
+): HTMLCanvasElement | null {
+  if (typeof document === 'undefined' || dimensions.width <= 0 || dimensions.height <= 0) {
+    return null;
+  }
+
+  const probeCanvas = document.createElement('canvas');
+  const requestedTileSize = options?.tileSize ?? SORA_V2_DEFAULT_TILE_EXPORT_SIZE;
+  probeCanvas.width = Math.min(requestedTileSize, dimensions.width);
+  probeCanvas.height = Math.min(requestedTileSize, dimensions.height);
+
+  const compositor = new ViewportCompositor(probeCanvas, { preserveDrawingBuffer: true });
+  if (!compositor.isReady()) {
+    compositor.dispose();
+    releaseTemporaryCanvas(probeCanvas);
+    return null;
+  }
+
+  const prepared = prepareExportTileGrid(dimensions, layers, layerCanvasesMap, tileGrid);
+  const exportCanvas = document.createElement('canvas');
+  exportCanvas.width = dimensions.width;
+  exportCanvas.height = dimensions.height;
+  const dstCtx = exportCanvas.getContext('2d');
+
+  try {
+    if (!dstCtx) {
+      return exportCanvas;
+    }
+
+    const maxGpuTile = Math.min(requestedTileSize, compositor.getMaxTextureSize());
+    const styleMargin = computeMaxLayerStyleMargin(layers);
+    const plan = buildGpuExportTilePlan(dimensions.width, dimensions.height, maxGpuTile, styleMargin);
+
+    if (probeCanvas.width !== plan.fboWidth) probeCanvas.width = plan.fboWidth;
+    if (probeCanvas.height !== plan.fboHeight) probeCanvas.height = plan.fboHeight;
+
+    const total = plan.tiles.length;
+    for (let i = 0; i < total; i++) {
+      const entry = plan.tiles[i];
+      const transform: ViewportTransform = {
+        pan: {
+          x: dimensions.width * 0.5 - entry.originX,
+          y: dimensions.height * 0.5 - entry.originY,
+        },
+        zoom: 1.0,
+        rotation: 0,
+        flipX: false,
+        flipY: false,
+      };
+
+      compositor.render(layers, transform, dimensions, prepared.grid, {
+        dimensions,
+        colorMode: options?.colorMode,
+        showCheckerboard: false,
+        transparentBackground: !fillWhiteBackground,
+        bypassStackCache: true,
+        devicePixelRatio: 1,
+      });
+
+      dstCtx.drawImage(
+        probeCanvas,
+        entry.padLeft,
+        entry.padTop,
+        entry.width,
+        entry.height,
+        entry.tileX,
+        entry.tileY,
+        entry.width,
+        entry.height
+      );
+
+      if (options?.onProgress) {
+        const done = i + 1;
+        options.onProgress({
+          phase: 'compositing',
+          current: done,
+          total,
+          percent: Math.round((done / total) * 100),
+          message: `Compositing GPU tile ${done}/${total}...`,
+        });
+      }
+    }
+
+    return exportCanvas;
+  } catch (err) {
+    console.warn('GPU tiled export failed, falling back to CPU compositor:', err);
+    releaseTemporaryCanvas(exportCanvas);
+    return null;
+  } finally {
+    compositor.dispose();
+    releaseTemporaryCanvas(probeCanvas);
+    if (prepared.isTemporary) {
+      prepared.grid.clearAll();
+    }
+  }
+}
+
+/**
+ * Asynchronous tiled GPU compositor with paged-tile hydration, progress reporting,
+ * and event-loop yields between tiles. Falls back to CPU only when WebGL2 is unavailable.
+ */
+export async function compositeCanvasAsync(
+  dimensions: CanvasDimensions,
+  layers: LayerItem[],
+  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  getEffectiveOpacity: (layer: LayerItem) => number,
+  isLayerEffectivelyVisible: (layer: LayerItem) => boolean,
+  fillWhiteBackground: boolean = false,
+  tileGrid?: SparseTileGrid,
+  options?: CompositeCanvasOptions
+): Promise<{ canvas: HTMLCanvasElement; usedGpu: boolean }> {
+  await hydratePagedTilesForLayers(tileGrid, layers, true);
+
+  if (typeof document !== 'undefined' && dimensions.width > 0 && dimensions.height > 0) {
+    const requestedTileSize = options?.tileSize ?? SORA_V2_DEFAULT_TILE_EXPORT_SIZE;
+    const probeCanvas = document.createElement('canvas');
+    probeCanvas.width = Math.min(requestedTileSize, dimensions.width);
+    probeCanvas.height = Math.min(requestedTileSize, dimensions.height);
+
+    const compositor = new ViewportCompositor(probeCanvas, { preserveDrawingBuffer: true });
+    if (compositor.isReady()) {
+      const prepared = prepareExportTileGrid(dimensions, layers, layerCanvasesMap, tileGrid);
+      const exportCanvas = document.createElement('canvas');
+      exportCanvas.width = dimensions.width;
+      exportCanvas.height = dimensions.height;
+      const dstCtx = exportCanvas.getContext('2d');
+
+      try {
+        if (dstCtx) {
+          const maxGpuTile = Math.min(requestedTileSize, compositor.getMaxTextureSize());
+          const styleMargin = computeMaxLayerStyleMargin(layers);
+          const plan = buildGpuExportTilePlan(dimensions.width, dimensions.height, maxGpuTile, styleMargin);
+
+          if (probeCanvas.width !== plan.fboWidth) probeCanvas.width = plan.fboWidth;
+          if (probeCanvas.height !== plan.fboHeight) probeCanvas.height = plan.fboHeight;
+
+          const total = plan.tiles.length;
+          for (let i = 0; i < total; i++) {
+            const entry = plan.tiles[i];
+            const transform: ViewportTransform = {
+              pan: {
+                x: dimensions.width * 0.5 - entry.originX,
+                y: dimensions.height * 0.5 - entry.originY,
+              },
+              zoom: 1.0,
+              rotation: 0,
+              flipX: false,
+              flipY: false,
+            };
+
+            compositor.render(layers, transform, dimensions, prepared.grid, {
+              dimensions,
+              colorMode: options?.colorMode,
+              showCheckerboard: false,
+              transparentBackground: !fillWhiteBackground,
+              bypassStackCache: true,
+              devicePixelRatio: 1,
+            });
+
+            dstCtx.drawImage(
+              probeCanvas,
+              entry.padLeft,
+              entry.padTop,
+              entry.width,
+              entry.height,
+              entry.tileX,
+              entry.tileY,
+              entry.width,
+              entry.height
+            );
+
+            if (options?.onProgress) {
+              const done = i + 1;
+              options.onProgress({
+                phase: 'compositing',
+                current: done,
+                total,
+                percent: Math.round((done / total) * 85),
+                message: `Compositing GPU tile ${done}/${total}...`,
+              });
+            }
+
+            if (i + 1 < total) {
+              await yieldToMainThread();
+            }
+          }
+        }
+        return { canvas: exportCanvas, usedGpu: true };
+      } catch (err) {
+        console.warn('Async GPU tiled export failed, falling back to CPU compositor:', err);
+        releaseTemporaryCanvas(exportCanvas);
+      } finally {
+        compositor.dispose();
+        releaseTemporaryCanvas(probeCanvas);
+        if (prepared.isTemporary) {
+          prepared.grid.clearAll();
+        }
+      }
+    } else {
+      compositor.dispose();
+      releaseTemporaryCanvas(probeCanvas);
+    }
+  }
+
+  const cpuCanvas = compositeCanvasCpuFallback(
+    dimensions,
+    layers,
+    layerCanvasesMap,
+    getEffectiveOpacity,
+    isLayerEffectivelyVisible,
+    fillWhiteBackground,
+    tileGrid
+  );
+  return { canvas: cpuCanvas, usedGpu: false };
+}
+
+/**
+ * Creates a reusable GPU region renderer (with CPU fallback) for rendering arbitrary
+ * document strips (e.g., tall 800x50,000px Webtoon chapter slices without allocating
+ * a monolithic full-height canvas). Caller MUST call `dispose()` when done.
+ */
+export function createDocumentRegionRenderer(
+  dimensions: CanvasDimensions,
+  layers: LayerItem[],
+  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  getEffectiveOpacity: (layer: LayerItem) => number,
+  isLayerEffectivelyVisible: (layer: LayerItem) => boolean,
+  tileGrid?: SparseTileGrid,
+  options?: { colorMode?: CanvasColorMode; maxTileSize?: number }
+): {
+  usedGpu: boolean;
+  renderRegion: (
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    targetCanvas: HTMLCanvasElement,
+    fillWhiteBackground: boolean
+  ) => void;
+  dispose: () => void;
+} {
+  const maxTileSize = options?.maxTileSize ?? SORA_V2_DEFAULT_TILE_EXPORT_SIZE;
+  const styleMargin = computeMaxLayerStyleMargin(layers);
+  const prepared = prepareExportTileGrid(dimensions, layers, layerCanvasesMap, tileGrid);
+
+  let gpuCanvas: HTMLCanvasElement | null = null;
+  let compositor: ViewportCompositor | null = null;
+  let usedGpu = false;
+  let cpuFullCache: HTMLCanvasElement | null = null;
+  let cpuFullCacheWhite = false;
+
+  if (typeof document !== 'undefined') {
+    gpuCanvas = document.createElement('canvas');
+    gpuCanvas.width = Math.min(maxTileSize, Math.max(1, dimensions.width));
+    gpuCanvas.height = Math.min(maxTileSize, Math.max(1, dimensions.height));
+    const candidate = new ViewportCompositor(gpuCanvas, { preserveDrawingBuffer: true });
+    if (candidate.isReady()) {
+      compositor = candidate;
+      usedGpu = true;
+    } else {
+      candidate.dispose();
+      releaseTemporaryCanvas(gpuCanvas);
+      gpuCanvas = null;
+    }
+  }
+
+  const renderRegion = (
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    targetCanvas: HTMLCanvasElement,
+    fillWhiteBackground: boolean
+  ): void => {
+    const dstCtx = targetCanvas.getContext('2d');
+    if (!dstCtx || width <= 0 || height <= 0) return;
+
+    if (fillWhiteBackground) {
+      dstCtx.fillStyle = '#ffffff';
+      dstCtx.fillRect(0, 0, width, height);
+    } else {
+      dstCtx.clearRect(0, 0, width, height);
+    }
+
+    if (compositor && gpuCanvas) {
+      const maxGpuTile = Math.min(maxTileSize, compositor.getMaxTextureSize());
+      const clampedMargin = Math.max(0, Math.min(styleMargin, Math.floor((maxGpuTile - 256) / 2)));
+      const innerStep = Math.max(256, maxGpuTile - clampedMargin * 2);
+
+      for (let sy = 0; sy < height; sy += innerStep) {
+        const subH = Math.min(innerStep, height - sy);
+        const docY = y + sy;
+        const padTop = Math.min(clampedMargin, docY);
+        const padBottom = Math.min(clampedMargin, Math.max(0, dimensions.height - (docY + subH)));
+
+        for (let sx = 0; sx < width; sx += innerStep) {
+          const subW = Math.min(innerStep, width - sx);
+          const docX = x + sx;
+          const padLeft = Math.min(clampedMargin, docX);
+          const padRight = Math.min(clampedMargin, Math.max(0, dimensions.width - (docX + subW)));
+
+          const fboW = subW + padLeft + padRight;
+          const fboH = subH + padTop + padBottom;
+          if (gpuCanvas.width < fboW) gpuCanvas.width = fboW;
+          if (gpuCanvas.height < fboH) gpuCanvas.height = fboH;
+
+          const transform: ViewportTransform = {
+            pan: {
+              x: dimensions.width * 0.5 - (docX - padLeft),
+              y: dimensions.height * 0.5 - (docY - padTop),
+            },
+            zoom: 1.0,
+            rotation: 0,
+            flipX: false,
+            flipY: false,
+          };
+
+          compositor.render(layers, transform, dimensions, prepared.grid, {
+            dimensions,
+            colorMode: options?.colorMode,
+            showCheckerboard: false,
+            transparentBackground: !fillWhiteBackground,
+            bypassStackCache: true,
+            devicePixelRatio: 1,
+          });
+
+          dstCtx.drawImage(gpuCanvas, padLeft, padTop, subW, subH, sx, sy, subW, subH);
+        }
+      }
+      return;
+    }
+
+    // CPU fallback when WebGL2 is unavailable
+    if (!cpuFullCache || cpuFullCacheWhite !== fillWhiteBackground) {
+      if (cpuFullCache) releaseTemporaryCanvas(cpuFullCache);
+      cpuFullCache = compositeCanvasCpuFallback(
+        dimensions,
+        layers,
+        layerCanvasesMap,
+        getEffectiveOpacity,
+        isLayerEffectivelyVisible,
+        fillWhiteBackground,
+        tileGrid
+      );
+      cpuFullCacheWhite = fillWhiteBackground;
+    }
+    dstCtx.drawImage(cpuFullCache, x, y, width, height, 0, 0, width, height);
+  };
+
+  const dispose = (): void => {
+    if (compositor) {
+      compositor.dispose();
+      compositor = null;
+    }
+    if (gpuCanvas) {
+      releaseTemporaryCanvas(gpuCanvas);
+      gpuCanvas = null;
+    }
+    if (cpuFullCache) {
+      releaseTemporaryCanvas(cpuFullCache);
+      cpuFullCache = null;
+    }
+    if (prepared.isTemporary) {
+      prepared.grid.clearAll();
+    }
+  };
+
+  return { usedGpu, renderRegion, dispose };
+}
+
+/**
+ * CPU 2D fallback compositor — used strictly when WebGL2 is unavailable.
+ */
+export function compositeCanvasCpuFallback(
   dimensions: CanvasDimensions,
   layers: LayerItem[],
   layerCanvasesMap: Map<string, HTMLCanvasElement>,
@@ -494,6 +1314,108 @@ export function compositeCanvas(
 }
 
 /**
+ * Composites all visible layers using tiled offscreen WebGL2 rendering via `ViewportCompositor`
+ * (preserving 100% of GPU blend modes, Layer Styles, Screentones, Layer Color Tint,
+ * Expression Color, Frame Folders, and Adjustment Layers).
+ * Falls back to 2D CPU compositing strictly when WebGL2 is unavailable.
+ */
+export function compositeCanvas(
+  dimensions: CanvasDimensions,
+  layers: LayerItem[],
+  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  getEffectiveOpacity: (layer: LayerItem) => number,
+  isLayerEffectivelyVisible: (layer: LayerItem) => boolean,
+  fillWhiteBackground: boolean = false,
+  tileGrid?: SparseTileGrid,
+  options?: CompositeCanvasOptions
+): HTMLCanvasElement {
+  const gpuResult = tryCompositeCanvasGpuSync(
+    dimensions,
+    layers,
+    layerCanvasesMap,
+    fillWhiteBackground,
+    tileGrid,
+    options
+  );
+  if (gpuResult) {
+    return gpuResult;
+  }
+
+  return compositeCanvasCpuFallback(
+    dimensions,
+    layers,
+    layerCanvasesMap,
+    getEffectiveOpacity,
+    isLayerEffectivelyVisible,
+    fillWhiteBackground,
+    tileGrid
+  );
+}
+
+/**
+ * Pixel-accurate tiled GPU image exporter (PNG / JPEG / WebP) with automatic
+ * CPU fallback when WebGL2 is unavailable.
+ */
+export async function exportImage(
+  data: SaveDocumentData,
+  options: ExportImageOptions = {}
+): Promise<ExportImageResult> {
+  const format = options.format ?? 'png';
+  const isJpeg = format === 'jpg' || format === 'jpeg';
+  const isWebp = format === 'webp';
+  const mimeType = isJpeg ? 'image/jpeg' : isWebp ? 'image/webp' : 'image/png';
+  const quality = isJpeg || isWebp ? (options.quality ?? 0.92) : undefined;
+  const fillWhite = options.fillWhiteBackground ?? isJpeg;
+  const tileGrid =
+    data.tileGrid ??
+    (data.tabId ? documentStore.getSession(data.tabId)?.tileGrid : documentStore.getActiveTileGrid());
+
+  const onProgress = options.onProgress ?? data.onProgress;
+
+  const { canvas, usedGpu } = await compositeCanvasAsync(
+    data.dimensions,
+    data.layers,
+    data.layerCanvasesMap,
+    data.getEffectiveOpacity,
+    data.isLayerEffectivelyVisible,
+    fillWhite,
+    tileGrid,
+    {
+      tileSize: options.tileSize ?? SORA_V2_DEFAULT_TILE_EXPORT_SIZE,
+      colorMode: data.colorMode,
+      onProgress,
+    }
+  );
+
+  try {
+    onProgress?.({
+      phase: 'encoding',
+      current: 1,
+      total: 1,
+      percent: 92,
+      message: `Encoding ${format.toUpperCase()}...`,
+    });
+    const blob = await canvasToBlob(canvas, mimeType, quality);
+    onProgress?.({
+      phase: 'done',
+      current: 1,
+      total: 1,
+      percent: 100,
+      message: 'Export complete',
+    });
+    return {
+      blob,
+      mimeType,
+      width: data.dimensions.width,
+      height: data.dimensions.height,
+      usedGpu,
+    };
+  } finally {
+    releaseTemporaryCanvas(canvas);
+  }
+}
+
+/**
  * Converts a canvas element into a Blob with the specified mime-type.
  */
 export function canvasToBlob(
@@ -513,6 +1435,10 @@ export function canvasToBlob(
   });
 }
 
+// ============================================================================
+// Binary `.sora` v2 Container (fflate ZIP) & Legacy v1.2 JSON Support
+// ============================================================================
+
 export interface SerializedSoraProject {
   app: string;
   version: string;
@@ -525,8 +1451,7 @@ export interface SerializedSoraProject {
 }
 
 /**
- * Pure serializer for native `.sora` / `.ink` project JSON, preserving non-destructive
- * text, speech balloon, vector, adjustment, and frame-folder metadata.
+ * Legacy v1.2 JSON serializer — kept exported for backward compatibility and tests.
  */
 export function buildSoraProjectPayload(
   data: SaveDocumentData,
@@ -562,28 +1487,22 @@ export function buildSoraProjectPayload(
 }
 
 /**
- * Pure parser for `.sora` / `.ink` JSON strings validating structural integrity
- * and restoring non-destructive text, balloon, and frame-folder layer metadata.
+ * Pure parser for legacy `.sora` / `.ink` v1.x JSON strings.
  */
 export function parseSoraProjectJson(jsonText: string): SerializedSoraProject {
-  const parsed = JSON.parse(jsonText);
+  const cleanText = jsonText.charCodeAt(0) === 0xfeff ? jsonText.slice(1) : jsonText;
+  const parsed = JSON.parse(cleanText);
   if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.layers)) {
     throw new Error('Invalid .sora project payload: missing layers array');
   }
-  const layers = parsed.layers.map((l: any) => {
-    const clean = { ...l };
-    if (clean.maskCanvas && typeof clean.maskCanvas.getContext !== 'function') {
-      clean.maskCanvas = undefined;
-    }
-    return clean;
-  });
+  const layers = parsed.layers.map((l: any) => sanitizeJsonLayer(l));
   return {
     app: typeof parsed.app === 'string' ? parsed.app : 'Ink Studio',
     version: typeof parsed.version === 'string' ? parsed.version : '1.0',
     name: typeof parsed.name === 'string' ? parsed.name : 'Untitled',
     dimensions: {
-      width: Number(parsed.dimensions?.width) || 1440,
-      height: Number(parsed.dimensions?.height) || 900,
+      width: Math.max(1, Math.min(MAX_DOCUMENT_DIM, Number(parsed.dimensions?.width) || 1440)),
+      height: Math.max(1, Math.min(MAX_DOCUMENT_DIM, Number(parsed.dimensions?.height) || 900)),
       dpi: Number(parsed.dimensions?.dpi) || 300,
     },
     colorMode: parsed.colorMode || 'color',
@@ -593,18 +1512,712 @@ export function parseSoraProjectJson(jsonText: string): SerializedSoraProject {
   };
 }
 
+function encodeNativeTileRecord(tile: TileBuffer, rawBytes: Uint8Array): Uint8Array {
+  const fmtByte = SORA_V2_FORMAT_TO_BYTE[tile.format] ?? 2;
+  const out = new Uint8Array(TILE_BINARY_HEADER_BYTES + rawBytes.byteLength);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  view.setUint8(0, fmtByte);
+  view.setUint32(1, tile.version >>> 0, true);
+  view.setUint32(5, rawBytes.byteLength >>> 0, true);
+  out.set(rawBytes, TILE_BINARY_HEADER_BYTES);
+  return out;
+}
+
+function decodeNativeTileRecord(
+  layerId: string,
+  tileX: number,
+  tileY: number,
+  payload: Uint8Array
+): TileBuffer {
+  if (payload.byteLength < TILE_BINARY_HEADER_BYTES) {
+    throw new Error(`Corrupted .sora v2 tile (${layerId} ${tileX}_${tileY}): header truncated`);
+  }
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const fmtByte = view.getUint8(0);
+  const format = SORA_V2_BYTE_TO_FORMAT[fmtByte];
+  if (!format) {
+    throw new Error(`Corrupted .sora v2 tile (${layerId} ${tileX}_${tileY}): unknown format byte ${fmtByte}`);
+  }
+  const version = view.getUint32(1, true);
+  const dataLen = view.getUint32(5, true);
+  const expectedLen = getTileByteSize(format);
+  if (dataLen !== expectedLen || payload.byteLength !== TILE_BINARY_HEADER_BYTES + expectedLen) {
+    throw new Error(
+      `Corrupted .sora v2 tile (${layerId} ${tileX}_${tileY}): length mismatch (expected ${expectedLen}, got ${dataLen}/${payload.byteLength - TILE_BINARY_HEADER_BYTES})`
+    );
+  }
+  const data = new Uint8Array(expectedLen);
+  data.set(payload.subarray(TILE_BINARY_HEADER_BYTES, TILE_BINARY_HEADER_BYTES + expectedLen));
+  return {
+    layerId,
+    tileX,
+    tileY,
+    format,
+    data,
+    dirty: true,
+    version: version || 1,
+    isPagedToDisk: false,
+    lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
+    lod: 0,
+  };
+}
+
+function encodeMaskBinary(maskCanvas: HTMLCanvasElement): { width: number; height: number; record: Uint8Array } | null {
+  const w = maskCanvas.width;
+  const h = maskCanvas.height;
+  if (w <= 0 || h <= 0 || w > MAX_DOCUMENT_DIM || h > MAX_DOCUMENT_DIM) return null;
+  const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx || typeof ctx.getImageData !== 'function') return null;
+
+  const src = ctx.getImageData(0, 0, w, h).data;
+  const pixelCount = w * h;
+  const record = new Uint8Array(MASK_BINARY_HEADER_BYTES + pixelCount);
+  const view = new DataView(record.buffer, record.byteOffset, record.byteLength);
+  view.setUint32(0, w >>> 0, true);
+  view.setUint32(4, h >>> 0, true);
+
+  for (let p = 0, i = 0; p < pixelCount; p++, i += 4) {
+    record[MASK_BINARY_HEADER_BYTES + p] = Math.round(
+      ((0.299 * src[i] + 0.587 * src[i + 1] + 0.114 * src[i + 2]) * src[i + 3]) / 255
+    );
+  }
+  return { width: w, height: h, record };
+}
+
+function decodeMaskBinary(payload: Uint8Array): { width: number; height: number; data: Uint8Array } {
+  if (payload.byteLength < MASK_BINARY_HEADER_BYTES) {
+    throw new Error('Corrupted .sora v2 mask: header truncated');
+  }
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const width = view.getUint32(0, true);
+  const height = view.getUint32(4, true);
+  if (width === 0 || height === 0 || width > MAX_DOCUMENT_DIM || height > MAX_DOCUMENT_DIM) {
+    throw new Error(`Invalid .sora v2 mask dimensions: ${width}x${height}`);
+  }
+  const expectedPixels = width * height;
+  if (payload.byteLength !== MASK_BINARY_HEADER_BYTES + expectedPixels) {
+    throw new Error(
+      `Corrupted .sora v2 mask: expected ${expectedPixels} bytes, got ${payload.byteLength - MASK_BINARY_HEADER_BYTES}`
+    );
+  }
+  const data = new Uint8Array(expectedPixels);
+  data.set(payload.subarray(MASK_BINARY_HEADER_BYTES));
+  return { width, height, data };
+}
+
+function createMaskCanvasFromAlpha(width: number, height: number, alpha: Uint8Array): HTMLCanvasElement | undefined {
+  if (typeof document === 'undefined') return undefined;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx || typeof ctx.putImageData !== 'function') return undefined;
+
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  for (let p = 0, i = 0; p < alpha.length; p++, i += 4) {
+    const v = alpha[p];
+    rgba[i] = v;
+    rgba[i + 1] = v;
+    rgba[i + 2] = v;
+    rgba[i + 3] = 255;
+  }
+  if (typeof ImageData !== 'undefined') {
+    ctx.putImageData(new ImageData(rgba, width, height), 0, 0);
+  } else if (typeof ctx.createImageData === 'function') {
+    const imgData = ctx.createImageData(width, height);
+    imgData.data.set(rgba);
+    ctx.putImageData(imgData, 0, 0);
+  }
+  return canvas;
+}
+
+async function generatePreviewPng(
+  data: SaveDocumentData,
+  tileGrid: SparseTileGrid | undefined
+): Promise<{ bytes: Uint8Array; width: number; height: number } | null> {
+  if (typeof document === 'undefined' || data.dimensions.width <= 0 || data.dimensions.height <= 0) {
+    return null;
+  }
+  const scale = Math.min(1, PREVIEW_MAX_DIM / Math.max(data.dimensions.width, data.dimensions.height));
+  const outW = Math.max(1, Math.round(data.dimensions.width * scale));
+  const outH = Math.max(1, Math.round(data.dimensions.height * scale));
+  const previewCanvas = document.createElement('canvas');
+  previewCanvas.width = outW;
+  previewCanvas.height = outH;
+
+  if (typeof previewCanvas.toBlob !== 'function') {
+    releaseTemporaryCanvas(previewCanvas);
+    return null;
+  }
+
+  try {
+    if (tileGrid) {
+      ViewportCompositor.renderLowResPreview(previewCanvas, data.layers, data.dimensions, tileGrid, {
+        showCheckerboard: false,
+      });
+    } else {
+      const ctx = previewCanvas.getContext('2d');
+      if (!ctx) return null;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, outW, outH);
+      for (let i = data.layers.length - 1; i >= 0; i--) {
+        const layer = data.layers[i];
+        if (!layer.visible || layer.opacity <= 0.001) continue;
+        const src = data.layerCanvasesMap.get(layer.id);
+        if (!src) continue;
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, layer.opacity));
+        ctx.drawImage(src, 0, 0, outW, outH);
+        ctx.restore();
+      }
+    }
+
+    const blob = await canvasToBlob(previewCanvas, 'image/png');
+    const buf = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    if (bytes.byteLength === 0) return null;
+    return { bytes, width: outW, height: outH };
+  } catch {
+    return null;
+  } finally {
+    releaseTemporaryCanvas(previewCanvas);
+  }
+}
+
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Serializes a document into the compact binary `.sora` v2 ZIP container:
+ * - `manifest.json` (metadata: document, layers, folders, masks, vectors, text, balloons, perspective, animation, timelapse)
+ * - `preview.png` (downscaled preview for Recent Documents)
+ * - `tiles/<layerKey>/<tx>_<ty>.bin` (native 1-bit/8-bit/32-bit SparseTileGrid buffers, zero `toDataURL`, zero full-canvas assembly)
+ * - `masks/<layerKey>.bin` (8-bit mask luminance buffers)
+ *
+ * Uses chunked non-blocking streaming compression via `fflate.Zip` with progress reporting.
+ */
+export async function serializeSoraV2(
+  data: SaveDocumentData,
+  tileGrid?: SparseTileGrid
+): Promise<{
+  bytes: Uint8Array;
+  previewBytes: Uint8Array | null;
+  previewDataUrl?: string;
+  manifest: SoraV2Manifest;
+}> {
+  const onProgress = data.onProgress;
+  const tileCompressionLevel = data.compressionLevel ?? 3;
+  const resolvedGrid =
+    tileGrid ??
+    data.tileGrid ??
+    (data.tabId ? documentStore.getSession(data.tabId)?.tileGrid : undefined);
+
+  onProgress?.({
+    phase: 'preparing',
+    current: 0,
+    total: 1,
+    percent: 2,
+    message: 'Preparing project metadata...',
+  });
+
+  const usedKeys = new Set<string>();
+  const layerTileKeys: Record<string, string> = {};
+  const layerFormats: Record<string, TileFormat> = {};
+  const masksMeta: Record<string, { width: number; height: number; format: 'alpha-8bit' }> = {};
+  const encodedMasks: Array<{ path: string; record: Uint8Array }> = [];
+
+  // Fallback temporary tile grid strictly for legacy layers only present in layerCanvasesMap
+  let fallbackTempGrid: SparseTileGrid | null = null;
+
+  type PendingTileSource = {
+    path: string;
+    tile: TileBuffer;
+    sourceGrid: SparseTileGrid;
+  };
+  const pendingTiles: PendingTileSource[] = [];
+
+  const serializableLayers: Array<Omit<LayerItem, 'maskCanvas'>> = [];
+
+  for (const layer of data.layers) {
+    const safeKey = toSafeZipKey(layer.id, usedKeys);
+    layerTileKeys[layer.id] = safeKey;
+
+    if (hasTileBackedLayer(layer)) {
+      const gridHasTiles = Boolean(resolvedGrid && resolvedGrid.hasLayerTiles(layer.id));
+      if (resolvedGrid && gridHasTiles) {
+        const tiles = resolvedGrid.getLayerTiles(layer.id, 0);
+        const fmt = tiles[0]?.format ?? resolvedGrid.getLayerFormat(layer.id);
+        layerFormats[layer.id] = fmt;
+        for (const tile of tiles) {
+          pendingTiles.push({
+            path: `tiles/${safeKey}/${tile.tileX}_${tile.tileY}.bin`,
+            tile,
+            sourceGrid: resolvedGrid,
+          });
+        }
+      } else {
+        const fmt = resolvedGrid?.getLayerFormat(layer.id) ?? inferLayerTileFormat(layer);
+        layerFormats[layer.id] = fmt;
+
+        // Legacy fallback when raster data exists only on layerCanvasesMap (no toDataURL!)
+        const canvas = data.layerCanvasesMap.get(layer.id);
+        if (canvas && canvas.width > 0 && canvas.height > 0) {
+          if (!fallbackTempGrid) {
+            fallbackTempGrid = new SparseTileGrid();
+          }
+          fallbackTempGrid.ingestCanvas(layer.id, canvas, fmt);
+          const tiles = fallbackTempGrid.getLayerTiles(layer.id, 0);
+          for (const tile of tiles) {
+            pendingTiles.push({
+              path: `tiles/${safeKey}/${tile.tileX}_${tile.tileY}.bin`,
+              tile,
+              sourceGrid: fallbackTempGrid,
+            });
+          }
+        }
+      }
+    }
+
+    if (layer.maskCanvas) {
+      const encodedMask = encodeMaskBinary(layer.maskCanvas);
+      if (encodedMask) {
+        masksMeta[layer.id] = {
+          width: encodedMask.width,
+          height: encodedMask.height,
+          format: 'alpha-8bit',
+        };
+        encodedMasks.push({
+          path: `masks/${safeKey}.bin`,
+          record: encodedMask.record,
+        });
+      }
+    }
+
+    const { maskCanvas: _mc, ...rest } = layer;
+    serializableLayers.push(rest);
+  }
+
+  // Generate downscaled preview.png
+  onProgress?.({
+    phase: 'preview',
+    current: 0,
+    total: 1,
+    percent: 8,
+    message: 'Generating preview thumbnail...',
+  });
+  const preview = await generatePreviewPng(data, resolvedGrid);
+
+  const manifest: SoraV2Manifest = {
+    format: 'sora-v2',
+    app: 'Ink Studio',
+    version: '2.0',
+    tileSize: TILE_SIZE,
+    name: data.name,
+    dimensions: {
+      width: data.dimensions.width,
+      height: data.dimensions.height,
+      dpi: data.dimensions.dpi ?? 300,
+    },
+    colorMode: data.colorMode,
+    layers: serializableLayers,
+    layerFormats,
+    layerTileKeys,
+    masksMeta,
+    perspectiveRuler: data.perspectiveRuler ?? null,
+    animationTimeline: data.animationTimeline ?? null,
+    timelapse: data.timelapse ?? null,
+    preview: preview ? { path: 'preview.png', width: preview.width, height: preview.height } : null,
+    savedAt: Date.now(),
+  };
+
+  const encoder = new TextEncoder();
+  const manifestBytes = encoder.encode(JSON.stringify(manifest));
+
+  const chunks: Uint8Array[] = [];
+  let zipError: Error | null = null;
+  const zip = new Zip((err, chunk, _final) => {
+    if (err) {
+      zipError = err;
+      return;
+    }
+    if (chunk && chunk.byteLength > 0) {
+      chunks.push(chunk);
+    }
+  });
+
+  try {
+    // 1. manifest.json
+    const manifestEntry = new ZipDeflate('manifest.json', { level: 6 });
+    zip.add(manifestEntry);
+    manifestEntry.push(manifestBytes, true);
+    if (zipError) throw zipError;
+
+    // 2. preview.png (store uncompressed — PNG is already DEFLATE-compressed)
+    if (preview) {
+      const previewEntry = new ZipPassThrough('preview.png');
+      zip.add(previewEntry);
+      previewEntry.push(preview.bytes, true);
+      if (zipError) throw zipError;
+    }
+
+    // 3. Stream native SparseTileGrid tiles in non-blocking chunks
+    const totalTiles = pendingTiles.length;
+    for (let i = 0; i < totalTiles; i++) {
+      const item = pendingTiles[i];
+      const { tile, sourceGrid, path } = item;
+
+      let rawBytes: Uint8Array | null = tile.data;
+      if (!rawBytes && tile.isPagedToDisk) {
+        const mm = sourceGrid.getMemoryManager();
+        if (mm) {
+          // Read directly from scratch driver without inflating RAM cache
+          rawBytes = await mm.getDriver().readTile(mm.getSessionId(), tile.layerId, tile.tileX, tile.tileY);
+        }
+      }
+      if (!rawBytes) {
+        rawBytes = new Uint8Array(getTileByteSize(tile.format));
+      }
+
+      const record = encodeNativeTileRecord(tile, rawBytes);
+      const entry = new ZipDeflate(path, { level: tileCompressionLevel });
+      zip.add(entry);
+      entry.push(record, true);
+      if (zipError) throw zipError;
+
+      const done = i + 1;
+      if (done % CHUNK_YIELD_INTERVAL === 0 || done === totalTiles) {
+        const pct = 10 + Math.round((done / Math.max(1, totalTiles)) * 75);
+        onProgress?.({
+          phase: 'tiles',
+          current: done,
+          total: totalTiles,
+          percent: Math.min(85, pct),
+          message: `Saving tiles (${done}/${totalTiles})...`,
+        });
+        if (done < totalTiles) {
+          await yieldToMainThread();
+        }
+      }
+    }
+
+    // 4. Layer masks
+    const totalMasks = encodedMasks.length;
+    for (let i = 0; i < totalMasks; i++) {
+      const m = encodedMasks[i];
+      const entry = new ZipDeflate(m.path, { level: tileCompressionLevel });
+      zip.add(entry);
+      entry.push(m.record, true);
+      if (zipError) throw zipError;
+
+      const done = i + 1;
+      onProgress?.({
+        phase: 'masks',
+        current: done,
+        total: totalMasks,
+        percent: 85 + Math.round((done / Math.max(1, totalMasks)) * 10),
+        message: `Saving layer masks (${done}/${totalMasks})...`,
+      });
+      if (done % CHUNK_YIELD_INTERVAL === 0 && done < totalMasks) {
+        await yieldToMainThread();
+      }
+    }
+
+    onProgress?.({
+      phase: 'finalizing',
+      current: 1,
+      total: 1,
+      percent: 96,
+      message: 'Finalizing .sora archive...',
+    });
+
+    zip.end();
+    if (zipError) throw zipError;
+
+    const bytes = concatUint8Arrays(chunks);
+    const previewBytes = preview ? preview.bytes : null;
+    const previewDataUrl = toPngDataUrl(previewBytes);
+
+    onProgress?.({
+      phase: 'done',
+      current: 1,
+      total: 1,
+      percent: 100,
+      message: 'Saved successfully',
+    });
+
+    return { bytes, previewBytes, previewDataUrl, manifest };
+  } finally {
+    if (fallbackTempGrid) {
+      fallbackTempGrid.clearAll();
+    }
+  }
+}
+
+/**
+ * Fast preview-only extraction from a `.sora` v2 archive for Recent Documents.
+ * Inflates ONLY `preview.png` without decompressing any tile payloads.
+ */
+export function extractSoraPreview(input: ArrayBuffer | Uint8Array): Uint8Array | null {
+  const raw = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (!isSoraV2Bytes(raw)) return null;
+  try {
+    const zipBytes = unwrapZipPayload(raw);
+    const extracted = unzipSync(zipBytes, {
+      filter: (file) => file.name === 'preview.png',
+    });
+    const png = extracted['preview.png'];
+    return png && png.byteLength > 0 ? png : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parses a `.sora` / `.ink` project with automatic format detection:
+ * - Binary `.sora` v2 (ZIP container magic bytes) -> restores native SparseTileGrid tiles, masks, preview, and full metadata
+ * - Legacy v1.2 JSON -> falls back to `parseSoraProjectJson` seamlessly
+ */
+export async function parseSoraProject(
+  input: ArrayBuffer | Uint8Array | string,
+  options?: { onProgress?: (progress: SaveProgress) => void }
+): Promise<ParsedSoraProject> {
+  const onProgress = options?.onProgress;
+
+  if (typeof input === 'string') {
+    const v1 = parseSoraProjectJson(input);
+    return {
+      format: 'v1',
+      ...v1,
+    };
+  }
+
+  const rawBytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+
+  // Automatic format detection: v2 binary magic bytes vs legacy JSON v1.2
+  if (!isSoraV2Bytes(rawBytes)) {
+    const text = new TextDecoder('utf-8').decode(rawBytes);
+    const v1 = parseSoraProjectJson(text);
+    return {
+      format: 'v1',
+      ...v1,
+    };
+  }
+
+  onProgress?.({
+    phase: 'preparing',
+    current: 0,
+    total: 1,
+    percent: 5,
+    message: 'Unpacking .sora v2 container...',
+  });
+
+  const zipBytes = unwrapZipPayload(rawBytes);
+  const files = unzipSync(zipBytes);
+
+  // Validate all entry paths against path traversal attacks
+  const fileNames = Object.keys(files);
+  for (const name of fileNames) {
+    if (!isSafeZipPath(name)) {
+      throw new Error(`Unsafe archive path in .sora v2 file: "${name}"`);
+    }
+  }
+
+  const manifestRaw = files['manifest.json'];
+  if (!manifestRaw || manifestRaw.byteLength === 0) {
+    throw new Error('Invalid .sora v2 project: missing manifest.json');
+  }
+  if (manifestRaw.byteLength > MAX_MANIFEST_BYTES) {
+    throw new Error('Invalid .sora v2 project: manifest.json exceeds size limit');
+  }
+
+  const manifestText = new TextDecoder('utf-8').decode(manifestRaw);
+  const parsedManifest = JSON.parse(manifestText);
+  if (
+    !parsedManifest ||
+    typeof parsedManifest !== 'object' ||
+    !Array.isArray(parsedManifest.layers)
+  ) {
+    throw new Error('Invalid .sora v2 manifest: missing layers array');
+  }
+
+  const width = Math.floor(Number(parsedManifest.dimensions?.width) || 0);
+  const height = Math.floor(Number(parsedManifest.dimensions?.height) || 0);
+  if (width <= 0 || height <= 0 || width > MAX_DOCUMENT_DIM || height > MAX_DOCUMENT_DIM) {
+    throw new Error(`Invalid .sora v2 dimensions: ${width}x${height}`);
+  }
+  const dpi = Number(parsedManifest.dimensions?.dpi) || 300;
+  const colorMode: CanvasColorMode = parsedManifest.colorMode || 'color';
+  const layers: LayerItem[] = parsedManifest.layers.map((l: any) => sanitizeJsonLayer(l));
+
+  // Reverse map safeKey -> layerId from manifest
+  const keyToLayerId = new Map<string, string>();
+  if (parsedManifest.layerTileKeys && typeof parsedManifest.layerTileKeys === 'object') {
+    for (const [layerId, safeKey] of Object.entries(parsedManifest.layerTileKeys)) {
+      if (typeof safeKey === 'string' && safeKey.length > 0) {
+        keyToLayerId.set(safeKey, layerId);
+      }
+    }
+  }
+  for (const layer of layers) {
+    if (!keyToLayerId.has(layer.id)) {
+      keyToLayerId.set(layer.id, layer.id);
+    }
+  }
+
+  const layerFormats = new Map<string, TileFormat>();
+  if (parsedManifest.layerFormats && typeof parsedManifest.layerFormats === 'object') {
+    for (const [layerId, fmt] of Object.entries(parsedManifest.layerFormats)) {
+      if (fmt === 'monochrome-1bit' || fmt === 'grayscale-8bit' || fmt === 'color-32bit') {
+        layerFormats.set(layerId, fmt);
+      }
+    }
+  }
+
+  const tileRegex = /^tiles\/([^/]+)\/(-?\d+)_(-?\d+)\.bin$/;
+  const maskRegex = /^masks\/([^/]+)\.bin$/;
+
+  const tileEntries: Array<{ path: string; layerId: string; tx: number; ty: number }> = [];
+  const maskEntries: Array<{ path: string; layerId: string }> = [];
+
+  for (const path of fileNames) {
+    const tileMatch = tileRegex.exec(path);
+    if (tileMatch) {
+      const safeKey = tileMatch[1];
+      const layerId = keyToLayerId.get(safeKey);
+      if (!layerId) continue;
+      const tx = parseInt(tileMatch[2], 10);
+      const ty = parseInt(tileMatch[3], 10);
+      if (!Number.isSafeInteger(tx) || !Number.isSafeInteger(ty)) {
+        throw new Error(`Invalid tile coordinates in .sora v2 archive: ${path}`);
+      }
+      tileEntries.push({ path, layerId, tx, ty });
+      continue;
+    }
+
+    const maskMatch = maskRegex.exec(path);
+    if (maskMatch) {
+      const safeKey = maskMatch[1];
+      const layerId = keyToLayerId.get(safeKey);
+      if (layerId) {
+        maskEntries.push({ path, layerId });
+      }
+    }
+  }
+
+  if (tileEntries.length > MAX_TILE_ENTRIES) {
+    throw new Error(`Invalid .sora v2 project: tile count ${tileEntries.length} exceeds limit`);
+  }
+
+  const restoredTiles: TileBuffer[] = [];
+  for (let i = 0; i < tileEntries.length; i++) {
+    const entry = tileEntries[i];
+    const payload = files[entry.path];
+    const tile = decodeNativeTileRecord(entry.layerId, entry.tx, entry.ty, payload);
+    restoredTiles.push(tile);
+    if (!layerFormats.has(entry.layerId)) {
+      layerFormats.set(entry.layerId, tile.format);
+    }
+
+    const done = i + 1;
+    if (done % (CHUNK_YIELD_INTERVAL * 2) === 0 && done < tileEntries.length) {
+      onProgress?.({
+        phase: 'tiles',
+        current: done,
+        total: tileEntries.length,
+        percent: 15 + Math.round((done / tileEntries.length) * 70),
+        message: `Loading tiles (${done}/${tileEntries.length})...`,
+      });
+      await yieldToMainThread();
+    }
+  }
+
+  const tileGrid = new SparseTileGrid();
+  tileGrid.restoreFromSnapshot(restoredTiles, layerFormats);
+  for (const layer of layers) {
+    if (hasTileBackedLayer(layer)) {
+      const fmt = layerFormats.get(layer.id) ?? inferLayerTileFormat(layer);
+      tileGrid.setLayerFormat(layer.id, fmt);
+      tileGrid.markLayerIngested(layer.id);
+    }
+  }
+
+  const masksBinary = new Map<string, { width: number; height: number; data: Uint8Array }>();
+  const layerById = new Map<string, LayerItem>();
+  for (const l of layers) layerById.set(l.id, l);
+
+  for (const mEntry of maskEntries) {
+    const decoded = decodeMaskBinary(files[mEntry.path]);
+    masksBinary.set(mEntry.layerId, decoded);
+    const layer = layerById.get(mEntry.layerId);
+    if (layer) {
+      const maskCanvas = createMaskCanvasFromAlpha(decoded.width, decoded.height, decoded.data);
+      if (maskCanvas) {
+        layer.maskCanvas = maskCanvas;
+        layer.maskVersion = (layer.maskVersion || 0) + 1;
+      }
+    }
+  }
+
+  const previewPath =
+    typeof parsedManifest.preview?.path === 'string' && isSafeZipPath(parsedManifest.preview.path)
+      ? parsedManifest.preview.path
+      : 'preview.png';
+  const previewRaw = files[previewPath];
+  const previewBytes = previewRaw && previewRaw.byteLength > 0 ? new Uint8Array(previewRaw) : null;
+  const previewDataUrl = toPngDataUrl(previewBytes);
+
+  onProgress?.({
+    phase: 'done',
+    current: 1,
+    total: 1,
+    percent: 100,
+    message: 'Project loaded',
+  });
+
+  return {
+    format: 'v2',
+    app: typeof parsedManifest.app === 'string' ? parsedManifest.app : 'Ink Studio',
+    version: typeof parsedManifest.version === 'string' ? parsedManifest.version : '2.0',
+    name: typeof parsedManifest.name === 'string' ? parsedManifest.name : 'Untitled',
+    dimensions: { width, height, dpi },
+    colorMode,
+    layers,
+    tileGrid,
+    canvases: {},
+    masks: {},
+    masksBinary,
+    perspectiveRuler: parsedManifest.perspectiveRuler ?? null,
+    animationTimeline: parsedManifest.animationTimeline ?? null,
+    timelapse: parsedManifest.timelapse ?? null,
+    previewBytes,
+    previewDataUrl,
+  };
+}
+
 /**
  * Serializes the document according to the requested file extension.
  */
 export async function serializeDocument(
   data: SaveDocumentData,
   extension: string
-): Promise<{ data: Blob | ArrayBuffer; mimeType: string }> {
+): Promise<{ data: Blob | ArrayBuffer; mimeType: string; previewDataUrl?: string }> {
   const ext = extension.toLowerCase();
-  const tileGrid = data.tileGrid ?? (data.tabId ? documentStore.getSession(data.tabId)?.tileGrid : documentStore.getActiveTileGrid());
+  const tileGrid =
+    data.tileGrid ??
+    (data.tabId ? documentStore.getSession(data.tabId)?.tileGrid : documentStore.getActiveTileGrid());
 
   // 1. PSD/PSB format with full folder hierarchy, blend modes, clipping, alphaLock, and masks
   if (ext === '.psd' || ext === '.psb') {
+    await hydratePagedTilesForLayers(tileGrid, data.layers, false);
     const tempCanvases: HTMLCanvasElement[] = [];
     try {
       const tree = buildLayerTree(data.layers);
@@ -651,70 +2264,40 @@ export async function serializeDocument(
     }
   }
 
-  // 2. Native Ink Studio Project (.ink, .sora) format
+  // 2. Native Ink Studio Project (.sora, .ink) — Binary v2 container
   if (ext === '.ink' || ext === '.sora') {
-    const projectData = buildSoraProjectPayload(data, tileGrid);
-    const json = JSON.stringify(projectData);
+    const result = await serializeSoraV2(data, tileGrid);
     return {
-      data: new Blob([json], { type: 'application/json' }),
-      mimeType: 'application/json',
+      data: new Blob([result.bytes as BlobPart], { type: 'application/octet-stream' }),
+      mimeType: 'application/octet-stream',
+      previewDataUrl: result.previewDataUrl,
     };
   }
 
-  // 3. JPEG format
+  // 3. JPEG format (tiled GPU compositor with white background)
   if (ext === '.jpg' || ext === '.jpeg') {
-    const compCanvas = compositeCanvas(
-      data.dimensions,
-      data.layers,
-      data.layerCanvasesMap,
-      data.getEffectiveOpacity,
-      data.isLayerEffectivelyVisible,
-      true, // white background for JPEG
-      tileGrid
+    const exported = await exportImage(
+      { ...data, tileGrid },
+      { format: 'jpg', quality: 0.92, fillWhiteBackground: true }
     );
-    try {
-      const blob = await canvasToBlob(compCanvas, 'image/jpeg', 0.92);
-      return { data: blob, mimeType: 'image/jpeg' };
-    } finally {
-      releaseTemporaryCanvas(compCanvas);
-    }
+    return { data: exported.blob, mimeType: exported.mimeType };
   }
 
-  // 4. WebP format
+  // 4. WebP format (tiled GPU compositor with transparency)
   if (ext === '.webp') {
-    const compCanvas = compositeCanvas(
-      data.dimensions,
-      data.layers,
-      data.layerCanvasesMap,
-      data.getEffectiveOpacity,
-      data.isLayerEffectivelyVisible,
-      false,
-      tileGrid
+    const exported = await exportImage(
+      { ...data, tileGrid },
+      { format: 'webp', quality: 0.92, fillWhiteBackground: false }
     );
-    try {
-      const blob = await canvasToBlob(compCanvas, 'image/webp', 0.92);
-      return { data: blob, mimeType: 'image/webp' };
-    } finally {
-      releaseTemporaryCanvas(compCanvas);
-    }
+    return { data: exported.blob, mimeType: exported.mimeType };
   }
 
-  // 5. Default: PNG format
-  const compCanvas = compositeCanvas(
-    data.dimensions,
-    data.layers,
-    data.layerCanvasesMap,
-    data.getEffectiveOpacity,
-    data.isLayerEffectivelyVisible,
-    false,
-    tileGrid
+  // 5. Default: PNG format (tiled GPU compositor with transparency)
+  const exported = await exportImage(
+    { ...data, tileGrid },
+    { format: 'png', fillWhiteBackground: false }
   );
-  try {
-    const blob = await canvasToBlob(compCanvas, 'image/png');
-    return { data: blob, mimeType: 'image/png' };
-  } finally {
-    releaseTemporaryCanvas(compCanvas);
-  }
+  return { data: exported.blob, mimeType: exported.mimeType };
 }
 
 /**
@@ -738,6 +2321,10 @@ export function downloadFile(
   }, 200);
 }
 
+function getSerializedByteSize(content: Blob | ArrayBuffer): number {
+  return content instanceof Blob ? content.size : content.byteLength;
+}
+
 /**
  * Prompts user to select save location and extension via File System Access API or fallback.
  */
@@ -752,7 +2339,7 @@ export async function promptSaveAs(
   const types = [
     {
       description: 'Ink Studio Layered Project (*.sora, *.ink)',
-      accept: { 'application/json': ['.sora', '.ink'] },
+      accept: { 'application/octet-stream': ['.sora', '.ink'] },
     },
     {
       description: 'Photoshop Document with Layers (*.psd)',
@@ -797,6 +2384,8 @@ export async function promptSaveAs(
         handle,
         name: fileName,
         extension: ext,
+        size: getSerializedByteSize(serialized.data),
+        previewDataUrl: serialized.previewDataUrl,
       };
     } catch (err: any) {
       if (err.name === 'AbortError') {
@@ -806,7 +2395,6 @@ export async function promptSaveAs(
     }
   }
 
-  // Fallback if File System Access API is unavailable or rejected
   if (fallbackToDownload) {
     const ext = defaultExtension;
     const serialized = await serializeDocument(data, ext);
@@ -819,6 +2407,8 @@ export async function promptSaveAs(
     return {
       name: suggestedName,
       extension: ext,
+      size: getSerializedByteSize(serialized.data),
+      previewDataUrl: serialized.previewDataUrl,
     };
   }
 
@@ -831,7 +2421,7 @@ export async function promptSaveAs(
 export async function saveToExistingHandle(
   data: SaveDocumentData,
   fileInfo: SavedFileInfo
-): Promise<void> {
+): Promise<{ size: number; previewDataUrl?: string }> {
   if (!fileInfo.handle || typeof fileInfo.handle.createWritable !== 'function') {
     throw new Error('No valid file handle to save to');
   }
@@ -844,10 +2434,15 @@ export async function saveToExistingHandle(
   if (data.tabId) {
     recoveryService.markCleanSaved(data.tabId).catch(console.warn);
   }
+
+  return {
+    size: getSerializedByteSize(serialized.data),
+    previewDataUrl: serialized.previewDataUrl,
+  };
 }
 
 /**
- * Prompts user to choose a download/save path specifically for a PNG image.
+ * Prompts user to choose a download/save path specifically for an exported image (PNG / JPG / WebP).
  */
 export async function promptExportPngImage(
   data: SaveDocumentData,
@@ -861,6 +2456,14 @@ export async function promptExportPngImage(
       description: 'PNG Image (*.png)',
       accept: { 'image/png': ['.png'] },
     },
+    {
+      description: 'JPEG Image (*.jpg, *.jpeg)',
+      accept: { 'image/jpeg': ['.jpg', '.jpeg'] },
+    },
+    {
+      description: 'WebP Image (*.webp)',
+      accept: { 'image/webp': ['.webp'] },
+    },
   ];
 
   if (typeof window !== 'undefined' && 'showSaveFilePicker' in window) {
@@ -870,12 +2473,16 @@ export async function promptExportPngImage(
         types,
       });
 
-      const serialized = await serializeDocument(data, '.png');
+      const fileName: string = handle.name;
+      const ext = fileName.includes('.')
+        ? fileName.slice(fileName.lastIndexOf('.')).toLowerCase()
+        : '.png';
+      const serialized = await serializeDocument(data, ext);
       const writable = await handle.createWritable();
       await writable.write(serialized.data);
       await writable.close();
 
-      return handle.name;
+      return fileName;
     } catch (err: any) {
       if (err.name === 'AbortError') {
         throw new Error('Export canceled');
@@ -884,7 +2491,6 @@ export async function promptExportPngImage(
     }
   }
 
-  // Fallback download
   const serialized = await serializeDocument(data, '.png');
   downloadFile(serialized.data, suggestedName, 'image/png');
   return suggestedName;

@@ -1,11 +1,17 @@
 import React, { useState } from 'react';
 import { X, Archive, Download, Loader2 } from 'lucide-react';
-import { exportWebtoonChapterZip, downloadWebtoonZip } from '../utils/webtoonExporter';
+import {
+  exportWebtoonChapterZip,
+  exportWebtoonChapterZipFromRenderer,
+  downloadWebtoonZip,
+  WebtoonRegionRenderer,
+} from '../utils/webtoonExporter';
 
 interface WebtoonExportModalProps {
   isOpen: boolean;
   onClose: () => void;
   getActiveCanvas: () => HTMLCanvasElement | null;
+  createRegionRenderer?: () => { renderRegion: WebtoonRegionRenderer; dispose: () => void };
   canvasWidth: number;
   canvasHeight: number;
   documentTitle?: string;
@@ -15,6 +21,7 @@ export const WebtoonExportModal: React.FC<WebtoonExportModalProps> = ({
   isOpen,
   onClose,
   getActiveCanvas,
+  createRegionRenderer,
   canvasWidth,
   canvasHeight,
   documentTitle = 'webtoon_chapter',
@@ -30,21 +37,46 @@ export const WebtoonExportModal: React.FC<WebtoonExportModalProps> = ({
   const totalSlices = Math.max(1, Math.ceil(canvasHeight / sliceHeight));
 
   const handleStartExport = async () => {
-    const canvas = getActiveCanvas();
-    if (!canvas) return;
-
     try {
       setIsExporting(true);
       setProgress({ current: 0, total: totalSlices, percent: 0 });
 
-      const zipBytes = await exportWebtoonChapterZip(canvas, {
-        sliceWidth: canvasWidth,
-        sliceHeight,
-        format,
-        quality: quality / 100,
-        filePrefix: `${documentTitle.replace(/\s+/g, '_')}_slice_`,
-        onProgress: (p) => setProgress(p),
-      });
+      let zipBytes: Uint8Array;
+      if (createRegionRenderer) {
+        const renderer = createRegionRenderer();
+        try {
+          zipBytes = await exportWebtoonChapterZipFromRenderer(
+            canvasWidth,
+            canvasHeight,
+            renderer.renderRegion,
+            {
+              sliceWidth: canvasWidth,
+              sliceHeight,
+              format,
+              quality: quality / 100,
+              filePrefix: `${documentTitle.replace(/\s+/g, '_')}_slice_`,
+              onProgress: (p) => setProgress(p),
+            }
+          );
+        } finally {
+          renderer.dispose();
+        }
+      } else {
+        const canvas = getActiveCanvas();
+        if (!canvas) {
+          setIsExporting(false);
+          setProgress(null);
+          return;
+        }
+        zipBytes = await exportWebtoonChapterZip(canvas, {
+          sliceWidth: canvasWidth,
+          sliceHeight,
+          format,
+          quality: quality / 100,
+          filePrefix: `${documentTitle.replace(/\s+/g, '_')}_slice_`,
+          onProgress: (p) => setProgress(p),
+        });
+      }
 
       const zipName = `${documentTitle.replace(/\s+/g, '_')}_slices.zip`;
       downloadWebtoonZip(zipBytes, zipName);

@@ -152,14 +152,20 @@ export class TaperEngine {
     lastY: number,
     lastWidth: number,
     lastPressure: number,
-    exitVx: number, // px / ms
-    exitVy: number, // px / ms
+    exitVx: number, // doc px / ms
+    exitVy: number, // doc px / ms
     lastTimestampMs: number,
-    angularVelRadPerMs: number = 0
+    angularVelRadPerMs: number = 0,
+    zoomScale: number = 1.0,
+    maxTailLengthDoc?: number
   ): { points: ExtrapolatedPoint[]; count: number } {
-    const exitSpeed = Math.hypot(exitVx, exitVy); // px / ms
+    const exitSpeed = Math.hypot(exitVx, exitVy); // doc px / ms
+    const safeZoom = Number.isFinite(zoomScale) && zoomScale > 0 ? zoomScale : 1.0;
+    // Normalize velocity to screen space so zoomed-out high-DPI canvases (e.g. 6071x8598 at 0.1x)
+    // do not false-trigger flick extrapolation on normal hand speed.
+    const screenSpeed = exitSpeed * safeZoom;
 
-    if (exitSpeed < this.fConfig.minFlickSpeed || lastWidth <= 0.4) {
+    if (screenSpeed < this.fConfig.minFlickSpeed || lastWidth <= 0.4) {
       return { points: this.flickPointPool, count: 0 };
     }
 
@@ -167,17 +173,31 @@ export class TaperEngine {
     const clampedOmega = Math.max(-0.012, Math.min(0.012, angularVelRadPerMs));
 
     const count = Math.min(this.fConfig.flickPoints, this.flickPointPool.length);
-    let curX = lastX;
-    let curY = lastY;
-    let curSpeed = exitSpeed;
-    let curTime = lastTimestampMs;
-
     const dt = this.fConfig.stepDtMs;
     const lambda = this.fConfig.decayRate;
+    const dragFactor = Math.exp(-this.fConfig.dragCoefficient * (dt * 0.05));
+
+    // Compute natural extrapolated length and clamp tightly so tips never shoot past liftoff
+    let rawTotalDist = 0;
+    let simSpeed = exitSpeed;
+    for (let i = 0; i < count; i++) {
+      simSpeed *= dragFactor;
+      rawTotalDist += simSpeed * dt;
+    }
+    const defaultMaxTail = Math.min(
+      Math.max(lastWidth * 1.25, 3.0),
+      14.0 / Math.max(0.05, safeZoom)
+    );
+    const maxTail = maxTailLengthDoc !== undefined ? Math.max(0, maxTailLengthDoc) : defaultMaxTail;
+    const distScale = rawTotalDist > maxTail && rawTotalDist > 1e-6 ? maxTail / rawTotalDist : 1.0;
+
+    let curX = lastX;
+    let curY = lastY;
+    let curSpeed = exitSpeed * distScale;
+    let curTime = lastTimestampMs;
 
     for (let i = 0; i < count; i++) {
       // Inertial damping on velocity & gentle curvature continuation (prevents linear kinks on curved flicks)
-      const dragFactor = Math.exp(-this.fConfig.dragCoefficient * (dt * 0.05));
       curSpeed *= dragFactor;
       curAngle += clampedOmega * dt * Math.exp(-0.22 * i);
       const stepDist = curSpeed * dt;

@@ -13,8 +13,10 @@ import {
   promptExportPngImage,
   promptSaveAs,
   SaveDocumentData,
+  SaveProgress,
   saveToExistingHandle,
 } from '../utils/saveManager';
+import { globalTimelapseManager } from '../utils/timelapseEngine';
 import { saveRecentDocument, RecentDocument } from '../utils/recentDocumentsManager';
 import { enforceColorMode } from '../utils/colorUtils';
 import { parseSutFile } from '../utils/sutParser';
@@ -361,10 +363,13 @@ export function useDocumentLifecycle({
           colorMode: doc.colorMode,
           layers: doc.layers,
           activeLayerId: doc.layers[0]?.id || 'layer-1',
-          perspectiveRuler: null,
+          perspectiveRuler: doc.perspectiveRuler ?? null,
         };
 
-        documentStoreActions.setPerspectiveRuler(null);
+        documentStoreActions.setPerspectiveRuler(doc.perspectiveRuler ?? null);
+        if (doc.animationTimeline !== undefined) {
+          documentStoreActions.setAnimationTimeline(doc.animationTimeline);
+        }
         documentStoreActions.setDocuments((prev) => [...prev, newDoc]);
         documentStoreActions.setActiveDocumentId(newDocId);
 
@@ -374,7 +379,7 @@ export function useDocumentLifecycle({
           title: file.name,
           path: fileWithPath.path || `C:\\Users\\Artist\\Documents\\InkStudio\\${file.name}`,
           size: file.size || 1048576,
-          coverUrl: doc.layers[0]?.thumbnailUrl,
+          coverUrl: doc.previewDataUrl || doc.layers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: file.name.slice(file.name.lastIndexOf('.')),
           isSaved: true,
@@ -608,19 +613,47 @@ export function useDocumentLifecycle({
     [handleProcessFile]
   );
 
-  const handleSave = useCallback(async () => {
-    const cleanNameForSave = documentName.replace(/\*+$/, '') || 'Untitled';
-    const docData: SaveDocumentData = {
-      name: cleanNameForSave,
-      dimensions,
+  const buildSaveData = useCallback(
+    (onProgress?: (p: SaveProgress) => void): SaveDocumentData => {
+      const cleanNameForSave = documentName.replace(/\*+$/, '') || 'Untitled';
+      const docStoreState = useDocumentStore.getState();
+      const tlStats = globalTimelapseManager.getStats(activeDocumentId);
+      return {
+        name: cleanNameForSave,
+        dimensions,
+        colorMode,
+        layers,
+        layerCanvasesMap: layerCanvasesRef.current,
+        tileGrid: documentStore.getActiveTileGrid(),
+        getEffectiveOpacity,
+        isLayerEffectivelyVisible,
+        tabId: activeDocumentId || undefined,
+        perspectiveRuler: docStoreState.perspectiveRuler,
+        animationTimeline: docStoreState.animationTimeline,
+        timelapse:
+          tlStats.enabled || tlStats.frameCount > 0
+            ? { enabled: tlStats.enabled, frameCount: tlStats.frameCount }
+            : null,
+        onProgress,
+      };
+    },
+    [
+      activeDocumentId,
       colorMode,
-      layers,
-      layerCanvasesMap: layerCanvasesRef.current,
-      tileGrid: documentStore.getActiveTileGrid(),
+      dimensions,
+      documentName,
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
-      tabId: activeDocumentId || undefined,
+      layerCanvasesRef,
+      layers,
+    ]
+  );
+
+  const handleSave = useCallback(async () => {
+    const onProgress = (p: SaveProgress) => {
+      uiStoreActions.setLoading(true, `${p.message} (${p.percent}%)`);
     };
+    const docData = buildSaveData(onProgress);
 
     if (!savedFileInfo?.handle) {
       try {
@@ -636,8 +669,8 @@ export function useDocumentLifecycle({
           id: activeDocumentId || `doc-${Date.now()}`,
           title: info.name,
           path: `InkStudio\\${info.name}`,
-          size: 1572864,
-          coverUrl: layers[0]?.thumbnailUrl,
+          size: info.size || 1572864,
+          coverUrl: info.previewDataUrl || layers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: info.extension,
           isSaved: true,
@@ -648,10 +681,12 @@ export function useDocumentLifecycle({
         if (msg !== 'Save canceled') {
           alert('Failed to save file: ' + msg);
         }
+      } finally {
+        uiStoreActions.setLoading(false, '');
       }
     } else {
       try {
-        await saveToExistingHandle(docData, savedFileInfo);
+        const saveRes = await saveToExistingHandle(docData, savedFileInfo);
         documentStoreActions.setDocumentName(savedFileInfo.name);
         documentStoreActions.setDocuments((prev) =>
           prev.map((d) =>
@@ -662,8 +697,8 @@ export function useDocumentLifecycle({
           id: activeDocumentId || `doc-${Date.now()}`,
           title: savedFileInfo.name,
           path: `InkStudio\\${savedFileInfo.name}`,
-          size: 1572864,
-          coverUrl: layers[0]?.thumbnailUrl,
+          size: saveRes.size || 1572864,
+          coverUrl: saveRes.previewDataUrl || layers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: savedFileInfo.extension,
           isSaved: true,
@@ -684,8 +719,8 @@ export function useDocumentLifecycle({
             id: activeDocumentId || `doc-${Date.now()}`,
             title: info.name,
             path: `InkStudio\\${info.name}`,
-            size: 1572864,
-            coverUrl: layers[0]?.thumbnailUrl,
+            size: info.size || 1572864,
+            coverUrl: info.previewDataUrl || layers[0]?.thumbnailUrl,
             isStarred: false,
             fileType: info.extension,
             isSaved: true,
@@ -697,34 +732,17 @@ export function useDocumentLifecycle({
             alert('Failed to save file: ' + msg);
           }
         }
+      } finally {
+        uiStoreActions.setLoading(false, '');
       }
     }
-  }, [
-    activeDocumentId,
-    colorMode,
-    dimensions,
-    documentName,
-    getEffectiveOpacity,
-    isLayerEffectivelyVisible,
-    layerCanvasesRef,
-    layers,
-    savedFileInfo,
-    showToast,
-  ]);
+  }, [activeDocumentId, buildSaveData, layers, savedFileInfo, showToast]);
 
   const handleSaveAs = useCallback(async () => {
-    const cleanNameForSave = documentName.replace(/\*+$/, '') || 'Untitled';
-    const docData: SaveDocumentData = {
-      name: cleanNameForSave,
-      dimensions,
-      colorMode,
-      layers,
-      layerCanvasesMap: layerCanvasesRef.current,
-      tileGrid: documentStore.getActiveTileGrid(),
-      getEffectiveOpacity,
-      isLayerEffectivelyVisible,
-      tabId: activeDocumentId || undefined,
+    const onProgress = (p: SaveProgress) => {
+      uiStoreActions.setLoading(true, `${p.message} (${p.percent}%)`);
     };
+    const docData = buildSaveData(onProgress);
 
     try {
       const defaultExt = savedFileInfo?.extension || '.sora';
@@ -740,8 +758,8 @@ export function useDocumentLifecycle({
         id: activeDocumentId || `doc-${Date.now()}`,
         title: info.name,
         path: `InkStudio\\${info.name}`,
-        size: 1572864,
-        coverUrl: layers[0]?.thumbnailUrl,
+        size: info.size || 1572864,
+        coverUrl: info.previewDataUrl || layers[0]?.thumbnailUrl,
         isStarred: false,
         fileType: info.extension,
         isSaved: true,
@@ -752,32 +770,17 @@ export function useDocumentLifecycle({
       if (msg !== 'Save canceled') {
         alert('Failed to save file: ' + msg);
       }
+    } finally {
+      uiStoreActions.setLoading(false, '');
     }
-  }, [
-    activeDocumentId,
-    colorMode,
-    dimensions,
-    documentName,
-    getEffectiveOpacity,
-    isLayerEffectivelyVisible,
-    layerCanvasesRef,
-    layers,
-    savedFileInfo,
-    showToast,
-  ]);
+  }, [activeDocumentId, buildSaveData, layers, savedFileInfo, showToast]);
 
   const handleExportImage = useCallback(async () => {
     const cleanNameForSave = documentName.replace(/\*+$/, '') || 'Untitled';
-    const docData: SaveDocumentData = {
-      name: cleanNameForSave,
-      dimensions,
-      colorMode,
-      layers,
-      layerCanvasesMap: layerCanvasesRef.current,
-      tileGrid: documentStore.getActiveTileGrid(),
-      getEffectiveOpacity,
-      isLayerEffectivelyVisible,
+    const onProgress = (p: SaveProgress) => {
+      uiStoreActions.setLoading(true, `${p.message} (${p.percent}%)`);
     };
+    const docData = buildSaveData(onProgress);
 
     try {
       const exportedName = await promptExportPngImage(docData, cleanNameForSave);
@@ -787,17 +790,10 @@ export function useDocumentLifecycle({
       if (msg !== 'Export canceled') {
         alert('Failed to export image: ' + msg);
       }
+    } finally {
+      uiStoreActions.setLoading(false, '');
     }
-  }, [
-    colorMode,
-    dimensions,
-    documentName,
-    getEffectiveOpacity,
-    isLayerEffectivelyVisible,
-    layerCanvasesRef,
-    layers,
-    showToast,
-  ]);
+  }, [buildSaveData, documentName, showToast]);
 
   const handleSelectWelcomeDocument = useCallback(
     async (doc: RecentDocument) => {

@@ -2,7 +2,8 @@ import { LoadedDocument, LayerItem, CanvasColorMode, isFolderLikeLayer } from '.
 import { createCanvasThumbnail } from './canvasUtils';
 import { renderVectorLayer } from './vectorEngine';
 import { renderBalloonLayerData, renderTextLayerData } from './vectorLayerRenderer';
-import { parseSoraProjectJson } from './saveManager';
+import { parseSoraProject } from './saveManager';
+import { releaseTemporaryCanvas } from './tileEngine';
 
 /**
  * Loads standard raster/vector image formats (.png, .jpg, .jpeg, .webp, .bmp, .gif, .svg).
@@ -106,14 +107,63 @@ export async function openFile(file: File): Promise<LoadedDocument> {
 
   if (ext === '.ink' || ext === '.sora' || ext === '.json') {
     try {
-      const text = await file.text();
-      const project = parseSoraProjectJson(text);
+      const buffer = await file.arrayBuffer();
+      const project = await parseSoraProject(buffer);
       if (project.layers && Array.isArray(project.layers)) {
         const width = project.dimensions.width;
         const height = project.dimensions.height;
         const dpi = project.dimensions.dpi || 300;
         const colorMode: CanvasColorMode = project.colorMode || 'color';
         const layers: LayerItem[] = project.layers;
+
+        // Fast native binary v2 path: tiles are already populated directly into SparseTileGrid
+        if (project.format === 'v2' && project.tileGrid) {
+          const grid = project.tileGrid;
+          if (typeof document !== 'undefined') {
+            for (const layer of layers) {
+              if (grid.hasLayerTiles(layer.id)) continue;
+              if (layer.type === 'text' && layer.textData) {
+                const temp = document.createElement('canvas');
+                temp.width = width;
+                temp.height = height;
+                const ctx = temp.getContext('2d');
+                if (ctx) renderTextLayerData(ctx, layer.textData);
+                grid.ingestCanvas(layer.id, temp, grid.getLayerFormat(layer.id));
+                releaseTemporaryCanvas(temp);
+              } else if (layer.type === 'balloon' && layer.balloonData) {
+                const temp = document.createElement('canvas');
+                temp.width = width;
+                temp.height = height;
+                const ctx = temp.getContext('2d');
+                if (ctx) renderBalloonLayerData(ctx, layer.balloonData);
+                grid.ingestCanvas(layer.id, temp, grid.getLayerFormat(layer.id));
+                releaseTemporaryCanvas(temp);
+              } else if (layer.type === 'vector' && layer.vectorStrokes && layer.vectorStrokes.length > 0) {
+                const temp = document.createElement('canvas');
+                temp.width = width;
+                temp.height = height;
+                const ctx = temp.getContext('2d');
+                if (ctx) renderVectorLayer(ctx, layer.vectorStrokes);
+                grid.ingestCanvas(layer.id, temp, grid.getLayerFormat(layer.id));
+                releaseTemporaryCanvas(temp);
+              }
+            }
+          }
+
+          return {
+            name: project.name || file.name.replace(/\.[^/.]+$/, ''),
+            dimensions: { width, height, dpi },
+            colorMode,
+            layers,
+            tileGrid: grid,
+            perspectiveRuler: project.perspectiveRuler ?? null,
+            animationTimeline: project.animationTimeline ?? null,
+            timelapse: project.timelapse ?? null,
+            previewDataUrl: project.previewDataUrl,
+          };
+        }
+
+        // Legacy v1.2 JSON path: reconstruct canvases from base64 PNG data URLs
         const layerCanvases = new Map<string, HTMLCanvasElement>();
 
         const loadPromises = layers.map((layer) => {
@@ -203,7 +253,7 @@ export async function openFile(file: File): Promise<LoadedDocument> {
         };
       }
     } catch (err) {
-      console.warn('Failed to parse .sora project JSON, falling back to image loader:', err);
+      console.warn('Failed to parse .sora project, falling back to image loader:', err);
     }
   }
 

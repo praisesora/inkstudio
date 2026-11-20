@@ -5,7 +5,7 @@ import {
 } from '../tileEngine';
 import { binarizeCanvasRect } from '../colorUtils';
 import { TaperEngine } from '../../engine/TaperEngine';
-import { COMPOSITOR_FRAGMENT_SHADER } from '../compositor';
+import { COMPOSITOR_FRAGMENT_SHADER, COMPOSITOR_INSTANCED_FRAGMENT_SHADER } from '../compositor';
 import { extractCoalescedEvents } from '../../components/CanvasArea';
 import { LayerPixelSampler } from '../colorMixingEngine';
 import {
@@ -174,10 +174,13 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
     grid.writeImageData(layerId, { data: stroke1, width: 20, height: 20 }, 300, 300, 'monochrome-1bit');
 
     // 3. Query zoomed-out LOD 1, LOD 2, and LOD 3 tiles (simulating fit-to-screen viewport compositor)
+    // Display LOD > 0 tiles use box-filtered color-32bit coverage to match live mipmapped drafts
+    // without bitwise-OR dilation, while canonical LOD 0 tiles remain 1-bit.
+    expect(grid.getTile(layerId, 1, 1, 0)!.format).toBe('monochrome-1bit');
     for (const lod of [1, 2, 3]) {
       const lodTile = grid.generateLodTile(layerId, 0, 0, lod);
       expect(lodTile).not.toBeNull();
-      expect(lodTile!.format).toBe('monochrome-1bit');
+      expect(lodTile!.format).toBe('color-32bit');
       const rgba = grid.getTileAsRGBA(lodTile!);
       let inkPixels = 0;
       for (let i = 3; i < rgba.length; i += 4) {
@@ -406,5 +409,33 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
     expect(extractCoalescedEvents({ nativeEvent: alignedMoveNative } as React.PointerEvent<HTMLElement>)).toEqual(
       validCoalesced
     );
+  });
+
+  it('uses identical monochrome alpha curve in draft and instanced shaders and box-filters 1-bit LOD coverage', () => {
+    // Draft (COMPOSITOR_FRAGMENT_SHADER) and baked tiles (COMPOSITOR_INSTANCED_FRAGMENT_SHADER)
+    // must use the exact same monochrome alpha expression (no edge-bloating smoothstep on draft).
+    expect(COMPOSITOR_FRAGMENT_SHADER).toContain(
+      'float monoAlpha = u_zoom >= 0.99 ? step(0.5, finalColor.a) : finalColor.a;'
+    );
+    expect(COMPOSITOR_INSTANCED_FRAGMENT_SHADER).toContain(
+      'float monoAlpha = u_zoom >= 0.99 ? step(0.5, finalColor.a) : finalColor.a;'
+    );
+    expect(COMPOSITOR_FRAGMENT_SHADER).not.toContain('smoothstep(0.02, monoHi');
+
+    // A single 1-bit ink pixel in a 2x2 block must produce 1/4 alpha coverage (64), NOT bitwise-OR 255
+    const layerId = 'layer-mono-lod-cov';
+    const dot = new Uint8ClampedArray(4);
+    dot[3] = 255;
+    grid.writeImageData(layerId, { data: dot, width: 1, height: 1 }, 10, 10, 'monochrome-1bit');
+
+    const lod1 = grid.generateLodTile(layerId, 0, 0, 1);
+    expect(lod1).not.toBeNull();
+    expect(lod1!.format).toBe('color-32bit');
+    const rgba = grid.getTileAsRGBA(lod1!);
+    const idx = (5 * TILE_SIZE + 5) * 4;
+    expect(rgba[idx]).toBe(0);
+    expect(rgba[idx + 1]).toBe(0);
+    expect(rgba[idx + 2]).toBe(0);
+    expect(rgba[idx + 3]).toBe(64);
   });
 });

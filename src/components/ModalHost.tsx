@@ -12,7 +12,7 @@ import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType } from '../utils/tonalEngine';
 import { AnyTonalParams } from '../hooks/useTonalAndFilterActions';
 import { SaturatedLinesOptions, StreamLinesOptions } from '../utils/mangaEffectsEngine';
-import { compositeCanvas } from '../utils/saveManager';
+import { compositeCanvas, createDocumentRegionRenderer } from '../utils/saveManager';
 import { documentStore } from '../utils/documentStore';
 import { useDocumentStore, useUiStore, uiStoreActions } from '../stores';
 import { CrashRecoveryModal } from './CrashRecoveryModal';
@@ -149,6 +149,8 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     const loadingStatus = useUiStore((s) => s.loadingStatus);
     const toastMessage = useUiStore((s) => s.toastMessage);
 
+    const colorMode = useDocumentStore((s) => s.colorMode);
+
     const getWebtoonActiveCanvas = useCallback(
       () =>
         compositeCanvas(
@@ -158,9 +160,24 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           getEffectiveOpacity,
           isLayerEffectivelyVisible,
           false,
-          documentStore.getActiveTileGrid()
+          documentStore.getActiveTileGrid(),
+          { colorMode }
         ),
-      [dimensions, layers, layerCanvasesRef, getEffectiveOpacity, isLayerEffectivelyVisible]
+      [dimensions, layers, layerCanvasesRef, getEffectiveOpacity, isLayerEffectivelyVisible, colorMode]
+    );
+
+    const createWebtoonRegionRenderer = useCallback(
+      () =>
+        createDocumentRegionRenderer(
+          dimensions,
+          layers,
+          layerCanvasesRef.current,
+          getEffectiveOpacity,
+          isLayerEffectivelyVisible,
+          documentStore.getActiveTileGrid(),
+          { colorMode }
+        ),
+      [dimensions, layers, layerCanvasesRef, getEffectiveOpacity, isLayerEffectivelyVisible, colorMode]
     );
 
     const activeDoc = documents.find((d) => d.id === activeDocumentId);
@@ -284,7 +301,9 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
                   {loadingStatus || 'Opening Document...'}
                 </span>
                 <span className="text-[#8a8a8a] text-[10px]">
-                  Extracting layers and pixel data
+                  {loadingStatus && /sav|export|composit|encod/i.test(loadingStatus)
+                    ? 'Processing layers and tile data'
+                    : 'Extracting layers and pixel data'}
                 </span>
               </div>
             </div>
@@ -310,6 +329,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           isOpen={isWebtoonExportModalOpen}
           onClose={() => uiStoreActions.setWebtoonExportModalOpen(false)}
           getActiveCanvas={getWebtoonActiveCanvas}
+          createRegionRenderer={createWebtoonRegionRenderer}
           canvasWidth={dimensions.width}
           canvasHeight={dimensions.height}
           documentTitle={activeDoc?.name || 'webtoon_chapter'}

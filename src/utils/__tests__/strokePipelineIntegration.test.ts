@@ -17,7 +17,8 @@ import {
   TexturedBrushOptions,
 } from '../stampEngine';
 import { WebGlBrushEngine, GpuDab } from '../webglBrushEngine';
-import { Point } from '../../types/editor';
+import { renderCompleteStroke } from '../canvasUtils';
+import { BrushSettings, Point } from '../../types/editor';
 
 function makeMock2DCtx(w = 1000, h = 1000) {
   const ops: string[] = [];
@@ -398,6 +399,127 @@ describe('WebGlBrushEngine Integration & Canvas 2D Fallback in stampEngine', () 
       });
       expect(renderSpy).toHaveBeenCalledTimes(1);
       expect(fallbackMock.raw.drawImage).toHaveBeenCalled();
+    } finally {
+      availSpy.mockRestore();
+      renderSpy.mockRestore();
+    }
+  });
+
+  it('does not elongate tips on zoomed-out 6071x8598 strokes or paused releases, and tightly caps true flicks', () => {
+    // 1. Zoomed-out manga canvas (zoom = 0.1): 4 doc px/ms is only 0.4 screen px/ms (< 0.70 threshold)
+    const pipeZoomedOut = new StrokePipeline();
+    pipeZoomedOut.beginStroke({ stabilizerLevel: 0, zoom: 0.1, brushSize: 12 });
+    pipeZoomedOut.seedKnot(1000, 1000, 0.6, 8, 0, 0, 0, 0);
+    pipeZoomedOut.enqueueSample(1032, 1000, 0.55, 0, 0, 0, 8, POINTER_TYPE_PEN);
+    pipeZoomedOut.enqueueSample(1064, 1000, 0.5, 0, 0, 0, 16, POINTER_TYPE_PEN);
+    pipeZoomedOut.drain();
+
+    const flickPointsZoomedOut: Array<{ x: number; y: number; width: number }> = [];
+    pipeZoomedOut.finalizeStroke(20, {
+      enableFlickTaper: true,
+      onPoint: (s) => flickPointsZoomedOut.push({ x: s.x, y: s.y, width: s.width }),
+    });
+    expect(flickPointsZoomedOut.length).toBe(0);
+
+    // 2. True fast flick at zoom = 0.1 (15 doc px/ms = 1.5 screen px/ms): tightly capped near brush width
+    const pipeFastFlick = new StrokePipeline();
+    pipeFastFlick.beginStroke({ stabilizerLevel: 0, zoom: 0.1, brushSize: 12 });
+    pipeFastFlick.seedKnot(1000, 1000, 0.6, 8, 0, 0, 0, 0);
+    pipeFastFlick.enqueueSample(1120, 1000, 0.55, 0, 0, 0, 8, POINTER_TYPE_PEN);
+    pipeFastFlick.enqueueSample(1240, 1000, 0.5, 0, 0, 0, 16, POINTER_TYPE_PEN);
+    pipeFastFlick.drain();
+
+    const fastFlickPts: Array<{ x: number; y: number; width: number }> = [];
+    pipeFastFlick.finalizeStroke(20, {
+      enableFlickTaper: true,
+      onPoint: (s) => fastFlickPts.push({ x: s.x, y: s.y, width: s.width }),
+    });
+    expect(fastFlickPts.length).toBeGreaterThanOrEqual(6);
+    const tailLen = Math.hypot(
+      fastFlickPts[fastFlickPts.length - 1].x - 1240,
+      fastFlickPts[fastFlickPts.length - 1].y - 1000
+    );
+    expect(tailLen).toBeLessThanOrEqual(16);
+
+    // 3. Dwell gate (>32ms pause before pointerup) suppresses flick completely even at 1.0x zoom
+    const pipeDwell = new StrokePipeline();
+    pipeDwell.beginStroke({ stabilizerLevel: 0, zoom: 1.0, brushSize: 12 });
+    pipeDwell.seedKnot(100, 100, 0.6, 8, 0, 0, 0, 0);
+    pipeDwell.enqueueSample(140, 100, 0.55, 0, 0, 0, 8, POINTER_TYPE_PEN);
+    pipeDwell.enqueueSample(180, 100, 0.5, 0, 0, 0, 16, POINTER_TYPE_PEN);
+    pipeDwell.drain();
+
+    const dwellFlickPts: Array<{ x: number; y: number }> = [];
+    pipeDwell.finalizeStroke(80, {
+      enableFlickTaper: true,
+      onPoint: (s) => dwellFlickPts.push({ x: s.x, y: s.y }),
+    });
+    expect(dwellFlickPts.length).toBe(0);
+  });
+
+  it('routes monochrome pointerup bakes via GPU when allowGpuForMonochrome is enabled and preserves tapered tips', () => {
+    const gpu = WebGlBrushEngine.getInstance();
+    const availSpy = vi.spyOn(gpu, 'isAvailable').mockReturnValue(true);
+    const renderedBatches: GpuDab[][] = [];
+    const renderSpy = vi.spyOn(gpu, 'renderDabsToContext').mockImplementation((_ctx, dabs) => {
+      renderedBatches.push(dabs.map((d) => ({ ...d })));
+      return true;
+    });
+
+    try {
+      const taperedPoints: Point[] = [
+        { x: 10, y: 10, pressure: 0.8, width: 10 },
+        { x: 30, y: 10, pressure: 0.6, width: 6 },
+        { x: 50, y: 10, pressure: 0.1, width: 0.5 },
+      ];
+      const gPenSettings = {
+        size: 12,
+        opacity: 1,
+        flow: 1,
+        hardness: 1,
+        spacing: 0.05,
+        color: '#000000',
+        antiAlias: 2,
+        useGpu: true,
+        customTipImage: mockTipImage,
+        taper: { useIn: true, useOut: true, inLength: 10, outLength: 10 },
+      } as unknown as BrushSettings;
+
+      const mockCtx = makeMock2DCtx(256, 256);
+      renderCompleteStroke(
+        mockCtx.ctx,
+        taperedPoints,
+        gPenSettings,
+        'brush',
+        'monochrome',
+        false,
+        undefined,
+        false,
+        undefined,
+        true
+      );
+
+      expect(renderSpy).toHaveBeenCalledTimes(1);
+      expect(mockCtx.raw.drawImage).not.toHaveBeenCalled();
+      // Tapered tail width (<1.25px) must NOT be inflated back to 1.25px
+      const lastDab = renderedBatches[0][renderedBatches[0].length - 1];
+      expect(lastDab.width).toBeLessThan(1.25);
+
+      // Dot Pen (antiAlias: 0) still stays on CPU even with allowGpuForMonochrome = true
+      const dotPenCtx = makeMock2DCtx(256, 256);
+      renderCompleteStroke(
+        dotPenCtx.ctx,
+        taperedPoints,
+        { ...gPenSettings, antiAlias: 0, customTipImage: undefined },
+        'brush',
+        'monochrome',
+        false,
+        undefined,
+        false,
+        undefined,
+        true
+      );
+      expect(renderSpy).toHaveBeenCalledTimes(1);
     } finally {
       availSpy.mockRestore();
       renderSpy.mockRestore();

@@ -2221,9 +2221,10 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
         grid = session.tileGrid;
       }
 
+      const restoredFormats = doc.tileGrid ? doc.tileGrid.getAllLayerFormats() : null;
       if (!skipIngest) {
         if (doc.tileGrid && doc.tileGrid !== grid) {
-          grid.restoreFromSnapshot(doc.tileGrid.getAllTiles(), doc.tileGrid.getAllLayerFormats());
+          grid.restoreFromSnapshot(doc.tileGrid.getAllTiles(), restoredFormats || undefined);
           doc.tileGrid.clearAll();
         } else if (!doc.tileGrid) {
           grid.clearAll();
@@ -2238,8 +2239,15 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
 
       for (const l of doc.layers) {
         if (hasTileBackedLayer(l)) {
-          const isMono = l.expressionColor === 'monochrome';
-          grid.setLayerFormat(l.id, isMono ? 'monochrome-1bit' : 'color-32bit');
+          const existingFormat = restoredFormats?.get(l.id);
+          const inferredFormat =
+            existingFormat ??
+            (l.expressionColor === 'monochrome'
+              ? 'monochrome-1bit'
+              : l.expressionColor === 'gray'
+                ? 'grayscale-8bit'
+                : 'color-32bit');
+          grid.setLayerFormat(l.id, inferredFormat);
           grid.markLayerIngested(l.id);
         }
       }

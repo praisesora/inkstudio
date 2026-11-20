@@ -192,6 +192,7 @@ export class StrokePipeline {
   private lastVy: number = 0;
   private hasLastRaw: boolean = false;
   private stabilizerLevel: number = 0;
+  private zoomScale: number = 1.0;
 
   // Dirty rect tracking (integer bounds in canvas space)
   public dirtyRect: DirtyRectBounds = {
@@ -227,6 +228,9 @@ export class StrokePipeline {
   }
 
   public setZoomScale(zoom: number): void {
+    if (Number.isFinite(zoom) && zoom > 0) {
+      this.zoomScale = zoom;
+    }
     this.stabilizer.setZoomScale(zoom);
   }
 
@@ -338,7 +342,9 @@ export class StrokePipeline {
       this.setStabilizerLevel(config.stabilizerLevel);
     }
     if (config?.zoom !== undefined) {
-      this.stabilizer.setZoomScale(config.zoom);
+      this.setZoomScale(config.zoom);
+    } else {
+      this.zoomScale = 1.0;
     }
     if (config?.sharpCorners !== undefined) {
       this.stabilizer.setSharpCorners(config.sharpCorners);
@@ -634,80 +640,95 @@ export class StrokePipeline {
     const padExtra = options?.dirtyPadExtra ?? 0;
 
     if (this.knotCount >= 2) {
-      // Seal the final unsealed interior segment knotP1 -> knotP2
-      const finalSeg = this.splineGen.generateCatmullRomSegment(
-        this.knotP0,
-        this.knotP1,
-        this.knotP2,
-        this.knotP2
-      );
-      this.expandSegmentDirtyRect(finalSeg, padExtra);
-      if (options?.onSegment) {
-        options.onSegment(finalSeg, false);
-      } else if (this.scratchCtx) {
-        this.renderSegment(this.scratchCtx, finalSeg, false);
-      }
+      let flickCount = 0;
+      let flickPoints: ReturnType<TaperEngine['computeFlickTaper']>['points'] = [];
+      let velX = 0;
+      let velY = 0;
 
       if (options?.enableFlickTaper) {
+        const dwellMs = this.hasLastRaw ? Math.max(0, endTimestampMs - this.lastRawTime) : 0;
         const vel = this.getLastVelocity();
-        const flick = this.taperEngine.computeFlickTaper(
-          this.knotP2.x,
-          this.knotP2.y,
-          this.knotP2.width,
-          this.knotP2.pressure,
-          vel.vx,
-          vel.vy,
-          endTimestampMs
-        );
-        if (flick.count > 0) {
-          for (let i = 0; i < flick.count; i++) {
-            const fp = flick.points[i];
-            const sample = this.scratchSample;
-            sample.x = fp.x;
-            sample.y = fp.y;
-            sample.pressure = fp.pressure;
-            sample.width = fp.width;
-            sample.opacity = fp.alpha;
-            sample.tiltX = this.knotP2.tiltX ?? 0;
-            sample.tiltY = this.knotP2.tiltY ?? 0;
-            sample.twist = this.knotP2.twist ?? 0;
-            sample.timestamp = fp.timestamp;
-            sample.isCorner = false;
-            sample.vx = vel.vx;
-            sample.vy = vel.vy;
-            sample.pointerType = 'pen';
-
-            this.expandDirtyRect(fp.x, fp.y, fp.width + padExtra);
-            options.onPoint?.(sample);
-            this.advanceSplineKnot(
-              fp.x,
-              fp.y,
-              fp.pressure,
-              fp.width,
-              sample.tiltX,
-              sample.tiltY,
-              sample.twist,
-              fp.timestamp,
-              vel.vx,
-              vel.vy,
-              false,
-              padExtra,
-              options.onSegment
-            );
-          }
-          // Seal final flick segment
-          const flickTailSeg = this.splineGen.generateCatmullRomSegment(
-            this.knotP0,
-            this.knotP1,
-            this.knotP2,
-            this.knotP2
+        velX = vel.vx;
+        velY = vel.vy;
+        if (dwellMs <= 32) {
+          const flick = this.taperEngine.computeFlickTaper(
+            this.knotP2.x,
+            this.knotP2.y,
+            this.knotP2.width,
+            this.knotP2.pressure,
+            vel.vx,
+            vel.vy,
+            endTimestampMs,
+            0,
+            this.zoomScale
           );
-          this.expandSegmentDirtyRect(flickTailSeg, padExtra);
-          if (options.onSegment) {
-            options.onSegment(flickTailSeg, false);
-          } else if (this.scratchCtx) {
-            this.renderSegment(this.scratchCtx, flickTailSeg, false);
-          }
+          flickCount = flick.count;
+          flickPoints = flick.points;
+        }
+      }
+
+      if (flickCount > 0) {
+        for (let i = 0; i < flickCount; i++) {
+          const fp = flickPoints[i];
+          const sample = this.scratchSample;
+          sample.x = fp.x;
+          sample.y = fp.y;
+          sample.pressure = fp.pressure;
+          sample.width = fp.width;
+          sample.opacity = fp.alpha;
+          sample.tiltX = this.knotP2.tiltX ?? 0;
+          sample.tiltY = this.knotP2.tiltY ?? 0;
+          sample.twist = this.knotP2.twist ?? 0;
+          sample.timestamp = fp.timestamp;
+          sample.isCorner = false;
+          sample.vx = velX;
+          sample.vy = velY;
+          sample.pointerType = 'pen';
+
+          this.expandDirtyRect(fp.x, fp.y, fp.width + padExtra);
+          options?.onPoint?.(sample);
+          this.advanceSplineKnot(
+            fp.x,
+            fp.y,
+            fp.pressure,
+            fp.width,
+            sample.tiltX,
+            sample.tiltY,
+            sample.twist,
+            fp.timestamp,
+            velX,
+            velY,
+            false,
+            padExtra,
+            options?.onSegment
+          );
+        }
+        // Seal final flick segment
+        const flickTailSeg = this.splineGen.generateCatmullRomSegment(
+          this.knotP0,
+          this.knotP1,
+          this.knotP2,
+          this.knotP2
+        );
+        this.expandSegmentDirtyRect(flickTailSeg, padExtra);
+        if (options?.onSegment) {
+          options.onSegment(flickTailSeg, false);
+        } else if (this.scratchCtx) {
+          this.renderSegment(this.scratchCtx, flickTailSeg, false);
+        }
+      } else {
+        // Seal the final unsealed interior segment knotP1 -> knotP2
+        const finalSeg = this.splineGen.generateCatmullRomSegment(
+          this.knotP0,
+          this.knotP1,
+          this.knotP2,
+          this.knotP2
+        );
+        this.expandSegmentDirtyRect(finalSeg, padExtra);
+        if (options?.onSegment) {
+          options.onSegment(finalSeg, false);
+        } else if (this.scratchCtx) {
+          this.renderSegment(this.scratchCtx, finalSeg, false);
         }
       }
     }

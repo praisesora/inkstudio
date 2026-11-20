@@ -353,6 +353,7 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
 
     // Throttled low-LOD preview composite (<= 1 render per ~200ms during rapid brush strokes)
     const lastPreviewTsRef = useRef<number>(0);
+    const lastContentVersionRef = useRef<number>(-1);
     const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     const renderPreviewNow = useCallback(() => {
@@ -371,6 +372,9 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
       ViewportCompositor.renderLowResPreview(canvas, curLayers, curDims, curGrid, {
         showCheckerboard: curCheck,
       });
+      if (typeof curGrid.getContentVersion === 'function') {
+        lastContentVersionRef.current = curGrid.getContentVersion();
+      }
       lastPreviewTsRef.current = Date.now();
     }, []);
 
@@ -418,9 +422,16 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
       scheduleThrottledPreview();
     }, [layers, dimensions, showCheckerboard, tileGrid, scheduleThrottledPreview]);
 
-    // Subscribe to SparseTileGrid changes with 200ms throttle to avoid stroke overhead
+    // Subscribe to SparseTileGrid changes with 200ms throttle, ignoring draft-only redraw notifications
     useEffect(() => {
+      lastContentVersionRef.current = -1;
       const unsub = tileGrid.subscribe(() => {
+        if (
+          typeof tileGrid.getContentVersion === 'function' &&
+          tileGrid.getContentVersion() === lastContentVersionRef.current
+        ) {
+          return;
+        }
         scheduleThrottledPreview();
       });
       return () => {

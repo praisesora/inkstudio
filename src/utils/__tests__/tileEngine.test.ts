@@ -208,5 +208,128 @@ describe('Sparse Virtual Tile Engine', () => {
     expect(redoTile).not.toBeNull();
     expect(getPixel1Bit(redoTile!.data!, 10, 10)).toBe(1);
   });
+
+  it('packs partial unaligned sub-rects directly into 1-bit tiles without clobbering untouched bits', () => {
+    grid.setLayerFormat('mono-sub', 'monochrome-1bit');
+    const tile = grid.getOrCreateTile('mono-sub', 0, 0, 'monochrome-1bit');
+    // Seed sentinel bits immediately outside the target sub-rect [5..21) x [3..5)
+    setPixel1Bit(tile.data!, 4, 3, true);
+    setPixel1Bit(tile.data!, 21, 3, true);
+    setPixel1Bit(tile.data!, 10, 2, true);
+    setPixel1Bit(tile.data!, 10, 5, true);
+
+    const w = 16; // covers local x = 5..20 (unaligned start=5, aligned middle 8..15, trailing 16..20)
+    const h = 2;
+    const rgba = new Uint8ClampedArray(w * h * 4);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const off = (y * w + x) * 4;
+        if ((x + y) % 2 === 0) {
+          rgba[off] = 0;
+          rgba[off + 1] = 0;
+          rgba[off + 2] = 0;
+          rgba[off + 3] = 255;
+        }
+      }
+    }
+
+    grid.writeImageData('mono-sub', { data: rgba, width: w, height: h }, 5, 3, 'monochrome-1bit', true);
+
+    // Sentinel bits must remain intact
+    expect(getPixel1Bit(tile.data!, 4, 3)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 21, 3)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 10, 2)).toBe(1);
+    expect(getPixel1Bit(tile.data!, 10, 5)).toBe(1);
+
+    // Checkerboard inside [5..20] x [3..4] must match exactly
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        expect(getPixel1Bit(tile.data!, 5 + x, 3 + y)).toBe((x + y) % 2 === 0 ? 1 : 0);
+      }
+    }
+  });
+
+  it('compositeStrokeToTiles composites directly onto 1-bit and 32-bit tiles, skipping untouched tiles', () => {
+    // 1. Monochrome 1-bit source-over + destination-out + snapshot isolation
+    const monoLayer = 'mono-comp';
+    const w = 4;
+    const h = 4;
+    const stroke = new Uint8ClampedArray(w * h * 4);
+    // (0,0): black alpha 200 (>=128 -> ink 1), (1,0): black alpha 100 (<128 -> stays 0)
+    stroke[3] = 200;
+    stroke[7] = 100;
+
+    const snap1 = new Map<string, { format: 'monochrome-1bit' | 'grayscale-8bit' | 'color-32bit'; data: Uint8Array | null }>();
+    const mod1 = grid.compositeStrokeToTiles({
+      layerId: monoLayer,
+      strokeData: { data: stroke, width: w, height: h },
+      destX: 10,
+      destY: 10,
+      format: 'monochrome-1bit',
+      compositeOp: 'source-over',
+      opacity: 1.0,
+      monochrome: { threshold: 128, expressBlack: true, expressWhite: true },
+      snapshotOut: snap1,
+      suppressNotify: true,
+    });
+    expect(mod1).toBe(true);
+    expect(snap1.size).toBe(1);
+    const monoTile = grid.getTile(monoLayer, 0, 0, 0)!;
+    expect(getPixel1Bit(monoTile.data!, 10, 10)).toBe(1);
+    expect(getPixel1Bit(monoTile.data!, 11, 10)).toBe(0);
+
+    // Erase (10,10) with destination-out
+    const snapErase = new Map<string, { format: 'monochrome-1bit' | 'grayscale-8bit' | 'color-32bit'; data: Uint8Array | null }>();
+    grid.compositeStrokeToTiles({
+      layerId: monoLayer,
+      strokeData: { data: stroke, width: w, height: h },
+      destX: 10,
+      destY: 10,
+      format: 'monochrome-1bit',
+      compositeOp: 'destination-out',
+      opacity: 1.0,
+      monochrome: { threshold: 128, expressBlack: true, expressWhite: true },
+      snapshotOut: snapErase,
+      suppressNotify: true,
+    });
+    expect(getPixel1Bit(monoTile.data!, 10, 10)).toBe(0);
+
+    // Undo erase restores bit 1
+    const eraseDeltas = grid.computeDeltasFromSnapshot(snapErase, monoLayer);
+    expect(eraseDeltas.length).toBe(1);
+    grid.applyTileDeltas(eraseDeltas, 'undo');
+    expect(getPixel1Bit(grid.getTile(monoLayer, 0, 0, 0)!.data!, 10, 10)).toBe(1);
+
+    // 2. Color 32-bit semi-transparent source-over + source-atop
+    const colorLayer = 'color-comp';
+    const basePx = new Uint8ClampedArray([0, 0, 255, 255]); // opaque blue
+    grid.compositeStrokeToTiles({
+      layerId: colorLayer,
+      strokeData: { data: basePx, width: 1, height: 1 },
+      destX: 20,
+      destY: 20,
+      format: 'color-32bit',
+      compositeOp: 'source-over',
+      opacity: 1.0,
+      suppressNotify: true,
+    });
+    const redPx = new Uint8ClampedArray([255, 0, 0, 255]);
+    grid.compositeStrokeToTiles({
+      layerId: colorLayer,
+      strokeData: { data: redPx, width: 1, height: 1 },
+      destX: 20,
+      destY: 20,
+      format: 'color-32bit',
+      compositeOp: 'source-over',
+      opacity: 0.5,
+      suppressNotify: true,
+    });
+    const blended = grid.readImageData(colorLayer, 20, 20, 1, 1).data;
+    expect(blended[0]).toBeGreaterThanOrEqual(126);
+    expect(blended[0]).toBeLessThanOrEqual(130);
+    expect(blended[2]).toBeGreaterThanOrEqual(126);
+    expect(blended[2]).toBeLessThanOrEqual(130);
+    expect(blended[3]).toBe(255);
+  });
 });
 
