@@ -2410,6 +2410,7 @@ export function useBrushStrokeSession({
         );
 
         if (clampedBakeRect) {
+          const strokeIdForHistory = currentStrokeIdRef.current || undefined;
           const { x: sx, y: sy, width: dw, height: dh } = clampedBakeRect;
           let label = 'Brush Stroke';
           if (bs.isTransparentInk) {
@@ -2519,7 +2520,7 @@ export function useBrushStrokeSession({
                   undefined,
                   undefined,
                   undefined,
-                  undefined,
+                  strokeIdForHistory,
                   true
                 );
               });
@@ -2634,7 +2635,10 @@ export function useBrushStrokeSession({
                 null,
                 currentLayerId,
                 dirtyRect,
-                tileDeltas
+                tileDeltas,
+                undefined,
+                undefined,
+                strokeIdForHistory
               );
             });
           } else {
@@ -2830,7 +2834,10 @@ export function useBrushStrokeSession({
                     null,
                     currentLayerId,
                     dirtyRect,
-                    tileDeltas
+                    tileDeltas,
+                    undefined,
+                    undefined,
+                    strokeIdForHistory
                   );
                 });
               };
@@ -2933,7 +2940,10 @@ export function useBrushStrokeSession({
                       null,
                       currentLayerId,
                       dirtyRect,
-                      tileDeltas
+                      tileDeltas,
+                      undefined,
+                      undefined,
+                      strokeIdForHistory
                     );
                   });
                 };
@@ -3097,7 +3107,10 @@ export function useBrushStrokeSession({
                       null,
                       currentLayerId,
                       dirtyRect,
-                      tileDeltas
+                      tileDeltas,
+                      undefined,
+                      undefined,
+                      strokeIdForHistory
                     );
                   });
                 };

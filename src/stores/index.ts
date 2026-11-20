@@ -28,3 +28,6 @@ export type { SubViewStoreState, SubViewImageItem, SubViewTransform } from './us
 
 export { useAutoActionStore, autoActionStoreActions } from './useAutoActionStore';
 export type { AutoActionStoreState } from './useAutoActionStore';
+
+export { useUpdaterStore, updaterStoreActions } from './useUpdaterStore';
+export type { UpdaterStoreState, UpdaterStatus } from './useUpdaterStore';

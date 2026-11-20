@@ -46,7 +46,7 @@ function renderBuiltinIcon(icon: BuiltinBrushDefinition['icon']) {
 export const SubToolList: React.FC<SubToolListProps> = React.memo(
   ({ customBrushes, setCustomBrushes }) => {
     const currentTool = useToolStore((s) => s.tool);
-    const activePreset = useToolStore((s) => s.brushSettings.preset);
+    const activePreset = useToolStore((s) => s.activePresetId);
 
     const [isImportingSut, setIsImportingSut] = useState(false);
     const [isDraggingFileOver, setIsDraggingFileOver] = useState(false);

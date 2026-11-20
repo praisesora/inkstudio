@@ -47,6 +47,12 @@ export interface UseDrawingHistoryParams {
   abortActiveStrokeRef: React.MutableRefObject<() => void>;
 }
 
+export interface SelectiveUndoResult {
+  strokeId?: string;
+  layerId: string;
+  tileDeltas?: TileDelta[];
+}
+
 export interface UseDrawingHistoryResult {
   activeSessionIdRef: React.MutableRefObject<string | null>;
   activeTileGridRef: React.MutableRefObject<SparseTileGrid>;
@@ -61,7 +67,10 @@ export interface UseDrawingHistoryResult {
   jumpToHistoryIndex: (targetIndex: number) => Promise<void>;
   undo: () => void;
   redo: () => void;
-  selectiveUndo: (peerIdToUndo?: string | number) => Promise<void>;
+  selectiveUndo: (
+    peerIdToUndo?: string | number,
+    strokeIdToUndo?: string
+  ) => Promise<SelectiveUndoResult | null>;
   clearCanvas: () => void;
   resetHistory: (targetDocumentId?: string) => void;
 }
@@ -193,6 +202,7 @@ export function useDrawingHistory({
       strokeId?: string,
       isMaskEdit?: boolean
     ) => {
+      ensureInitialHistory();
       const now = Date.now();
       const dims = dimensionsRef.current;
       const grid = activeTileGridRef.current;
@@ -315,7 +325,7 @@ export function useDrawingHistory({
         recoveryService.logStrokeDelta(sessionKey, tileDeltas, vectorDelta, targetLayerId);
       }
     },
-    [colorModeRef, dimensionsRef, layersRef, persistSessionHistory, syncHistoryState]
+    [colorModeRef, dimensionsRef, ensureInitialHistory, layersRef, persistSessionHistory, syncHistoryState]
   );
 
   const pendingHistoryTasksRef = useRef<Array<() => void>>([]);
@@ -712,92 +722,170 @@ export function useDrawingHistory({
   }, [abortActiveStrokeRef, flushPendingHistoryTasks, isDrawingRef, jumpToHistoryIndex]);
 
   const selectiveUndo = useCallback(
-    async (peerIdToUndo?: string | number) => {
+    (
+      peerIdToUndo?: string | number,
+      strokeIdToUndo?: string
+    ): Promise<SelectiveUndoResult | null> => {
       flushPendingHistoryTasks();
       if (isDrawingRef.current) {
         abortActiveStrokeRef.current();
       }
 
-      const history = historyRef.current;
-      const currIdx = historyIndexRef.current;
-      if (currIdx < 0 || history.length === 0) return;
+      let result: SelectiveUndoResult | null = null;
+      const nextOp = historyQueueRef.current.then(async () => {
+        const history = historyRef.current;
+        const currIdx = historyIndexRef.current;
+        if (currIdx <= 0 || history.length <= 1) return;
 
-      let targetItemIdx = -1;
-      for (let i = currIdx; i >= 0; i--) {
-        const item = history[i];
-        if (
-          !peerIdToUndo ||
-          item.peerId === peerIdToUndo ||
-          (peerIdToUndo === 'local' && !item.peerId)
-        ) {
-          targetItemIdx = i;
-          break;
-        }
-      }
+        let targetItemIdx = -1;
 
-      if (targetItemIdx === -1) return;
-
-      const item = history[targetItemIdx];
-      const targetLayerId = item.layerId || activeLayerId;
-      const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
-      const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-      const grid = activeTileGridRef.current;
-      const undoCache = activeUndoCacheRef.current;
-      const dims = dimensionsRef.current;
-
-      if (item.vectorStrokesDelta && targetLayer) {
-        targetLayer.vectorStrokes = item.vectorStrokesDelta.before;
-        const tempVec = canvas || document.createElement('canvas');
-        if (!canvas) {
-          tempVec.width = dims.width;
-          tempVec.height = dims.height;
-        }
-        const cCtx = get2DContext(tempVec);
-        if (cCtx) {
-          cCtx.clearRect(0, 0, tempVec.width, tempVec.height);
-          renderVectorLayer(cCtx, targetLayer.vectorStrokes);
-          const isMono = targetLayer.expressionColor === 'monochrome';
-          grid.clearLayer(targetLayerId);
-          grid.ingestCanvas(targetLayerId, tempVec, isMono ? 'monochrome-1bit' : 'color-32bit');
-        }
-        if (!canvas) releaseTemporaryCanvas(tempVec);
-      } else {
-        const deltas = await undoCache.resolveDeltas(item);
-        if (deltas && deltas.length > 0) {
-          grid.applyTileDeltas(deltas, 'undo');
-          if (canvas) {
-            grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-          }
-        } else if (item.beforeImageData) {
-          const isMono =
-            !isBackgroundLayerId(targetLayerId) &&
-            (targetLayer?.expressionColor === 'monochrome' ||
-              colorModeRef.current === 'monochrome');
-          const bx = item.dirtyRect ? item.dirtyRect.x : 0;
-          const by = item.dirtyRect ? item.dirtyRect.y : 0;
-          grid.writeImageData(
-            targetLayerId,
-            item.beforeImageData,
-            bx,
-            by,
-            isMono ? 'monochrome-1bit' : 'color-32bit'
-          );
-          if (canvas) {
-            grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
+        // 1. Exact strokeId match when provided (reliable collaborative selective undo)
+        if (strokeIdToUndo) {
+          for (let i = currIdx; i >= 1; i--) {
+            const item = history[i];
+            if (item.type !== 'initial' && item.strokeId === strokeIdToUndo) {
+              targetItemIdx = i;
+              break;
+            }
           }
         }
-      }
 
-      historyRef.current.splice(targetItemIdx, 1);
-      historyIndexRef.current = Math.min(
-        historyIndexRef.current - 1,
-        historyRef.current.length - 1
-      );
-      persistSessionHistory();
-      syncHistoryState();
+        // 2. Fallback to most recent matching peerId (or local actions where item.peerId is unset)
+        if (targetItemIdx === -1) {
+          for (let i = currIdx; i >= 1; i--) {
+            const item = history[i];
+            if (item.type === 'initial') continue;
+            if (
+              !peerIdToUndo ||
+              item.peerId === peerIdToUndo ||
+              (peerIdToUndo === 'local' && (!item.peerId || item.peerId === 'local'))
+            ) {
+              targetItemIdx = i;
+              break;
+            }
+          }
+        }
 
-      onUpdateLayerThumbnail(targetLayerId);
-      grid.notifyChange(true);
+        if (targetItemIdx === -1) return;
+
+        const item = history[targetItemIdx];
+        const targetLayerId = item.layerId || activeLayerId;
+        const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
+        const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
+        const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
+        const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
+        const grid = activeTileGridRef.current;
+        const undoCache = activeUndoCacheRef.current;
+        const dims = dimensionsRef.current;
+        let resolvedDeltas: TileDelta[] | null = null;
+
+        if (item.isMaskEdit && targetLayer?.maskCanvas) {
+          const mCtx = get2DContext(targetLayer.maskCanvas);
+          if (mCtx && item.beforeImageData) {
+            const mx =
+              item.dirtyRect && item.beforeImageData.width === item.dirtyRect.width
+                ? item.dirtyRect.x
+                : 0;
+            const my =
+              item.dirtyRect && item.beforeImageData.height === item.dirtyRect.height
+                ? item.dirtyRect.y
+                : 0;
+            mCtx.putImageData(item.beforeImageData, mx, my);
+            targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
+            onUpdateMaskThumbnailRef.current?.(targetLayerId);
+          }
+        } else if (item.vectorStrokesDelta && targetLayer) {
+          targetLayer.vectorStrokes = item.vectorStrokesDelta.before;
+          const tempVec = canvas || document.createElement('canvas');
+          if (!canvas) {
+            tempVec.width = dims.width;
+            tempVec.height = dims.height;
+          }
+          const cCtx = get2DContext(tempVec);
+          if (cCtx) {
+            cCtx.clearRect(0, 0, tempVec.width, tempVec.height);
+            renderVectorLayer(cCtx, targetLayer.vectorStrokes);
+            const isMono = targetLayer.expressionColor === 'monochrome';
+            grid.clearLayer(targetLayerId);
+            grid.ingestCanvas(targetLayerId, tempVec, isMono ? 'monochrome-1bit' : 'color-32bit');
+          }
+          if (!canvas) releaseTemporaryCanvas(tempVec);
+        } else {
+          resolvedDeltas = await undoCache.resolveDeltas(item);
+          if (resolvedDeltas && resolvedDeltas.length > 0) {
+            grid.applyTileDeltas(resolvedDeltas, 'undo');
+            if (isToneStep && sourceCanvas) {
+              grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
+              if (canvas && targetLayer) {
+                applyLayerEffects(
+                  sourceCanvas,
+                  canvas,
+                  targetLayer,
+                  dimensionsRef.current.dpi ?? 600,
+                  item.dirtyRect
+                );
+              }
+            } else if (canvas) {
+              grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
+              if (sourceCanvas) {
+                grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
+              }
+            }
+          } else if (item.beforeImageData) {
+            const isMono =
+              !isBackgroundLayerId(targetLayerId) &&
+              (targetLayer?.expressionColor === 'monochrome' ||
+                colorModeRef.current === 'monochrome');
+            const bx =
+              item.dirtyRect &&
+              item.beforeImageData.width === item.dirtyRect.width &&
+              item.beforeImageData.height === item.dirtyRect.height
+                ? item.dirtyRect.x
+                : 0;
+            const by =
+              item.dirtyRect &&
+              item.beforeImageData.width === item.dirtyRect.width &&
+              item.beforeImageData.height === item.dirtyRect.height
+                ? item.dirtyRect.y
+                : 0;
+            grid.writeImageData(
+              targetLayerId,
+              item.beforeImageData,
+              bx,
+              by,
+              isMono ? 'monochrome-1bit' : 'color-32bit'
+            );
+            if (canvas) {
+              grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
+            }
+            if (sourceCanvas) {
+              grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
+            }
+          }
+        }
+
+        historyRef.current.splice(targetItemIdx, 1);
+        historyIndexRef.current = Math.max(
+          0,
+          Math.min(historyIndexRef.current - 1, historyRef.current.length - 1)
+        );
+        persistSessionHistory();
+        syncHistoryState();
+
+        onUpdateLayerThumbnail(targetLayerId);
+        grid.notifyChange(true);
+
+        result = {
+          strokeId: item.strokeId,
+          layerId: targetLayerId,
+          tileDeltas: resolvedDeltas ?? undefined,
+        };
+      });
+
+      historyQueueRef.current = nextOp.catch((err) => {
+        console.warn('[History] Error during selectiveUndo:', err);
+      });
+      return historyQueueRef.current.then(() => result);
     },
     [
       abortActiveStrokeRef,
@@ -807,8 +895,10 @@ export function useDrawingHistory({
       flushPendingHistoryTasks,
       isDrawingRef,
       layerCanvasesRef,
+      layerSourceCanvasesRef,
       layersRef,
       onUpdateLayerThumbnail,
+      onUpdateMaskThumbnailRef,
       persistSessionHistory,
       syncHistoryState,
     ]

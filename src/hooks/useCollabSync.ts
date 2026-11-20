@@ -30,7 +30,8 @@ import {
 import { drawPencilBezierSegment, drawPencilDot, PencilGrade } from '../utils/pencilEngine';
 import { renderVectorStroke } from '../utils/vectorEngine';
 import { documentStore } from '../utils/documentStore';
-import { documentStoreActions } from '../stores';
+import { documentStoreActions, uiStoreActions } from '../stores';
+import { PushHistoryStepFn } from './drawing/types';
 
 interface LayerActionMessageBase {
   type: string;
@@ -50,7 +51,12 @@ export interface UseCollabSyncParams {
   activeLayerId: string;
   selectedLayerIds: string[];
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  selectiveUndoRef: React.MutableRefObject<(peerId?: string | number) => void>;
+  materializeLayerCanvas: (id: string) => HTMLCanvasElement | null;
+  pushHistoryStepRef: React.MutableRefObject<PushHistoryStepFn | null>;
+  selectiveUndoRef: React.MutableRefObject<
+    (peerId?: string | number, strokeId?: string) => unknown
+  >;
+  resetZoomAndCenter: (dims?: CanvasDimensions) => void;
   setActiveLayerId: (id: string) => void;
   addLayer: (
     type?: 'raster' | 'folder' | 'vector',
@@ -64,7 +70,13 @@ export interface UseCollabSyncParams {
   deleteRemoteLayer: (id: string) => void;
   deleteSelectedLayers: () => void;
   groupSelectedLayers: () => void;
-  syncRemoteDocument: (layers: LayerItem[], dataUrls: Record<string, string>) => void;
+  syncRemoteDocument: (
+    layers: LayerItem[],
+    dataUrls: Record<string, string>,
+    assignedLayerId?: string,
+    targetDocumentId?: string,
+    syncDims?: CanvasDimensions
+  ) => void;
   renameLayer: (id: string, newName: string) => void;
   toggleVisibility: (id: string) => void;
   setOpacity: (id: string, opacity: number) => void;
@@ -81,7 +93,10 @@ export function useCollabSync({
   activeLayerId,
   selectedLayerIds,
   layerCanvasesRef,
+  materializeLayerCanvas,
+  pushHistoryStepRef,
   selectiveUndoRef,
+  resetZoomAndCenter,
   setActiveLayerId,
   addLayer,
   addRemoteLayer,
@@ -98,6 +113,7 @@ export function useCollabSync({
   showToast,
 }: UseCollabSyncParams) {
   const remoteDraftCanvasesRef = useRef<Map<string | number, HTMLCanvasElement>>(new Map());
+  const pendingAssignedLayerIdRef = useRef<string | undefined>(undefined);
   const remoteStrokeStatesRef = useRef<
     Map<
       string,
@@ -284,16 +300,21 @@ export function useCollabSync({
         strokeState.points.push(msg.endPoint);
       }
 
-      let targetCanvas = layerCanvasesRef.current.get(msg.layerId);
       let targetLayerId = msg.layerId;
+      let targetCanvas =
+        layerCanvasesRef.current.get(targetLayerId) ??
+        (layersRef.current.some((l) => l.id === targetLayerId)
+          ? materializeLayerCanvas(targetLayerId)
+          : null);
 
       if (!targetCanvas) {
         const byPeerId = layersRef.current.find(
           (l) => l.type === 'raster' && l.id.includes(String(msg.peerId))
         );
         if (byPeerId) {
-          targetCanvas = layerCanvasesRef.current.get(byPeerId.id);
           targetLayerId = byPeerId.id;
+          targetCanvas =
+            layerCanvasesRef.current.get(byPeerId.id) ?? materializeLayerCanvas(byPeerId.id);
         }
       }
 
@@ -303,28 +324,42 @@ export function useCollabSync({
             (l) => l.type === 'raster' && l.id !== 'layer-bg' && !l.id.startsWith('layer-bg')
           ) || layersRef.current.find((l) => l.type === 'raster');
         if (fallback) {
-          targetCanvas = layerCanvasesRef.current.get(fallback.id);
           targetLayerId = fallback.id;
+          targetCanvas =
+            layerCanvasesRef.current.get(fallback.id) ?? materializeLayerCanvas(fallback.id);
         }
       }
 
       if (targetCanvas && strokeState.points.length > 0) {
+        const activeGrid = documentStore.getActiveTileGrid();
         const targetLayer = layersRef.current.find((l) => l.id === targetLayerId);
         const isMono =
           colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
         const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
 
         if (msg.vectorStroke && targetLayer?.type === 'vector') {
-          targetLayer.vectorStrokes = [...(targetLayer.vectorStrokes || []), msg.vectorStroke];
+          const beforeStrokes = [...(targetLayer.vectorStrokes || [])];
+          const afterStrokes = [...beforeStrokes, msg.vectorStroke];
+          targetLayer.vectorStrokes = afterStrokes;
           const ctx = get2DContext(targetCanvas);
           if (ctx) {
             renderVectorStroke(ctx, msg.vectorStroke);
             const fullData = ctx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
-            documentStore
-              .getActiveTileGrid()
-              .writeImageData(targetLayerId, fullData, 0, 0, targetFormat);
+            activeGrid.writeImageData(targetLayerId, fullData, 0, 0, targetFormat);
           }
-          documentStore.getActiveTileGrid().notifyChange(true);
+          pushHistoryStepRef.current?.(
+            'brush',
+            'Remote Vector Stroke',
+            null,
+            null,
+            targetLayerId,
+            undefined,
+            undefined,
+            { before: beforeStrokes, after: afterStrokes },
+            msg.peerId,
+            msg.strokeId
+          );
+          activeGrid.notifyChange(true);
           updateLayerThumbnail(targetLayerId, true);
         } else {
           const ctx = get2DContext(targetCanvas);
@@ -336,6 +371,48 @@ export function useCollabSync({
             const isTranslucentBrush = !isEraser && (bs.opacity ?? 1.0) < 0.999;
             const isAlphaLocked = Boolean(targetLayer?.alphaLocked);
             const isTransparentInk = Boolean(bs.isTransparentInk);
+
+            const pad = Math.ceil(Math.max(32, (bs.size || 10) * 1.5));
+            let dirtyX = 0;
+            let dirtyY = 0;
+            let dirtyW = targetCanvas.width;
+            let dirtyH = targetCanvas.height;
+
+            if (msg.dirtyRect) {
+              dirtyX = Math.max(0, Math.floor(msg.dirtyRect.x));
+              dirtyY = Math.max(0, Math.floor(msg.dirtyRect.y));
+              dirtyW = Math.min(targetCanvas.width - dirtyX, Math.ceil(msg.dirtyRect.width));
+              dirtyH = Math.min(targetCanvas.height - dirtyY, Math.ceil(msg.dirtyRect.height));
+            } else if (strokeState.points.length > 0) {
+              let minX = Infinity;
+              let minY = Infinity;
+              let maxX = -Infinity;
+              let maxY = -Infinity;
+              for (const pt of strokeState.points) {
+                if (pt.x < minX) minX = pt.x;
+                if (pt.y < minY) minY = pt.y;
+                if (pt.x > maxX) maxX = pt.x;
+                if (pt.y > maxY) maxY = pt.y;
+              }
+              dirtyX = Math.max(0, Math.floor(minX - pad));
+              dirtyY = Math.max(0, Math.floor(minY - pad));
+              dirtyW = Math.min(targetCanvas.width - dirtyX, Math.ceil(maxX + pad) - dirtyX);
+              dirtyH = Math.min(targetCanvas.height - dirtyY, Math.ceil(maxY + pad) - dirtyY);
+            }
+
+            const dirtyRect =
+              dirtyW > 0 && dirtyH > 0
+                ? { x: dirtyX, y: dirtyY, width: dirtyW, height: dirtyH }
+                : undefined;
+
+            // Keep display canvas synced with authoritative grid before baking remote stroke
+            if (dirtyRect && activeGrid.hasLayerTiles(targetLayerId)) {
+              activeGrid.renderLayerToCanvas(targetLayerId, targetCanvas, dirtyRect);
+            }
+
+            const beforeSnapshot = dirtyRect
+              ? activeGrid.snapshotTilesInRect(targetLayerId, dirtyRect)
+              : null;
 
             if (isTranslucentBrush || isTransparentInk || isAlphaLocked) {
               const bakeCanvas = getReusableBakeCanvas(targetCanvas.width, targetCanvas.height);
@@ -377,42 +454,33 @@ export function useCollabSync({
               );
             }
 
-            const pad = Math.ceil(Math.max(32, (bs.size || 10) * 1.5));
-            let dirtyX = 0;
-            let dirtyY = 0;
-            let dirtyW = targetCanvas.width;
-            let dirtyH = targetCanvas.height;
-
-            if (msg.dirtyRect) {
-              dirtyX = Math.max(0, Math.floor(msg.dirtyRect.x));
-              dirtyY = Math.max(0, Math.floor(msg.dirtyRect.y));
-              dirtyW = Math.min(targetCanvas.width - dirtyX, Math.ceil(msg.dirtyRect.width));
-              dirtyH = Math.min(targetCanvas.height - dirtyY, Math.ceil(msg.dirtyRect.height));
-            } else if (strokeState.points.length > 0) {
-              let minX = Infinity;
-              let minY = Infinity;
-              let maxX = -Infinity;
-              let maxY = -Infinity;
-              for (const pt of strokeState.points) {
-                if (pt.x < minX) minX = pt.x;
-                if (pt.y < minY) minY = pt.y;
-                if (pt.x > maxX) maxX = pt.x;
-                if (pt.y > maxY) maxY = pt.y;
-              }
-              dirtyX = Math.max(0, Math.floor(minX - pad));
-              dirtyY = Math.max(0, Math.floor(minY - pad));
-              dirtyW = Math.min(targetCanvas.width - dirtyX, Math.ceil(maxX + pad) - dirtyX);
-              dirtyH = Math.min(targetCanvas.height - dirtyY, Math.ceil(maxY + pad) - dirtyY);
-            }
-
-            if (dirtyW > 0 && dirtyH > 0) {
+            if (dirtyRect) {
               const afterData = ctx.getImageData(dirtyX, dirtyY, dirtyW, dirtyH);
-              documentStore
-                .getActiveTileGrid()
-                .writeImageData(targetLayerId, afterData, dirtyX, dirtyY, targetFormat);
+              activeGrid.writeImageData(targetLayerId, afterData, dirtyX, dirtyY, targetFormat);
+              if (beforeSnapshot) {
+                const tileDeltas = activeGrid.computeDeltasFromSnapshot(
+                  beforeSnapshot,
+                  targetLayerId,
+                  dirtyRect
+                );
+                if (tileDeltas.length > 0) {
+                  pushHistoryStepRef.current?.(
+                    isEraser ? 'eraser' : 'brush',
+                    isEraser ? 'Remote Eraser' : 'Remote Brush',
+                    null,
+                    null,
+                    targetLayerId,
+                    dirtyRect,
+                    tileDeltas,
+                    undefined,
+                    msg.peerId,
+                    msg.strokeId
+                  );
+                }
+              }
             }
 
-            documentStore.getActiveTileGrid().notifyChange(true);
+            activeGrid.notifyChange(true);
             updateLayerThumbnail(targetLayerId, true);
           }
         }
@@ -428,7 +496,7 @@ export function useCollabSync({
 
       remoteStrokeStatesRef.current.delete(msg.strokeId);
     },
-    [colorMode, layerCanvasesRef, updateLayerThumbnail]
+    [colorMode, layerCanvasesRef, materializeLayerCanvas, pushHistoryStepRef, updateLayerThumbnail]
   );
 
   const handleRemoteDocSync = useCallback(
@@ -436,31 +504,55 @@ export function useCollabSync({
       syncDims: CanvasDimensions,
       syncMode: CanvasColorMode,
       syncLayers: LayerItem[],
-      syncDataUrls: Record<string, string>
+      syncDataUrls: Record<string, string>,
+      assignedLayerId?: string,
+      roomName?: string
     ) => {
+      const newDocId = `doc-collab-${Date.now()}`;
+      const effectiveAssignedId = assignedLayerId || pendingAssignedLayerIdRef.current;
+      pendingAssignedLayerIdRef.current = undefined;
+
+      const resolvedActiveLayerId =
+        effectiveAssignedId && syncLayers.some((l) => l.id === effectiveAssignedId)
+          ? effectiveAssignedId
+          : syncLayers.find(
+              (l) => l.type === 'raster' && l.id !== 'layer-bg' && !l.id.startsWith('layer-bg')
+            )?.id ||
+            syncLayers[0]?.id ||
+            'layer-1';
+
+      const tabName = (roomName || '').trim() || 'Collab Session';
+
+      // Bind new documentStore session BEFORE any BINARY_TILE packets arrive
+      syncRemoteDocument(syncLayers, syncDataUrls, resolvedActiveLayerId, newDocId, syncDims);
+
       documentStoreActions.setDimensions(syncDims);
       documentStoreActions.setColorMode(syncMode);
-      syncRemoteDocument(syncLayers, syncDataUrls);
-      const newDocId = `doc-collab-${Date.now()}`;
       const newDoc: DocumentTab = {
         id: newDocId,
-        name: 'Collab Session',
+        name: tabName,
         dimensions: syncDims,
         colorMode: syncMode,
         layers: syncLayers,
-        activeLayerId: syncLayers[0]?.id || 'layer-1',
+        activeLayerId: resolvedActiveLayerId,
         perspectiveRuler: null,
       };
       documentStoreActions.setPerspectiveRuler(null);
       documentStoreActions.setDocuments([newDoc]);
       documentStoreActions.setActiveDocumentId(newDocId);
-      documentStoreActions.setDocumentName('Collab Session');
+      documentStoreActions.setDocumentName(tabName);
+      uiStoreActions.setAppView('workspace');
+
+      requestAnimationFrame(() => {
+        resetZoomAndCenter(syncDims);
+      });
     },
-    [syncRemoteDocument]
+    [resetZoomAndCenter, syncRemoteDocument]
   );
 
   const handleRemoteAssignedLayer = useCallback(
     (layerId: string) => {
+      pendingAssignedLayerIdRef.current = layerId;
       setActiveLayerId(layerId);
     },
     [setActiveLayerId]
@@ -553,19 +645,25 @@ export function useCollabSync({
     onRemoteJoinRequest: handleRemoteJoinRequest,
     onRemoteAssignedLayer: handleRemoteAssignedLayer,
     onRemoteLayerAction: handleRemoteLayerAction,
-    onRemoteSelectiveUndo: (_strokeId, peerId) => {
-      selectiveUndoRef.current(peerId);
+    onRemoteSelectiveUndo: (strokeId, peerId) => {
+      selectiveUndoRef.current(peerId, strokeId);
     },
     showToast,
   });
 
   const handleStartHosting = useCallback(
-    async (roomName: string, port: number, hostNickname?: string, isGlobal?: boolean) => {
+    async (
+      roomName: string,
+      port: number,
+      hostNickname?: string,
+      isGlobal?: boolean,
+      onStatus?: (status: string) => void
+    ) => {
       if (!hasOpenDocument) {
         showToast('Please create or open a canvas before hosting a session.');
         return false;
       }
-      const finalHostName = (hostNickname || mp.myPeer.name || 'Sora').trim();
+      const finalHostName = (hostNickname || mp.myPeer.name || 'Artist').trim();
       const defaultLayer =
         layersRef.current.find((l) => l.id === activeLayerId) ||
         layersRef.current.find(
@@ -582,7 +680,7 @@ export function useCollabSync({
         );
         renameLayer(defaultLayer.id, hostLayerName);
       }
-      return await mp.startHosting(roomName, port, finalHostName, isGlobal);
+      return await mp.startHosting(roomName, port, finalHostName, isGlobal, onStatus);
     },
     [hasOpenDocument, showToast, mp.myPeer.name, activeLayerId, renameLayer, mp.startHosting]
   );

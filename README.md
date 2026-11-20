@@ -1,6 +1,6 @@
 # Ink Studio
 
-A lightweight desktop digital painting application with real-time collaborative multiplayer drawing, inspired by Clip Studio Paint.
+**Collaborative Drawing Studio** by Sora — a lightweight desktop digital painting and manga application with real-time collaborative multiplayer drawing, inspired by Clip Studio Paint.
 
 ## Features
 
@@ -103,3 +103,7 @@ npm run tauri build
 | `Ctrl + Shift + R` | Toggle perspective ruler |
 | `Ctrl + Shift + P` | Toggle perspective snapping |
 | `Ctrl + ,` | Settings |
+
+## License
+
+Ink Studio is licensed under the [GNU General Public License v3.0](./LICENSE) — Copyright © 2026 Sora.

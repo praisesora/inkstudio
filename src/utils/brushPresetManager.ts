@@ -379,6 +379,7 @@ export function getActivePresetId(): string {
 }
 
 export function saveActivePresetId(presetId: string): void {
+  if (!presetId || presetId === ERASER_PRESET_ID || presetId === 'eraser') return;
   safeLocalStorageSetItem(STORAGE_KEY_ACTIVE_PRESET, presetId, 'active brush preset');
 }
 

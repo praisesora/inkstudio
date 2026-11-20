@@ -35,6 +35,7 @@ export interface ToolStoreState {
   tool: ToolType;
   activePresetId: BrushPresetId;
   brushSettings: BrushSettings;
+  lastBrushSettings: BrushSettings | null;
   primaryColor: string;
   secondaryColor: string;
   isTransparentColor: boolean;
@@ -107,6 +108,7 @@ const createInitialToolState = (): ToolStoreState => {
     tool: 'brush',
     activePresetId: presetId,
     brushSettings,
+    lastBrushSettings: brushSettings,
     primaryColor: '#000000',
     secondaryColor: '#ffffff',
     isTransparentColor: false,
@@ -173,6 +175,59 @@ const createInitialToolState = (): ToolStoreState => {
 
 export const useToolStore = createStore<ToolStoreState>(createInitialToolState);
 
+function isValidBrushPresetId(presetId?: string | null): presetId is BrushPresetId {
+  return Boolean(presetId && presetId !== ERASER_PRESET_ID && presetId !== 'eraser');
+}
+
+function resolveBrushPresetId(state: ToolStoreState): BrushPresetId {
+  if (isValidBrushPresetId(state.activePresetId)) {
+    return state.activePresetId;
+  }
+  if (isValidBrushPresetId(state.brushSettings.preset)) {
+    return state.brushSettings.preset;
+  }
+  if (isValidBrushPresetId(state.lastBrushSettings?.preset)) {
+    return state.lastBrushSettings.preset;
+  }
+  return getActivePresetId();
+}
+
+function buildRestoredBrushSettings(
+  state: ToolStoreState,
+  presetId: BrushPresetId
+): BrushSettings {
+  const effective = getEffectiveBrushSettings(presetId);
+  const snapshot =
+    state.lastBrushSettings && state.lastBrushSettings.preset === presetId
+      ? state.lastBrushSettings
+      : null;
+
+  // If getEffectiveBrushSettings couldn't resolve a custom brush from storage/cache
+  // and fell back to the default preset, restore the in-memory snapshot instead.
+  if (snapshot && effective.preset !== presetId) {
+    return {
+      ...snapshot,
+      preset: presetId,
+      color: state.primaryColor,
+      secondaryColor: state.secondaryColor,
+      isTransparentInk: state.isTransparentColor,
+    };
+  }
+
+  return {
+    ...state.brushSettings,
+    ...effective,
+    preset: (effective.preset || presetId) as BrushPresetId,
+    customTipImage: effective.customTipImage ?? snapshot?.customTipImage,
+    dualTipImage: effective.dualTipImage ?? snapshot?.dualTipImage,
+    paperTextureImage: effective.paperTextureImage ?? snapshot?.paperTextureImage,
+    subTipImages: effective.subTipImages ?? snapshot?.subTipImages,
+    color: state.primaryColor,
+    secondaryColor: state.secondaryColor,
+    isTransparentInk: state.isTransparentColor,
+  };
+}
+
 export const toolStoreActions = {
   selectTool(newTool: ToolType): void {
     const state = useToolStore.getState();
@@ -180,29 +235,41 @@ export const toolStoreActions = {
     if (prevTool === newTool) return;
 
     if (newTool === 'eraser') {
+      const preservedPresetId = resolveBrushPresetId(state);
+      const preservedBrushSettings = isValidBrushPresetId(state.brushSettings.preset)
+        ? state.brushSettings
+        : state.lastBrushSettings;
       const eraserSettings = getEffectiveBrushSettings(ERASER_PRESET_ID);
       useToolStore.setState({
         tool: newTool,
+        activePresetId: preservedPresetId,
+        lastBrushSettings: preservedBrushSettings,
         brushSettings: {
           ...state.brushSettings,
           ...eraserSettings,
-          color: state.brushSettings.color,
+          preset: ERASER_PRESET_ID,
+          color: state.primaryColor,
+          secondaryColor: state.secondaryColor,
+          isTransparentInk: state.isTransparentColor,
         },
       });
       return;
     }
 
-    if (prevTool === 'eraser' && newTool === 'brush') {
-      const activePreset = state.brushSettings.preset || getActivePresetId();
-      const brushCfg = getEffectiveBrushSettings(activePreset);
+    const activePreset = resolveBrushPresetId(state);
+    const needsBrushRestore =
+      prevTool === 'eraser' ||
+      state.brushSettings.preset === ERASER_PRESET_ID ||
+      state.brushSettings.preset === 'eraser' ||
+      (newTool === 'brush' && state.brushSettings.preset !== activePreset);
+
+    if (needsBrushRestore) {
+      const restoredBrush = buildRestoredBrushSettings(state, activePreset);
       useToolStore.setState({
         tool: newTool,
-        activePresetId: activePreset,
-        brushSettings: {
-          ...state.brushSettings,
-          ...brushCfg,
-          color: state.brushSettings.color,
-        },
+        activePresetId: (restoredBrush.preset || activePreset) as BrushPresetId,
+        brushSettings: restoredBrush,
+        lastBrushSettings: restoredBrush,
       });
       return;
     }
@@ -216,21 +283,26 @@ export const toolStoreActions = {
 
   updateBrushSettings(newSettings: Partial<BrushSettings>): void {
     const state = useToolStore.getState();
+    const isEraser = state.tool === 'eraser';
     const next: BrushSettings = { ...state.brushSettings, ...newSettings };
-    const targetPresetId =
-      state.tool === 'eraser'
-        ? ERASER_PRESET_ID
-        : next.preset || state.brushSettings.preset || DEFAULT_BRUSH_PRESET_ID;
+    const nextValidPreset = isValidBrushPresetId(next.preset) ? next.preset : null;
+    const targetPresetId = isEraser
+      ? ERASER_PRESET_ID
+      : nextValidPreset || resolveBrushPresetId(state);
 
     saveBrushSettingsDebounced(targetPresetId, next);
-    if (next.preset && state.tool === 'brush') {
-      saveActivePresetId(next.preset);
+    if (!isEraser && nextValidPreset && state.tool === 'brush') {
+      saveActivePresetId(nextValidPreset);
     }
 
     useToolStore.setState({
       brushSettings: next,
       activePresetId:
-        next.preset && state.tool === 'brush' ? next.preset : state.activePresetId,
+        !isEraser && nextValidPreset && state.tool === 'brush'
+          ? nextValidPreset
+          : state.activePresetId,
+      lastBrushSettings:
+        !isEraser && nextValidPreset ? next : state.lastBrushSettings,
     });
   },
 
@@ -247,16 +319,18 @@ export const toolStoreActions = {
     const mode = colorModeOverride ?? useDocumentStore.getState().colorMode;
     const effective = enforceColorMode(color, mode);
     const state = useToolStore.getState();
+    const isEraser = state.tool === 'eraser';
 
     const nextBrush: BrushSettings = {
       ...state.brushSettings,
       color: effective,
       isTransparentInk: false,
     };
-    const targetPresetId =
-      state.tool === 'eraser'
-        ? ERASER_PRESET_ID
-        : nextBrush.preset || DEFAULT_BRUSH_PRESET_ID;
+    const targetPresetId = isEraser
+      ? ERASER_PRESET_ID
+      : isValidBrushPresetId(nextBrush.preset)
+        ? nextBrush.preset
+        : resolveBrushPresetId(state);
     saveBrushSettingsDebounced(targetPresetId, nextBrush);
 
     const nextRecent = commit
@@ -270,10 +344,14 @@ export const toolStoreActions = {
       primaryColor: effective,
       isTransparentColor: false,
       brushSettings: nextBrush,
+      lastBrushSettings:
+        !isEraser && isValidBrushPresetId(nextBrush.preset)
+          ? nextBrush
+          : state.lastBrushSettings,
       recentColors: nextRecent,
     });
 
-    if (state.tool === 'eraser') {
+    if (isEraser) {
       toolStoreActions.selectTool('brush');
     }
   },
@@ -282,15 +360,17 @@ export const toolStoreActions = {
     const mode = colorModeOverride ?? useDocumentStore.getState().colorMode;
     const effective = enforceColorMode(color, mode);
     const state = useToolStore.getState();
+    const isEraser = state.tool === 'eraser';
 
     const nextBrush: BrushSettings = {
       ...state.brushSettings,
       secondaryColor: effective,
     };
-    const targetPresetId =
-      state.tool === 'eraser'
-        ? ERASER_PRESET_ID
-        : nextBrush.preset || DEFAULT_BRUSH_PRESET_ID;
+    const targetPresetId = isEraser
+      ? ERASER_PRESET_ID
+      : isValidBrushPresetId(nextBrush.preset)
+        ? nextBrush.preset
+        : resolveBrushPresetId(state);
     saveBrushSettingsDebounced(targetPresetId, nextBrush);
 
     const nextRecent = commit
@@ -303,6 +383,10 @@ export const toolStoreActions = {
     useToolStore.setState({
       secondaryColor: effective,
       brushSettings: nextBrush,
+      lastBrushSettings:
+        !isEraser && isValidBrushPresetId(nextBrush.preset)
+          ? nextBrush
+          : state.lastBrushSettings,
       recentColors: nextRecent,
     });
   },
@@ -310,6 +394,7 @@ export const toolStoreActions = {
   swapColors(colorModeOverride?: CanvasColorMode): void {
     const mode = colorModeOverride ?? useDocumentStore.getState().colorMode;
     const state = useToolStore.getState();
+    const isEraser = state.tool === 'eraser';
     const prevPrimary = state.primaryColor;
     const effectivePrimary = enforceColorMode(state.secondaryColor, mode);
     const nextBrush: BrushSettings = {
@@ -318,10 +403,11 @@ export const toolStoreActions = {
       secondaryColor: prevPrimary,
       isTransparentInk: false,
     };
-    const targetPresetId =
-      state.tool === 'eraser'
-        ? ERASER_PRESET_ID
-        : nextBrush.preset || DEFAULT_BRUSH_PRESET_ID;
+    const targetPresetId = isEraser
+      ? ERASER_PRESET_ID
+      : isValidBrushPresetId(nextBrush.preset)
+        ? nextBrush.preset
+        : resolveBrushPresetId(state);
     saveBrushSettingsDebounced(targetPresetId, nextBrush);
 
     const nextRecent = [
@@ -336,30 +422,40 @@ export const toolStoreActions = {
       secondaryColor: prevPrimary,
       isTransparentColor: false,
       brushSettings: nextBrush,
+      lastBrushSettings:
+        !isEraser && isValidBrushPresetId(nextBrush.preset)
+          ? nextBrush
+          : state.lastBrushSettings,
       recentColors: nextRecent,
     });
 
-    if (state.tool === 'eraser') {
+    if (isEraser) {
       toolStoreActions.selectTool('brush');
     }
   },
 
   toggleTransparentColor(): boolean {
     const state = useToolStore.getState();
+    const isEraser = state.tool === 'eraser';
     const next = !state.isTransparentColor;
     const nextBrush: BrushSettings = {
       ...state.brushSettings,
       isTransparentInk: next,
     };
-    const targetPresetId =
-      state.tool === 'eraser'
-        ? ERASER_PRESET_ID
-        : nextBrush.preset || DEFAULT_BRUSH_PRESET_ID;
+    const targetPresetId = isEraser
+      ? ERASER_PRESET_ID
+      : isValidBrushPresetId(nextBrush.preset)
+        ? nextBrush.preset
+        : resolveBrushPresetId(state);
     saveBrushSettingsDebounced(targetPresetId, nextBrush);
 
     useToolStore.setState({
       isTransparentColor: next,
       brushSettings: nextBrush,
+      lastBrushSettings:
+        !isEraser && isValidBrushPresetId(nextBrush.preset)
+          ? nextBrush
+          : state.lastBrushSettings,
     });
     return next;
   },

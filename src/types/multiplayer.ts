@@ -135,6 +135,8 @@ export interface DocSyncRequestMessage extends BaseMultiplayerMessage {
 export interface DocSyncResponseMessage extends BaseMultiplayerMessage {
   type: 'DOC_SYNC_RESPONSE';
   targetPeerId: string | number;
+  roomName?: string;
+  assignedLayerId?: string;
   dimensions: CanvasDimensions;
   colorMode: CanvasColorMode;
   layers: LayerItem[];

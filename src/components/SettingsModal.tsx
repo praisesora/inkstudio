@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { version as APP_VERSION } from '../../package.json';
 import { safeLocalStorageSetItem } from '../utils/safeStorage';
 import {
   X,
@@ -12,7 +13,13 @@ import {
   Check,
   Search,
   AlertTriangle,
+  ArrowDownToLine,
+  Loader2,
+  RefreshCw,
 } from 'lucide-react';
+import { isTauriEnvironment } from '../hooks/useMultiplayer';
+import { updaterService } from '../services/updaterService';
+import { useUpdaterStore } from '../stores/useUpdaterStore';
 import {
   AppSettings,
   DEFAULT_APP_SETTINGS,
@@ -121,9 +128,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     conflicts: CommandDefinition[];
   } | null>(null);
 
+  const isDesktopTauri = isTauriEnvironment();
+  const updaterStatus = useUpdaterStore((s) => s.status);
+  const runtimeAppVersion = useUpdaterStore((s) => s.currentVersion);
+  const availableUpdateVersion = useUpdaterStore((s) => s.availableVersion);
+  const updateProgressPercent = useUpdaterStore((s) => s.progressPercent);
+  const updateErrorMessage = useUpdaterStore((s) => s.errorMessage);
+
   useEffect(() => {
     setLocalSettings(settings);
   }, [settings]);
+
+  useEffect(() => {
+    if (isOpen && isDesktopTauri) {
+      void updaterService.resolveCurrentVersion();
+    }
+  }, [isOpen, isDesktopTauri]);
 
   useEffect(() => {
     if (!isOpen) {
@@ -511,6 +531,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       const val = e.target.value;
                       handleChange('userName', val);
                       safeLocalStorageSetItem('sora_paint_nickname', val, 'artist name');
+                      safeLocalStorageSetItem('ink_nickname_customized', val.trim() ? '1' : '0', 'artist name flag');
                     }}
                     placeholder="Artist"
                     className="w-full bg-[#161616] px-3 py-1.5 rounded text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"
@@ -952,12 +973,110 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   />
                   <div>
                     <h2 className="text-sm font-semibold text-[#e5e5e5]">Ink Studio</h2>
-                    <p className="text-[11px] font-mono text-[#8a8a8a]">v0.1.0</p>
+                    <p className="text-[11px] font-mono text-[#8a8a8a]">
+                      v{runtimeAppVersion || APP_VERSION} · Collaborative Drawing Studio · by Sora
+                    </p>
                   </div>
                 </div>
                 <p className="text-xs text-[#8a8a8a] leading-relaxed">
-                  Digital drawing and manga studio supporting layered PSD/CSP workflows, GPU tile compositing, stylus pressure dynamics, and 1-bit monochrome inking.
+                  Collaborative Drawing Studio supporting layered PSD/CSP workflows, GPU tile compositing, stylus pressure dynamics, vector inking, and real-time multiplayer drawing.
                 </p>
+
+                {isDesktopTauri && (
+                  <section className="space-y-2.5 pt-2 border-t border-[#2c2c2c]">
+                    <div>
+                      <h3 className="text-xs font-medium text-[#e5e5e5]">Updates</h3>
+                      <p className="text-[11px] text-[#8a8a8a]">
+                        Keep Ink Studio up to date with the latest desktop releases
+                      </p>
+                    </div>
+
+                    <div className="bg-[#161616] rounded p-3 space-y-3">
+                      <label className="flex items-center justify-between py-0.5 cursor-pointer">
+                        <span className="text-xs text-[#e5e5e5]">
+                          Automatically check for updates on startup
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={localSettings.autoCheckUpdates}
+                          onChange={(e) => handleChange('autoCheckUpdates', e.target.checked)}
+                        />
+                      </label>
+
+                      <div className="pt-2.5 border-t border-[#2c2c2c] flex items-center justify-between gap-3">
+                        <div className="min-w-0 text-[11px]">
+                          {updaterStatus === 'checking' && (
+                            <span className="text-[#8a8a8a]">Checking for updates...</span>
+                          )}
+                          {updaterStatus === 'up-to-date' && (
+                            <span className="text-emerald-400">Up to date</span>
+                          )}
+                          {updaterStatus === 'available' && availableUpdateVersion && (
+                            <span className="text-[var(--accent)] font-medium">
+                              Update v{availableUpdateVersion} available
+                            </span>
+                          )}
+                          {updaterStatus === 'downloading' && (
+                            <span className="text-[var(--accent)] font-mono">
+                              Downloading update... {updateProgressPercent}%
+                            </span>
+                          )}
+                          {updaterStatus === 'ready' && (
+                            <span className="text-emerald-400">
+                              Update ready — restarting...
+                            </span>
+                          )}
+                          {updaterStatus === 'error' && (
+                            <span className="text-red-400 break-words">
+                              {updateErrorMessage || 'Failed to check for updates'}
+                            </span>
+                          )}
+                          {updaterStatus === 'idle' && (
+                            <span className="text-[#8a8a8a]">
+                              Current version: <span className="font-mono">v{runtimeAppVersion || APP_VERSION}</span>
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          {(updaterStatus === 'available' || updaterStatus === 'downloading') && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onClose();
+                                updaterService.openUpdateModal();
+                              }}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 text-[11px] font-medium transition-opacity cursor-pointer"
+                            >
+                              <ArrowDownToLine className="w-3 h-3" />
+                              <span>
+                                {updaterStatus === 'downloading' ? 'View Progress' : 'View Update'}
+                              </span>
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            disabled={
+                              updaterStatus === 'checking' ||
+                              updaterStatus === 'downloading' ||
+                              updaterStatus === 'ready'
+                            }
+                            onClick={() => void updaterService.checkForUpdates({ silent: false })}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[#2c2c2c] hover:bg-[#383838] disabled:opacity-50 disabled:cursor-not-allowed text-[#e5e5e5] text-[11px] font-medium transition-colors cursor-pointer"
+                          >
+                            {updaterStatus === 'checking' ? (
+                              <Loader2 className="w-3 h-3 animate-spin text-[var(--accent)]" />
+                            ) : (
+                              <RefreshCw className="w-3 h-3" />
+                            )}
+                            <span>Check for Updates</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                )}
               </div>
             )}
           </div>

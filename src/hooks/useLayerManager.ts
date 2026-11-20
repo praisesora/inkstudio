@@ -807,17 +807,49 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     (
       syncedLayers: LayerItem[],
       layerDataUrls: Record<string, string>,
-      assignedLayerId?: string
+      assignedLayerId?: string,
+      targetDocumentId?: string,
+      syncDims?: CanvasDimensions
     ) => {
-      const grid = activeTileGridRef.current;
-      setLayers(syncedLayers);
+      for (const timer of thumbDebounceTimersRef.current.values()) {
+        clearTimeout(timer);
+      }
+      thumbDebounceTimersRef.current.clear();
 
-      if (assignedLayerId) {
+      let grid = activeTileGridRef.current;
+      if (targetDocumentId) {
+        const session =
+          documentStore.setActiveDocument(targetDocumentId) ??
+          documentStore.getOrCreateSession(targetDocumentId);
+        activeSessionIdRef.current = targetDocumentId;
+        activeTileGridRef.current = session.tileGrid;
+        layerCanvasesRef.current = session.layerCanvases;
+        layerSourceCanvasesRef.current = session.layerSourceCanvases;
+        grid = session.tileGrid;
+      }
+      if (syncDims) {
+        dimensionsRef.current = syncDims;
+      }
+
+      grid.clearAll();
+      pendingCanvasCopiesRef.current.clear();
+      pendingInitialDataRef.current.clear();
+      for (const c of layerCanvasesRef.current.values()) releaseTemporaryCanvas(c);
+      layerCanvasesRef.current.clear();
+      for (const c of layerSourceCanvasesRef.current.values()) releaseTemporaryCanvas(c);
+      layerSourceCanvasesRef.current.clear();
+
+      setLayers(syncedLayers);
+      layersRef.current = syncedLayers;
+
+      if (assignedLayerId && syncedLayers.some((l) => l.id === assignedLayerId)) {
         setActiveLayerId(assignedLayerId);
       } else {
         const topRaster = syncedLayers.find((l) => l.type === 'raster' && !isBackgroundLayerId(l.id));
         if (topRaster) {
           setActiveLayerId(topRaster.id);
+        } else if (syncedLayers[0]) {
+          setActiveLayerId(syncedLayers[0].id);
         }
       }
 
@@ -850,6 +882,8 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
           img.src = dataUrl;
         }
       });
+
+      grid.notifyChange(true);
     },
     [setActiveLayerId, updateLayerThumbnail]
   );

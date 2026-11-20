@@ -215,6 +215,10 @@ export interface AppSettings {
 
   // Performance & Scratch Disk
   tileMemoryBudgetMb: number;
+
+  // Auto-Updater (Desktop)
+  autoCheckUpdates: boolean;
+  skippedUpdateVersion: string;
 }
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -249,6 +253,9 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   },
 
   tileMemoryBudgetMb: 1024,
+
+  autoCheckUpdates: true,
+  skippedUpdateVersion: '',
 };
 
 const VALID_MODIFIER_ACTIONS = new Set<ModifierAction>([
@@ -400,6 +407,14 @@ export function loadAppSettings(): AppSettings {
         typeof parsed.tileMemoryBudgetMb === 'number' && parsed.tileMemoryBudgetMb >= 256 && parsed.tileMemoryBudgetMb <= 8192
           ? parsed.tileMemoryBudgetMb
           : 1024;
+      const validAutoCheckUpdates: boolean =
+        typeof parsed.autoCheckUpdates === 'boolean'
+          ? parsed.autoCheckUpdates
+          : DEFAULT_APP_SETTINGS.autoCheckUpdates;
+      const validSkippedUpdateVersion: string =
+        typeof parsed.skippedUpdateVersion === 'string'
+          ? parsed.skippedUpdateVersion.trim()
+          : DEFAULT_APP_SETTINGS.skippedUpdateVersion;
       return {
         ...DEFAULT_APP_SETTINGS,
         ...parsed,
@@ -410,6 +425,8 @@ export function loadAppSettings(): AppSettings {
         modernCustomColor: validCustomColor,
         uiTone: validTone,
         tileMemoryBudgetMb: validBudget,
+        autoCheckUpdates: validAutoCheckUpdates,
+        skippedUpdateVersion: validSkippedUpdateVersion,
         shortcuts: sanitizeShortcuts(parsed.shortcuts),
         modifierKeys: sanitizeModifierKeys(parsed.modifierKeys),
         pressureCurve: sanitizePressureCurve(parsed.pressureCurve),

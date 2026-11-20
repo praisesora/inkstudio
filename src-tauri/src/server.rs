@@ -29,9 +29,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const CLIENT_CHANNEL_CAPACITY: usize = 256;
+const CLIENT_CHANNEL_CAPACITY: usize = 2048;
 const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024; // 8 MB
 const MAX_CONCURRENT_CLIENTS: usize = 16;
+const WS_PING_INTERVAL_SECS: u64 = 25;
 
 // Per-client message and bandwidth token bucket limits.
 // Burst headroom accommodates progressive tile streaming on room join.
@@ -180,7 +181,13 @@ fn is_valid_port_suffix(rest: &str) -> bool {
         && port_str.parse::<u16>().is_ok()
 }
 
-fn is_allowed_origin(origin: &str, local_ip: &str, port: u16, tunnel_origin: Option<&str>) -> bool {
+fn is_allowed_origin(
+    origin: &str,
+    local_ip: &str,
+    port: u16,
+    tunnel_origin: Option<&str>,
+    host_header: Option<&str>,
+) -> bool {
     if origin.is_empty() || origin.eq_ignore_ascii_case("null") {
         return false;
     }
@@ -210,6 +217,24 @@ fn is_allowed_origin(origin: &str, local_ip: &str, port: u16, tunnel_origin: Opt
     if let Some(tunnel) = tunnel_origin {
         if !tunnel.is_empty() && origin == tunnel.trim_end_matches('/') {
             return true;
+        }
+    }
+    // Same-origin check against Host header (supports multi-NIC LAN / Tailscale IPs
+    // while still blocking cross-site WebSocket hijacking from external domains).
+    if let Some(host) = host_header {
+        let trimmed_host = host.trim();
+        if !trimmed_host.is_empty()
+            && !trimmed_host.contains('/')
+            && !trimmed_host.contains('@')
+        {
+            if let Some(origin_host) = origin
+                .strip_prefix("http://")
+                .or_else(|| origin.strip_prefix("https://"))
+            {
+                if origin_host.eq_ignore_ascii_case(trimmed_host) {
+                    return true;
+                }
+            }
         }
     }
     false
@@ -426,13 +451,27 @@ fn extract_trycloudflare_url(line: &str) -> Option<String> {
     None
 }
 
+pub async fn is_cloudflared_installed() -> bool {
+    locate_cloudflared().await.is_ok()
+}
+
+async fn ensure_cloudflared() -> Result<PathBuf, String> {
+    if let Ok(path) = locate_cloudflared().await {
+        return Ok(path);
+    }
+    let installed = download_cloudflared().await?;
+    Ok(PathBuf::from(installed))
+}
+
 async fn start_cloudflare_tunnel(port: u16) -> Result<(tokio::process::Child, String), String> {
-    let exe_path = locate_cloudflared().await?;
+    let exe_path = ensure_cloudflared().await?;
     let mut cmd = tokio::process::Command::new(exe_path);
     cmd.args([
         "tunnel",
         "--url",
         &format!("http://127.0.0.1:{}", port),
+        "--protocol",
+        "http2",
         "--no-autoupdate",
     ])
     .stdout(Stdio::null())
@@ -452,21 +491,67 @@ async fn start_cloudflare_tunnel(port: u16) -> Result<(tokio::process::Child, St
         .ok_or_else(|| "Could not capture cloudflared stderr".to_string())?;
 
     let mut reader = BufReader::new(stderr).lines();
+    let mut found_url: Option<String> = None;
+    let mut last_error_line: Option<String> = None;
 
-    let tunnel_url = tokio::select! {
-        url = async {
-            while let Ok(Some(line)) = reader.next_line().await {
-                if let Some(url) = extract_trycloudflare_url(&line) {
-                    return Some(url);
+    let overall_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
+    let mut post_url_deadline: Option<tokio::time::Instant> = None;
+
+    loop {
+        let active_deadline = match post_url_deadline {
+            Some(d) => d.min(overall_deadline),
+            None => overall_deadline,
+        };
+
+        let next = tokio::select! {
+            line = reader.next_line() => Some(line),
+            _ = tokio::time::sleep_until(active_deadline) => None,
+        };
+
+        match next {
+            Some(Ok(Some(line))) => {
+                if found_url.is_none() {
+                    if let Some(url) = extract_trycloudflare_url(&line) {
+                        found_url = Some(url);
+                        // Wait briefly for Cloudflare edge registration so the link works immediately
+                        post_url_deadline =
+                            Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(8));
+                    }
+                }
+                let lower = line.to_ascii_lowercase();
+                if lower.contains("err") || lower.contains("failed") || lower.contains("unable") {
+                    last_error_line = Some(line.trim().chars().take(180).collect());
+                }
+                if found_url.is_some()
+                    && (line.contains("Registered tunnel connection")
+                        || lower.contains("connection registered"))
+                {
+                    break;
                 }
             }
-            None
-        } => url,
-        _ = tokio::time::sleep(tokio::time::Duration::from_secs(18)) => None,
-    };
+            Some(Ok(None)) | Some(Err(_)) => {
+                // Process closed stderr / exited
+                break;
+            }
+            None => {
+                // Deadline reached
+                break;
+            }
+        }
+    }
 
-    match tunnel_url {
+    match found_url {
         Some(url) => {
+            // Confirm process is still alive
+            if let Ok(Some(exit_status)) = child.try_wait() {
+                let detail = last_error_line
+                    .map(|l| format!(" ({})", l))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "Cloudflare tunnel exited unexpectedly ({}){}",
+                    exit_status, detail
+                ));
+            }
             // Keep draining stderr in the background so cloudflared never receives EPIPE
             tokio::spawn(async move {
                 while let Ok(Some(_)) = reader.next_line().await {}
@@ -475,7 +560,13 @@ async fn start_cloudflare_tunnel(port: u16) -> Result<(tokio::process::Child, St
         }
         None => {
             let _ = child.kill().await;
-            Err("Timed out waiting for Cloudflare tunnel URL".to_string())
+            let detail = last_error_line
+                .map(|l| format!(": {}", l))
+                .unwrap_or_default();
+            Err(format!(
+                "Could not establish Cloudflare tunnel URL{}",
+                detail
+            ))
         }
     }
 }
@@ -486,12 +577,19 @@ fn build_router(state: AppState) -> Router {
     let cors_tunnel_origin = Arc::clone(&state.tunnel_origin);
 
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, _| {
+        .allow_origin(AllowOrigin::predicate(move |origin: &HeaderValue, req| {
             let Ok(origin_str) = origin.to_str() else {
                 return false;
             };
+            let host_str = req.headers.get(header::HOST).and_then(|v| v.to_str().ok());
             let tunnel = cors_tunnel_origin.read().ok().and_then(|g| g.clone());
-            is_allowed_origin(origin_str, &cors_local_ip, cors_port, tunnel.as_deref())
+            is_allowed_origin(
+                origin_str,
+                &cors_local_ip,
+                cors_port,
+                tunnel.as_deref(),
+                host_str,
+            )
         }))
         .allow_methods([Method::GET, Method::OPTIONS])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
@@ -577,10 +675,9 @@ pub async fn start_embedded_server(
                 is_global = true;
             }
             Err(err) => {
-                eprintln!(
-                    "[Multiplayer] Cloudflare tunnel notice: {}. Using local network IP.",
-                    err
-                );
+                // Do not silently fall back to an unreachable private LAN IP when Worldwide was requested.
+                let _ = shutdown_tx.send(());
+                return Err(format!("Worldwide tunnel failed: {}", err));
             }
         }
     }
@@ -707,9 +804,16 @@ async fn ws_handler(
 
     // 2. Origin check when Origin header is present (prevents cross-site WebSocket hijacking)
     if let Some(origin_val) = headers.get(header::ORIGIN) {
+        let host_str = headers.get(header::HOST).and_then(|v| v.to_str().ok());
         let origin_allowed = origin_val.to_str().ok().map_or(false, |origin_str| {
             let tunnel = state.tunnel_origin.read().ok().and_then(|g| g.clone());
-            is_allowed_origin(origin_str, &state.local_ip, state.port, tunnel.as_deref())
+            is_allowed_origin(
+                origin_str,
+                &state.local_ip,
+                state.port,
+                tunnel.as_deref(),
+                host_str,
+            )
         });
         if !origin_allowed {
             return (StatusCode::FORBIDDEN, "Origin not allowed").into_response();
@@ -758,6 +862,26 @@ async fn broadcast_message(state: &AppState, sender_id: Option<usize>, msg: Mess
     }
 }
 
+fn extract_peer_id_from_join(text: &str) -> Option<String> {
+    if !text.contains("JOIN_REQUEST") {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(text).ok()?;
+    if val.get("type")?.as_str()? != "JOIN_REQUEST" {
+        return None;
+    }
+    let peer_id = val.get("peer")?.get("id")?;
+    let id_str = match peer_id {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return None,
+    };
+    if id_str.is_empty() || id_str.len() > 128 {
+        return None;
+    }
+    Some(id_str)
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemaphorePermit) {
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let (mut sender, mut receiver) = socket.split();
@@ -799,41 +923,60 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
 
     let mut msg_limiter = TokenBucket::new(CLIENT_MSG_BURST, CLIENT_MSG_REFILL_PER_SEC);
     let mut byte_limiter = TokenBucket::new(CLIENT_BYTES_BURST, CLIENT_BYTES_REFILL_PER_SEC);
+    let mut known_peer_id: Option<String> = None;
+
+    // Periodic WebSocket Ping keeps Cloudflare Quick Tunnels alive past the 100s idle cutoff
+    let mut ping_interval =
+        tokio::time::interval(tokio::time::Duration::from_secs(WS_PING_INTERVAL_SECS));
+    ping_interval.tick().await;
 
     // Broadcast loop for incoming WebSocket messages from this client
     loop {
-        let next_item = tokio::select! {
-            _ = kick.notified() => None,
-            item = receiver.next() => item,
-        };
-
-        let Some(Ok(msg)) = next_item else {
-            break;
-        };
-
-        match msg {
-            Message::Text(text) => {
-                let len = text.len();
-                if len > MAX_WS_MESSAGE_BYTES
-                    || !msg_limiter.try_consume(1.0)
-                    || !byte_limiter.try_consume(len as f64)
-                {
+        tokio::select! {
+            _ = kick.notified() => break,
+            _ = ping_interval.tick() => {
+                if tx.try_send(Message::Ping(Vec::new())).is_err() {
                     break;
                 }
-                broadcast_message(&state, Some(client_id), Message::Text(text)).await;
             }
-            Message::Binary(bin) => {
-                let len = bin.len();
-                if len > MAX_WS_MESSAGE_BYTES
-                    || !msg_limiter.try_consume(1.0)
-                    || !byte_limiter.try_consume(len as f64)
-                {
+            item = receiver.next() => {
+                let Some(Ok(msg)) = item else {
                     break;
+                };
+
+                match msg {
+                    Message::Text(text) => {
+                        let len = text.len();
+                        if len > MAX_WS_MESSAGE_BYTES
+                            || !msg_limiter.try_consume(1.0)
+                            || !byte_limiter.try_consume(len as f64)
+                        {
+                            break;
+                        }
+                        if known_peer_id.is_none() {
+                            if let Some(pid) = extract_peer_id_from_join(&text) {
+                                known_peer_id = Some(pid);
+                            }
+                        }
+                        broadcast_message(&state, Some(client_id), Message::Text(text)).await;
+                    }
+                    Message::Binary(bin) => {
+                        let len = bin.len();
+                        if len > MAX_WS_MESSAGE_BYTES
+                            || !msg_limiter.try_consume(1.0)
+                            || !byte_limiter.try_consume(len as f64)
+                        {
+                            break;
+                        }
+                        broadcast_message(&state, Some(client_id), Message::Binary(bin)).await;
+                    }
+                    Message::Ping(payload) => {
+                        let _ = tx.try_send(Message::Pong(payload));
+                    }
+                    Message::Pong(_) => {}
+                    Message::Close(_) => break,
                 }
-                broadcast_message(&state, Some(client_id), Message::Binary(bin)).await;
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
@@ -843,11 +986,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, _permit: OwnedSemapho
     }
     forward_task.abort();
 
-    // Broadcast user left event
-    let leave_msg = serde_json::json!({
-        "type": "PEER_DISCONNECTED",
-        "clientId": client_id,
-    });
+    // Broadcast user left event with both peerId and clientId so peers never turn into ghosts
+    let leave_msg = match known_peer_id {
+        Some(pid) => serde_json::json!({
+            "type": "PEER_DISCONNECTED",
+            "peerId": pid,
+            "clientId": client_id,
+        }),
+        None => serde_json::json!({
+            "type": "PEER_DISCONNECTED",
+            "clientId": client_id,
+        }),
+    };
     broadcast_message(&state, None, Message::Text(leave_msg.to_string())).await;
 }
 
@@ -888,22 +1038,38 @@ mod tests {
     #[test]
     fn test_origin_allowlist() {
         let tunnel = Some("https://calm-brush.trycloudflare.com");
-        assert!(is_allowed_origin("tauri://localhost", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("http://tauri.localhost", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("https://tauri.localhost", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("http://localhost:1420", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("http://localhost", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("http://127.0.0.1:30303", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("http://192.168.1.5:30303", "192.168.1.5", 30303, tunnel));
-        assert!(is_allowed_origin("https://calm-brush.trycloudflare.com", "192.168.1.5", 30303, tunnel));
+        assert!(is_allowed_origin("tauri://localhost", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("http://tauri.localhost", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("https://tauri.localhost", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("http://localhost:1420", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("http://localhost", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("http://127.0.0.1:30303", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("http://192.168.1.5:30303", "192.168.1.5", 30303, tunnel, None));
+        assert!(is_allowed_origin("https://calm-brush.trycloudflare.com", "192.168.1.5", 30303, tunnel, None));
+        // Same-origin Host match (e.g. Tailscale / secondary LAN NIC)
+        assert!(is_allowed_origin(
+            "http://100.64.0.9:30303",
+            "192.168.1.5",
+            30303,
+            tunnel,
+            Some("100.64.0.9:30303")
+        ));
 
         // Disallowed origins
-        assert!(!is_allowed_origin("https://evil.com", "192.168.1.5", 30303, tunnel));
-        assert!(!is_allowed_origin("http://localhost.evil.com", "192.168.1.5", 30303, tunnel));
-        assert!(!is_allowed_origin("http://localhost:1420/path", "192.168.1.5", 30303, tunnel));
-        assert!(!is_allowed_origin("http://192.168.1.5:9999", "192.168.1.5", 30303, tunnel));
-        assert!(!is_allowed_origin("https://other.trycloudflare.com", "192.168.1.5", 30303, tunnel));
-        assert!(!is_allowed_origin("null", "192.168.1.5", 30303, tunnel));
+        assert!(!is_allowed_origin("https://evil.com", "192.168.1.5", 30303, tunnel, Some("192.168.1.5:30303")));
+        assert!(!is_allowed_origin("http://localhost.evil.com", "192.168.1.5", 30303, tunnel, None));
+        assert!(!is_allowed_origin("http://localhost:1420/path", "192.168.1.5", 30303, tunnel, None));
+        assert!(!is_allowed_origin("http://192.168.1.5:9999", "192.168.1.5", 30303, tunnel, Some("192.168.1.5:30303")));
+        assert!(!is_allowed_origin("https://other.trycloudflare.com", "192.168.1.5", 30303, tunnel, Some("calm-brush.trycloudflare.com")));
+        assert!(!is_allowed_origin("null", "192.168.1.5", 30303, tunnel, None));
+    }
+
+    #[test]
+    fn test_extract_peer_id_from_join() {
+        let msg = r##"{"type":"JOIN_REQUEST","peer":{"id":"peer-123-abc","name":"Alex","color":"#fff"}}"##;
+        assert_eq!(extract_peer_id_from_join(msg), Some("peer-123-abc".to_string()));
+        assert_eq!(extract_peer_id_from_join(r#"{"type":"CURSOR_MOVE","peerId":"x"}"#), None);
+        assert_eq!(extract_peer_id_from_join("not json"), None);
     }
 
     #[test]

@@ -1,7 +1,10 @@
 {
   "name": "ink-studio",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "description": "Collaborative Drawing Studio",
+  "author": "Sora",
+  "license": "GPL-3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -14,6 +17,8 @@
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.1",
     "@types/sql.js": "^1.4.11",
     "@types/three": "^0.186.0",
     "ag-psd": "^31.0.2",

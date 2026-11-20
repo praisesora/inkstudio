@@ -725,10 +725,16 @@ export function matchesKeyboardEvent(e: KeyboardEventLike, shortcutStr: string):
     return false;
   }
 
+  // For single ASCII letters (e.g. QWERTY, QWERTZ, AZERTY, Dvorak), respect the layout's
+  // actual letter so Ctrl+Z on QWERTZ/AZERTY triggers Undo instead of Redo/nothing.
+  // For non-Latin layouts (e.g. Cyrillic 'я' on KeyZ), fall through to layout-independent e.code.
+  if (e.key && /^[a-zA-Z]$/.test(e.key) && /^Key[A-Z]$/.test(parsed.code)) {
+    return e.key.toUpperCase() === parsed.key;
+  }
+
   if (e.code) {
     if (e.code === parsed.code) return true;
     if (parsed.altCodes && parsed.altCodes.includes(e.code)) return true;
-    // Allow e.key match only when code does not contradict a different known letter/digit
     return false;
   }
 

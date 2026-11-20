@@ -3,6 +3,7 @@ import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType, ProcessingBounds } from '../utils/tonalEngine';
 import { safeLocalStorageSetItem, setStorageQuotaNotifier } from '../utils/safeStorage';
 import { createStore } from './createStore';
+import { useUpdaterStore } from './useUpdaterStore';
 
 export interface TonalModalState {
   isOpen: boolean;
@@ -256,7 +257,11 @@ export const uiStoreActions = {
 
 setStorageQuotaNotifier((msg) => uiStoreActions.showToast(msg));
 
-export function selectIsAnyModalOpen(state: UiStoreState, isHostModalOpen = false): boolean {
+export function selectIsAnyModalOpen(
+  state: UiStoreState,
+  isHostModalOpen = false,
+  isUpdateModalOpen = useUpdaterStore.getState().isModalOpen
+): boolean {
   return (
     state.isNewCanvasModalOpen ||
     state.isResizeCanvasModalOpen ||
@@ -269,6 +274,7 @@ export function selectIsAnyModalOpen(state: UiStoreState, isHostModalOpen = fals
     state.tonalModalState.isOpen ||
     state.adjustmentModalState.isOpen ||
     state.layerStylesModalState.isOpen ||
-    isHostModalOpen
+    isHostModalOpen ||
+    isUpdateModalOpen
   );
 }

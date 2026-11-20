@@ -29,6 +29,70 @@ export const CODE_SELECTIVE_UNDO = 0x06;
 const MAX_BINARY_PACKET_BYTES = 16 * 1024 * 1024;
 const MAX_JSON_MESSAGE_CHARS = 8 * 1024 * 1024;
 const MAX_STROKE_CHUNK_POINTS = 4096;
+const WS_CONNECT_TIMEOUT_MS = 15000;
+
+export interface ParsedInviteLink {
+  roomName: string;
+  host: string;
+  port: number;
+  url: string;
+  token?: string;
+  isSecure: boolean;
+}
+
+export function parseInviteUrl(raw: string): ParsedInviteLink | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(trimmed);
+  } catch {
+    return null;
+  }
+
+  if (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:') {
+    const roomParam = parsedUrl.searchParams.get('room');
+    if (!roomParam) return null;
+    const isSecure = parsedUrl.protocol === 'https:';
+    const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : isSecure ? 443 : 80;
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
+    const token = parsedUrl.searchParams.get('token') || undefined;
+    return {
+      roomName: roomParam,
+      host: parsedUrl.hostname,
+      port,
+      url: trimmed,
+      token,
+      isSecure,
+    };
+  }
+
+  if (parsedUrl.protocol === 'forsora:') {
+    const host = parsedUrl.searchParams.get('host');
+    const portParam = parsedUrl.searchParams.get('port');
+    if (!host) return null;
+    const protoParam = parsedUrl.searchParams.get('protocol');
+    const isSecure =
+      protoParam === 'https' ||
+      portParam === '443' ||
+      host.toLowerCase().endsWith('.trycloudflare.com');
+    const port = portParam ? parseInt(portParam, 10) : isSecure ? 443 : 30303;
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
+    const roomName = parsedUrl.searchParams.get('room') || 'Studio';
+    const token = parsedUrl.searchParams.get('token') || undefined;
+    return {
+      roomName,
+      host,
+      port,
+      url: trimmed,
+      token,
+      isSecure,
+    };
+  }
+
+  return null;
+}
 
 function sanitizeRemoteBrushSettings(raw: unknown): BrushSettings | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -104,6 +168,10 @@ class MultiplayerService {
     return this.currentPeer;
   }
 
+  public getBufferedAmount(): number {
+    return this.ws ? this.ws.bufferedAmount : 0;
+  }
+
   public connect(url: string, peer: CollabPeer, token?: string): Promise<void> {
     return new Promise((resolve, reject) => {
       this.disconnect();
@@ -126,21 +194,54 @@ class MultiplayerService {
         }
       }
 
+      let settled = false;
+      const settleResolve = () => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        resolve();
+      };
+      const settleReject = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutId !== null) clearTimeout(timeoutId);
+        reject(err);
+      };
+
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
       try {
         const ws = new WebSocket(connectUrl);
         ws.binaryType = 'arraybuffer';
         this.ws = ws;
 
+        timeoutId = setTimeout(() => {
+          if (this.ws === ws && !settled) {
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+            this.ws = null;
+            settleReject(new Error(`Connection timed out (${displayUrl})`));
+          }
+        }, WS_CONNECT_TIMEOUT_MS);
+
         ws.onopen = () => {
+          if (this.ws !== ws) {
+            ws.close();
+            return;
+          }
           // Send join handshake
           this.sendMessage({
             type: 'JOIN_REQUEST',
             peer: this.currentPeer!,
           });
-          resolve();
+          settleResolve();
         };
 
         ws.onmessage = async (event) => {
+          if (this.ws !== ws) return;
           try {
             if (event.data instanceof ArrayBuffer) {
               const parsed = this.decodeBinaryPacket(event.data);
@@ -165,31 +266,48 @@ class MultiplayerService {
           }
         };
 
-        ws.onclose = () => {
-          this.ws = null;
-          this.closeHandlers.forEach((h) => h());
+        ws.onclose = (ev) => {
+          if (this.ws === ws) {
+            this.ws = null;
+          }
+          if (!settled) {
+            const detail = ev.reason ? `: ${ev.reason}` : '';
+            settleReject(new Error(`Failed to connect to socket server (${displayUrl})${detail}`));
+          } else {
+            this.closeHandlers.forEach((h) => h());
+          }
         };
 
         ws.onerror = (err) => {
+          if (this.ws !== ws) return;
           this.errorHandlers.forEach((h) => h(err));
-          reject(new Error(`Failed to connect to socket server (${displayUrl})`));
+          settleReject(new Error(`Failed to connect to socket server (${displayUrl})`));
         };
       } catch (err: any) {
-        reject(new Error(err?.message || `WebSocket initialization error (${displayUrl})`));
+        settleReject(new Error(err?.message || `WebSocket initialization error (${displayUrl})`));
       }
     });
   }
 
   public disconnect() {
     if (this.ws) {
-      if (this.currentPeer) {
+      const closingWs = this.ws;
+      if (this.currentPeer && closingWs.readyState === WebSocket.OPEN) {
         this.sendMessage({
           type: 'PEER_LEFT',
           peerId: this.currentPeer.id,
         });
       }
-      this.ws.close();
       this.ws = null;
+      try {
+        closingWs.onopen = null;
+        closingWs.onmessage = null;
+        closingWs.onclose = null;
+        closingWs.onerror = null;
+        closingWs.close();
+      } catch {
+        // ignore close errors
+      }
     }
     this.currentPeer = null;
     if (this.cursorThrottleRaf) {

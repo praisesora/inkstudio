@@ -17,6 +17,11 @@ import { Header } from '../../components/Header';
 import { RightSidebar, RightSidebarColorSection } from '../../components/RightSidebar';
 import { ToolStrip } from '../../components/ToolStrip';
 import { LayerItem, MenuSection } from '../../types/editor';
+import {
+  ERASER_PRESET_ID,
+  NEUTRAL_BRUSH_DEFAULTS,
+  getEffectiveBrushSettings,
+} from '../../utils/brushPresetManager';
 
 interface MiniNode {
   nodeType: number;
@@ -394,6 +399,87 @@ describe('External stores (useToolStore, useDocumentStore, useUiStore)', () => {
     // Quick modifiers
     toolStoreActions.setQuickModifiers({ isAltActive: true });
     expect(useToolStore.getState().quickModifiers.isAltActive).toBe(true);
+  });
+
+  it('preserves selected builtin and custom brush presets across tool switches instead of resetting', () => {
+    // Select a non-default builtin brush and tweak its settings
+    const charcoalCfg = getEffectiveBrushSettings('charcoal-pencil');
+    toolStoreActions.updateBrushSettings({
+      ...NEUTRAL_BRUSH_DEFAULTS,
+      ...charcoalCfg,
+      preset: 'charcoal-pencil',
+      size: 19,
+      opacity: 0.65,
+    });
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.preset).toBe('charcoal-pencil');
+
+    // Brush -> Eraser -> Brush preserves charcoal-pencil and keeps eraser settings independent
+    toolStoreActions.selectTool('eraser');
+    expect(useToolStore.getState().tool).toBe('eraser');
+    expect(useToolStore.getState().brushSettings.preset).toBe(ERASER_PRESET_ID);
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+
+    toolStoreActions.updateBrushSettings({ size: 52 });
+    expect(useToolStore.getState().brushSettings.size).toBe(52);
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+
+    toolStoreActions.selectTool('brush');
+    expect(useToolStore.getState().tool).toBe('brush');
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.preset).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.size).toBe(19);
+    expect(useToolStore.getState().brushSettings.opacity).toBe(0.65);
+
+    // Returning to eraser still remembers eraser size
+    toolStoreActions.selectTool('eraser');
+    expect(useToolStore.getState().brushSettings.size).toBe(52);
+
+    // Eraser -> another non-brush tool -> Brush still restores charcoal-pencil
+    toolStoreActions.selectTool('fill');
+    expect(useToolStore.getState().tool).toBe('fill');
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.preset).toBe('charcoal-pencil');
+
+    toolStoreActions.selectTool('select-rect');
+    toolStoreActions.selectTool('pipette');
+    toolStoreActions.selectTool('brush');
+    expect(useToolStore.getState().tool).toBe('brush');
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.preset).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.size).toBe(19);
+
+    // Eraser -> setPrimaryColor / swapColors returns to brush with selected preset intact
+    toolStoreActions.selectTool('eraser');
+    toolStoreActions.setPrimaryColor('#2266cc');
+    expect(useToolStore.getState().tool).toBe('brush');
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.preset).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.color).toBe('#2266cc');
+
+    toolStoreActions.selectTool('eraser');
+    toolStoreActions.swapColors();
+    expect(useToolStore.getState().tool).toBe('brush');
+    expect(useToolStore.getState().activePresetId).toBe('charcoal-pencil');
+    expect(useToolStore.getState().brushSettings.preset).toBe('charcoal-pencil');
+
+    // Custom .sut brush not yet in storage cache is preserved across Eraser -> Brush
+    const fakeTipImg = { complete: true } as unknown as HTMLImageElement;
+    toolStoreActions.updateBrushSettings({
+      ...NEUTRAL_BRUSH_DEFAULTS,
+      preset: 'csp-custom-ink-test',
+      brushName: 'Custom Manga Ink',
+      size: 14,
+      customTipDataUrl: 'data:image/png;base64,AAAA',
+      customTipImage: fakeTipImg,
+    });
+    toolStoreActions.selectTool('eraser');
+    toolStoreActions.selectTool('brush');
+    expect(useToolStore.getState().activePresetId).toBe('csp-custom-ink-test');
+    expect(useToolStore.getState().brushSettings.preset).toBe('csp-custom-ink-test');
+    expect(useToolStore.getState().brushSettings.brushName).toBe('Custom Manga Ink');
+    expect(useToolStore.getState().brushSettings.size).toBe(14);
+    expect(useToolStore.getState().brushSettings.customTipImage).toBe(fakeTipImg);
   });
 
   it('useDocumentStore manages tabs, dimensions, active layer, and soft proof metadata', () => {

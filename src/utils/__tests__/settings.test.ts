@@ -86,4 +86,44 @@ describe('settings theme & accent system', () => {
     });
     expect(loadAppSettings().uiTone).toBe('charcoal');
   });
+
+  it('defaults and sanitizes autoCheckUpdates and skippedUpdateVersion safely for legacy storage', () => {
+    const defaults = loadAppSettings();
+    expect(defaults.autoCheckUpdates).toBe(true);
+    expect(defaults.skippedUpdateVersion).toBe('');
+
+    // Legacy user settings missing updater fields
+    localStorage.setItem(
+      'ink_studio_app_settings',
+      JSON.stringify({
+        themePreset: 'modern',
+        modernAccent: 'blue',
+      })
+    );
+    const migrated = loadAppSettings();
+    expect(migrated.autoCheckUpdates).toBe(true);
+    expect(migrated.skippedUpdateVersion).toBe('');
+
+    // Corrupted updater field types fall back safely
+    localStorage.setItem(
+      'ink_studio_app_settings',
+      JSON.stringify({
+        autoCheckUpdates: 'yes',
+        skippedUpdateVersion: 12345,
+      })
+    );
+    const sanitized = loadAppSettings();
+    expect(sanitized.autoCheckUpdates).toBe(true);
+    expect(sanitized.skippedUpdateVersion).toBe('');
+
+    // Valid persisted values round-trip cleanly
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      autoCheckUpdates: false,
+      skippedUpdateVersion: ' 1.2.3 ',
+    });
+    const roundTripped = loadAppSettings();
+    expect(roundTripped.autoCheckUpdates).toBe(false);
+    expect(roundTripped.skippedUpdateVersion).toBe('1.2.3');
+  });
 });

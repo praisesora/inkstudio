@@ -8,6 +8,7 @@ import {
 } from '../types/editor';
 import { AppSettings, ResizeCanvasOptions } from '../types/settings';
 import { CollabPeer, SessionHostInfo } from '../types/multiplayer';
+import { ParsedInviteLink } from '../services/multiplayerService';
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType } from '../utils/tonalEngine';
 import { AnyTonalParams } from '../hooks/useTonalAndFilterActions';
@@ -29,14 +30,10 @@ import { WebLandingModal } from './WebLandingModal';
 import { MangaEffectsModal } from './MangaEffectsModal';
 import { WebtoonExportModal } from './WebtoonExportModal';
 import { TimelapseExportModal } from './TimelapseExportModal';
+import { UpdateModal } from './UpdateModal';
+import { UpdateToast } from './UpdateToast';
 
-export interface InviteLinkPayload {
-  roomName: string;
-  host: string;
-  port: number;
-  url: string;
-  token?: string;
-}
+export type InviteLinkPayload = ParsedInviteLink;
 
 export interface ModalHostProps {
   layers: LayerItem[];
@@ -79,15 +76,27 @@ export interface ModalHostProps {
     roomName: string,
     port: number,
     hostNickname?: string,
-    isGlobal?: boolean
+    isGlobal?: boolean,
+    onStatus?: (status: string) => void
   ) => Promise<boolean | SessionHostInfo>;
   stopHosting: () => void;
+  joinByInviteUrl: (rawUrl: string, nickname?: string, persistName?: boolean) => Promise<boolean>;
+  leaveRoom: () => void;
   clipboardInvite: InviteLinkPayload | null;
   setClipboardInvite: (invite: InviteLinkPayload | null) => void;
   webLandingInvite: InviteLinkPayload | null;
   setWebLandingInvite: (invite: InviteLinkPayload | null) => void;
-  joinRoom: (host: string, port: number, roomName: string, name: string, token?: string) => void;
+  joinRoom: (
+    host: string,
+    port: number,
+    roomName: string,
+    name?: string,
+    token?: string,
+    isSecureOverride?: boolean,
+    persistName?: boolean
+  ) => Promise<boolean>;
   onCaptureTimelapseNow?: () => void;
+  handleSave?: () => void;
   showToast: (msg: string) => void;
 }
 
@@ -120,12 +129,15 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     updateMyName,
     handleStartHosting,
     stopHosting,
+    joinByInviteUrl,
+    leaveRoom,
     clipboardInvite,
     setClipboardInvite,
     webLandingInvite,
     setWebLandingInvite,
     joinRoom,
     onCaptureTimelapseNow,
+    handleSave,
     showToast,
   }) => {
     const dimensions = useDocumentStore((s) => s.dimensions);
@@ -274,20 +286,26 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           onUpdateMyName={updateMyName}
           onStartHosting={handleStartHosting}
           onStopHosting={stopHosting}
+          onJoinByInviteUrl={joinByInviteUrl}
+          onLeaveRoom={leaveRoom}
           showToast={showToast}
         />
 
         <ClipboardInviteToast
           invite={clipboardInvite}
-          onJoin={(h, p, r, t) => joinRoom(h, p, r, collabMyPeer.name, t)}
+          onJoin={(h, p, r, t, isSecure) =>
+            void joinRoom(h, p, r, collabMyPeer.name, t, isSecure, false)
+          }
           onDismiss={() => setClipboardInvite(null)}
         />
 
         <WebLandingModal
           invite={webLandingInvite}
-          onJoinInBrowser={(name, h, p, r, t) => {
-            updateMyName(name);
-            joinRoom(h, p, r, name, t);
+          onJoinInBrowser={(name, h, p, r, t, isSecure, persistName) => {
+            if (persistName) {
+              updateMyName(name);
+            }
+            void joinRoom(h, p, r, name, t, isSecure, Boolean(persistName));
           }}
           onDismiss={() => setWebLandingInvite(null)}
         />
@@ -343,6 +361,13 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           onCaptureNow={onCaptureTimelapseNow}
           showToast={showToast}
         />
+
+        <UpdateModal
+          hasActiveCollabSession={Boolean(isCollabHost || collabHostInfo)}
+          onSaveFirst={handleSave}
+        />
+
+        <UpdateToast />
       </>
     );
   }

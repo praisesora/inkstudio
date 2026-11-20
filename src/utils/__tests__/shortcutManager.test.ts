@@ -51,6 +51,19 @@ describe('Shortcut Parsing, Normalization & Matching', () => {
       matchesKeyboardEvent({ key: 'я', code: 'KeyZ', ctrlKey: true }, 'Ctrl+Z')
     ).toBe(true);
 
+    // QWERTZ layout pressing Z (located on physical KeyY) triggers Ctrl+Z, not Ctrl+Y
+    expect(
+      matchesKeyboardEvent({ key: 'z', code: 'KeyY', ctrlKey: true }, 'Ctrl+Z')
+    ).toBe(true);
+    expect(
+      matchesKeyboardEvent({ key: 'z', code: 'KeyY', ctrlKey: true }, 'Ctrl+Y')
+    ).toBe(false);
+
+    // AZERTY layout pressing Z (located on physical KeyW) triggers Ctrl+Z
+    expect(
+      matchesKeyboardEvent({ key: 'z', code: 'KeyW', ctrlKey: true }, 'Ctrl+Z')
+    ).toBe(true);
+
     // Rejects extra modifiers
     expect(
       matchesKeyboardEvent({ key: 'z', code: 'KeyZ', ctrlKey: true, shiftKey: true }, 'Ctrl+Z')

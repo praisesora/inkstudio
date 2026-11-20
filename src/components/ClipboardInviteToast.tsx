@@ -1,15 +1,16 @@
 import React from 'react';
 import { Users, ArrowRight, X } from 'lucide-react';
+import { ParsedInviteLink } from '../services/multiplayerService';
 
 interface ClipboardInviteToastProps {
-  invite: {
-    roomName: string;
-    host: string;
-    port: number;
-    url: string;
-    token?: string;
-  } | null;
-  onJoin: (host: string, port: number, roomName: string, token?: string) => void;
+  invite: ParsedInviteLink | null;
+  onJoin: (
+    host: string,
+    port: number,
+    roomName: string,
+    token?: string,
+    isSecure?: boolean
+  ) => void;
   onDismiss: () => void;
 }
 
@@ -35,13 +36,16 @@ export const ClipboardInviteToast: React.FC<ClipboardInviteToastProps> = ({
             Room: <span className="font-semibold text-amber-300">"{invite.roomName}"</span>
           </div>
           <div className="text-[10px] text-[#888888] font-mono mt-0.5">
-            Host: {invite.host}:{invite.port}
+            Host: {invite.host}
+            {invite.port && invite.port !== 443 && invite.port !== 80 ? `:${invite.port}` : ''}
           </div>
         </div>
 
         <div className="flex items-center space-x-2 pl-2">
           <button
-            onClick={() => onJoin(invite.host, invite.port, invite.roomName, invite.token)}
+            onClick={() =>
+              onJoin(invite.host, invite.port, invite.roomName, invite.token, invite.isSecure)
+            }
             className="flex items-center space-x-1.5 rounded-md bg-rose-600 hover:bg-rose-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors shadow-sm cursor-pointer"
           >
             <span>Connect</span>

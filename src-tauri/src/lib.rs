@@ -5,7 +5,8 @@ mod timelapse;
 
 use server::{
     download_cloudflared as server_download_cloudflared, get_local_ip, get_server_status,
-    start_embedded_server, stop_embedded_server, ServerInfo,
+    is_cloudflared_installed as server_is_cloudflared_installed, start_embedded_server,
+    stop_embedded_server, ServerInfo,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,30 @@ async fn get_collab_server_status() -> ServerInfo {
 #[tauri::command]
 async fn download_cloudflared() -> Result<String, String> {
     server_download_cloudflared().await
+}
+
+#[tauri::command]
+async fn is_cloudflared_installed() -> bool {
+    server_is_cloudflared_installed().await
+}
+
+#[tauri::command]
+fn get_os_username() -> String {
+    let raw = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(40)
+        .collect();
+    if cleaned.is_empty() {
+        "Artist".to_string()
+    } else {
+        cleaned
+    }
 }
 
 #[tauri::command]
@@ -504,6 +529,13 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_process::init())
+        .setup(|app| {
+            #[cfg(desktop)]
+            app.handle()
+                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            Ok(())
+        })
         .on_window_event(|_window, event| {
             if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
                 for p in paths {
@@ -516,6 +548,8 @@ pub fn run() {
             stop_collab_server,
             get_collab_server_status,
             download_cloudflared,
+            is_cloudflared_installed,
+            get_os_username,
             get_local_lan_ip,
             save_undo_tile_cache,
             load_undo_tile_cache,

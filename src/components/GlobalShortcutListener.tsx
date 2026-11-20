@@ -106,10 +106,28 @@ const NON_REPEATABLE_COMMANDS = new Set<string>([
   'file.saveAs',
 ]);
 
+const NON_TEXT_INPUT_TYPES = new Set([
+  'range',
+  'checkbox',
+  'radio',
+  'color',
+  'button',
+  'submit',
+  'reset',
+  'file',
+  'image',
+]);
+
 function isEditableTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
   const tag = target.tagName;
-  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'INPUT') {
+    const inputType = ((target as HTMLInputElement).type || 'text').toLowerCase();
+    return !NON_TEXT_INPUT_TYPES.has(inputType);
+  }
+  return false;
 }
 
 function modifierActionToTempTool(action: ModifierAction): ToolType | null {
@@ -451,6 +469,7 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
             return;
           }
 
+          clearModHold();
           e.preventDefault();
           shortcutManager.executeCommand(matched.id);
           return;

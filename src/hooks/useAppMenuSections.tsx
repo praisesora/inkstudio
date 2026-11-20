@@ -37,6 +37,9 @@ import {
   WorkspacePresetId,
 } from '../types/workspace';
 import { listVisiblePanelIds } from '../utils/workspacePresets';
+import { isTauriEnvironment } from './useMultiplayer';
+import { updaterService } from '../services/updaterService';
+import { useUpdaterStore } from '../stores/useUpdaterStore';
 
 export interface UseAppMenuSectionsParams {
   hasOpenDocument: boolean;
@@ -1277,6 +1280,22 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
         id: 'help',
         label: 'Help',
         items: [
+          ...(isTauriEnvironment()
+            ? [
+                {
+                  id: 'help-check-updates',
+                  label: 'Check for Updates...',
+                  onClick: () => {
+                    updaterService.openUpdateModal();
+                    const st = useUpdaterStore.getState().status;
+                    if (st !== 'downloading' && st !== 'ready') {
+                      void updaterService.checkForUpdates({ silent: false });
+                    }
+                  },
+                },
+                { id: 'help-div-1', label: '', divider: true },
+              ]
+            : []),
           {
             id: 'help-about',
             label: 'About Ink Studio',

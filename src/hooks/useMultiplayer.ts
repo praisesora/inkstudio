@@ -12,10 +12,18 @@ import {
   TileStreamMessage,
   SelectiveUndoMessage,
 } from '../types/multiplayer';
-import { multiplayerService } from '../services/multiplayerService';
+import {
+  multiplayerService,
+  ParsedInviteLink,
+  parseInviteUrl,
+} from '../services/multiplayerService';
 import { LayerItem, CanvasDimensions, CanvasColorMode } from '../types/editor';
 import { TILE_SIZE, TileBuffer } from '../utils/tileEngine';
 import { documentStore } from '../utils/documentStore';
+import { uiStoreActions, useUiStore } from '../stores';
+
+const NICKNAME_KEY = 'sora_paint_nickname';
+const NICKNAME_CUSTOMIZED_KEY = 'ink_nickname_customized';
 
 const PEER_COLORS = [
   '#f43f5e', // Rose
@@ -34,7 +42,27 @@ function getRandomColor(): string {
 
 export function isTauriEnvironment(): boolean {
   if (typeof window === 'undefined') return false;
-  return Boolean((window as any).__TAURI_INTERNALS__ || (window as any).__TAURI__ || (window as any).isTauri);
+  return Boolean(
+    (window as any).__TAURI_INTERNALS__ || (window as any).__TAURI__ || (window as any).isTauri
+  );
+}
+
+function getInitialPeerName(): string {
+  if (typeof window === 'undefined') return 'Guest';
+  try {
+    const isCustomized = localStorage.getItem(NICKNAME_CUSTOMIZED_KEY) === '1';
+    const saved = (localStorage.getItem(NICKNAME_KEY) || '').trim();
+    if (isCustomized && saved) {
+      return saved;
+    }
+    if (!isTauriEnvironment()) {
+      return 'Guest';
+    }
+    // Desktop: will be replaced by OS username via get_os_username on mount
+    return 'Artist';
+  } catch {
+    return isTauriEnvironment() ? 'Artist' : 'Guest';
+  }
 }
 
 export interface UseMultiplayerProps {
@@ -46,8 +74,17 @@ export interface UseMultiplayerProps {
   onRemoteStrokeChunk?: (msg: StrokeChunkMessage) => void;
   onRemoteStrokeFinish?: (msg: StrokeFinishMessage) => void;
   onRemoteLayerAction?: (msg: MultiplayerMessage) => void;
-  onRemoteDocSync?: (dimensions: CanvasDimensions, colorMode: CanvasColorMode, layers: LayerItem[], dataUrls: Record<string, string>) => void;
-  onRemoteJoinRequest?: (peer: CollabPeer) => { assignedLayerId: string; updatedLayers: LayerItem[] } | void;
+  onRemoteDocSync?: (
+    dimensions: CanvasDimensions,
+    colorMode: CanvasColorMode,
+    layers: LayerItem[],
+    dataUrls: Record<string, string>,
+    assignedLayerId?: string,
+    roomName?: string
+  ) => void;
+  onRemoteJoinRequest?: (
+    peer: CollabPeer
+  ) => { assignedLayerId: string; updatedLayers: LayerItem[] } | void;
   onRemoteAssignedLayer?: (layerId: string) => void;
   onRemoteSelectiveUndo?: (strokeId: string, peerId: string | number) => void;
   showToast: (msg: string) => void;
@@ -74,37 +111,24 @@ export function useMultiplayer({
   const [peers, setPeers] = useState<CollabPeer[]>([]);
   const peersRef = useRef<CollabPeer[]>([]);
 
-  const [myPeer, setMyPeer] = useState<CollabPeer>(() => {
-    const savedName = (typeof window !== 'undefined' && localStorage.getItem('sora_paint_nickname')) || 'Sora';
-    return {
-      id: `peer-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      name: savedName,
-      color: getRandomColor(),
-    };
-  });
+  const [myPeer, setMyPeer] = useState<CollabPeer>(() => ({
+    id: `peer-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    name: getInitialPeerName(),
+    color: getRandomColor(),
+  }));
   const myPeerRef = useRef(myPeer);
 
-  const [activePings, setActivePings] = useState<Array<{ id: string; x: number; y: number; color: string; name: string }>>([]);
+  const [activePings, setActivePings] = useState<
+    Array<{ id: string; x: number; y: number; color: string; name: string }>
+  >([]);
   const [isHostModalOpen, setIsHostModalOpen] = useState(false);
 
   // Smart Clipboard Invitation Prompt
-  const [clipboardInvite, setClipboardInvite] = useState<{
-    roomName: string;
-    host: string;
-    port: number;
-    url: string;
-    token?: string;
-  } | null>(null);
+  const [clipboardInvite, setClipboardInvite] = useState<ParsedInviteLink | null>(null);
   const lastProcessedClipboardUrlRef = useRef<string | null>(null);
 
   // Web Landing modal for browser guests visiting via ?room=...
-  const [webLandingInvite, setWebLandingInvite] = useState<{
-    roomName: string;
-    host: string;
-    port: number;
-    url: string;
-    token?: string;
-  } | null>(null);
+  const [webLandingInvite, setWebLandingInvite] = useState<ParsedInviteLink | null>(null);
 
   // Synchronous refs for event handlers
   const dimensionsRef = useRef(dimensions);
@@ -142,6 +166,99 @@ export function useMultiplayer({
   onRemoteSelectiveUndoRef.current = onRemoteSelectiveUndo;
   showToastRef.current = showToast;
 
+  // Desktop: resolve default peer name from OS account name unless explicitly customized
+  useEffect(() => {
+    if (!isTauriEnvironment()) return;
+    try {
+      if (
+        localStorage.getItem(NICKNAME_CUSTOMIZED_KEY) === '1' &&
+        (localStorage.getItem(NICKNAME_KEY) || '').trim()
+      ) {
+        return;
+      }
+    } catch {
+      // ignore storage errors
+    }
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const osName = await invoke<string>('get_os_username');
+        const trimmed = (osName || '').trim();
+        if (!cancelled && trimmed) {
+          setMyPeer((prev) => {
+            const next = { ...prev, name: trimmed };
+            myPeerRef.current = next;
+            return next;
+          });
+          const curSettings = useUiStore.getState().appSettings;
+          if (!curSettings.userName || curSettings.userName === 'Sora') {
+            uiStoreActions.updateAppSettings({ ...curSettings, userName: trimmed });
+          }
+        }
+      } catch {
+        // Fallback stays 'Artist'
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Keep myPeer.name synchronized when changed via SettingsModal
+  useEffect(() => {
+    return useUiStore.subscribe(() => {
+      const configured = (useUiStore.getState().appSettings.userName || '').trim();
+      if (configured && configured !== myPeerRef.current.name) {
+        setMyPeer((prev) => {
+          if (prev.name === configured) return prev;
+          const next = { ...prev, name: configured };
+          myPeerRef.current = next;
+          return next;
+        });
+      }
+    });
+  }, []);
+
+  // Paced async tile streaming so large canvases never saturate WS or server mpsc buffers
+  const streamTilesPaced = useCallback((layersToStream: LayerItem[]) => {
+    const activeGrid = documentStore.getActiveTileGrid();
+    const queue: Array<{ layerId: string; tile: TileBuffer }> = [];
+    for (const layer of layersToStream) {
+      const tiles = activeGrid.getLayerTiles(layer.id);
+      for (const tile of tiles) {
+        if (tile.data && tile.data.byteLength > 0) {
+          queue.push({ layerId: layer.id, tile });
+        }
+      }
+    }
+    if (queue.length === 0) return;
+
+    let idx = 0;
+    const BATCH_SIZE = 16;
+    const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+
+    const pump = () => {
+      if (!multiplayerService.isConnected()) return;
+      if (multiplayerService.getBufferedAmount() > MAX_BUFFERED_BYTES) {
+        setTimeout(pump, 20);
+        return;
+      }
+      const end = Math.min(idx + BATCH_SIZE, queue.length);
+      for (; idx < end; idx++) {
+        const entry = queue[idx];
+        multiplayerService.sendTileDelta(entry.layerId, entry.tile);
+      }
+      if (idx < queue.length) {
+        setTimeout(pump, 4);
+      }
+    };
+
+    pump();
+  }, []);
+
   // Handle incoming messages
   useEffect(() => {
     const unsubscribe = multiplayerService.onMessage((msg: MultiplayerMessage) => {
@@ -156,8 +273,8 @@ export function useMultiplayer({
             const guestPeer = msg.peer;
 
             setPeers((prev) => {
-              if (prev.some((p) => p.id === guestPeer.id)) return prev;
-              const next = [...prev, guestPeer];
+              const filtered = prev.filter((p) => p.id !== guestPeer.id);
+              const next = [...filtered, guestPeer];
               peersRef.current = next;
               return next;
             });
@@ -176,11 +293,13 @@ export function useMultiplayer({
               }
             }
 
+            const roomName = hostInfoRef.current?.roomName || 'Studio';
+
             // Send JOIN_ACCEPTED to the joining guest
             const joinAcceptedMsg: JoinAcceptedMessage = {
               type: 'JOIN_ACCEPTED',
               targetPeerId: guestPeer.id,
-              roomName: hostInfoRef.current?.roomName || 'Studio',
+              roomName,
               peers: [...peersRef.current.filter((p) => p.id !== guestPeer.id), myPeerRef.current],
               hostId: myPeerRef.current.id,
               docDimensions: dimensionsRef.current,
@@ -189,24 +308,20 @@ export function useMultiplayer({
             };
             multiplayerService.sendMessage(joinAcceptedMsg);
 
-            // Send document synchronization
+            // Send document synchronization (carries assignedLayerId & roomName so there is no race)
             multiplayerService.sendMessage({
               type: 'DOC_SYNC_RESPONSE',
               targetPeerId: guestPeer.id,
+              roomName,
+              assignedLayerId,
               dimensions: dimensionsRef.current,
               colorMode: colorModeRef.current,
               layers: effectiveLayers,
               layerDataUrls: {},
             });
 
-            // Progressive Tile Streaming: stream active layer tiles progressively from active document's sparse tile grid
-            const activeGrid = documentStore.getActiveTileGrid();
-            for (const layer of effectiveLayers) {
-              const tiles = activeGrid.getLayerTiles(layer.id);
-              for (const tile of tiles) {
-                multiplayerService.sendTileDelta(layer.id, tile);
-              }
-            }
+            // Progressive paced tile streaming from active document's sparse tile grid
+            streamTilesPaced(effectiveLayers);
 
             // Broadcast PEER_JOINED to other already connected peers
             multiplayerService.sendMessage({
@@ -232,7 +347,7 @@ export function useMultiplayer({
             onRemoteAssignedLayerRef.current?.(accMsg.assignedLayerId);
           }
 
-          showToastRef.current(`Connected to room "${accMsg.roomName}"!`);
+          showToastRef.current(`Connected to room "${accMsg.roomName}"`);
           break;
         }
 
@@ -243,20 +358,21 @@ export function useMultiplayer({
               peersRef.current = next;
               return next;
             });
-            showToastRef.current(`🎨 ${msg.peer.name} joined the canvas`);
+            showToastRef.current(`${msg.peer.name} joined the canvas`);
           }
           break;
         }
 
         case 'PEER_LEFT':
         case 'PEER_DISCONNECTED': {
-          const id = (msg as any).peerId || (msg as any).clientId;
+          const id = (msg as any).peerId ?? (msg as any).clientId;
+          if (id === undefined || id === null) break;
           setPeers((prev) => {
-            const leaving = prev.find((p) => p.id === id);
+            const leaving = prev.find((p) => String(p.id) === String(id));
             if (leaving) {
-              showToastRef.current(`👋 ${leaving.name} left the canvas`);
+              showToastRef.current(`${leaving.name} left the canvas`);
             }
-            const next = prev.filter((p) => p.id !== id);
+            const next = prev.filter((p) => String(p.id) !== String(id));
             peersRef.current = next;
             return next;
           });
@@ -268,10 +384,9 @@ export function useMultiplayer({
           setPeers((prev) => {
             const existing = prev.find((p) => p.id === cMsg.peerId);
             if (!existing) {
-              // Dynamically register peer if not yet in list so cursor and draft canvas exist
               const newPeer: CollabPeer = {
                 id: cMsg.peerId,
-                name: cMsg.peerName || 'Friend',
+                name: cMsg.peerName || 'Guest',
                 color: cMsg.peerColor || getRandomColor(),
                 x: cMsg.x,
                 y: cMsg.y,
@@ -310,7 +425,7 @@ export function useMultiplayer({
             if (prev.some((p) => p.id === sMsg.peerId)) return prev;
             const newPeer: CollabPeer = {
               id: sMsg.peerId,
-              name: sMsg.peerName || 'Friend',
+              name: sMsg.peerName || 'Guest',
               color: sMsg.peerColor || getRandomColor(),
               isDrawing: true,
               tool: sMsg.tool,
@@ -349,7 +464,14 @@ export function useMultiplayer({
             return;
           }
           if (onRemoteDocSyncRef.current && msg.layers) {
-            onRemoteDocSyncRef.current(msg.dimensions, msg.colorMode, msg.layers, msg.layerDataUrls || {});
+            onRemoteDocSyncRef.current(
+              msg.dimensions,
+              msg.colorMode,
+              msg.layers,
+              msg.layerDataUrls || {},
+              msg.assignedLayerId,
+              msg.roomName
+            );
           }
           break;
         }
@@ -405,15 +527,17 @@ export function useMultiplayer({
 
     const unsubClose = multiplayerService.onClose(() => {
       setIsConnected(false);
+      setIsHost(false);
       setPeers([]);
       peersRef.current = [];
+      showToastRef.current('Disconnected from collaborative session');
     });
 
     return () => {
       unsubscribe();
       unsubClose();
     };
-  }, [layerCanvasesRef]);
+  }, [layerCanvasesRef, streamTilesPaced]);
 
   // SMART CLIPBOARD INVITATION DETECTION
   useEffect(() => {
@@ -425,39 +549,13 @@ export function useMultiplayer({
         const text = await navigator.clipboard.readText();
         if (!text || text === lastProcessedClipboardUrlRef.current) return;
 
-        const trimmed = text.trim();
-        let parsedUrl: URL | null = null;
-        try {
-          parsedUrl = new URL(trimmed);
-        } catch {
-          parsedUrl = null;
-        }
-
-        if (parsedUrl && (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:')) {
-          const roomParam = parsedUrl.searchParams.get('room');
-          if (roomParam) {
-            const host = parsedUrl.hostname;
-            const isHttps = parsedUrl.protocol === 'https:';
-            const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : (isHttps ? 443 : 80);
-            const token = parsedUrl.searchParams.get('token') || undefined;
-            lastProcessedClipboardUrlRef.current = text;
-            setClipboardInvite({ roomName: roomParam, host, port, url: trimmed, token });
-          }
-        } else if (parsedUrl && parsedUrl.protocol === 'forsora:') {
-          const host = parsedUrl.searchParams.get('host');
-          const portParam = parsedUrl.searchParams.get('port');
-          if (host && portParam) {
-            const port = parseInt(portParam, 10);
-            const roomName = parsedUrl.searchParams.get('room') || 'Studio';
-            const token = parsedUrl.searchParams.get('token') || undefined;
-            if (Number.isFinite(port)) {
-              lastProcessedClipboardUrlRef.current = text;
-              setClipboardInvite({ roomName, host, port, url: trimmed, token });
-            }
-          }
+        const parsed = parseInviteUrl(text);
+        if (parsed) {
+          lastProcessedClipboardUrlRef.current = text;
+          setClipboardInvite(parsed);
         }
       } catch {
-        // Clipboard read permission might be denied or window not focused, ignore silently
+        // Clipboard read permission might be denied or window not focused
       }
     };
 
@@ -468,43 +566,41 @@ export function useMultiplayer({
   // Check URL query parameters on initial page load (for Web Browser joins)
   useEffect(() => {
     if (typeof window === 'undefined') return;
-
-    const params = new URLSearchParams(window.location.search);
-    const room = params.get('room');
-    if (room) {
-      const host = window.location.hostname || '127.0.0.1';
-      const isHttps = window.location.protocol === 'https:';
-      const port = window.location.port ? parseInt(window.location.port, 10) : (isHttps ? 443 : 80);
-      const token = params.get('token') || undefined;
-      setWebLandingInvite({
-        roomName: room,
-        host,
-        port,
-        url: window.location.href,
-        token,
-      });
+    const parsed = parseInviteUrl(window.location.href);
+    if (parsed) {
+      setWebLandingInvite(parsed);
     }
   }, []);
 
   // START HOSTING
   const startHosting = useCallback(
     async (
-      roomName: string = "Ink Studio Session",
+      roomName: string = 'Ink Studio Session',
       port: number = 30303,
       hostNickname?: string,
-      isGlobal: boolean = true
+      isGlobal: boolean = true,
+      onStatus?: (status: string) => void
     ) => {
       try {
-        let currentName = myPeer.name;
+        let currentName = myPeerRef.current.name;
         if (hostNickname && hostNickname.trim()) {
           currentName = hostNickname.trim();
-          safeLocalStorageSetItem('sora_paint_nickname', currentName, 'artist name');
         }
 
         let serverInfo: SessionHostInfo;
 
         if (isTauriEnvironment()) {
           const { invoke } = await import('@tauri-apps/api/core');
+          if (isGlobal) {
+            const installed = await invoke<boolean>('is_cloudflared_installed').catch(() => true);
+            if (!installed) {
+              onStatus?.('Downloading Cloudflare Tunnel (first time)...');
+            } else {
+              onStatus?.('Starting Worldwide Tunnel...');
+            }
+          } else {
+            onStatus?.('Starting Local Server...');
+          }
           serverInfo = await invoke<SessionHostInfo>('start_collab_server', {
             port,
             roomName,
@@ -527,7 +623,9 @@ export function useMultiplayer({
         const resolvedIp = serverInfo.localIp || (serverInfo as any).local_ip || '127.0.0.1';
         const resolvedRoomName = serverInfo.roomName || (serverInfo as any).room_name || roomName;
         const resolvedRoomToken = serverInfo.roomToken || (serverInfo as any).room_token || '';
-        const tokenQuery = resolvedRoomToken ? `&token=${encodeURIComponent(resolvedRoomToken)}` : '';
+        const tokenQuery = resolvedRoomToken
+          ? `&token=${encodeURIComponent(resolvedRoomToken)}`
+          : '';
         const resolvedInviteUrl =
           serverInfo.inviteUrl ||
           (serverInfo as any).invite_url ||
@@ -549,9 +647,11 @@ export function useMultiplayer({
 
         setHostInfo(normalizedServerInfo);
         setIsHost(true);
+        isHostRef.current = true;
+        hostInfoRef.current = normalizedServerInfo;
 
         const hostPeer: CollabPeer = {
-          ...myPeer,
+          ...myPeerRef.current,
           name: currentName,
           isHost: true,
         };
@@ -566,10 +666,11 @@ export function useMultiplayer({
         // Auto-copy invite link
         try {
           await navigator.clipboard.writeText(normalizedServerInfo.inviteUrl);
+          lastProcessedClipboardUrlRef.current = normalizedServerInfo.inviteUrl;
           showToast(
             isGlobalServer
-              ? '🌍 Global room invite link copied! Friends worldwide can join.'
-              : '🔗 Local room invite link copied to clipboard!'
+              ? 'Worldwide invite link copied to clipboard.'
+              : 'Local Wi-Fi invite link copied to clipboard.'
           );
         } catch {
           showToast(`Room created: ${normalizedServerInfo.inviteUrl}`);
@@ -583,23 +684,25 @@ export function useMultiplayer({
         throw err;
       }
     },
-    [myPeer, showToast]
+    [showToast]
   );
 
   // STOP HOSTING
   const stopHosting = useCallback(async () => {
     try {
+      multiplayerService.disconnect();
       if (isTauriEnvironment()) {
         const { invoke } = await import('@tauri-apps/api/core');
         await invoke('stop_collab_server');
       }
-      multiplayerService.disconnect();
       setIsConnected(false);
       setIsHost(false);
+      isHostRef.current = false;
       setHostInfo(null);
+      hostInfoRef.current = null;
       setPeers([]);
       peersRef.current = [];
-      showToast('Collaborative drawing session stopped');
+      showToast('Collaborative session stopped');
     } catch (err) {
       console.error('Failed to stop collab server:', err);
     }
@@ -607,22 +710,36 @@ export function useMultiplayer({
 
   // JOIN ROOM
   const joinRoom = useCallback(
-    async (host: string, port: number, roomName: string, guestNickname?: string, token?: string) => {
+    async (
+      host: string,
+      port: number,
+      roomName: string,
+      guestNickname?: string,
+      token?: string,
+      isSecureOverride?: boolean,
+      persistName: boolean = false
+    ): Promise<boolean> => {
       try {
-        let currentName = myPeer.name;
+        let currentName = myPeerRef.current.name;
         if (guestNickname && guestNickname.trim()) {
           currentName = guestNickname.trim();
-          safeLocalStorageSetItem('sora_paint_nickname', currentName, 'artist name');
+          if (persistName) {
+            safeLocalStorageSetItem(NICKNAME_KEY, currentName, 'artist name');
+            safeLocalStorageSetItem(NICKNAME_CUSTOMIZED_KEY, '1', 'artist name flag');
+          }
         }
 
         const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:';
-        const isSecure = isHttps || port === 443 || host.includes('trycloudflare.com');
+        const isSecure =
+          isSecureOverride !== undefined
+            ? isSecureOverride
+            : isHttps || port === 443 || host.toLowerCase().endsWith('.trycloudflare.com');
         const proto = isSecure ? 'wss' : 'ws';
         const portPart = port === 80 || port === 443 || !port ? '' : `:${port}`;
         const wsUrl = `${proto}://${host}${portPart}/ws`;
 
         const guestPeer: CollabPeer = {
-          ...myPeer,
+          ...myPeerRef.current,
           name: currentName,
           isHost: false,
         };
@@ -632,9 +749,10 @@ export function useMultiplayer({
         await multiplayerService.connect(wsUrl, guestPeer, token);
         setIsConnected(true);
         setIsHost(false);
+        isHostRef.current = false;
         const inviteProto = isSecure ? 'https' : 'http';
         const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : '';
-        setHostInfo({
+        const nextHostInfo: SessionHostInfo = {
           isRunning: true,
           port,
           localIp: host,
@@ -643,35 +761,76 @@ export function useMultiplayer({
           inviteUrl: `${inviteProto}://${host}${portPart}/?room=${encodeURIComponent(roomName)}${tokenQuery}`,
           peerCount: 1,
           isGlobal: isSecure,
-        });
+        };
+        setHostInfo(nextHostInfo);
+        hostInfoRef.current = nextHostInfo;
         setClipboardInvite(null);
         setWebLandingInvite(null);
-        showToast(`Connecting to room "${roomName}"...`);
+        return true;
       } catch (err: any) {
         showToast(`Failed to connect: ${err?.message || err}`);
+        return false;
       }
     },
-    [myPeer, showToast]
+    [showToast]
+  );
+
+  const joinByInviteUrl = useCallback(
+    async (rawUrl: string, nickname?: string, persistName: boolean = false): Promise<boolean> => {
+      const parsed = parseInviteUrl(rawUrl);
+      if (!parsed) {
+        showToast('Invalid invite link. Paste the full room URL.');
+        return false;
+      }
+      return joinRoom(
+        parsed.host,
+        parsed.port,
+        parsed.roomName,
+        nickname,
+        parsed.token,
+        parsed.isSecure,
+        persistName
+      );
+    },
+    [joinRoom, showToast]
   );
 
   const leaveRoom = useCallback(() => {
     multiplayerService.disconnect();
     setIsConnected(false);
     setIsHost(false);
+    isHostRef.current = false;
     setHostInfo(null);
+    hostInfoRef.current = null;
     setPeers([]);
     peersRef.current = [];
-    showToast('You left the room');
+    showToast('Left the collaborative session');
   }, [showToast]);
 
-  const updateMyName = useCallback((name: string) => {
-    const trimmed = name.trim() || 'Artist';
-    safeLocalStorageSetItem('sora_paint_nickname', trimmed, 'artist name');
-    setMyPeer((prev) => ({ ...prev, name: trimmed }));
+  const updateMyName = useCallback((name: string, markCustomized: boolean = true) => {
+    const fallback = isTauriEnvironment() ? 'Artist' : 'Guest';
+    const trimmed = name.trim() || fallback;
+    if (markCustomized) {
+      safeLocalStorageSetItem(NICKNAME_KEY, trimmed, 'artist name');
+      safeLocalStorageSetItem(NICKNAME_CUSTOMIZED_KEY, '1', 'artist name flag');
+      const curSettings = useUiStore.getState().appSettings;
+      if (curSettings.userName !== trimmed) {
+        uiStoreActions.updateAppSettings({ ...curSettings, userName: trimmed });
+      }
+    }
+    setMyPeer((prev) => {
+      const next = { ...prev, name: trimmed };
+      myPeerRef.current = next;
+      return next;
+    });
   }, []);
 
   const updateMyColor = useCallback((color: string) => {
-    setMyPeer((prev) => ({ ...prev, color }));
+    setMyPeer((prev) => {
+      const next = { ...prev, color };
+      myPeerRef.current = next;
+      return next;
+    });
   }, []);
 
   const sendPing = useCallback((x: number, y: number) => {
@@ -694,6 +853,7 @@ export function useMultiplayer({
     startHosting,
     stopHosting,
     joinRoom,
+    joinByInviteUrl,
     leaveRoom,
     updateMyName,
     updateMyColor,

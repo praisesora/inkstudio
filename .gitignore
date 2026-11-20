@@ -25,3 +25,10 @@ dist-ssr
 
 # Database and temp files
 *.db
+
+# Secrets and signing keys
+*.key
+*.pub
+*.pem
+.env
+.env.*

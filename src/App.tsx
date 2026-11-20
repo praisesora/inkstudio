@@ -9,9 +9,10 @@ import { screenToCanvas } from './utils/canvasUtils';
 import { createDefaultPageFrame } from './utils/frameEngine';
 import { AutoAction, AutoActionExecutionContext, executeAutoAction } from './utils/autoActionEngine';
 import { globalTimelapseManager } from './utils/timelapseEngine';
-import { globalTileGrid } from './utils/tileEngine';
+import { globalTileGrid, parseTileKey } from './utils/tileEngine';
 import { documentStore } from './utils/documentStore';
 import { multiplayerService } from './services/multiplayerService';
+import { updaterService } from './services/updaterService';
 import { useCanvasDrawing } from './hooks/useCanvasDrawing';
 import {
   PushHistoryStepFn,
@@ -53,9 +54,14 @@ export function App() {
   const animationTimeline = useDocumentStore((s) => s.animationTimeline);
   const isWebtoonMode = useUiStore((s) => s.isWebtoonMode);
 
+  // Delayed silent startup check for desktop Tauri updates (never blocks startup or crash recovery)
+  useEffect(() => {
+    return updaterService.scheduleStartupUpdateCheck(4500);
+  }, []);
+
   const draftCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const strokeCanvasRef = draftCanvasRef;
-  const selectiveUndoRef = useRef<(peerId?: string | number) => void>(() => {});
+  const selectiveUndoRef = useRef<(peerId?: string | number, strokeId?: string) => unknown>(() => {});
   const pushHistoryStepRef = useRef<PushHistoryStepFn | null>(null);
   const getActiveCanvasRef = useRef<() => HTMLCanvasElement | null>(() => null);
   const showToast = uiStoreActions.showToast;
@@ -145,7 +151,10 @@ export function App() {
     activeLayerId: layerMgr.activeLayerId,
     selectedLayerIds: layerMgr.selectedLayerIds,
     layerCanvasesRef: layerMgr.layerCanvasesRef,
+    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
+    pushHistoryStepRef,
     selectiveUndoRef,
+    resetZoomAndCenter: nav.resetZoomAndCenter,
     setActiveLayerId: layerMgr.setActiveLayerId,
     addLayer: layerMgr.addLayer,
     addRemoteLayer: layerMgr.addRemoteLayer,
@@ -277,8 +286,34 @@ export function App() {
 
   const handleUndo = useCallback(() => {
     if (collab.isConnected && collab.myPeer.id) {
-      drawing.selectiveUndo(collab.myPeer.id);
-      multiplayerService.sendSelectiveUndo(collab.myPeer.id.toString());
+      void drawing.selectiveUndo('local').then((undone) => {
+        if (!undone || !multiplayerService.isConnected()) return;
+        if (undone.strokeId) {
+          multiplayerService.sendSelectiveUndo(undone.strokeId);
+        } else if (undone.tileDeltas && undone.tileDeltas.length > 0) {
+          const grid = documentStore.getActiveTileGrid();
+          for (const delta of undone.tileDeltas) {
+            const { layerId, tileX, tileY } = parseTileKey(delta.key);
+            const tile = grid.getTile(layerId, tileX, tileY, 0);
+            if (tile) {
+              multiplayerService.sendTileDelta(layerId, tile);
+            } else {
+              multiplayerService.sendTileDelta(layerId, {
+                layerId,
+                tileX,
+                tileY,
+                format: delta.format,
+                data: null,
+                dirty: true,
+                version: 0,
+                isPagedToDisk: false,
+                lastAccessTimestamp: Date.now(),
+                lod: 0,
+              });
+            }
+          }
+        }
+      });
     } else {
       drawing.undo();
     }
@@ -1136,12 +1171,15 @@ export function App() {
         updateMyName={collab.updateMyName}
         handleStartHosting={collab.handleStartHosting}
         stopHosting={collab.stopHosting}
+        joinByInviteUrl={collab.joinByInviteUrl}
+        leaveRoom={collab.leaveRoom}
         clipboardInvite={collab.clipboardInvite}
         setClipboardInvite={collab.setClipboardInvite}
         webLandingInvite={collab.webLandingInvite}
         setWebLandingInvite={collab.setWebLandingInvite}
         joinRoom={collab.joinRoom}
         onCaptureTimelapseNow={handleCaptureTimelapseNow}
+        handleSave={docLifecycle.handleSave}
         showToast={showToast}
       />
     </AppShell>
