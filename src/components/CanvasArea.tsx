@@ -11,7 +11,9 @@ import {
   SpeechBalloon,
   SoftProofSettings,
   CanvasColorMode,
+  ShapeDragPreview,
 } from '../types/editor';
+import { buildShapeSvgPaths, isOpenShape, resolveShapeFillColor } from '../utils/shapeEngine';
 import { ROTATE_CURSOR_CSS, CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
 import { SelectionOverlay } from './SelectionOverlay';
 import { TransformOverlay } from './TransformOverlay';
@@ -128,6 +130,8 @@ interface CanvasAreaProps {
   onConfirmBalloon?: () => void;
   onDeleteBalloon?: () => void;
   frameDragPreview?: { mode: 'create' | 'divide'; start: { x: number; y: number }; end: { x: number; y: number } } | null;
+  shapeDragPreview?: ShapeDragPreview | null;
+  secondaryColor?: string;
   animationTimeline?: AnimationTimelineType | null;
   onUpdateAnimationTimeline?: (timeline: AnimationTimelineType) => void;
   onAddAnimationCel?: (frameIndex: number) => void;
@@ -240,6 +244,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onConfirmBalloon,
   onDeleteBalloon,
   frameDragPreview = null,
+  shapeDragPreview = null,
+  secondaryColor = '#ffffff',
   isHovering: _isHovering,
   cursorPos: _cursorPos,
   onPointerDown,
@@ -1287,7 +1293,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     if (tool === 'text') {
       return { cursor: 'text' };
     }
-    if (tool === 'select-rect' || tool === 'select-lasso' || tool === 'select-wand' || tool === 'fill' || tool === 'frame') {
+    if (tool === 'select-rect' || tool === 'select-lasso' || tool === 'select-wand' || tool === 'fill' || tool === 'frame' || tool === 'shape') {
       return { cursor: 'crosshair' };
     }
     if (tool === 'liquify') {
@@ -1566,6 +1572,78 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
             )}
           </svg>
         )}
+
+        {/* Live Geometric Shape Placement Preview */}
+        {shapeDragPreview && (() => {
+          const { geom, mainPath, arrowHeadPath } = buildShapeSvgPaths(shapeDragPreview);
+          const s = shapeDragPreview.settings;
+          const open = isOpenShape(s.shape);
+          const strokeColor = primaryColor || '#000000';
+          const fillColor = resolveShapeFillColor(s, strokeColor, secondaryColor);
+          const shouldFill = !open && (s.mode === 'fill' || s.mode === 'both');
+          const shouldStroke = open || s.mode === 'stroke' || s.mode === 'both';
+          const dashArray = s.dashed ? `${Math.max(1, s.dashLength)} ${Math.max(1, s.dashGap)}` : undefined;
+          const invZoom = 1 / Math.max(0.05, liveZoom);
+          const readoutText = open
+            ? `${Math.round(geom.length)}px · ${Math.round(geom.angleDeg)}°`
+            : `${Math.round(geom.width)} × ${Math.round(geom.height)}px`;
+          return (
+            <>
+              <svg
+                className="absolute inset-0 w-full h-full pointer-events-none z-30 overflow-visible"
+                viewBox={`0 0 ${dimensions.width} ${dimensions.height}`}
+              >
+                {mainPath && (
+                  <path
+                    d={mainPath}
+                    fill={shouldFill ? fillColor : 'none'}
+                    stroke={shouldStroke ? strokeColor : 'none'}
+                    strokeWidth={Math.max(1, s.strokeWidth)}
+                    strokeLinecap={s.lineCap}
+                    strokeLinejoin={s.lineJoin}
+                    strokeDasharray={dashArray}
+                    opacity={Math.max(0.05, Math.min(1, s.opacity))}
+                  />
+                )}
+                {arrowHeadPath && (
+                  <path
+                    d={arrowHeadPath}
+                    fill="none"
+                    stroke={strokeColor}
+                    strokeWidth={Math.max(1, s.strokeWidth)}
+                    strokeLinecap={s.lineCap}
+                    strokeLinejoin={s.lineJoin}
+                    opacity={Math.max(0.05, Math.min(1, s.opacity))}
+                  />
+                )}
+                {!open && geom.width > 1 && geom.height > 1 && (
+                  <rect
+                    x={geom.x}
+                    y={geom.y}
+                    width={geom.width}
+                    height={geom.height}
+                    fill="none"
+                    stroke="#e5e5e5"
+                    strokeOpacity={0.55}
+                    strokeWidth={1 * invZoom}
+                    strokeDasharray={`${4 * invZoom} ${3 * invZoom}`}
+                  />
+                )}
+              </svg>
+              <div
+                className="absolute pointer-events-none z-30 px-1.5 py-0.5 rounded bg-[#161616]/90 border border-white/15 text-[#e5e5e5] font-mono text-[10px] whitespace-nowrap"
+                style={{
+                  left: `${geom.x2}px`,
+                  top: `${geom.y2}px`,
+                  transform: `translate(${10 * invZoom}px, ${10 * invZoom}px) scale(${invZoom})`,
+                  transformOrigin: 'top left',
+                }}
+              >
+                {readoutText}
+              </div>
+            </>
+          );
+        })()}
 
         {/* Local-Only 3D Viewport Ghost Layer (Strictly Client-Side Isolated State) */}
         {is3DLayerOpen && onClose3DLayer && onInsertRasterLayer && (

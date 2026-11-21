@@ -185,7 +185,7 @@ interface CommandBarProps {
 
 export const CommandBar: React.FC<CommandBarProps> = React.memo(({
   handlers,
-  themePreset = 'modern',
+  themePreset: _themePreset = 'modern',
 }) => {
   const commandBarIds = useWorkspaceStore((s) => s.commandBarIds);
   const showCommandBar = useWorkspaceStore((s) => s.showCommandBar);
@@ -196,8 +196,6 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
   const [isPresetMenuOpen, setIsPresetMenuOpen] = useState(false);
   const customizeRef = useRef<HTMLDivElement>(null);
   const presetRef = useRef<HTMLDivElement>(null);
-
-  const isVintage = themePreset === 'vintage-manga';
 
   useEffect(() => {
     if (!isCustomizeOpen && !isPresetMenuOpen) return;
@@ -244,13 +242,7 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
     >
       {/* Customizable Command Buttons */}
       {showCommandBar && (
-        <div
-          className={`flex items-center gap-0.5 px-1 h-6 rounded overflow-x-auto no-scrollbar ${
-            isVintage
-              ? 'bg-[#2b2b2e] border border-[#202022] shadow-[inset_1px_1px_2px_rgba(0,0,0,0.45)]'
-              : 'bg-[#161616]'
-          }`}
-        >
+        <div className="flex items-center gap-0.5 px-1 h-6 rounded overflow-x-auto no-scrollbar bg-[#161616]">
           {commandBarIds.map((cmdId) => {
             const entry = catalogById.get(cmdId);
             if (!entry) return null;
@@ -270,11 +262,7 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
                   disabled
                     ? 'opacity-30 cursor-not-allowed text-[#8a8a8a]'
                     : active
-                    ? isVintage
-                      ? 'bg-[#337bb5] text-white cursor-pointer'
-                      : 'bg-[#2c2c2c] text-[var(--accent)] cursor-pointer'
-                    : isVintage
-                    ? 'text-[#c0c0c6] hover:text-white hover:bg-[#444448] cursor-pointer'
+                    ? 'bg-[#2c2c2c] text-[var(--accent)] cursor-pointer'
                     : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
                 }`}
               >
@@ -303,13 +291,7 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
             </button>
 
             {isCustomizeOpen && (
-              <div
-                className={`fixed top-9 left-1/2 -translate-x-1/2 w-64 rounded-md shadow-2xl p-2 z-50 text-[11px] ${
-                  isVintage
-                    ? 'bg-[#333336] border border-[#202022] text-[#e5e5e5]'
-                    : 'bg-[#202020] border border-white/[0.1] text-[#e5e5e5]'
-                }`}
-              >
+              <div className="fixed top-9 left-1/2 -translate-x-1/2 w-64 rounded-md shadow-2xl p-2 z-50 text-[11px] bg-[#202020] border border-white/[0.1] text-[#e5e5e5]">
                 <div className="flex items-center justify-between pb-1.5 mb-1.5 border-b border-white/[0.08]">
                   <span className="font-medium text-xs">Command Bar</span>
                   <button
@@ -416,11 +398,7 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
           }}
           data-testid="workspace-preset-trigger"
           title="Workspace Presets & Layout"
-          className={`h-6 px-2 rounded flex items-center gap-1 text-[11px] transition-colors cursor-pointer ${
-            isVintage
-              ? 'bg-gradient-to-b from-[#4e4e52] to-[#3a3a3d] border border-[#242426] text-[#e5e5e5] hover:brightness-110'
-              : 'bg-[#161616] hover:bg-[#2c2c2c] text-[#cccccc] hover:text-white'
-          }`}
+          className="h-6 px-2 rounded flex items-center gap-1 text-[11px] transition-colors cursor-pointer bg-[#161616] hover:bg-[#2c2c2c] text-[#cccccc] hover:text-white"
         >
           <LayoutGrid className="w-3 h-3 text-[var(--accent)]" />
           <span className="hidden xl:inline max-w-[116px] truncate">
@@ -432,11 +410,7 @@ export const CommandBar: React.FC<CommandBarProps> = React.memo(({
         {isPresetMenuOpen && (
           <div
             data-testid="workspace-preset-menu"
-            className={`absolute top-7 right-0 w-52 rounded-md shadow-2xl p-1 z-50 text-[11px] ${
-              isVintage
-                ? 'bg-[#333336] border border-[#202022] text-[#e5e5e5]'
-                : 'bg-[#202020] border border-white/[0.1] text-[#e5e5e5]'
-            }`}
+            className="absolute top-7 right-0 w-52 rounded-md shadow-2xl p-1 z-50 text-[11px] bg-[#202020] border border-white/[0.1] text-[#e5e5e5]"
           >
             <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-[#8a8a8a]">
               Workspace Presets

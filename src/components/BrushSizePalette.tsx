@@ -6,7 +6,6 @@ import {
   Square,
   Eraser,
   RotateCcw,
-  Sparkles,
 } from 'lucide-react';
 import { ToolType } from '../types/editor';
 import { ThemePreset } from '../types/settings';
@@ -39,7 +38,6 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
 }) => {
   const [showMenu, setShowMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const isVintage = themePreset === 'vintage-manga';
 
   useEffect(() => {
     if (!showMenu) return;
@@ -67,26 +65,11 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
     if (presetId === 'square-digital') {
       return <Square className="w-3.5 h-3.5 text-teal-400 shrink-0" />;
     }
-    if (presetId?.startsWith('csp-')) {
-      return (
-        <Sparkles
-          className={`w-3.5 h-3.5 shrink-0 ${
-            isVintage ? 'text-[#5ce1e6]' : 'text-[var(--accent)]'
-          }`}
-        />
-      );
-    }
-    return (
-      <Paintbrush
-        className={`w-3.5 h-3.5 shrink-0 ${
-          isVintage ? 'text-[#5ce1e6]' : 'text-[var(--accent)]'
-        }`}
-      />
-    );
+    return <Paintbrush className="w-3.5 h-3.5 shrink-0 text-[var(--accent)]" />;
   };
 
   const renderSizeCircle = (size: number) => {
-    const dotClass = isVintage ? 'bg-[#f0f0f4]' : 'bg-[#e5e5e5]';
+    const dotClass = 'bg-[#e5e5e5]';
     const smallMap: Array<[number, number]> = [
       [0.7, 1.5],
       [1, 2],
@@ -152,41 +135,23 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
     <div
       data-testid="brush-size-palette"
       data-theme-preset={themePreset}
-      className={`flex flex-col h-full min-h-0 select-none ${
-        isVintage ? 'bg-[#363638] text-[#e5e5e5]' : 'bg-[#202020] text-[#e5e5e5]'
-      } ${className}`}
+      className={`flex flex-col h-full min-h-0 select-none bg-[#202020] text-[#e5e5e5] ${className}`}
     >
       {!hideHeader && (
-        <div
-          className={`h-7 px-2 flex items-center justify-between shrink-0 relative ${
-            isVintage
-              ? 'bg-gradient-to-b from-[#464649] to-[#363638] border-b border-[#232325] text-[#f0f0f4]'
-              : 'bg-[#1a1a1a] border-b border-white/[0.06] text-[#e5e5e5]'
-          }`}
-        >
+        <div className="h-7 px-2 flex items-center justify-between shrink-0 relative bg-[#1a1a1a] border-b border-white/[0.06] text-[#e5e5e5]">
           <div className="flex items-center space-x-1.5 min-w-0">
             <div className="relative" ref={menuRef}>
               <button
                 type="button"
                 onClick={() => setShowMenu((prev) => !prev)}
                 title="Brush Size Options"
-                className={`p-1 rounded transition-colors cursor-pointer ${
-                  isVintage
-                    ? 'text-[#b0b0b6] hover:text-white hover:bg-[#4e4e52]'
-                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
-                }`}
+                className="p-1 rounded transition-colors cursor-pointer text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]"
               >
                 <Menu className="w-3.5 h-3.5" />
               </button>
 
               {showMenu && (
-                <div
-                  className={`absolute top-6 left-0 w-44 rounded shadow-xl py-1 z-50 text-[11px] ${
-                    isVintage
-                      ? 'bg-[#2b2b2e] border border-[#202022] text-[#e0e0e4]'
-                      : 'bg-[#1a1a1a] border border-white/[0.1] text-[#cccccc]'
-                  }`}
-                >
+                <div className="absolute top-6 left-0 w-44 rounded shadow-xl py-1 z-50 text-[11px] bg-[#1a1a1a] border border-white/[0.1] text-[#cccccc]">
                   {onResetSizeToDefault && (
                     <button
                       type="button"
@@ -230,13 +195,7 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
             </span>
           </div>
 
-          <span
-            className={`text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 ${
-              isVintage
-                ? 'bg-[#2b2b2e] border border-[#202022] text-[#38bdf8]'
-                : 'bg-[#161616] text-[var(--accent)]'
-            }`}
-          >
+          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded shrink-0 bg-[#161616] text-[var(--accent)]">
             {currentSize}px
           </span>
         </div>
@@ -244,13 +203,7 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
 
       {/* Responsive CSP-style grid of brush size presets */}
       <div className="p-1 flex-1 min-h-0 overflow-y-auto">
-        <div
-          className={`grid grid-cols-[repeat(auto-fill,minmax(32px,1fr))] border-t border-l ${
-            isVintage
-              ? 'border-[#252528] bg-[#2a2a2d]'
-              : 'border-[#2a2a2a] bg-[#161616]'
-          }`}
-        >
+        <div className="grid grid-cols-[repeat(auto-fill,minmax(32px,1fr))] border-t border-l border-[#2a2a2a] bg-[#161616]">
           {BRUSH_SIZE_PRESETS.map((preset) => {
             const isSelected = Math.abs(currentSize - preset) < 0.05;
 
@@ -263,11 +216,7 @@ export const BrushSizePalette: React.FC<BrushSizePaletteProps> = React.memo(({
                 aria-pressed={isSelected}
                 className={`h-10 flex flex-col items-center justify-between py-1 px-0.5 border-r border-b transition-colors cursor-pointer relative ${
                   isSelected
-                    ? isVintage
-                      ? 'bg-[#337bb5] border-[#4e95cf] text-white font-semibold z-10'
-                      : 'bg-[var(--accent-subtle)] border-[var(--accent-border)] text-[var(--accent)] font-semibold z-10'
-                    : isVintage
-                    ? 'bg-[#343437] hover:bg-[#444448] border-[#252528] text-[#b8b8be] hover:text-white'
+                    ? 'bg-[var(--accent-subtle)] border-[var(--accent-border)] text-[var(--accent)] font-semibold z-10'
                     : 'bg-[#202020] hover:bg-[#2c2c2c] border-[#2a2a2a] text-[#8a8a8a] hover:text-[#e5e5e5]'
                 }`}
               >

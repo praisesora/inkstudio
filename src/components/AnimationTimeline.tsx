@@ -3,16 +3,10 @@ import {
   Play,
   Pause,
   RotateCcw,
-  Plus,
   Trash2,
-  Download,
   ChevronLeft,
   ChevronRight,
-  Repeat,
-  Layers,
-  Sparkles,
   X,
-  Film,
 } from 'lucide-react';
 import { AnimationTimeline as TimelineData, LayerItem, AnimationExportFormat } from '../types/editor';
 import {
@@ -229,16 +223,16 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
     <div
       ref={timelineRootRef}
       tabIndex={-1}
-      className="absolute inset-x-0 bottom-0 z-40 bg-[#17191e]/95 backdrop-blur-md border-t border-[#2e323b] shadow-2xl flex flex-col select-none text-xs text-gray-300 outline-none"
+      className="absolute inset-x-0 bottom-0 z-40 bg-[#202020]/95 backdrop-blur-md border-t border-white/[0.08] shadow-2xl flex flex-col select-none text-xs text-[#e5e5e5] outline-none"
     >
       {/* 1. Header & Transport Controls Dock */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[#242730] bg-[#1a1d24]">
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/[0.06] bg-[#1a1a1a]">
         {/* Playback Transport */}
         <div className="flex items-center space-x-1.5">
           <button
             type="button"
             onClick={() => onChangeTimeline({ ...timeline, currentFrame: 0 })}
-            className="p-1 hover:bg-white/10 rounded text-gray-400 hover:text-white"
+            className="p-1 hover:bg-[#2c2c2c] rounded text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
             title="First Frame (Home)"
           >
             <RotateCcw className="w-3.5 h-3.5" />
@@ -251,7 +245,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                 currentFrame: Math.max(0, timeline.currentFrame - 1),
               })
             }
-            className="p-1 hover:bg-white/10 rounded text-gray-400 hover:text-white"
+            className="p-1 hover:bg-[#2c2c2c] rounded text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
             title="Previous Frame (Left Arrow)"
           >
             <ChevronLeft className="w-4 h-4" />
@@ -259,15 +253,15 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
           <button
             type="button"
             onClick={() => setIsPlaying(!isPlaying)}
-            className={`p-1.5 px-3 rounded font-medium flex items-center space-x-1.5 shadow-md transition-colors ${
+            className={`py-1 px-2.5 rounded font-medium flex items-center space-x-1.5 transition-colors cursor-pointer ${
               isPlaying
-                ? 'bg-amber-600 hover:bg-amber-500 text-white'
-                : 'bg-emerald-600 hover:bg-emerald-500 text-white'
+                ? 'bg-[#2c2c2c] text-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+                : 'bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90'
             }`}
             title="Play / Pause (Alt+Space)"
           >
             {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-            <span className="text-[11px] font-semibold">{isPlaying ? 'Pause' : 'Play'}</span>
+            <span className="text-[11px] font-medium">{isPlaying ? 'Pause' : 'Play'}</span>
           </button>
           <button
             type="button"
@@ -277,7 +271,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                 currentFrame: Math.min(timeline.totalFrames - 1, timeline.currentFrame + 1),
               })
             }
-            className="p-1 hover:bg-white/10 rounded text-gray-400 hover:text-white"
+            className="p-1 hover:bg-[#2c2c2c] rounded text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
             title="Next Frame (Right Arrow)"
           >
             <ChevronRight className="w-4 h-4" />
@@ -287,18 +281,19 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
           <button
             type="button"
             onClick={() => onChangeTimeline({ ...timeline, loop: !timeline.loop })}
-            className={`p-1 px-2 rounded border border-white/5 flex items-center space-x-1 ${
-              timeline.loop ? 'bg-sky-600/30 text-sky-300 ring-1 ring-sky-400' : 'text-gray-400 hover:bg-white/10'
+            className={`px-2 py-1 rounded text-[11px] transition-colors cursor-pointer ${
+              timeline.loop
+                ? 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+                : 'bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
             }`}
             title="Loop Playback"
           >
-            <Repeat className="w-3 h-3" />
-            <span className="text-[10px]">Loop</span>
+            Loop
           </button>
 
           {/* Frame Rate FPS Selector */}
-          <div className="flex items-center space-x-1 bg-[#22252c] rounded px-2 py-0.5 border border-white/5">
-            <span className="text-[10px] text-gray-400 font-mono">FPS:</span>
+          <div className="flex items-center space-x-1 bg-[#161616] rounded px-2 py-0.5 border border-white/[0.06]">
+            <span className="text-[10px] text-[#8a8a8a] font-mono">FPS</span>
             <select
               value={timeline.fps}
               onChange={(e) =>
@@ -307,10 +302,10 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                   fps: parseInt(e.target.value, 10),
                 })
               }
-              className="bg-transparent text-white font-mono text-[11px] outline-none cursor-pointer"
+              className="bg-transparent text-[#e5e5e5] font-mono text-[11px] outline-none cursor-pointer"
             >
               {[6, 8, 12, 16, 24, 30, 60].map((rate) => (
-                <option key={rate} value={rate} className="bg-[#1e2129]">
+                <option key={rate} value={rate} className="bg-[#202020] text-[#e5e5e5]">
                   {rate} fps
                 </option>
               ))}
@@ -318,22 +313,21 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
           </div>
 
           {/* Frame Ticker Counter */}
-          <div className="font-mono text-cyan-400 bg-[#14161b] px-2.5 py-0.5 rounded border border-[#2a2d36] text-[11px] tracking-wider">
+          <div className="font-mono text-[#e5e5e5] bg-[#161616] px-2.5 py-0.5 rounded border border-white/[0.06] text-[11px] tracking-wider">
             {String(timeline.currentFrame + 1).padStart(3, '0')} / {String(timeline.totalFrames).padStart(3, '0')}
           </div>
         </div>
 
         {/* Cel & Onion Skin Tools */}
-        <div className="flex items-center space-x-2">
+        <div className="flex items-center space-x-1.5">
           {/* Add Cel Button */}
           <button
             type="button"
             onClick={() => onAddCel(timeline.currentFrame)}
-            className="flex items-center space-x-1 px-2.5 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded font-medium shadow-sm"
+            className="px-2.5 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-[11px] font-medium transition-colors cursor-pointer"
             title="Add Cel for Current Frame"
           >
-            <Plus className="w-3.5 h-3.5" />
-            <span className="text-[11px]">Add Cel</span>
+            + Add Cel
           </button>
 
           {/* Delete Cel Button */}
@@ -341,7 +335,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
             <button
               type="button"
               onClick={() => onDeleteCel(timeline.currentFrame)}
-              className="p-1 hover:bg-red-500/20 text-gray-400 hover:text-red-400 rounded transition-colors"
+              className="p-1 hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-rose-400 rounded transition-colors cursor-pointer"
               title="Delete Cel from Current Frame"
             >
               <Trash2 className="w-3.5 h-3.5" />
@@ -353,24 +347,20 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
             <button
               type="button"
               onClick={() => setShowOnionSettings(!showOnionSettings)}
-              className={`flex items-center space-x-1 px-2 py-1 rounded border border-white/5 transition-colors ${
+              className={`px-2.5 py-1 rounded text-[11px] transition-colors cursor-pointer ${
                 timeline.onionSkin.enabled
-                  ? 'bg-purple-600/30 text-purple-300 ring-1 ring-purple-400'
-                  : 'text-gray-400 hover:bg-white/10'
+                  ? 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+                  : 'bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
               }`}
               title="Configure Colored Onion Skinning"
             >
-              <Layers className="w-3.5 h-3.5" />
-              <span className="text-[11px]">Onion Skin</span>
+              Onion Skin
             </button>
 
             {showOnionSettings && (
-              <div className="absolute bottom-full mb-2 right-0 bg-[#1b1e24] border border-purple-500/40 rounded-xl p-3 shadow-2xl z-50 flex flex-col space-y-2.5 w-64">
+              <div className="absolute bottom-full mb-2 right-0 bg-[#202020] border border-white/[0.1] rounded-lg p-3 shadow-2xl z-50 flex flex-col space-y-2.5 w-64">
                 <div className="flex items-center justify-between">
-                  <span className="font-semibold text-purple-300 text-xs flex items-center space-x-1">
-                    <Sparkles className="w-3.5 h-3.5" />
-                    <span>Colored Onion Skin</span>
-                  </span>
+                  <span className="font-medium text-[#e5e5e5] text-xs">Onion Skin</span>
                   <label className="flex items-center space-x-1.5 cursor-pointer">
                     <input
                       type="checkbox"
@@ -384,15 +374,14 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                           },
                         })
                       }
-                      className="accent-purple-500"
                     />
-                    <span className="text-[10px] text-gray-300">Enabled</span>
+                    <span className="text-[10px] text-[#8a8a8a]">Enabled</span>
                   </label>
                 </div>
 
-                {/* Prior Frames Settings (Cyan/Red) */}
-                <div className="flex items-center justify-between text-[11px] text-gray-300">
-                  <span>Prior Frames ({timeline.onionSkin.prevFrames}):</span>
+                {/* Prior Frames Settings */}
+                <div className="flex items-center justify-between text-[11px] text-[#cccccc]">
+                  <span>Prior Frames ({timeline.onionSkin.prevFrames})</span>
                   <div className="flex items-center space-x-2">
                     <input
                       type="color"
@@ -422,14 +411,14 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                           },
                         })
                       }
-                      className="w-16 accent-cyan-400 h-1"
+                      className="w-16"
                     />
                   </div>
                 </div>
 
-                {/* Next Frames Settings (Magenta/Blue) */}
-                <div className="flex items-center justify-between text-[11px] text-gray-300">
-                  <span>Next Frames ({timeline.onionSkin.nextFrames}):</span>
+                {/* Next Frames Settings */}
+                <div className="flex items-center justify-between text-[11px] text-[#cccccc]">
+                  <span>Next Frames ({timeline.onionSkin.nextFrames})</span>
                   <div className="flex items-center space-x-2">
                     <input
                       type="color"
@@ -459,14 +448,14 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                           },
                         })
                       }
-                      className="w-16 accent-pink-500 h-1"
+                      className="w-16"
                     />
                   </div>
                 </div>
 
                 {/* Base Opacity */}
-                <div className="flex items-center justify-between text-[11px] text-gray-300">
-                  <span>Base Opacity:</span>
+                <div className="flex items-center justify-between text-[11px] text-[#cccccc]">
+                  <span>Opacity</span>
                   <div className="flex items-center space-x-2">
                     <input
                       type="range"
@@ -483,9 +472,9 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                           },
                         })
                       }
-                      className="w-24 accent-purple-500 h-1"
+                      className="w-24"
                     />
-                    <span className="font-mono text-[10px] w-6 text-right">
+                    <span className="font-mono text-[10px] w-7 text-right text-[#8a8a8a]">
                       {Math.round(timeline.onionSkin.opacity * 100)}%
                     </span>
                   </div>
@@ -495,8 +484,8 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
           </div>
 
           {/* Total Frames Adjuster */}
-          <div className="flex items-center space-x-1 bg-[#22252c] rounded px-1.5 py-0.5 border border-white/5">
-            <span className="text-[10px] text-gray-400">Total:</span>
+          <div className="flex items-center space-x-1 bg-[#161616] rounded px-1.5 py-0.5 border border-white/[0.06]">
+            <span className="text-[10px] text-[#8a8a8a]">Total</span>
             <input
               type="number"
               min="2"
@@ -508,7 +497,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                   totalFrames: Math.max(2, Math.min(240, parseInt(e.target.value, 10) || 24)),
                 })
               }
-              className="w-10 bg-transparent font-mono text-white text-center text-[11px] outline-none"
+              className="w-10 bg-transparent font-mono text-[#e5e5e5] text-center text-[11px] outline-none"
             />
           </div>
 
@@ -516,11 +505,10 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
           <button
             type="button"
             onClick={() => setShowExportModal(true)}
-            className="flex items-center space-x-1 px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-medium shadow-sm"
+            className="px-2.5 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-[11px] font-medium transition-colors cursor-pointer"
             title="Export Animation"
           >
-            <Download className="w-3.5 h-3.5" />
-            <span className="text-[11px]">Export</span>
+            Export
           </button>
 
           {/* Close Timeline */}
@@ -528,7 +516,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
             <button
               type="button"
               onClick={onClose}
-              className="p-1 text-gray-400 hover:text-white hover:bg-white/10 rounded transition-colors"
+              className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
               title="Close Timeline Dock"
             >
               <X className="w-3.5 h-3.5" />
@@ -538,23 +526,23 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
       </div>
 
       {/* 2. Interactive Scrubber Timeline Track */}
-      <div className="px-3 py-2 flex flex-col space-y-1 bg-[#14161b]">
+      <div className="px-3 py-2 flex flex-col space-y-1 bg-[#161616]">
         {/* Frame Ruler Numbers */}
         <div
           ref={scrubberRef}
           onPointerDown={handlePointerDown}
-          className="relative h-14 bg-[#1b1e25] rounded border border-[#2d313b] cursor-pointer overflow-hidden flex flex-col justify-between"
+          className="relative h-14 bg-[#1a1a1a] rounded border border-white/[0.08] cursor-pointer overflow-hidden flex flex-col justify-between"
         >
           {/* Top Frame Tick Ruler */}
-          <div className="relative h-5 border-b border-[#292c36] bg-[#20242d] flex items-center">
+          <div className="relative h-5 border-b border-white/[0.06] bg-[#202020] flex items-center">
             {Array.from({ length: timeline.totalFrames }).map((_, f) => (
               <div
                 key={f}
                 style={{
                   width: `${100 / timeline.totalFrames}%`,
                 }}
-                className={`h-full border-r border-[#2d313b] flex items-center justify-center text-[9px] font-mono select-none ${
-                  f % 5 === 0 ? 'text-gray-300 font-bold' : 'text-gray-500 text-[8px]'
+                className={`h-full border-r border-white/[0.05] flex items-center justify-center text-[9px] font-mono select-none ${
+                  f % 5 === 0 ? 'text-[#cccccc] font-semibold' : 'text-[#666666] text-[8px]'
                 }`}
               >
                 {f % 2 === 0 || timeline.totalFrames <= 24 ? f + 1 : ''}
@@ -574,30 +562,30 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
                   style={{
                     width: `${100 / timeline.totalFrames}%`,
                   }}
-                  className={`h-full border-r border-[#262933] flex items-center justify-center p-0.5 transition-colors ${
-                    isCurrent ? 'bg-sky-500/10' : ''
+                  className={`h-full border-r border-white/[0.04] flex items-center justify-center p-0.5 transition-colors ${
+                    isCurrent ? 'bg-[var(--accent-subtle)]' : ''
                   }`}
                 >
                   {hasCel ? (
                     <div
-                      className={`w-full h-5 rounded-[2px] flex items-center justify-center text-[9px] font-mono font-medium shadow-sm truncate ${
+                      className={`w-full h-5 rounded-[2px] flex items-center justify-center text-[9px] font-mono font-medium truncate ${
                         isCurrent
-                          ? 'bg-sky-500 text-white font-bold ring-1 ring-white'
-                          : 'bg-[#3b4252] text-gray-200 hover:bg-[#434c5e]'
+                          ? 'bg-[var(--accent)] text-[var(--accent-contrast)] font-semibold'
+                          : 'bg-[#2c2c2c] text-[#cccccc] hover:bg-[#383838]'
                       }`}
                       title={`Frame ${f + 1}: Cel Assigned`}
                     >
-                      ●
+                      <span className="w-1.5 h-1.5 rounded-full bg-current" />
                     </div>
                   ) : (
-                    <div className="w-1 h-1 rounded-full bg-gray-600/40" />
+                    <div className="w-1 h-1 rounded-full bg-white/15" />
                   )}
                 </div>
               );
             })}
           </div>
 
-          {/* Scrub Playhead Red Line */}
+          {/* Scrub Playhead Line */}
           <div
             className="absolute top-0 bottom-0 pointer-events-none z-20 transition-all duration-75 flex flex-col items-center"
             style={{
@@ -605,70 +593,67 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
               transform: 'translateX(-50%)',
             }}
           >
-            <div className="w-3 h-2 bg-red-500 rounded-b shadow-[0_0_8px_rgba(239,68,68,0.8)]" />
-            <div className="w-[2px] h-full bg-red-500" />
+            <div className="w-2.5 h-1.5 bg-red-500 rounded-b" />
+            <div className="w-[1.5px] h-full bg-red-500" />
           </div>
         </div>
 
         {/* Cel Info Bar */}
-        <div className="flex items-center justify-between text-[10px] text-gray-400 px-1">
+        <div className="flex items-center justify-between text-[10px] text-[#8a8a8a] px-1">
           <div className="flex items-center space-x-2">
             <span>
               Active Cel:{' '}
               {currentCelLayer ? (
-                <span className="text-cyan-400 font-medium font-mono">{currentCelLayer.name}</span>
+                <span className="text-[var(--accent)] font-medium font-mono">{currentCelLayer.name}</span>
               ) : (
-                <span className="text-gray-500 italic">None (Drawing creates new frame cel)</span>
+                <span className="text-[#666666] italic">None (Drawing creates new frame cel)</span>
               )}
             </span>
           </div>
-          <div className="flex items-center space-x-3 text-gray-500">
-            <span>Click/drag scrubber to navigate</span>
-            <span>•</span>
-            <span>Space: Play/Pause</span>
-            <span>•</span>
-            <span>← / →: Prev/Next frame</span>
+          <div className="flex items-center space-x-3 text-[#666666]">
+            <span>Drag scrubber to navigate</span>
+            <span>·</span>
+            <span>Alt+Space: Play/Pause</span>
+            <span>·</span>
+            <span>← / →: Step frame</span>
           </div>
         </div>
       </div>
 
       {/* 3. Export Modal */}
       {showExportModal && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center">
-          <div className="bg-[#1b1e25] border border-white/10 rounded-xl p-5 shadow-2xl w-84 flex flex-col space-y-4">
+        <div className="fixed inset-0 z-50 bg-black/65 backdrop-blur-xs flex items-center justify-center">
+          <div className="bg-[#202020] border border-white/[0.1] rounded-lg p-4 shadow-2xl w-80 flex flex-col space-y-3.5">
             <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold text-white flex items-center space-x-1.5">
-                <Film className="w-4 h-4 text-emerald-400" />
-                <span>Export Animation</span>
-              </span>
+              <span className="text-xs font-medium text-[#e5e5e5]">Export Animation</span>
               <button
                 type="button"
                 onClick={() => setShowExportModal(false)}
-                className="text-gray-400 hover:text-white"
+                className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
               >
-                <X className="w-4 h-4" />
+                <X className="w-3.5 h-3.5" />
               </button>
             </div>
 
-            <div className="flex flex-col space-y-2">
-              <label className="text-xs text-gray-300">Format</label>
-              <div className="grid grid-cols-2 gap-2 text-xs">
+            <div className="flex flex-col space-y-1.5">
+              <label className="text-[11px] text-[#8a8a8a]">Format</label>
+              <div className="grid grid-cols-2 gap-1.5 text-[11px]">
                 {(
                   [
                     ['gif', 'Animated GIF'],
-                    ['apng', 'Animated PNG (APNG)'],
+                    ['apng', 'Animated PNG'],
                     ['webm', 'WebM Video'],
-                    ['png-zip', 'Numbered PNGs (.zip)'],
+                    ['png-zip', 'PNG Sequence (.zip)'],
                   ] as Array<[AnimationExportFormat, string]>
                 ).map(([fmt, label]) => (
                   <button
                     key={fmt}
                     type="button"
                     onClick={() => setExportFormat(fmt)}
-                    className={`py-2 px-2.5 rounded text-left border transition-colors ${
+                    className={`py-1.5 px-2.5 rounded text-left border transition-colors cursor-pointer ${
                       exportFormat === fmt
-                        ? 'bg-emerald-600/30 border-emerald-500 text-white font-medium ring-1 ring-emerald-500'
-                        : 'bg-[#252831] border-white/5 text-gray-400 hover:bg-white/5'
+                        ? 'bg-[var(--accent-subtle)] border-[var(--accent-border)] text-[var(--accent)] font-medium'
+                        : 'bg-[#161616] border-white/[0.06] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
                     }`}
                   >
                     {label}
@@ -677,20 +662,19 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
               </div>
             </div>
 
-            <div className="text-[11px] text-gray-400 space-y-1 bg-[#14161b] p-2.5 rounded border border-white/5 font-mono">
+            <div className="text-[11px] text-[#8a8a8a] space-y-1 bg-[#161616] p-2.5 rounded border border-white/[0.06] font-mono">
               <div>Resolution: {dimensions.width} × {dimensions.height} px</div>
               <div>Frame Rate: {timeline.fps} FPS</div>
-              <div>Total Frames: {timeline.totalFrames} frames</div>
+              <div>Total Frames: {timeline.totalFrames}</div>
             </div>
 
             <button
               type="button"
               onClick={handleExport}
               disabled={isExporting}
-              className="w-full py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded text-xs transition-colors shadow-lg flex items-center justify-center space-x-1.5 disabled:opacity-50"
+              className="w-full py-1.5 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium rounded text-xs transition-opacity disabled:opacity-50 cursor-pointer"
             >
-              <Download className="w-4 h-4" />
-              <span>{isExporting ? exportProgress || 'Exporting...' : 'Start Export'}</span>
+              {isExporting ? exportProgress || 'Exporting...' : 'Start Export'}
             </button>
           </div>
         </div>

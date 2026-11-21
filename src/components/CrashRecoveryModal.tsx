@@ -3,14 +3,8 @@ import {
   RotateCcw,
   Trash2,
   AlertTriangle,
-  Layers,
-  Calendar,
-  Maximize2,
-  Cpu,
   FileText,
-  Clock,
-  Sparkles,
-  ShieldCheck,
+  Layers,
 } from 'lucide-react';
 import { CrashedSessionInfo } from '../services/recoveryService';
 
@@ -84,23 +78,22 @@ export const CrashRecoveryModal: React.FC<CrashRecoveryModalProps> = ({
       aria-labelledby="crash-recovery-title"
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 select-none animate-in fade-in duration-150"
     >
-      <div className="bg-[#242426] border border-[#3c3c40] rounded-xl shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden text-xs text-[#d0d0d0]">
+      <div className="bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl w-full max-w-2xl flex flex-col overflow-hidden text-xs text-[#e5e5e5]">
         {/* Header Bar */}
-        <div className="flex items-center justify-between px-6 py-4 bg-[#2a2a2d] border-b border-[#38383a]">
+        <div className="flex items-center justify-between px-5 py-3.5 bg-[#1a1a1a] border-b border-white/[0.06]">
           <div className="flex items-center space-x-3">
-            <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-400">
+            <div className="w-7 h-7 rounded-md bg-[#2c2c2c] flex items-center justify-center text-amber-400">
               <AlertTriangle className="w-4 h-4" />
             </div>
             <div>
-              <h2 id="crash-recovery-title" className="text-sm font-semibold text-white tracking-wide flex items-center gap-2">
+              <h2 id="crash-recovery-title" className="text-sm font-medium text-[#e5e5e5] flex items-center gap-2">
                 Restore Unsaved Session?
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 flex items-center gap-1">
-                  <ShieldCheck className="w-3 h-3" />
+                <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-[#161616] text-[var(--accent)] border border-[var(--accent-border)]">
                   WAL Protected
                 </span>
               </h2>
-              <p className="text-[11px] text-[#999999] mt-0.5">
-                Ink Studio detected an unexpected application shutdown. Your progress can be restored with zero data loss.
+              <p className="text-[11px] text-[#8a8a8a] mt-0.5">
+                Ink Studio detected an unexpected shutdown. Your progress can be restored.
               </p>
             </div>
           </div>
@@ -169,54 +162,36 @@ export const CrashRecoveryModal: React.FC<CrashRecoveryModalProps> = ({
               </div>
 
               <div className="grid grid-cols-2 gap-2 text-xs">
-                <div className="bg-[#242427] border border-[#323236] rounded p-2 flex items-center gap-2">
-                  <Maximize2 className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                  <div>
-                    <span className="text-[10px] text-[#888888] block">Canvas Size</span>
-                    <span className="font-semibold text-white">{width} × {height}</span>
-                  </div>
+                <div className="bg-[#161616] border border-white/[0.06] rounded p-2">
+                  <span className="text-[10px] text-[#8a8a8a] block">Canvas Size</span>
+                  <span className="font-medium text-[#e5e5e5]">{width} × {height}</span>
                 </div>
 
-                <div className="bg-[#242427] border border-[#323236] rounded p-2 flex items-center gap-2">
-                  <Sparkles className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                  <div>
-                    <span className="text-[10px] text-[#888888] block">Resolution</span>
-                    <span className="font-semibold text-white">{dpi} DPI</span>
-                  </div>
+                <div className="bg-[#161616] border border-white/[0.06] rounded p-2">
+                  <span className="text-[10px] text-[#8a8a8a] block">Resolution</span>
+                  <span className="font-medium text-[#e5e5e5]">{dpi} DPI</span>
                 </div>
 
-                <div className="bg-[#242427] border border-[#323236] rounded p-2 flex items-center gap-2">
-                  <Layers className="w-3.5 h-3.5 text-purple-400 shrink-0" />
-                  <div>
-                    <span className="text-[10px] text-[#888888] block">Layer Tree</span>
-                    <span className="font-semibold text-white">{layerCount} {layerCount === 1 ? 'Layer' : 'Layers'}</span>
-                  </div>
+                <div className="bg-[#161616] border border-white/[0.06] rounded p-2">
+                  <span className="text-[10px] text-[#8a8a8a] block">Layer Tree</span>
+                  <span className="font-medium text-[#e5e5e5]">{layerCount} {layerCount === 1 ? 'Layer' : 'Layers'}</span>
                 </div>
 
-                <div className="bg-[#242427] border border-[#323236] rounded p-2 flex items-center gap-2">
-                  <Cpu className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                  <div>
-                    <span className="text-[10px] text-[#888888] block">Color Expression</span>
-                    <span className="font-semibold text-white capitalize">{colorMode}</span>
-                  </div>
+                <div className="bg-[#161616] border border-white/[0.06] rounded p-2">
+                  <span className="text-[10px] text-[#8a8a8a] block">Color Mode</span>
+                  <span className="font-medium text-[#e5e5e5] capitalize">{colorMode}</span>
                 </div>
               </div>
 
               {/* Timestamp & Process Info */}
-              <div className="bg-[#202022] border border-[#2d2d30] rounded p-2 text-[11px] space-y-1">
-                <div className="flex items-center justify-between text-[#888888]">
-                  <span className="flex items-center gap-1.5">
-                    <Clock className="w-3 h-3 text-[#999999]" />
-                    Terminated At:
-                  </span>
-                  <span className="text-white font-mono">{crashDate}</span>
+              <div className="bg-[#161616] border border-white/[0.06] rounded p-2 text-[11px] space-y-1">
+                <div className="flex items-center justify-between text-[#8a8a8a]">
+                  <span>Terminated At</span>
+                  <span className="text-[#e5e5e5] font-mono">{crashDate}</span>
                 </div>
-                <div className="flex items-center justify-between text-[#888888]">
-                  <span className="flex items-center gap-1.5">
-                    <Calendar className="w-3 h-3 text-[#999999]" />
-                    Previous PID:
-                  </span>
-                  <span className="text-[#aaaaaa] font-mono">{currentSession.pid}</span>
+                <div className="flex items-center justify-between text-[#8a8a8a]">
+                  <span>Previous PID</span>
+                  <span className="text-[#cccccc] font-mono">{currentSession.pid}</span>
                 </div>
               </div>
             </div>

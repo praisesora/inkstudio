@@ -10,7 +10,9 @@ import {
   BalloonSettings,
   VectorEditSettings,
   LiquifySettings,
+  ShapeSettings,
 } from '../types/editor';
+import { DEFAULT_SHAPE_SETTINGS } from '../utils/shapeEngine';
 import {
   saveBrushSettingsDebounced,
   getEffectiveBrushSettings,
@@ -48,6 +50,7 @@ export interface ToolStoreState {
   balloonSettings: BalloonSettings;
   vectorEditSettings: VectorEditSettings;
   liquifySettings: LiquifySettings;
+  shapeSettings: ShapeSettings;
 }
 
 const DEFAULT_RECENT_COLORS = [
@@ -85,21 +88,35 @@ function createInitialBrushSettings(): { presetId: BrushPresetId; brushSettings:
 }
 
 function loadInitialLiquifySettings(): LiquifySettings {
-  try {
-    if (typeof localStorage !== 'undefined') {
-      const saved = localStorage.getItem('sora_paint_liquify_settings');
-      if (saved) return JSON.parse(saved) as LiquifySettings;
-    }
-  } catch {
-    // Ignore storage errors
-  }
-  return {
+  const defaults: LiquifySettings = {
     mode: 'push',
     size: 80,
     strength: 50,
     hardness: 50,
     usePressure: true,
+    multiLayer: false,
   };
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('sora_paint_liquify_settings');
+      if (saved) return { ...defaults, ...(JSON.parse(saved) as Partial<LiquifySettings>) };
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return defaults;
+}
+
+function loadInitialShapeSettings(): ShapeSettings {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('sora_paint_shape_settings');
+      if (saved) return { ...DEFAULT_SHAPE_SETTINGS, ...(JSON.parse(saved) as Partial<ShapeSettings>) };
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return { ...DEFAULT_SHAPE_SETTINGS };
 }
 
 const createInitialToolState = (): ToolStoreState => {
@@ -170,6 +187,7 @@ const createInitialToolState = (): ToolStoreState => {
       simplifyTolerance: 2.0,
     },
     liquifySettings: loadInitialLiquifySettings(),
+    shapeSettings: loadInitialShapeSettings(),
   };
 };
 
@@ -512,6 +530,14 @@ export const toolStoreActions = {
       const next = { ...prev.liquifySettings, ...patch };
       safeLocalStorageSetItem('sora_paint_liquify_settings', JSON.stringify(next), 'liquify settings');
       return { liquifySettings: next };
+    });
+  },
+
+  updateShapeSettings(patch: Partial<ShapeSettings>): void {
+    useToolStore.setState((prev) => {
+      const next = { ...prev.shapeSettings, ...patch };
+      safeLocalStorageSetItem('sora_paint_shape_settings', JSON.stringify(next), 'shape settings');
+      return { shapeSettings: next };
     });
   },
 };

@@ -386,6 +386,7 @@ class MultiplayerService {
       'balloon',
       'vector-edit',
       'liquify',
+      'shape',
     ];
 
     switch (code) {
@@ -780,6 +781,7 @@ class MultiplayerService {
       'balloon',
       'vector-edit',
       'liquify',
+      'shape',
     ];
     const toolIdx = Math.max(0, TOOL_TYPES_LIST.indexOf(this.pendingCursor.tool));
     view.setFloat32(offset, this.pendingCursor.x, true);

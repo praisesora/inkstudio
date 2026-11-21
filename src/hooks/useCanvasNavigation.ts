@@ -69,6 +69,43 @@ export const ZOOM_PRESETS = [
 export const ROTATE_CURSOR_SVG = `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none"><path d="M16 5 A11 11 0 0 1 27 16 A11 11 0 0 1 24.5 22.5" stroke="%23ffffff" stroke-width="3.5" stroke-linecap="round"/><path d="M16 5 A11 11 0 0 1 27 16 A11 11 0 0 1 24.5 22.5" stroke="%231a1a1a" stroke-width="2" stroke-linecap="round"/><polygon points="25.5,18 28.5,24 22,24" fill="%231a1a1a" stroke="%23ffffff" stroke-width="1.5"/><path d="M16 27 A11 11 0 0 1 5 16 A11 11 0 0 1 7.5 9.5" stroke="%23ffffff" stroke-width="3.5" stroke-linecap="round"/><path d="M16 27 A11 11 0 0 1 5 16 A11 11 0 0 1 7.5 9.5" stroke="%231a1a1a" stroke-width="2" stroke-linecap="round"/><polygon points="6.5,14 3.5,8 10,8" fill="%231a1a1a" stroke="%23ffffff" stroke-width="1.5"/><circle cx="16" cy="16" r="2" fill="%231a1a1a" stroke="%23ffffff" stroke-width="1.5"/></svg>`;
 export const ROTATE_CURSOR_CSS = `url('${ROTATE_CURSOR_SVG}') 16 16, crosshair`;
 
+export const ROTATION_CENTER_DAMP_RADIUS = 64;
+
+/**
+ * Computes a continuous, branch-cut-free signed angular delta (degrees) between two
+ * pointer positions around a pivot, with smooth radial damping near the pivot center
+ * to eliminate atan2 singularity jumps.
+ */
+export function computeSmoothRotationDelta(
+  prevX: number,
+  prevY: number,
+  curX: number,
+  curY: number,
+  centerX: number,
+  centerY: number
+): number {
+  const v1x = prevX - centerX;
+  const v1y = prevY - centerY;
+  const v2x = curX - centerX;
+  const v2y = curY - centerY;
+
+  const r1 = Math.hypot(v1x, v1y);
+  const r2 = Math.hypot(v2x, v2y);
+  if (r1 < 1e-4 || r2 < 1e-4) return 0;
+
+  const cross = v1x * v2y - v1y * v2x;
+  const dot = v1x * v2x + v1y * v2y;
+  const rawDeg = Math.atan2(cross, dot) * (180 / Math.PI);
+
+  const minR = Math.min(r1, r2);
+  if (minR >= ROTATION_CENTER_DAMP_RADIUS) {
+    return rawDeg;
+  }
+  const t = Math.max(0, Math.min(1, minR / ROTATION_CENTER_DAMP_RADIUS));
+  const smoothGain = t * t * (3 - 2 * t);
+  return rawDeg * smoothGain;
+}
+
 export function formatZoomPercent(zoom: number): string {
   const safeZoom = Number.isFinite(zoom) ? zoom : 1.0;
   const percent = safeZoom * 100;
@@ -264,17 +301,19 @@ export function useCanvasNavigation({
   });
 
   const rotateStartRef = useRef<{
-    initialPointerAngle: number;
-    lastPointerAngle: number;
+    lastX: number;
+    lastY: number;
     startCanvasRotation: number;
     totalAngleDelta: number;
+    targetRotation: number;
     startPan: { x: number; y: number };
     center: { x: number; y: number };
   }>({
-    initialPointerAngle: 0,
-    lastPointerAngle: 0,
+    lastX: 0,
+    lastY: 0,
     startCanvasRotation: 0,
     totalAngleDelta: 0,
+    targetRotation: 0,
     startPan: { x: 0, y: 0 },
     center: { x: 0, y: 0 },
   });
@@ -637,13 +676,13 @@ export function useCanvasNavigation({
 
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
-    const initialAngle = Math.atan2(py - vc.y, px - vc.x) * (180 / Math.PI);
 
     rotateStartRef.current = {
-      initialPointerAngle: initialAngle,
-      lastPointerAngle: initialAngle,
+      lastX: px,
+      lastY: py,
       startCanvasRotation: rotationRef.current,
       totalAngleDelta: 0,
+      targetRotation: rotationRef.current,
       startPan: { ...panRef.current },
       center: vc,
     };
@@ -919,13 +958,61 @@ export function useCanvasNavigation({
     };
   }, [isPanning, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
 
-  // Rotating pointermove: broadcasts directly to DOM/WebGL via rAF; commits React state only on pointerup
+  // Rotating pointermove: damped radial delta + frame-rate-independent rAF smoothing across all angles
   useEffect(() => {
     if (!isRotating) return;
 
     let cachedRect: DOMRect | null = viewportRef.current
       ? viewportRef.current.getBoundingClientRect()
       : null;
+    let smoothRafId: number | null = null;
+    let lastFrameTs = performance.now();
+
+    const applyRotationToCamera = (angleDeg: number) => {
+      const { center: vc, startCanvasRotation, startPan } = rotateStartRef.current;
+      rotationRef.current = angleDeg;
+      const dRad = ((angleDeg - startCanvasRotation) * Math.PI) / 180;
+      const cos = Math.cos(dRad);
+      const sin = Math.sin(dRad);
+      const rx = startPan.x - vc.x;
+      const ry = startPan.y - vc.y;
+      panRef.current = {
+        x: vc.x + rx * cos - ry * sin,
+        y: vc.y + rx * sin + ry * cos,
+      };
+    };
+
+    const stepSmoothRotation = (now: number) => {
+      smoothRafId = null;
+      if (!isRotatingRef.current) return;
+
+      const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTs) / 1000));
+      lastFrameTs = now;
+
+      const target = rotateStartRef.current.targetRotation;
+      const current = rotationRef.current;
+      const diff = target - current;
+
+      if (Math.abs(diff) < 0.01) {
+        if (current !== target) {
+          applyRotationToCamera(target);
+          emitCameraToSubscribers();
+        }
+        return;
+      }
+
+      const alpha = 1 - Math.exp(-dt * 28);
+      applyRotationToCamera(current + diff * alpha);
+      emitCameraToSubscribers();
+      smoothRafId = requestAnimationFrame(stepSmoothRotation);
+    };
+
+    const ensureSmoothLoop = () => {
+      if (smoothRafId === null) {
+        lastFrameTs = performance.now();
+        smoothRafId = requestAnimationFrame(stepSmoothRotation);
+      }
+    };
 
     const handleWindowPointerMove = (e: PointerEvent) => {
       if (!isRotatingRef.current) return;
@@ -937,40 +1024,37 @@ export function useCanvasNavigation({
       const px = e.clientX - cachedRect.left;
       const py = e.clientY - cachedRect.top;
 
-      const curAngle = Math.atan2(py - vc.y, px - vc.x) * (180 / Math.PI);
-      let diff = curAngle - rotateStartRef.current.lastPointerAngle;
-      if (diff > 180) diff -= 360;
-      if (diff < -180) diff += 360;
+      const diff = computeSmoothRotationDelta(
+        rotateStartRef.current.lastX,
+        rotateStartRef.current.lastY,
+        px,
+        py,
+        vc.x,
+        vc.y
+      );
 
-      rotateStartRef.current.lastPointerAngle = curAngle;
+      rotateStartRef.current.lastX = px;
+      rotateStartRef.current.lastY = py;
       rotateStartRef.current.totalAngleDelta += diff;
 
-      let newRotation =
+      let nextTarget =
         rotateStartRef.current.startCanvasRotation + rotateStartRef.current.totalAngleDelta;
 
       if (e.altKey || e.ctrlKey) {
-        newRotation = Math.round(newRotation / 15) * 15;
-      } else {
-        const nearestCardinal = Math.round(newRotation / 90) * 90;
-        if (Math.abs(newRotation - nearestCardinal) <= 2.5) {
-          newRotation = nearestCardinal;
-        }
+        nextTarget = Math.round(nextTarget / 15) * 15;
       }
 
-      rotationRef.current = newRotation;
-
-      const dRad = ((newRotation - rotateStartRef.current.startCanvasRotation) * Math.PI) / 180;
-      const rx = rotateStartRef.current.startPan.x - vc.x;
-      const ry = rotateStartRef.current.startPan.y - vc.y;
-      panRef.current = {
-        x: vc.x + rx * Math.cos(dRad) - ry * Math.sin(dRad),
-        y: vc.y + rx * Math.sin(dRad) + ry * Math.cos(dRad),
-      };
-      scheduleCameraBroadcast();
+      rotateStartRef.current.targetRotation = nextTarget;
+      ensureSmoothLoop();
     };
 
     const handleWindowPointerUp = () => {
+      if (smoothRafId !== null) {
+        cancelAnimationFrame(smoothRafId);
+        smoothRafId = null;
+      }
       isRotatingRef.current = false;
+      applyRotationToCamera(rotateStartRef.current.targetRotation);
       broadcastCameraImmediate();
       setIsRotating(false);
       commitNavStateImmediate();
@@ -982,17 +1066,20 @@ export function useCanvasNavigation({
 
     const prevCursor = document.body.style.cursor;
     const prevUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = 'crosshair';
+    document.body.style.cursor = ROTATE_CURSOR_CSS;
     document.body.style.userSelect = 'none';
 
     return () => {
+      if (smoothRafId !== null) {
+        cancelAnimationFrame(smoothRafId);
+      }
       window.removeEventListener('pointermove', handleWindowPointerMove);
       window.removeEventListener('pointerup', handleWindowPointerUp);
       window.removeEventListener('pointercancel', handleWindowPointerUp);
       document.body.style.cursor = prevCursor;
       document.body.style.userSelect = prevUserSelect;
     };
-  }, [isRotating, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
+  }, [isRotating, emitCameraToSubscribers, broadcastCameraImmediate, commitNavStateImmediate]);
 
   // Scrubby Zoom pointermove (default Ctrl+Space+Drag): zero-rerender via rAF camera broadcast
   useEffect(() => {

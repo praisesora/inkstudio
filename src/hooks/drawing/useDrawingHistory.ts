@@ -13,6 +13,7 @@ import {
 import {
   SparseTileGrid,
   globalTileGrid,
+  parseTileKey,
   releaseTemporaryCanvas,
 } from '../../utils/tileEngine';
 import { UndoCacheManager, globalUndoCache } from '../../utils/undoCache';
@@ -448,21 +449,37 @@ export function useDrawingHistory({
               } else if (deltas && deltas.length > 0) {
                 grid.applyTileDeltas(deltas, 'undo');
 
-                if (isToneStep && sourceCanvas) {
-                  grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-                  if (canvas && targetLayer) {
-                    applyLayerEffects(
-                      sourceCanvas,
-                      canvas,
-                      targetLayer,
-                      dimensionsRef.current.dpi ?? 600,
-                      item.dirtyRect
-                    );
+                const affectedLayerIds = new Set<string>();
+                for (const d of deltas) {
+                  affectedLayerIds.add(parseTileKey(d.key).layerId);
+                }
+                if (affectedLayerIds.size === 0) {
+                  affectedLayerIds.add(targetLayerId);
+                }
+                for (const lid of affectedLayerIds) {
+                  const lCanvas = layerCanvasesRef.current.get(lid) || null;
+                  const lSourceCanvas = layerSourceCanvasesRef?.current?.get(lid);
+                  const lLayer = layersRef.current?.find((l) => l.id === lid);
+                  const lIsTone = Boolean(lLayer?.toneEnabled && lSourceCanvas);
+                  if (lIsTone && lSourceCanvas) {
+                    grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
+                    if (lCanvas && lLayer) {
+                      applyLayerEffects(
+                        lSourceCanvas,
+                        lCanvas,
+                        lLayer,
+                        dimensionsRef.current.dpi ?? 600,
+                        item.dirtyRect
+                      );
+                    }
+                  } else if (lCanvas) {
+                    grid.renderLayerToCanvas(lid, lCanvas, item.dirtyRect);
+                    if (lSourceCanvas) {
+                      grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
+                    }
                   }
-                } else if (canvas) {
-                  grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-                  if (sourceCanvas) {
-                    grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
+                  if (lid !== targetLayerId) {
+                    onUpdateLayerThumbnail(lid);
                   }
                 }
               } else if (isToneStep && sourceCanvas) {
@@ -586,21 +603,37 @@ export function useDrawingHistory({
               } else if (deltas && deltas.length > 0) {
                 grid.applyTileDeltas(deltas, 'redo');
 
-                if (isToneStep && sourceCanvas) {
-                  grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-                  if (canvas && targetLayer) {
-                    applyLayerEffects(
-                      sourceCanvas,
-                      canvas,
-                      targetLayer,
-                      dimensionsRef.current.dpi ?? 600,
-                      item.dirtyRect
-                    );
+                const affectedLayerIds = new Set<string>();
+                for (const d of deltas) {
+                  affectedLayerIds.add(parseTileKey(d.key).layerId);
+                }
+                if (affectedLayerIds.size === 0) {
+                  affectedLayerIds.add(targetLayerId);
+                }
+                for (const lid of affectedLayerIds) {
+                  const lCanvas = layerCanvasesRef.current.get(lid) || null;
+                  const lSourceCanvas = layerSourceCanvasesRef?.current?.get(lid);
+                  const lLayer = layersRef.current?.find((l) => l.id === lid);
+                  const lIsTone = Boolean(lLayer?.toneEnabled && lSourceCanvas);
+                  if (lIsTone && lSourceCanvas) {
+                    grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
+                    if (lCanvas && lLayer) {
+                      applyLayerEffects(
+                        lSourceCanvas,
+                        lCanvas,
+                        lLayer,
+                        dimensionsRef.current.dpi ?? 600,
+                        item.dirtyRect
+                      );
+                    }
+                  } else if (lCanvas) {
+                    grid.renderLayerToCanvas(lid, lCanvas, item.dirtyRect);
+                    if (lSourceCanvas) {
+                      grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
+                    }
                   }
-                } else if (canvas) {
-                  grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-                  if (sourceCanvas) {
-                    grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
+                  if (lid !== targetLayerId) {
+                    onUpdateLayerThumbnail(lid);
                   }
                 }
               } else if (isToneStep && sourceCanvas) {

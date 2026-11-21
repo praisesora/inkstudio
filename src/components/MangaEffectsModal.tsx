@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { X, Sparkles, Check, RefreshCw } from 'lucide-react';
+import { X } from 'lucide-react';
 import {
   renderSaturatedLines,
   renderStreamLines,
@@ -127,30 +127,27 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs select-none">
-      <div className="w-[680px] bg-[#222327] border border-[#3b3d45] rounded-lg shadow-2xl overflow-hidden flex flex-col text-[#cccccc] font-sans">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs select-none">
+      <div className="w-[680px] bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl overflow-hidden flex flex-col text-[#e5e5e5] font-sans">
         {/* Header */}
-        <div className="px-4 py-3 bg-[#1a1b1e] border-b border-[#2e3036] flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <Sparkles className="w-4 h-4 text-amber-400" />
-            <h2 className="text-sm font-semibold text-white">Manga Effect Lines Generator</h2>
-          </div>
+        <div className="px-4 py-2.5 bg-[#1a1a1a] border-b border-white/[0.06] flex items-center justify-between">
+          <h2 className="text-xs font-medium text-[#e5e5e5]">Manga Effect Lines</h2>
           <button
             onClick={onClose}
-            className="p-1 rounded text-[#888888] hover:text-white hover:bg-[#2b2d31] transition-colors"
+            className="p-1 rounded text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
-            <X className="w-4 h-4" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         {/* Tab Switcher */}
-        <div className="flex border-b border-[#2e3036] bg-[#1d1e21] px-4 pt-2">
+        <div className="flex border-b border-white/[0.06] bg-[#1a1a1a] px-4">
           <button
             onClick={() => setActiveTab('saturated')}
             className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
               activeTab === 'saturated'
-                ? 'border-cyan-400 text-cyan-300'
-                : 'border-transparent text-[#888888] hover:text-[#cccccc]'
+                ? 'border-[var(--accent)] text-[#e5e5e5]'
+                : 'border-transparent text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
             Saturated Lines (Focus / Burst)
@@ -159,8 +156,8 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
             onClick={() => setActiveTab('stream')}
             className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
               activeTab === 'stream'
-                ? 'border-cyan-400 text-cyan-300'
-                : 'border-transparent text-[#888888] hover:text-[#cccccc]'
+                ? 'border-[var(--accent)] text-[#e5e5e5]'
+                : 'border-transparent text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
             Stream Lines (Parallel Speed)
@@ -171,7 +168,7 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
         <div className="p-4 flex space-x-4 max-h-[480px]">
           {/* Interactive Preview Canvas */}
           <div className="flex flex-col items-center">
-            <div className="relative border border-[#3b3d45] rounded overflow-hidden bg-white shadow-inner">
+            <div className="relative border border-white/[0.08] rounded overflow-hidden bg-white">
               <canvas
                 ref={previewCanvasRef}
                 width={300}
@@ -182,7 +179,7 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
               />
             </div>
             {activeTab === 'saturated' && (
-              <span className="text-[10px] text-[#777777] mt-1.5">
+              <span className="text-[10px] text-[#8a8a8a] mt-1.5">
                 Click preview to reposition focus point
               </span>
             )}
@@ -194,8 +191,8 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
               <>
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Center Cutout Radius:</span>
-                    <span className="font-mono text-cyan-400">{satOptions.innerRadius}px</span>
+                    <span className="text-[#8a8a8a]">Center Cutout Radius</span>
+                    <span className="font-mono text-[#e5e5e5]">{satOptions.innerRadius}px</span>
                   </div>
                   <input
                     type="range"
@@ -205,14 +202,14 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                     onChange={(e) =>
                       setSatOptions((p) => ({ ...p, innerRadius: Number(e.target.value) }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Line Density:</span>
-                    <span className="font-mono text-cyan-400">{satOptions.density} lines</span>
+                    <span className="text-[#8a8a8a]">Line Density</span>
+                    <span className="font-mono text-[#e5e5e5]">{satOptions.density} lines</span>
                   </div>
                   <input
                     type="range"
@@ -222,14 +219,14 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                     onChange={(e) =>
                       setSatOptions((p) => ({ ...p, density: Number(e.target.value) }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Stroke Width:</span>
-                    <span className="font-mono text-cyan-400">{satOptions.lineWidth}px</span>
+                    <span className="text-[#8a8a8a]">Stroke Width</span>
+                    <span className="font-mono text-[#e5e5e5]">{satOptions.lineWidth}px</span>
                   </div>
                   <input
                     type="range"
@@ -239,14 +236,14 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                     onChange={(e) =>
                       setSatOptions((p) => ({ ...p, lineWidth: Number(e.target.value) }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Spacing & Depth Jitter:</span>
-                    <span className="font-mono text-cyan-400">{Math.round(satOptions.spacingJitter * 100)}%</span>
+                    <span className="text-[#8a8a8a]">Spacing & Depth Jitter</span>
+                    <span className="font-mono text-[#e5e5e5]">{Math.round(satOptions.spacingJitter * 100)}%</span>
                   </div>
                   <input
                     type="range"
@@ -260,28 +257,28 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                         lengthJitter: Number(e.target.value) / 100,
                       }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div className="flex items-center space-x-2 pt-1">
-                  <span className="text-[11px] text-[#aaaaaa]">Taper Direction:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Taper Direction</span>
                   <button
                     onClick={() => setSatOptions((p) => ({ ...p, taper: 'in' }))}
-                    className={`px-2 py-0.5 rounded text-[11px] border ${
+                    className={`px-2 py-0.5 rounded text-[11px] border transition-colors cursor-pointer ${
                       satOptions.taper === 'in'
-                        ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
-                        : 'border-[#3b3d45] text-[#888888]'
+                        ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border-[var(--accent-border)]'
+                        : 'bg-[#161616] border-white/[0.06] text-[#8a8a8a] hover:text-[#e5e5e5]'
                     }`}
                   >
                     Point to Center
                   </button>
                   <button
                     onClick={() => setSatOptions((p) => ({ ...p, taper: 'none' }))}
-                    className={`px-2 py-0.5 rounded text-[11px] border ${
+                    className={`px-2 py-0.5 rounded text-[11px] border transition-colors cursor-pointer ${
                       satOptions.taper === 'none'
-                        ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
-                        : 'border-[#3b3d45] text-[#888888]'
+                        ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border-[var(--accent-border)]'
+                        : 'bg-[#161616] border-white/[0.06] text-[#8a8a8a] hover:text-[#e5e5e5]'
                     }`}
                   >
                     Uniform
@@ -292,8 +289,8 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
               <>
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Angle:</span>
-                    <span className="font-mono text-cyan-400">{streamOptions.angle}°</span>
+                    <span className="text-[#8a8a8a]">Angle</span>
+                    <span className="font-mono text-[#e5e5e5]">{streamOptions.angle}°</span>
                   </div>
                   <div className="flex items-center space-x-2">
                     <input
@@ -304,35 +301,26 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                       onChange={(e) =>
                         setStreamOptions((p) => ({ ...p, angle: Number(e.target.value) }))
                       }
-                      className="flex-1 accent-cyan-400"
+                      className="flex-1"
                     />
                     <div className="flex space-x-1">
-                      <button
-                        onClick={() => setStreamOptions((p) => ({ ...p, angle: 0 }))}
-                        className="px-1.5 py-0.5 rounded bg-[#18191c] border border-[#3b3d45] text-[10px]"
-                      >
-                        0°
-                      </button>
-                      <button
-                        onClick={() => setStreamOptions((p) => ({ ...p, angle: 90 }))}
-                        className="px-1.5 py-0.5 rounded bg-[#18191c] border border-[#3b3d45] text-[10px]"
-                      >
-                        90°
-                      </button>
-                      <button
-                        onClick={() => setStreamOptions((p) => ({ ...p, angle: 45 }))}
-                        className="px-1.5 py-0.5 rounded bg-[#18191c] border border-[#3b3d45] text-[10px]"
-                      >
-                        45°
-                      </button>
+                      {[0, 90, 45].map((deg) => (
+                        <button
+                          key={deg}
+                          onClick={() => setStreamOptions((p) => ({ ...p, angle: deg }))}
+                          className="px-1.5 py-0.5 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[10px] text-[#e5e5e5] cursor-pointer"
+                        >
+                          {deg}°
+                        </button>
+                      ))}
                     </div>
                   </div>
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Density:</span>
-                    <span className="font-mono text-cyan-400">{streamOptions.density} lines</span>
+                    <span className="text-[#8a8a8a]">Density</span>
+                    <span className="font-mono text-[#e5e5e5]">{streamOptions.density} lines</span>
                   </div>
                   <input
                     type="range"
@@ -342,14 +330,14 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                     onChange={(e) =>
                       setStreamOptions((p) => ({ ...p, density: Number(e.target.value) }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Streak Length:</span>
-                    <span className="font-mono text-cyan-400">{streamOptions.lineLength}px</span>
+                    <span className="text-[#8a8a8a]">Streak Length</span>
+                    <span className="font-mono text-[#e5e5e5]">{streamOptions.lineLength}px</span>
                   </div>
                   <input
                     type="range"
@@ -359,14 +347,14 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                     onChange={(e) =>
                       setStreamOptions((p) => ({ ...p, lineLength: Number(e.target.value) }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Thickness:</span>
-                    <span className="font-mono text-cyan-400">{streamOptions.thickness}px</span>
+                    <span className="text-[#8a8a8a]">Thickness</span>
+                    <span className="font-mono text-[#e5e5e5]">{streamOptions.thickness}px</span>
                   </div>
                   <input
                     type="range"
@@ -376,14 +364,14 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                     onChange={(e) =>
                       setStreamOptions((p) => ({ ...p, thickness: Number(e.target.value) }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
 
                 <div>
                   <div className="flex justify-between text-[11px] mb-1">
-                    <span className="text-[#aaaaaa]">Thickness & Length Noise:</span>
-                    <span className="font-mono text-cyan-400">
+                    <span className="text-[#8a8a8a]">Thickness & Length Noise</span>
+                    <span className="font-mono text-[#e5e5e5]">
                       {Math.round(streamOptions.thicknessNoise * 100)}%
                     </span>
                   </div>
@@ -399,7 +387,7 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                         lengthNoise: Number(e.target.value) / 100,
                       }))
                     }
-                    className="w-full accent-cyan-400"
+                    className="w-full"
                   />
                 </div>
               </>
@@ -408,10 +396,9 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-3 bg-[#1a1b1e] border-t border-[#2e3036] flex items-center justify-between">
+        <div className="px-4 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-between">
           <button
             onClick={() => {
-              // Quick reset to defaults
               if (activeTab === 'saturated') {
                 setSatOptions({
                   centerX: Math.round(canvasWidth * 0.5),
@@ -437,25 +424,23 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
                 });
               }
             }}
-            className="flex items-center space-x-1 text-xs text-[#888888] hover:text-[#cccccc] transition-colors cursor-pointer"
+            className="text-xs text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
           >
-            <RefreshCw className="w-3 h-3" />
-            <span>Reset Defaults</span>
+            Reset Defaults
           </button>
 
           <div className="flex items-center space-x-2">
             <button
               onClick={onClose}
-              className="px-3 py-1.5 bg-[#2b2d31] hover:bg-[#383a40] text-[#cccccc] rounded text-xs transition-colors cursor-pointer"
+              className="px-3 py-1.5 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               onClick={handleApplyClick}
-              className="px-3.5 py-1.5 bg-[#234b3e] hover:bg-[#2b604f] text-[#55eaab] border border-[#2e6e58] rounded text-xs font-semibold flex items-center space-x-1.5 transition-colors cursor-pointer"
+              className="px-3.5 py-1.5 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>Apply Effect to Layer</span>
+              Apply Effect
             </button>
           </div>
         </div>

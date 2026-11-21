@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Check, RotateCcw, Sparkles } from 'lucide-react';
+import { X } from 'lucide-react';
 import {
   LayerStyles,
   LayerStyleStroke,
@@ -267,9 +267,9 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs select-none">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs select-none">
       <div
-        className="w-[640px] max-w-[95vw] bg-[#242426] border border-[#3e3e42] rounded-lg shadow-2xl flex flex-col text-[#cccccc] overflow-hidden"
+        className="w-[640px] max-w-[95vw] bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl flex flex-col text-[#e5e5e5] overflow-hidden"
         style={{
           transform: `translate(${pos.x}px, ${pos.y}px)`,
         }}
@@ -279,26 +279,23 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          className="flex items-center justify-between px-4 py-2.5 bg-[#1e1e20] border-b border-[#333336] cursor-move text-xs font-semibold"
+          className="flex items-center justify-between px-4 py-2.5 bg-[#1a1a1a] border-b border-white/[0.06] cursor-move text-xs font-medium"
         >
-          <div className="flex items-center space-x-2">
-            <Sparkles className="w-4 h-4 text-amber-400" />
-            <span className="text-white">Layer Style (Blending Options) - {layerName}</span>
-          </div>
+          <span className="text-[#e5e5e5]">Layer Style — {layerName}</span>
           <button
             onClick={onClose}
-            className="p-1 text-[#888888] hover:text-white hover:bg-[#333336] rounded transition-colors"
+            className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
           >
-            <X className="w-4 h-4" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         {/* Modal Body: Left category sidebar + Right parameter panel */}
         <div className="flex flex-1 min-h-[380px] text-xs">
           {/* Left Column: Styles Checklist */}
-          <div className="w-48 bg-[#1a1a1c] border-r border-[#333336] p-2 flex flex-col justify-between">
+          <div className="w-48 bg-[#161616] border-r border-white/[0.06] p-2 flex flex-col justify-between">
             <div className="space-y-1">
-              <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-wider text-[#777777]">
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-[#8a8a8a]">
                 Styles
               </div>
 
@@ -307,8 +304,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 onClick={() => setActiveTab('stroke')}
                 className={`flex items-center space-x-2 px-2.5 py-2 rounded cursor-pointer transition-colors ${
                   activeTab === 'stroke'
-                    ? 'bg-[#353538] text-white font-medium shadow-xs'
-                    : 'hover:bg-[#252528] text-[#aaaaaa]'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'hover:bg-[#202020] text-[#8a8a8a]'
                 }`}
               >
                 <input
@@ -318,7 +315,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     e.stopPropagation();
                     setStroke((s) => ({ ...s, enabled: e.target.checked }));
                   }}
-                  className="rounded border-[#444448] bg-[#1a1a1c] text-blue-500 focus:ring-0 cursor-pointer"
+                  className="cursor-pointer"
                 />
                 <span className="flex-1 truncate">Stroke</span>
               </div>
@@ -328,8 +325,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 onClick={() => setActiveTab('dropShadow')}
                 className={`flex items-center space-x-2 px-2.5 py-2 rounded cursor-pointer transition-colors ${
                   activeTab === 'dropShadow'
-                    ? 'bg-[#353538] text-white font-medium shadow-xs'
-                    : 'hover:bg-[#252528] text-[#aaaaaa]'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'hover:bg-[#202020] text-[#8a8a8a]'
                 }`}
               >
                 <input
@@ -339,7 +336,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     e.stopPropagation();
                     setDropShadow((s) => ({ ...s, enabled: e.target.checked }));
                   }}
-                  className="rounded border-[#444448] bg-[#1a1a1c] text-blue-500 focus:ring-0 cursor-pointer"
+                  className="cursor-pointer"
                 />
                 <span className="flex-1 truncate">Drop Shadow</span>
               </div>
@@ -349,8 +346,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 onClick={() => setActiveTab('outerGlow')}
                 className={`flex items-center space-x-2 px-2.5 py-2 rounded cursor-pointer transition-colors ${
                   activeTab === 'outerGlow'
-                    ? 'bg-[#353538] text-white font-medium shadow-xs'
-                    : 'hover:bg-[#252528] text-[#aaaaaa]'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'hover:bg-[#202020] text-[#8a8a8a]'
                 }`}
               >
                 <input
@@ -360,20 +357,20 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     e.stopPropagation();
                     setOuterGlow((s) => ({ ...s, enabled: e.target.checked }));
                   }}
-                  className="rounded border-[#444448] bg-[#1a1a1c] text-blue-500 focus:ring-0 cursor-pointer"
+                  className="cursor-pointer"
                 />
                 <span className="flex-1 truncate">Outer Glow</span>
               </div>
             </div>
 
             {/* Interactive Swatch Preview Canvas */}
-            <div className="pt-2 border-t border-[#2d2d30] flex flex-col items-center">
-              <span className="text-[10px] text-[#777777] mb-1 font-mono">Preview</span>
+            <div className="pt-2 border-t border-white/[0.06] flex flex-col items-center">
+              <span className="text-[10px] text-[#8a8a8a] mb-1 font-mono">Preview</span>
               <canvas
                 ref={previewCanvasRef}
                 width={100}
                 height={100}
-                className="w-24 h-24 rounded border border-[#3e3e42] shadow-inner bg-[#1e1e20]"
+                className="w-24 h-24 rounded border border-white/[0.08] bg-[#202020]"
               />
             </div>
           </div>
@@ -383,14 +380,13 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
             {/* --- STROKE OPTIONS --- */}
             {activeTab === 'stroke' && (
               <div className="space-y-4">
-                <div className="flex items-center justify-between pb-2 border-b border-[#333336]">
-                  <span className="font-semibold text-white">Stroke Options</span>
-                  <label className="flex items-center space-x-1.5 cursor-pointer">
+                <div className="flex items-center justify-between pb-2 border-b border-white/[0.06]">
+                  <span className="font-medium text-[#e5e5e5]">Stroke Options</span>
+                  <label className="flex items-center space-x-1.5 cursor-pointer text-[#8a8a8a]">
                     <input
                       type="checkbox"
                       checked={stroke.enabled}
                       onChange={(e) => setStroke((s) => ({ ...s, enabled: e.target.checked }))}
-                      className="rounded border-[#444448] bg-[#1a1a1c] text-blue-500 focus:ring-0"
                     />
                     <span className="text-xs">Enable Stroke</span>
                   </label>
@@ -399,8 +395,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 {/* Structure / Size */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Size</span>
-                    <span className="font-mono">{stroke.size} px</span>
+                    <span className="text-[#8a8a8a]">Size</span>
+                    <span className="font-mono text-[#e5e5e5]">{stroke.size} px</span>
                   </div>
                   <input
                     type="range"
@@ -408,22 +404,22 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="100"
                     value={stroke.size}
                     onChange={(e) => setStroke((s) => ({ ...s, size: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
 
                 {/* Position */}
                 <div className="space-y-1">
-                  <span className="text-[#999999] block">Position</span>
-                  <div className="grid grid-cols-3 gap-1 bg-[#1a1a1c] p-1 rounded border border-[#333336]">
+                  <span className="text-[#8a8a8a] block">Position</span>
+                  <div className="grid grid-cols-3 gap-1 bg-[#161616] p-1 rounded border border-white/[0.06]">
                     {(['outside', 'inside', 'center'] as const).map((pos) => (
                       <button
                         key={pos}
                         onClick={() => setStroke((s) => ({ ...s, position: pos }))}
-                        className={`py-1 text-center capitalize rounded transition-colors ${
+                        className={`py-1 text-center capitalize rounded transition-colors cursor-pointer ${
                           stroke.position === pos
-                            ? 'bg-[#3b82f6] text-white font-medium shadow-xs'
-                            : 'hover:bg-[#28282b] text-[#aaaaaa]'
+                            ? 'bg-[var(--accent)] text-[var(--accent-contrast)] font-medium'
+                            : 'hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5]'
                         }`}
                       >
                         {pos}
@@ -435,8 +431,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 {/* Opacity */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Opacity</span>
-                    <span className="font-mono">{Math.round(stroke.opacity * 100)}%</span>
+                    <span className="text-[#8a8a8a]">Opacity</span>
+                    <span className="font-mono text-[#e5e5e5]">{Math.round(stroke.opacity * 100)}%</span>
                   </div>
                   <input
                     type="range"
@@ -445,25 +441,25 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     step="0.01"
                     value={stroke.opacity}
                     onChange={(e) => setStroke((s) => ({ ...s, opacity: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
 
                 {/* Color */}
                 <div className="space-y-1">
-                  <span className="text-[#999999] block">Color</span>
+                  <span className="text-[#8a8a8a] block">Color</span>
                   <div className="flex items-center space-x-2">
                     <input
                       type="color"
                       value={stroke.color}
                       onChange={(e) => setStroke((s) => ({ ...s, color: e.target.value }))}
-                      className="w-8 h-8 rounded border border-[#444448] bg-transparent cursor-pointer"
+                      className="w-7 h-7 rounded border border-white/[0.1] bg-transparent cursor-pointer"
                     />
                     <input
                       type="text"
                       value={stroke.color}
                       onChange={(e) => setStroke((s) => ({ ...s, color: e.target.value }))}
-                      className="w-24 px-2 py-1 bg-[#1a1a1c] border border-[#3e3e42] rounded font-mono text-xs focus:outline-none focus:border-blue-500"
+                      className="w-24 px-2 py-1 bg-[#161616] border border-white/[0.08] rounded font-mono text-xs text-[#e5e5e5]"
                     />
                   </div>
                 </div>
@@ -473,14 +469,13 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
             {/* --- DROP SHADOW OPTIONS --- */}
             {activeTab === 'dropShadow' && (
               <div className="space-y-4">
-                <div className="flex items-center justify-between pb-2 border-b border-[#333336]">
-                  <span className="font-semibold text-white">Drop Shadow Options</span>
-                  <label className="flex items-center space-x-1.5 cursor-pointer">
+                <div className="flex items-center justify-between pb-2 border-b border-white/[0.06]">
+                  <span className="font-medium text-[#e5e5e5]">Drop Shadow Options</span>
+                  <label className="flex items-center space-x-1.5 cursor-pointer text-[#8a8a8a]">
                     <input
                       type="checkbox"
                       checked={dropShadow.enabled}
                       onChange={(e) => setDropShadow((s) => ({ ...s, enabled: e.target.checked }))}
-                      className="rounded border-[#444448] bg-[#1a1a1c] text-blue-500 focus:ring-0"
                     />
                     <span className="text-xs">Enable Shadow</span>
                   </label>
@@ -489,27 +484,27 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 {/* Color & Opacity */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
-                    <span className="text-[#999999] block">Color</span>
+                    <span className="text-[#8a8a8a] block">Color</span>
                     <div className="flex items-center space-x-2">
                       <input
                         type="color"
                         value={dropShadow.color}
                         onChange={(e) => setDropShadow((s) => ({ ...s, color: e.target.value }))}
-                        className="w-8 h-8 rounded border border-[#444448] bg-transparent cursor-pointer"
+                        className="w-7 h-7 rounded border border-white/[0.1] bg-transparent cursor-pointer"
                       />
                       <input
                         type="text"
                         value={dropShadow.color}
                         onChange={(e) => setDropShadow((s) => ({ ...s, color: e.target.value }))}
-                        className="w-20 px-2 py-1 bg-[#1a1a1c] border border-[#3e3e42] rounded font-mono text-xs focus:outline-none focus:border-blue-500"
+                        className="w-20 px-2 py-1 bg-[#161616] border border-white/[0.08] rounded font-mono text-xs text-[#e5e5e5]"
                       />
                     </div>
                   </div>
 
                   <div className="space-y-1">
                     <div className="flex justify-between">
-                      <span className="text-[#999999]">Opacity</span>
-                      <span className="font-mono">{Math.round(dropShadow.opacity * 100)}%</span>
+                      <span className="text-[#8a8a8a]">Opacity</span>
+                      <span className="font-mono text-[#e5e5e5]">{Math.round(dropShadow.opacity * 100)}%</span>
                     </div>
                     <input
                       type="range"
@@ -518,7 +513,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                       step="0.01"
                       value={dropShadow.opacity}
                       onChange={(e) => setDropShadow((s) => ({ ...s, opacity: Number(e.target.value) }))}
-                      className="w-full accent-blue-500 cursor-pointer"
+                      className="w-full"
                     />
                   </div>
                 </div>
@@ -526,8 +521,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 {/* Angle */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Angle</span>
-                    <span className="font-mono">{dropShadow.angle}°</span>
+                    <span className="text-[#8a8a8a]">Angle</span>
+                    <span className="font-mono text-[#e5e5e5]">{dropShadow.angle}°</span>
                   </div>
                   <input
                     type="range"
@@ -535,15 +530,15 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="360"
                     value={dropShadow.angle}
                     onChange={(e) => setDropShadow((s) => ({ ...s, angle: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
 
                 {/* Distance */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Distance</span>
-                    <span className="font-mono">{dropShadow.distance} px</span>
+                    <span className="text-[#8a8a8a]">Distance</span>
+                    <span className="font-mono text-[#e5e5e5]">{dropShadow.distance} px</span>
                   </div>
                   <input
                     type="range"
@@ -551,15 +546,15 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="100"
                     value={dropShadow.distance}
                     onChange={(e) => setDropShadow((s) => ({ ...s, distance: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
 
                 {/* Spread */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Spread</span>
-                    <span className="font-mono">{dropShadow.spread}%</span>
+                    <span className="text-[#8a8a8a]">Spread</span>
+                    <span className="font-mono text-[#e5e5e5]">{dropShadow.spread}%</span>
                   </div>
                   <input
                     type="range"
@@ -567,15 +562,15 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="100"
                     value={dropShadow.spread}
                     onChange={(e) => setDropShadow((s) => ({ ...s, spread: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
 
                 {/* Size / Blur */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Size (Blur)</span>
-                    <span className="font-mono">{dropShadow.blur} px</span>
+                    <span className="text-[#8a8a8a]">Size (Blur)</span>
+                    <span className="font-mono text-[#e5e5e5]">{dropShadow.blur} px</span>
                   </div>
                   <input
                     type="range"
@@ -583,7 +578,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="100"
                     value={dropShadow.blur}
                     onChange={(e) => setDropShadow((s) => ({ ...s, blur: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
               </div>
@@ -592,14 +587,13 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
             {/* --- OUTER GLOW OPTIONS --- */}
             {activeTab === 'outerGlow' && (
               <div className="space-y-4">
-                <div className="flex items-center justify-between pb-2 border-b border-[#333336]">
-                  <span className="font-semibold text-white">Outer Glow Options</span>
-                  <label className="flex items-center space-x-1.5 cursor-pointer">
+                <div className="flex items-center justify-between pb-2 border-b border-white/[0.06]">
+                  <span className="font-medium text-[#e5e5e5]">Outer Glow Options</span>
+                  <label className="flex items-center space-x-1.5 cursor-pointer text-[#8a8a8a]">
                     <input
                       type="checkbox"
                       checked={outerGlow.enabled}
                       onChange={(e) => setOuterGlow((s) => ({ ...s, enabled: e.target.checked }))}
-                      className="rounded border-[#444448] bg-[#1a1a1c] text-blue-500 focus:ring-0"
                     />
                     <span className="text-xs">Enable Glow</span>
                   </label>
@@ -608,27 +602,27 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 {/* Color & Opacity */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
-                    <span className="text-[#999999] block">Color</span>
+                    <span className="text-[#8a8a8a] block">Color</span>
                     <div className="flex items-center space-x-2">
                       <input
                         type="color"
                         value={outerGlow.color}
                         onChange={(e) => setOuterGlow((s) => ({ ...s, color: e.target.value }))}
-                        className="w-8 h-8 rounded border border-[#444448] bg-transparent cursor-pointer"
+                        className="w-7 h-7 rounded border border-white/[0.1] bg-transparent cursor-pointer"
                       />
                       <input
                         type="text"
                         value={outerGlow.color}
                         onChange={(e) => setOuterGlow((s) => ({ ...s, color: e.target.value }))}
-                        className="w-20 px-2 py-1 bg-[#1a1a1c] border border-[#3e3e42] rounded font-mono text-xs focus:outline-none focus:border-blue-500"
+                        className="w-20 px-2 py-1 bg-[#161616] border border-white/[0.08] rounded font-mono text-xs text-[#e5e5e5]"
                       />
                     </div>
                   </div>
 
                   <div className="space-y-1">
                     <div className="flex justify-between">
-                      <span className="text-[#999999]">Opacity</span>
-                      <span className="font-mono">{Math.round(outerGlow.opacity * 100)}%</span>
+                      <span className="text-[#8a8a8a]">Opacity</span>
+                      <span className="font-mono text-[#e5e5e5]">{Math.round(outerGlow.opacity * 100)}%</span>
                     </div>
                     <input
                       type="range"
@@ -637,7 +631,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                       step="0.01"
                       value={outerGlow.opacity}
                       onChange={(e) => setOuterGlow((s) => ({ ...s, opacity: Number(e.target.value) }))}
-                      className="w-full accent-blue-500 cursor-pointer"
+                      className="w-full"
                     />
                   </div>
                 </div>
@@ -645,8 +639,8 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                 {/* Spread */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Spread</span>
-                    <span className="font-mono">{outerGlow.spread}%</span>
+                    <span className="text-[#8a8a8a]">Spread</span>
+                    <span className="font-mono text-[#e5e5e5]">{outerGlow.spread}%</span>
                   </div>
                   <input
                     type="range"
@@ -654,15 +648,15 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="100"
                     value={outerGlow.spread}
                     onChange={(e) => setOuterGlow((s) => ({ ...s, spread: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
 
                 {/* Size / Blur */}
                 <div className="space-y-1">
                   <div className="flex justify-between">
-                    <span className="text-[#999999]">Size (Blur)</span>
-                    <span className="font-mono">{outerGlow.blur} px</span>
+                    <span className="text-[#8a8a8a]">Size (Blur)</span>
+                    <span className="font-mono text-[#e5e5e5]">{outerGlow.blur} px</span>
                   </div>
                   <input
                     type="range"
@@ -670,7 +664,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
                     max="100"
                     value={outerGlow.blur}
                     onChange={(e) => setOuterGlow((s) => ({ ...s, blur: Number(e.target.value) }))}
-                    className="w-full accent-blue-500 cursor-pointer"
+                    className="w-full"
                   />
                 </div>
               </div>
@@ -679,28 +673,26 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className="flex items-center justify-between px-4 py-3 bg-[#1e1e20] border-t border-[#333336]">
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06]">
           <button
             onClick={handleResetDefaults}
-            className="flex items-center space-x-1.5 px-3 py-1.5 text-xs text-[#888888] hover:text-white bg-[#28282b] hover:bg-[#333336] rounded border border-[#3e3e42] transition-colors"
+            className="px-3 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] bg-[#161616] hover:bg-[#2c2c2c] rounded border border-white/[0.06] transition-colors cursor-pointer"
           >
-            <RotateCcw className="w-3.5 h-3.5" />
-            <span>Reset Category</span>
+            Reset Category
           </button>
 
           <div className="flex items-center space-x-2">
             <button
               onClick={onClose}
-              className="px-4 py-1.5 text-xs text-[#aaaaaa] hover:text-white hover:bg-[#333336] rounded transition-colors"
+              className="px-3.5 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               onClick={handleConfirm}
-              className="flex items-center space-x-1.5 px-4 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-500 rounded shadow transition-colors"
+              className="px-4 py-1.5 text-xs font-medium bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded transition-opacity cursor-pointer"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>OK</span>
+              OK
             </button>
           </div>
         </div>

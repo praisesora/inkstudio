@@ -380,40 +380,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             {activeTab === 'appearance' && (
               <>
                 <section className="space-y-2.5">
-                  <div>
-                    <h3 className="text-xs font-medium text-[#e5e5e5]">Interface Theme</h3>
-                    <p className="text-[11px] text-[#8a8a8a]">
-                      Switch between Modern dark chrome and Vintage Manga Studio beveled UI
-                    </p>
-                  </div>
-                  <div className="grid grid-cols-2 gap-1.5">
-                    {(
-                      [
-                        { id: 'modern', label: 'Modern Studio', desc: 'Flat dark + accent' },
-                        { id: 'vintage-manga', label: 'Vintage Manga', desc: 'Classic CSP bevel' },
-                      ] as const
-                    ).map((opt) => {
-                      const isSelected = localSettings.themePreset === opt.id;
-                      return (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          onClick={() => handleChange('themePreset', opt.id)}
-                          className={`flex flex-col items-start px-3 py-2 rounded text-left transition-colors cursor-pointer ${
-                            isSelected
-                              ? 'bg-[#2c2c2c] text-[#e5e5e5] ring-1 ring-[var(--accent-border)]'
-                              : 'bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
-                          }`}
-                        >
-                          <span className="text-xs font-medium">{opt.label}</span>
-                          <span className="text-[10px] text-[#8a8a8a]">{opt.desc}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
-
-                <section className="space-y-2.5">
                   <div className="flex items-center justify-between">
                     <div>
                       <h3 className="text-xs font-medium text-[#e5e5e5]">Accent Color</h3>

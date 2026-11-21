@@ -9,6 +9,7 @@ import {
   MenuSection,
   SpeechBalloon,
   TransformSession,
+  ShapeDragPreview,
 } from '../types/editor';
 import { CollabPeer } from '../types/multiplayer';
 import { SparseTileGrid } from '../utils/tileEngine';
@@ -109,6 +110,7 @@ interface CanvasAreaContainerProps {
   onConfirmBalloon: () => void;
   onDeleteBalloon: () => void;
   frameDragPreview?: FrameDragPreview | null;
+  shapeDragPreview?: ShapeDragPreview | null;
   animationTimeline: AnimationTimeline | null;
   onUpdateAnimationTimeline: (timeline: AnimationTimeline | null) => void;
   onAddAnimationCel: (frameIndex: number) => void;
@@ -125,6 +127,7 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
   const brushSettings = useToolStore((s) => s.brushSettings);
   const liquifySettings = useToolStore((s) => s.liquifySettings);
   const primaryColor = useToolStore((s) => s.primaryColor);
+  const secondaryColor = useToolStore((s) => s.secondaryColor);
 
   const dimensions = useDocumentStore((s) => s.dimensions);
   const colorMode = useDocumentStore((s) => s.colorMode);
@@ -270,6 +273,8 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       onConfirmBalloon={props.onConfirmBalloon}
       onDeleteBalloon={props.onDeleteBalloon}
       frameDragPreview={props.frameDragPreview}
+      shapeDragPreview={props.shapeDragPreview}
+      secondaryColor={secondaryColor}
       animationTimeline={props.animationTimeline}
       onUpdateAnimationTimeline={props.onUpdateAnimationTimeline}
       onAddAnimationCel={props.onAddAnimationCel}

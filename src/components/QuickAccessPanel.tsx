@@ -22,6 +22,7 @@ import {
   SlidersHorizontal,
   Palette,
   PenTool,
+  Shapes,
 } from 'lucide-react';
 import { ToolType } from '../types/editor';
 import { ThemePreset } from '../types/settings';
@@ -49,6 +50,7 @@ const QUICK_TOOL_CATALOG: Array<{ id: ToolType; label: string }> = [
   { id: 'pipette', label: 'Eyedropper' },
   { id: 'liquify', label: 'Liquify' },
   { id: 'fill', label: 'Fill Bucket' },
+  { id: 'shape', label: 'Shapes' },
   { id: 'select-rect', label: 'Marquee' },
   { id: 'select-lasso', label: 'Lasso' },
   { id: 'select-wand', label: 'Magic Wand' },
@@ -73,6 +75,8 @@ function renderToolIcon(tool: ToolType): React.ReactNode {
       return <LiquifyIcon className={cls} />;
     case 'fill':
       return <PaintBucket className={cls} />;
+    case 'shape':
+      return <Shapes className={cls} />;
     case 'select-rect':
       return <BoxSelect className={cls} />;
     case 'select-lasso':
@@ -117,7 +121,6 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
 
   const [isEditing, setIsEditing] = useState(false);
   const [addTab, setAddTab] = useState<'command' | 'tool' | 'brush'>('command');
-  const isVintage = themePreset === 'vintage-manga';
 
   const handleActivateItem = (item: QuickAccessItem) => {
     if (item.kind === 'command' && item.commandId) {
@@ -182,18 +185,10 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
     <div
       data-testid="quick-access-panel"
       data-theme-preset={themePreset}
-      className={`flex flex-col h-full min-h-0 select-none text-xs ${
-        isVintage ? 'bg-[#363638] text-[#e5e5e5]' : 'bg-[#202020] text-[#e5e5e5]'
-      }`}
+      className="flex flex-col h-full min-h-0 select-none text-xs bg-[#202020] text-[#e5e5e5]"
     >
       {/* Toolbar: Grid/List + Edit Mode */}
-      <div
-        className={`h-7 px-1.5 flex items-center justify-between shrink-0 ${
-          isVintage
-            ? 'bg-[#2e2e31] border-b border-[#232325]'
-            : 'bg-[#1a1a1a] border-b border-white/[0.06]'
-        }`}
-      >
+      <div className="h-7 px-1.5 flex items-center justify-between shrink-0 bg-[#1a1a1a] border-b border-white/[0.06]">
         <div className="flex items-center gap-0.5">
           <button
             type="button"
@@ -283,11 +278,7 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
                     disabled
                       ? 'opacity-30 cursor-not-allowed bg-[#161616] text-[#8a8a8a]'
                       : active
-                      ? isVintage
-                        ? 'bg-[#337bb5] text-white border border-[#4e95cf] cursor-pointer'
-                        : 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)] cursor-pointer'
-                      : isVintage
-                      ? 'bg-[#2c2c2f] hover:bg-[#444448] text-[#d0d0d5] border border-[#232325] cursor-pointer'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)] cursor-pointer'
                       : 'bg-[#161616] hover:bg-[#2c2c2c] text-[#cccccc] hover:text-white border border-transparent cursor-pointer'
                   }`}
                 >
@@ -328,11 +319,7 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
                   key={item.id}
                   className={`flex items-center gap-1 rounded px-1.5 py-1 transition-colors ${
                     active
-                      ? isVintage
-                        ? 'bg-[#337bb5] text-white'
-                        : 'bg-[var(--accent-subtle)] text-[var(--accent)]'
-                      : isVintage
-                      ? 'bg-[#2c2c2f] hover:bg-[#444448] text-[#d0d0d5]'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
                       : 'bg-[#161616] hover:bg-[#2c2c2c] text-[#cccccc]'
                   }`}
                 >

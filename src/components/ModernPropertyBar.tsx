@@ -43,7 +43,7 @@ export const ModernPropertyBar: React.FC<ModernPropertyBarProps> = ({
   const brushDisplayName = brushSettings.brushName || (brushSettings.preset as string) || 'Brush';
 
   return (
-    <div className="h-9 px-3 flex items-center justify-between text-xs select-none z-20 shrink-0 bg-[#1e1f24] border-b border-white/[0.08] text-white/90">
+    <div className="h-9 px-3 flex items-center justify-between text-xs select-none z-20 shrink-0 bg-[#202020] border-b border-white/[0.06] text-[#e5e5e5]">
       {/* Left controls */}
       <div className="flex items-center space-x-2">
         {/* Presets Button */}
@@ -97,7 +97,7 @@ export const ModernPropertyBar: React.FC<ModernPropertyBarProps> = ({
             title="Brush Blending Mode"
           >
             {BLEND_MODES.map((bm) => (
-              <option key={bm.value} value={bm.value} className="bg-[#1e1f24] text-white">
+              <option key={bm.value} value={bm.value} className="bg-[#202020] text-[#e5e5e5]">
                 {bm.label}
               </option>
             ))}

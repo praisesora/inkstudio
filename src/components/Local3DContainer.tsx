@@ -21,23 +21,7 @@ import {
 } from '../utils/mannequin3D';
 import { Csp3DToolbar, Csp3DToolMode } from './Csp3DToolbar';
 import { LightSourceWidget, LightSettings } from './LightSourceWidget';
-import {
-  Sun,
-  Layers,
-  RotateCcw,
-  CheckCircle2,
-  X,
-  Upload,
-  Grid,
-  Camera,
-  Compass,
-  Move,
-  Rotate3d,
-  User,
-  Sliders,
-  Sparkles,
-  Link,
-} from 'lucide-react';
+import { X, SlidersHorizontal, Upload } from 'lucide-react';
 
 export type ShadingMode = 'shaded' | 'smooth' | 'silhouette';
 export type GizmoMode = 'none' | 'rotate' | 'translate';
@@ -95,11 +79,10 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   const [activeToolMode, setActiveToolMode] = useState<Csp3DToolMode>('camera-orbit');
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>('none');
   const [showGrid, setShowGrid] = useState<boolean>(true);
+  const [showInspector, setShowInspector] = useState<boolean>(true);
+  const [inspectorTab, setInspectorTab] = useState<'transform' | 'scene' | 'pose'>('transform');
   const [showLightPanel, setShowLightPanel] = useState<boolean>(false);
-  const [showCameraPresets, setShowCameraPresets] = useState<boolean>(false);
   const [isMannequinActive, setIsMannequinActive] = useState<boolean>(false);
-  const [showPoseDrawer, setShowPoseDrawer] = useState<boolean>(false);
-  const [showLTModal, setShowLTModal] = useState<boolean>(false);
   const [syncCameraPerspective, setSyncCameraPerspective] = useState<boolean>(true);
   const syncCameraPerspectiveRef = useRef<boolean>(syncCameraPerspective);
   syncCameraPerspectiveRef.current = syncCameraPerspective;
@@ -108,8 +91,6 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   const perspectiveRulerRef = useRef(perspectiveRuler);
   perspectiveRulerRef.current = perspectiveRuler;
   const [activeIKHandle, setActiveIKHandle] = useState<string | null>(null);
-  const [ltLineThreshold, setLtLineThreshold] = useState<number>(0.28);
-  const [ltToneBands, setLtToneBands] = useState<2 | 3>(2);
 
   // Viewport Settings
   const [opacity, setOpacity] = useState<number>(0.85);
@@ -672,7 +653,6 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       }
       camera.lookAt(target);
       controls.update();
-      setShowCameraPresets(false);
     },
     []
   );
@@ -985,7 +965,6 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   const handleExtractLineAndTone = async (settings?: LTConversionSettings) => {
     if (!sceneRef.current || !cameraRef.current || !modelRootRef.current || isBaking) return;
     setIsBaking(true);
-    setShowLTModal(false);
 
     try {
       if (transformHelperRef.current) transformHelperRef.current.visible = false;
@@ -993,8 +972,8 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       if (ikHandlesContainerRef.current) ikHandlesContainerRef.current.visible = false;
 
       const effectiveLineWidth = settings?.lineWidth ?? 1;
-      const effectiveThreshold = settings?.lineThreshold ?? ltLineThreshold;
-      const effectiveToneCount = settings?.toneCount ?? ltToneBands;
+      const effectiveThreshold = settings?.lineThreshold ?? 0.28;
+      const effectiveToneCount = settings?.toneCount ?? 2;
       const modelDisplayName = loadedFileName
         ? loadedFileName.replace(/\.[^/.]+$/, '')
         : isMannequinActive
@@ -1119,29 +1098,33 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
         {/* Empty state prompt if no model is loaded */}
         {!loadedFileName && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="bg-[#181b20]/90 border border-white/10 backdrop-blur-md rounded-xl px-8 py-6 flex flex-col items-center space-y-3 pointer-events-auto shadow-2xl text-center">
-              <div className="w-12 h-12 rounded-full bg-purple-500/20 border border-purple-500/30 flex items-center justify-center text-purple-400">
-                <Upload className="w-6 h-6" />
+            <div className="bg-[#202020]/95 border border-white/[0.1] backdrop-blur-md rounded-lg px-6 py-5 flex flex-col items-center space-y-3 pointer-events-auto shadow-2xl text-center max-w-xs">
+              <div className="w-10 h-10 rounded-md bg-[#161616] border border-white/[0.08] flex items-center justify-center text-[#8a8a8a]">
+                <Upload className="w-5 h-5" />
               </div>
               <div>
-                <p className="text-sm font-medium text-white">Import 3D Model</p>
-                <p className="text-xs text-gray-400 mt-1">Drag and drop .glb, .gltf, or .obj file, or click upload</p>
+                <p className="text-xs font-medium text-[#e5e5e5]">3D Reference Stage</p>
+                <p className="text-[11px] text-[#8a8a8a] mt-1">
+                  Drop a .glb, .gltf, or .obj file, or start with a rigged mannequin
+                </p>
               </div>
-              <div className="flex items-center space-x-2">
+              <div className="flex items-center space-x-2 pt-1">
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
-                  className="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded text-xs font-medium transition-colors shadow-lg shadow-purple-900/30"
+                  className="px-3 py-1.5 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs font-medium transition-colors cursor-pointer"
                 >
-                  Upload Model
+                  Import Model
                 </button>
                 <button
                   type="button"
-                  onClick={loadProceduralMannequin}
-                  className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded text-xs font-medium transition-colors shadow-lg shadow-blue-900/30 flex items-center space-x-1.5"
+                  onClick={() => {
+                    loadProceduralMannequin();
+                    setInspectorTab('pose');
+                  }}
+                  className="px-3 py-1.5 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
                 >
-                  <User className="w-3.5 h-3.5" />
-                  <span>Insert 3D Mannequin</span>
+                  Insert Mannequin
                 </button>
               </div>
             </div>
@@ -1149,538 +1132,485 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
         )}
       </div>
 
-      {/* Floating Clip Studio Paint 3D HUD (Rendered via Portal) */}
+      {/* Modern Unified 3D Workspace HUD (Rendered via Portal) */}
       {createPortal(
-        <div className="fixed inset-x-0 top-12 pointer-events-none z-50 flex flex-col items-center select-none space-y-2">
-          {/* 1. Main Clip Studio Paint 3D Launcher Toolbar */}
-          <div className="pointer-events-auto shadow-2xl flex items-center space-x-2">
+        <>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".glb,.gltf,.obj"
+            className="hidden"
+            onChange={handleFileUpload}
+          />
+
+          {/* Compact Single-Row Top Action Bar */}
+          <div
+            className="fixed top-12 left-1/2 -translate-x-1/2 z-50 bg-[#202020]/95 backdrop-blur-md border border-white/[0.1] rounded-lg px-2 py-1 shadow-2xl flex items-center gap-1.5 text-xs text-[#e5e5e5] select-none"
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            {/* Model Source */}
+            <div className="flex items-center bg-[#161616] rounded p-0.5 border border-white/[0.06]">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                title="Import 3D Model (.glb, .gltf, .obj)"
+                className={`px-2 py-0.5 rounded text-[11px] transition-colors cursor-pointer max-w-[96px] truncate ${
+                  loadedFileName && !isMannequinActive
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                }`}
+              >
+                {loadedFileName && !isMannequinActive ? loadedFileName : 'Import 3D'}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  loadProceduralMannequin();
+                  setInspectorTab('pose');
+                }}
+                title="Load Rigged Humanoid Mannequin"
+                className={`px-2 py-0.5 rounded text-[11px] transition-colors cursor-pointer ${
+                  isMannequinActive
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                }`}
+              >
+                Mannequin
+              </button>
+            </div>
+
+            <div className="w-px h-4 bg-white/[0.08]" />
+
+            {/* Camera / Object Mode & Unified Line & Tone */}
             <Csp3DToolbar
               activeMode={activeToolMode}
               onSelectMode={(mode) => setActiveToolMode(mode)}
               onDirectDrag={(mode, dx, dy) => applyTransformDelta(mode, dx, dy)}
-              onSnapToGround={handleSnapToGround}
-              onResetModelTransform={handleResetModelTransform}
               onExtractLineAndTone={handleExtractLineAndTone}
               isExtracting={isBaking}
+              hasModel={Boolean(loadedFileName)}
               modelName={loadedFileName || (isMannequinActive ? 'Mannequin' : '3D Model')}
             />
 
-            {/* Quick Turn Buttons */}
-            <div className="flex items-center space-x-0.5 bg-[#1b1e24]/95 border border-[#3b82f6]/40 rounded-lg p-1 text-[11px] text-gray-300">
-              <button
-                type="button"
-                onClick={() => rotateModelYaw(-90)}
-                title="Turn 90° Left"
-                className="px-1.5 py-1 rounded hover:bg-white/10 text-sky-400 font-mono"
-              >
-                ↶ 90°
-              </button>
-              <button
-                type="button"
-                onClick={() => rotateModelYaw(90)}
-                title="Turn 90° Right"
-                className="px-1.5 py-1 rounded hover:bg-white/10 text-sky-400 font-mono"
-              >
-                ↷ 90°
-              </button>
-              <button
-                type="button"
-                onClick={() => rotateModelYaw(180)}
-                title="Flip Model 180°"
-                className="px-1.5 py-1 rounded hover:bg-white/10 text-sky-400 font-mono"
-              >
-                180°
-              </button>
-            </div>
-          </div>
+            <div className="w-px h-4 bg-white/[0.08]" />
 
-          {/* 2. Secondary Comprehensive Controls Toolbar */}
-          <div
-            className="pointer-events-auto bg-[#181b20]/95 backdrop-blur-md border border-[#3b82f6]/40 shadow-2xl rounded-lg px-3 py-1.5 flex items-center space-x-2.5 text-xs text-[#cccccc]"
-            onPointerDown={(e) => e.stopPropagation()}
-          >
-            {/* Model & Mannequin Upload / Preset Button */}
-            <div className="flex items-center space-x-1.5 bg-[#252830] rounded px-2 py-1 border border-white/10">
-              <span className="text-[10px] uppercase font-semibold text-gray-400">Model</span>
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                title="Upload 3D Model (.glb, .gltf, .obj)"
-                className={`p-1 px-2 rounded transition-colors flex items-center space-x-1.5 ${
-                  loadedFileName && !isMannequinActive
-                    ? 'bg-purple-600 text-white hover:bg-purple-500'
-                    : 'bg-purple-600/30 text-purple-300 hover:bg-purple-600 hover:text-white'
-                }`}
-              >
-                <Upload className="w-3.5 h-3.5" />
-                <span className="text-[10px] font-medium max-w-[100px] truncate">
-                  {loadedFileName || 'Upload'}
-                </span>
-              </button>
-              <button
-                type="button"
-                onClick={loadProceduralMannequin}
-                title="Load Rigged Humanoid Drawing Mannequin"
-                className={`p-1 px-2 rounded transition-colors flex items-center space-x-1.5 ${
-                  isMannequinActive
-                    ? 'bg-blue-600 text-white hover:bg-blue-500'
-                    : 'bg-blue-600/30 text-blue-300 hover:bg-blue-600 hover:text-white'
-                }`}
-              >
-                <User className="w-3.5 h-3.5" />
-                <span className="text-[10px] font-medium">Mannequin</span>
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".glb,.gltf,.obj"
-                className="hidden"
-                onChange={handleFileUpload}
-              />
-            </div>
-
-            {/* Poses Drawer Trigger (Standing, Action, Sitting, Fists, Relaxed Palm) */}
-            {isMannequinActive && (
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => setShowPoseDrawer(!showPoseDrawer)}
-                  className={`flex items-center space-x-1 px-2 py-1 rounded border border-white/10 text-[10px] transition-colors ${
-                    showPoseDrawer ? 'bg-amber-600 text-white' : 'bg-[#252830] text-amber-300 hover:bg-white/10'
-                  }`}
-                  title="Humanoid Pose Presets"
-                >
-                  <Sliders className="w-3.5 h-3.5" />
-                  <span>Poses</span>
-                </button>
-
-                {showPoseDrawer && (
-                  <div className="absolute top-full mt-1.5 left-0 bg-[#1b1e24] border border-[#f59e0b]/40 rounded-lg p-2 shadow-2xl z-50 flex flex-col space-y-1.5 w-44">
-                    <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider px-1">
-                      Pose Presets
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        handleApplyPreset('standing');
-                        setShowPoseDrawer(false);
-                      }}
-                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
-                    >
-                      <span>Heroic Standing</span>
-                      <span className="text-[9px] text-gray-500 font-mono">Neutral</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        handleApplyPreset('action');
-                        setShowPoseDrawer(false);
-                      }}
-                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
-                    >
-                      <span>Manga Action</span>
-                      <span className="text-[9px] text-orange-400 font-mono">Combat</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        handleApplyPreset('sitting');
-                        setShowPoseDrawer(false);
-                      }}
-                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
-                    >
-                      <span>Seated Pose</span>
-                      <span className="text-[9px] text-sky-400 font-mono">Rest</span>
-                    </button>
-                    <div className="border-t border-white/10 my-0.5" />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        handleApplyPreset('fists');
-                        setShowPoseDrawer(false);
-                      }}
-                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
-                    >
-                      <span>Hand Fists</span>
-                      <span className="text-[9px] text-gray-400 font-mono">Clenched</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        handleApplyPreset('relaxed_palm');
-                        setShowPoseDrawer(false);
-                      }}
-                      className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200 flex items-center justify-between"
-                    >
-                      <span>Relaxed Palm</span>
-                      <span className="text-[9px] text-gray-400 font-mono">Open</span>
-                    </button>
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* IK Limbs Selector */}
-            {isMannequinActive && (
-              <div className="flex items-center space-x-1 bg-[#252830] rounded px-1.5 py-1 border border-white/10">
-                <span className="text-[10px] uppercase font-semibold text-gray-400 mr-1">IK</span>
-                {(['head', 'leftHand', 'rightHand', 'leftFoot', 'rightFoot'] as const).map((limb) => (
-                  <button
-                    key={limb}
-                    type="button"
-                    onClick={() => selectIKTarget(activeIKHandle === limb ? null : limb)}
-                    title={`Manipulate ${limb} IK handle`}
-                    className={`px-1.5 py-0.5 rounded text-[10px] capitalize transition-colors ${
-                      activeIKHandle === limb ? 'bg-cyan-600 text-white font-medium' : 'text-gray-400 hover:bg-white/10'
-                    }`}
-                  >
-                    {limb === 'leftHand'
-                      ? 'L-Hand'
-                      : limb === 'rightHand'
-                      ? 'R-Hand'
-                      : limb === 'leftFoot'
-                      ? 'L-Foot'
-                      : limb === 'rightFoot'
-                      ? 'R-Foot'
-                      : 'Head'}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {/* 3D Gizmo Rings Mode (Rotate / Translate / Off) */}
-            <div className="flex items-center space-x-1 bg-[#252830] rounded px-1.5 py-1 border border-white/10">
-              <span className="text-[10px] uppercase font-semibold text-gray-400 mr-1">Gizmo</span>
-              <button
-                type="button"
-                onClick={() => setGizmoMode(gizmoMode === 'rotate' ? 'none' : 'rotate')}
-                title="Toggle 3D Rotation Rings"
-                className={`p-1 rounded flex items-center space-x-1 ${
-                  gizmoMode === 'rotate' ? 'bg-amber-600 text-white' : 'hover:bg-white/10 text-gray-300'
-                }`}
-              >
-                <Rotate3d className="w-3.5 h-3.5" />
-                <span className="text-[10px]">Rings</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setGizmoMode(gizmoMode === 'translate' ? 'none' : 'translate')}
-                title="Toggle 3D Translation Arrows"
-                className={`p-1 rounded flex items-center space-x-1 ${
-                  gizmoMode === 'translate' ? 'bg-amber-600 text-white' : 'hover:bg-white/10 text-gray-300'
-                }`}
-              >
-                <Move className="w-3.5 h-3.5" />
-              </button>
-            </div>
-
-            {/* Perspective (Dolly Zoom - Clip Studio Paint style) */}
-            <div className="flex items-center space-x-1.5 bg-[#252830] rounded px-2 py-1 border border-white/10">
-              <Compass className="w-3 h-3 text-sky-400" />
-              <span className="text-[10px] text-gray-400" title="Exaggerates or flattens perspective distortion">
-                Perspective
-              </span>
-              <input
-                type="range"
-                min="0.3"
-                max="2.5"
-                step="0.05"
-                value={perspective}
-                onChange={(e) => applyPerspectiveDollyZoom(parseFloat(e.target.value))}
-                className="w-16 accent-sky-400 cursor-pointer h-1.5"
-                title="Adjust perspective foreshortening (Dolly Zoom)"
-              />
-              <span className="text-[10px] font-mono w-7 text-right">{perspective.toFixed(1)}x</span>
-            </div>
-
-            {/* Camera Presets Menu */}
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowCameraPresets(!showCameraPresets)}
-                className="flex items-center space-x-1 bg-[#252830] hover:bg-white/10 px-2 py-1 rounded border border-white/10 text-sky-400 text-[10px]"
-                title="Camera Angle Presets"
-              >
-                <Camera className="w-3.5 h-3.5" />
-                <span>Angle</span>
-              </button>
-
-              {showCameraPresets && (
-                <div className="absolute top-full mt-1.5 left-0 bg-[#1b1e24] border border-[#3b82f6]/40 rounded-lg p-1.5 shadow-2xl z-50 flex flex-col space-y-1 w-32">
-                  <button
-                    onClick={() => setCameraPreset('front')}
-                    className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200"
-                  >
-                    Front View
-                  </button>
-                  <button
-                    onClick={() => setCameraPreset('threeQuarter')}
-                    className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200"
-                  >
-                    3/4 Perspective
-                  </button>
-                  <button
-                    onClick={() => setCameraPreset('side')}
-                    className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200"
-                  >
-                    Side Profile
-                  </button>
-                  <button
-                    onClick={() => setCameraPreset('top')}
-                    className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200"
-                  >
-                    Top (Bird's Eye)
-                  </button>
-                  <button
-                    onClick={() => setCameraPreset('lowAngle')}
-                    className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200"
-                  >
-                    Low Angle (Worm)
-                  </button>
-                  <button
-                    onClick={() => setCameraPreset('back')}
-                    className="text-left px-2 py-1 rounded text-[11px] hover:bg-white/10 text-gray-200"
-                  >
-                    Back View
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Shading Mode */}
-            <div className="flex items-center space-x-1 bg-[#252830] rounded px-1.5 py-1 border border-white/10">
-              <span className="text-[10px] uppercase font-semibold text-gray-400 mr-1">Shade</span>
-              {(['shaded', 'smooth', 'silhouette'] as ShadingMode[]).map((mode) => (
-                <button
-                  key={mode}
-                  type="button"
-                  onClick={() => {
-                    setShadingMode(mode);
-                    applyShading(mode);
-                  }}
-                  className={`px-1.5 py-0.5 rounded text-[10px] capitalize transition-colors ${
-                    shadingMode === mode ? 'bg-blue-600 text-white font-medium' : 'text-gray-400 hover:bg-white/10'
-                  }`}
-                >
-                  {mode}
-                </button>
-              ))}
-            </div>
-
-            {/* Floor Grid Toggle */}
+            {/* Inspector Toggle */}
             <button
               type="button"
-              onClick={() => setShowGrid(!showGrid)}
-              title="Toggle Ground Perspective Grid"
-              className={`p-1.5 rounded transition-colors ${
-                showGrid ? 'bg-sky-600/30 text-sky-300 ring-1 ring-sky-400' : 'text-gray-400 hover:bg-white/10'
+              onClick={() => setShowInspector((v) => !v)}
+              title={showInspector ? 'Hide 3D Inspector' : 'Show 3D Inspector'}
+              className={`p-1 rounded transition-colors cursor-pointer ${
+                showInspector
+                  ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
               }`}
             >
-              <Grid className="w-3.5 h-3.5" />
+              <SlidersHorizontal className="w-3.5 h-3.5" />
             </button>
 
-            {/* Light Source Panel Toggle */}
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowLightPanel(!showLightPanel)}
-                title="Configure 3D Light Source"
-                className={`p-1.5 rounded transition-colors flex items-center space-x-1 ${
-                  showLightPanel
-                    ? 'bg-amber-500/30 text-amber-300 ring-1 ring-amber-400'
-                    : 'text-amber-400 hover:bg-white/10'
-                }`}
-              >
-                <Sun className="w-3.5 h-3.5" />
-                <span className="text-[10px]">Light</span>
-              </button>
-
-              {showLightPanel && (
-                <div className="absolute top-full mt-2 right-0 z-50">
-                  <LightSourceWidget
-                    settings={lightSettings}
-                    onChange={(s) => setLightSettings(s)}
-                    onReset={() =>
-                      setLightSettings({
-                        azimuth: 45,
-                        elevation: 45,
-                        intensity: 1.5,
-                        ambientIntensity: 0.65,
-                        color: '#ffffff',
-                        isBacklit: false,
-                      })
-                    }
-                  />
-                </div>
-              )}
-            </div>
-
-            {/* Local Opacity */}
-            <div className="flex items-center space-x-1 bg-[#252830] rounded px-1.5 py-1 border border-white/10">
-              <Layers className="w-3 h-3 text-gray-400" />
-              <input
-                type="range"
-                min="0.1"
-                max="1"
-                step="0.05"
-                value={opacity}
-                onChange={(e) => setOpacity(parseFloat(e.target.value))}
-                className="w-14 accent-blue-500 cursor-pointer h-1.5"
-              />
-              <span className="text-[10px] font-mono">{Math.round(opacity * 100)}%</span>
-            </div>
-
-            {/* Reset Camera */}
-            <button
-              onClick={handleResetCamera}
-              title="Reset Camera View"
-              className="p-1.5 text-gray-400 hover:text-white hover:bg-white/10 rounded transition-colors"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-            </button>
-
-            {/* Perspective Ruler Camera Sync Toggle */}
-            <button
-              type="button"
-              onClick={() => {
-                const nextSync = !syncCameraPerspective;
-                setSyncCameraPerspective(nextSync);
-                if (nextSync && cameraRef.current && onUpdatePerspectiveRuler) {
-                  const ruler = calculatePerspectiveFromCamera(
-                    cameraRef.current,
-                    dimensions.width,
-                    dimensions.height,
-                    perspectiveRuler
-                  );
-                  onUpdatePerspectiveRuler(ruler);
-                }
-              }}
-              title="Synchronize 3D camera with document Perspective Ruler"
-              className={`p-1.5 px-2 rounded transition-colors flex items-center space-x-1 ${
-                syncCameraPerspective
-                  ? 'bg-cyan-600/30 text-cyan-300 ring-1 ring-cyan-400'
-                  : 'text-gray-400 hover:bg-white/10'
-              }`}
-            >
-              <Link className="w-3.5 h-3.5" />
-              <span className="text-[10px]">Ruler Sync</span>
-            </button>
-
-            {/* 3D LT Line & Screentone Extraction */}
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowLTModal(!showLTModal)}
-                disabled={isBaking || !modelRootRef.current}
-                title="Extract Lineart and Screentones from 3D Model (LT Conversion)"
-                className="flex items-center space-x-1 bg-purple-600 hover:bg-purple-500 text-white font-medium px-2.5 py-1 rounded shadow-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-300" />
-                <span className="text-xs">LT Convert</span>
-              </button>
-
-              {showLTModal && (
-                <div className="absolute top-full mt-2 right-0 bg-[#1b1e24] border border-purple-500/40 rounded-xl p-3 shadow-2xl z-50 flex flex-col space-y-2.5 w-60">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold text-purple-300 flex items-center space-x-1">
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span>LT Line & Tone Extraction</span>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setShowLTModal(false)}
-                      className="text-gray-400 hover:text-white"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-
-                  <div className="flex flex-col space-y-1">
-                    <div className="flex items-center justify-between text-[11px] text-gray-300">
-                      <span>Line Sensitivity</span>
-                      <span className="font-mono text-cyan-400">{Math.round((1 - ltLineThreshold) * 100)}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0.1"
-                      max="0.6"
-                      step="0.02"
-                      value={ltLineThreshold}
-                      onChange={(e) => setLtLineThreshold(parseFloat(e.target.value))}
-                      className="w-full accent-purple-500 cursor-pointer h-1.5"
-                    />
-                  </div>
-
-                  <div className="flex flex-col space-y-1">
-                    <span className="text-[11px] text-gray-300">Screentone Quantization</span>
-                    <div className="flex space-x-2">
-                      <button
-                        type="button"
-                        onClick={() => setLtToneBands(2)}
-                        className={`flex-1 py-1 rounded text-[10px] font-medium transition-colors ${
-                          ltToneBands === 2
-                            ? 'bg-purple-600 text-white'
-                            : 'bg-white/5 text-gray-400 hover:bg-white/10'
-                        }`}
-                      >
-                        2 Bands (Shadow)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setLtToneBands(3)}
-                        className={`flex-1 py-1 rounded text-[10px] font-medium transition-colors ${
-                          ltToneBands === 3
-                            ? 'bg-purple-600 text-white'
-                            : 'bg-white/5 text-gray-400 hover:bg-white/10'
-                        }`}
-                      >
-                        3 Bands (Deep/Mid)
-                      </button>
-                    </div>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleExtractLineAndTone({
-                        lineWidth: 1,
-                        lineThreshold: ltLineThreshold,
-                        toneCount: ltToneBands,
-                        folderName: '',
-                      })
-                    }
-                    disabled={isBaking}
-                    className="w-full py-1.5 bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-medium rounded text-xs transition-colors shadow-lg flex items-center justify-center space-x-1.5"
-                  >
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    <span>Extract Line & Tone</span>
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Bake to 2D Layer */}
+            {/* Primary Bake Action */}
             <button
               type="button"
               onClick={handleBakeTo2D}
-              disabled={isBaking || !modelRootRef.current}
-              title={!modelRootRef.current ? 'Upload a model to convert to layer' : 'Convert to 2D Layer'}
-              className="flex items-center space-x-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-medium px-3 py-1 rounded shadow-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={isBaking || !loadedFileName}
+              title={!loadedFileName ? 'Load a model first' : 'Rasterize 3D view into a 2D Layer'}
+              className="px-2.5 py-1 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium rounded text-[11px] transition-opacity disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
             >
-              <CheckCircle2 className="w-3.5 h-3.5" />
-              <span className="text-xs">{isBaking ? 'Baking...' : 'Convert to 2D Layer'}</span>
+              {isBaking ? 'Baking...' : 'Bake Layer'}
             </button>
 
             {/* Close */}
             <button
+              type="button"
               onClick={onClose}
-              title="Close 3D Viewport"
-              className="p-1 text-gray-400 hover:text-red-400 hover:bg-white/10 rounded transition-colors"
+              title="Close 3D Stage"
+              className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
             >
-              <X className="w-4 h-4" />
+              <X className="w-3.5 h-3.5" />
             </button>
           </div>
-        </div>,
+
+          {/* Collapsible Floating 3D Inspector (Docked Bottom-Left, Zero Overlap) */}
+          {showInspector && (
+            <div
+              className="fixed bottom-10 left-16 z-50 w-64 bg-[#202020]/95 backdrop-blur-md border border-white/[0.1] rounded-lg shadow-2xl overflow-hidden text-xs text-[#e5e5e5] select-none flex flex-col max-h-[calc(100vh-140px)]"
+              onPointerDown={(e) => e.stopPropagation()}
+            >
+              {/* Tabs */}
+              <div className="flex items-center bg-[#1a1a1a] border-b border-white/[0.06] p-1 gap-0.5">
+                {(
+                  [
+                    ['transform', 'Transform'],
+                    ['scene', 'Scene'],
+                    ...(isMannequinActive ? ([['pose', 'Pose']] as const) : []),
+                  ] as Array<['transform' | 'scene' | 'pose', string]>
+                ).map(([tabId, label]) => (
+                  <button
+                    key={tabId}
+                    type="button"
+                    onClick={() => setInspectorTab(tabId)}
+                    className={`flex-1 py-1 rounded text-[11px] transition-colors cursor-pointer ${
+                      inspectorTab === tabId
+                        ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                        : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="p-3 space-y-3 overflow-y-auto">
+                {inspectorTab === 'transform' && (
+                  <>
+                    {/* Fine Model Rotation Modes */}
+                    <div className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                        Model Controls
+                      </span>
+                      <div className="grid grid-cols-3 gap-1 bg-[#161616] p-0.5 rounded border border-white/[0.06]">
+                        {(
+                          [
+                            ['model-rotate-free', 'Free'],
+                            ['model-rotate-yaw', 'Turn Y'],
+                            ['model-rotate-roll', 'Roll'],
+                          ] as Array<[Csp3DToolMode, string]>
+                        ).map(([mode, lbl]) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => setActiveToolMode(mode)}
+                            className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                              activeToolMode === mode
+                                ? 'bg-[var(--accent)] text-[var(--accent-contrast)] font-medium'
+                                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                            }`}
+                          >
+                            {lbl}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Quick Turn */}
+                    <div className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                        Quick Turn
+                      </span>
+                      <div className="grid grid-cols-3 gap-1">
+                        <button
+                          type="button"
+                          onClick={() => rotateModelYaw(-90)}
+                          className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] font-mono text-[#e5e5e5] cursor-pointer"
+                        >
+                          -90°
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => rotateModelYaw(90)}
+                          className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] font-mono text-[#e5e5e5] cursor-pointer"
+                        >
+                          +90°
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => rotateModelYaw(180)}
+                          className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] font-mono text-[#e5e5e5] cursor-pointer"
+                        >
+                          180°
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* 3D Gizmo */}
+                    <div className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                        3D Gizmo
+                      </span>
+                      <div className="grid grid-cols-3 gap-1 bg-[#161616] p-0.5 rounded border border-white/[0.06]">
+                        {(
+                          [
+                            ['none', 'Off'],
+                            ['rotate', 'Rotate'],
+                            ['translate', 'Move'],
+                          ] as Array<[GizmoMode, string]>
+                        ).map(([gMode, lbl]) => (
+                          <button
+                            key={gMode}
+                            type="button"
+                            onClick={() => setGizmoMode(gMode)}
+                            className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                              gizmoMode === gMode
+                                ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                                : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                            }`}
+                          >
+                            {lbl}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Utility Actions */}
+                    <div className="grid grid-cols-2 gap-1.5 pt-1 border-t border-white/[0.06]">
+                      <button
+                        type="button"
+                        onClick={handleSnapToGround}
+                        className="py-1.5 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] text-[#e5e5e5] cursor-pointer"
+                      >
+                        Snap Floor
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleResetModelTransform}
+                        className="py-1.5 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer"
+                      >
+                        Reset Model
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleResetCamera}
+                        className="col-span-2 py-1.5 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer"
+                      >
+                        Reset Camera
+                      </button>
+                    </div>
+                  </>
+                )}
+
+                {inspectorTab === 'scene' && (
+                  <>
+                    {/* Camera Presets */}
+                    <div className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                        Camera Angle
+                      </span>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(
+                          [
+                            ['front', 'Front'],
+                            ['threeQuarter', '3/4'],
+                            ['side', 'Side'],
+                            ['back', 'Back'],
+                            ['top', 'Top'],
+                            ['lowAngle', 'Low'],
+                          ] as const
+                        ).map(([preset, lbl]) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            onClick={() => setCameraPreset(preset)}
+                            className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[10px] text-[#cccccc] hover:text-[#e5e5e5] cursor-pointer"
+                          >
+                            {lbl}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Shading */}
+                    <div className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                        Shading
+                      </span>
+                      <div className="grid grid-cols-3 gap-1 bg-[#161616] p-0.5 rounded border border-white/[0.06]">
+                        {(['shaded', 'smooth', 'silhouette'] as ShadingMode[]).map((mode) => (
+                          <button
+                            key={mode}
+                            type="button"
+                            onClick={() => {
+                              setShadingMode(mode);
+                              applyShading(mode);
+                            }}
+                            className={`py-1 rounded text-[10px] capitalize transition-colors cursor-pointer ${
+                              shadingMode === mode
+                                ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                                : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                            }`}
+                          >
+                            {mode}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Sliders */}
+                    <div className="space-y-2">
+                      <div>
+                        <div className="flex justify-between text-[11px] mb-0.5">
+                          <span className="text-[#8a8a8a]">Perspective</span>
+                          <span className="font-mono text-[#e5e5e5]">{perspective.toFixed(1)}x</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.3"
+                          max="2.5"
+                          step="0.05"
+                          value={perspective}
+                          onChange={(e) => applyPerspectiveDollyZoom(parseFloat(e.target.value))}
+                          className="w-full"
+                        />
+                      </div>
+
+                      <div>
+                        <div className="flex justify-between text-[11px] mb-0.5">
+                          <span className="text-[#8a8a8a]">Opacity</span>
+                          <span className="font-mono text-[#e5e5e5]">{Math.round(opacity * 100)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0.1"
+                          max="1"
+                          step="0.05"
+                          value={opacity}
+                          onChange={(e) => setOpacity(parseFloat(e.target.value))}
+                          className="w-full"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Toggles */}
+                    <div className="space-y-1.5 pt-1 border-t border-white/[0.06]">
+                      <label className="flex items-center justify-between text-[11px] text-[#cccccc] cursor-pointer">
+                        <span>Floor Grid</span>
+                        <input
+                          type="checkbox"
+                          checked={showGrid}
+                          onChange={(e) => setShowGrid(e.target.checked)}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between text-[11px] text-[#cccccc] cursor-pointer">
+                        <span>Sync Perspective Ruler</span>
+                        <input
+                          type="checkbox"
+                          checked={syncCameraPerspective}
+                          onChange={(e) => {
+                            const nextSync = e.target.checked;
+                            setSyncCameraPerspective(nextSync);
+                            if (nextSync && cameraRef.current && onUpdatePerspectiveRuler) {
+                              const ruler = calculatePerspectiveFromCamera(
+                                cameraRef.current,
+                                dimensions.width,
+                                dimensions.height,
+                                perspectiveRuler
+                              );
+                              onUpdatePerspectiveRuler(ruler);
+                            }
+                          }}
+                        />
+                      </label>
+                    </div>
+
+                    {/* Collapsible Light Source */}
+                    <div className="pt-1 border-t border-white/[0.06] space-y-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowLightPanel((v) => !v)}
+                        className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] text-[#e5e5e5] flex items-center justify-between cursor-pointer"
+                      >
+                        <span>Lighting</span>
+                        <span className="text-[10px] text-[#8a8a8a]">
+                          {showLightPanel ? 'Hide' : 'Adjust'}
+                        </span>
+                      </button>
+
+                      {showLightPanel && (
+                        <LightSourceWidget
+                          embedded
+                          settings={lightSettings}
+                          onChange={(s) => setLightSettings(s)}
+                          onReset={() =>
+                            setLightSettings({
+                              azimuth: 45,
+                              elevation: 45,
+                              intensity: 1.5,
+                              ambientIntensity: 0.65,
+                              color: '#ffffff',
+                              isBacklit: false,
+                            })
+                          }
+                        />
+                      )}
+                    </div>
+                  </>
+                )}
+
+                {inspectorTab === 'pose' && isMannequinActive && (
+                  <>
+                    {/* Pose Presets */}
+                    <div className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                        Pose Presets
+                      </span>
+                      <div className="grid grid-cols-2 gap-1">
+                        {(
+                          [
+                            ['standing', 'Standing'],
+                            ['action', 'Action'],
+                            ['sitting', 'Seated'],
+                            ['fists', 'Fists'],
+                            ['relaxed_palm', 'Relaxed'],
+                          ] as Array<[PosePresetName, string]>
+                        ).map(([preset, lbl]) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            onClick={() => handleApplyPreset(preset)}
+                            className="py-1.5 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-white/[0.06] text-[11px] text-[#e5e5e5] text-left cursor-pointer"
+                          >
+                            {lbl}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* IK Limb Handles */}
+                    <div className="space-y-1 pt-1 border-t border-white/[0.06]">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
+                          IK Limbs
+                        </span>
+                        {activeIKHandle && (
+                          <button
+                            type="button"
+                            onClick={() => selectIKTarget(null)}
+                            className="text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer"
+                          >
+                            Deselect
+                          </button>
+                        )}
+                      </div>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(
+                          [
+                            ['head', 'Head'],
+                            ['leftHand', 'L-Hand'],
+                            ['rightHand', 'R-Hand'],
+                            ['leftFoot', 'L-Foot'],
+                            ['rightFoot', 'R-Foot'],
+                          ] as const
+                        ).map(([limb, lbl]) => (
+                          <button
+                            key={limb}
+                            type="button"
+                            onClick={() => selectIKTarget(activeIKHandle === limb ? null : limb)}
+                            className={`py-1 px-1.5 rounded text-[10px] transition-colors cursor-pointer ${
+                              activeIKHandle === limb
+                                ? 'bg-[var(--accent)] text-[var(--accent-contrast)] font-medium'
+                                : 'bg-[#161616] border border-white/[0.06] text-[#cccccc] hover:bg-[#2c2c2c]'
+                            }`}
+                          >
+                            {lbl}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </>,
         document.body
       )}
     </>

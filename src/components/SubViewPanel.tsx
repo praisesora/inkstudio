@@ -151,7 +151,6 @@ export interface SubViewPanelProps {
 
 export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
   ({ colorMode = 'color', themePreset = 'modern' }) => {
-    const isVintage = themePreset === 'vintage-manga';
 
     const items = useSubViewStore((s) => s.items);
     const activeId = useSubViewStore((s) => s.activeId);
@@ -640,13 +639,11 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
       }
     };
 
-    const btnBase = isVintage
-      ? 'h-5 px-1 rounded text-[10px] flex items-center justify-center text-[#d0d0d5] hover:text-white hover:bg-[#4e4e52] disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer'
-      : 'h-5 px-1 rounded text-[10px] flex items-center justify-center text-[#a3a3a3] hover:text-[#f5f5f5] hover:bg-[#2c2c2c] disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer';
+    const btnBase =
+      'h-5 px-1 rounded text-[10px] flex items-center justify-center text-[#a3a3a3] hover:text-[#f5f5f5] hover:bg-[#2c2c2c] disabled:opacity-35 disabled:pointer-events-none transition-colors cursor-pointer';
 
-    const btnActive = isVintage
-      ? 'bg-[#337bb5] text-white'
-      : 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-inset ring-[var(--accent-border)]';
+    const btnActive =
+      'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-inset ring-[var(--accent-border)]';
 
     const stageCursorClass = !activeItem?.src
       ? 'cursor-default'
@@ -663,9 +660,7 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
         onDrop={handleDrop}
-        className={`flex flex-col h-full min-h-0 select-none relative ${
-          isVintage ? 'bg-[#363638] text-[#e5e5e5]' : 'bg-[#202020] text-[#e5e5e5]'
-        }`}
+        className="flex flex-col h-full min-h-0 select-none relative bg-[#202020] text-[#e5e5e5]"
       >
         {/* Hidden Local Image Inputs */}
         <input
@@ -694,13 +689,7 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
         />
 
         {/* Top Bar: Reference Management (+, < >, index, list toggle, delete) */}
-        <div
-          className={`h-6 px-1 flex items-center justify-between gap-1 shrink-0 border-b ${
-            isVintage
-              ? 'bg-[#313134] border-[#232325]'
-              : 'bg-[#1b1b1b] border-white/[0.06]'
-          }`}
-        >
+        <div className="h-6 px-1 flex items-center justify-between gap-1 shrink-0 border-b bg-[#1b1b1b] border-white/[0.06]">
           <div className="flex items-center gap-0.5 min-w-0">
             <button
               type="button"
@@ -776,11 +765,7 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
         {showList && items.length > 0 && (
           <div
             data-testid="subview-list-drawer"
-            className={`max-h-24 overflow-y-auto shrink-0 border-b px-1 py-0.5 flex flex-col gap-0.5 ${
-              isVintage
-                ? 'bg-[#2b2b2e] border-[#232325]'
-                : 'bg-[#181818] border-white/[0.06]'
-            }`}
+            className="max-h-24 overflow-y-auto shrink-0 border-b px-1 py-0.5 flex flex-col gap-0.5 bg-[#181818] border-white/[0.06]"
           >
             {items.map((item, idx) => {
               const isSelected = item.id === activeItem?.id;
@@ -791,9 +776,7 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
                   onClick={() => subViewStoreActions.selectImage(item.id)}
                   className={`flex items-center gap-1.5 px-1 py-0.5 rounded text-[10px] cursor-pointer ${
                     isSelected
-                      ? isVintage
-                        ? 'bg-[#337bb5] text-white'
-                        : 'bg-[#2c2c2c] text-[#f5f5f5]'
+                      ? 'bg-[#2c2c2c] text-[#f5f5f5]'
                       : 'text-[#a3a3a3] hover:bg-[#242424]'
                   }`}
                 >
@@ -834,8 +817,6 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
           className={`relative flex-1 min-h-[76px] overflow-hidden flex items-center justify-center ${stageCursorClass} ${
             isDragOverFiles
               ? 'ring-2 ring-inset ring-[var(--accent)] bg-[var(--accent-subtle)]'
-              : isVintage
-              ? 'bg-[#252527]'
               : 'bg-[#141414]'
           }`}
         >
@@ -898,13 +879,7 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
         </div>
 
         {/* Bottom Compact Control Bar (Strictly Local Sub View Transforms + Eyedropper Mode) */}
-        <div
-          className={`shrink-0 px-1.5 py-1 flex items-center justify-between gap-0.5 flex-wrap border-t ${
-            isVintage
-              ? 'bg-[#313134] border-[#232325]'
-              : 'bg-[#1b1b1b] border-white/[0.06]'
-          }`}
-        >
+        <div className="shrink-0 px-1.5 py-1 flex items-center justify-between gap-0.5 flex-wrap border-t bg-[#1b1b1b] border-white/[0.06]">
           {/* Zoom + Fit */}
           <div className="flex items-center gap-0.5">
             <button

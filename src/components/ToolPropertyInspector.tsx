@@ -21,7 +21,11 @@ import {
   CspTipFlipMode,
   CspTaperSettings,
   CspSpraySettings,
+  ShapeKind,
+  ShapeDrawMode,
+  ShapeFillColorMode,
 } from '../types/editor';
+import { isOpenShape } from '../utils/shapeEngine';
 import { saveCustomBrushDebounced } from '../utils/brushStorage';
 import { resolveBrushTipImage } from '../utils/brushOutline';
 import { BUILTIN_BRUSHES } from '../utils/presetBrushes';
@@ -132,6 +136,7 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
     const textSettings = useToolStore((s) => s.textSettings);
     const frameSettings = useToolStore((s) => s.frameSettings);
     const liquifySettings = useToolStore((s) => s.liquifySettings);
+    const shapeSettings = useToolStore((s) => s.shapeSettings);
     const balloonSettings = useToolStore((s) => s.balloonSettings);
     const vectorEditSettings = useToolStore((s) => s.vectorEditSettings);
     const wandSettings = useToolStore((s) => s.wandSettings);
@@ -361,6 +366,270 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
         );
       }
 
+      if (currentTool === 'shape') {
+        const openShape = isOpenShape(shapeSettings.shape);
+        const shapeOptions: Array<{ id: ShapeKind; label: string }> = [
+          { id: 'rectangle', label: 'Rect' },
+          { id: 'rounded-rect', label: 'Rounded' },
+          { id: 'ellipse', label: 'Ellipse' },
+          { id: 'triangle', label: 'Triangle' },
+          { id: 'polygon', label: 'Polygon' },
+          { id: 'star', label: 'Star' },
+          { id: 'line', label: 'Line' },
+          { id: 'arrow', label: 'Arrow' },
+        ];
+        return (
+          <div className="p-2 space-y-3 overflow-y-auto flex-1">
+            <div className="px-0.5 text-[11px] font-medium text-[#e5e5e5]">Geometric Shape</div>
+
+            <div className="grid grid-cols-2 gap-1">
+              {shapeOptions.map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => toolStoreActions.updateShapeSettings({ shape: opt.id })}
+                  className={`px-2 py-1 rounded text-[11px] text-left transition-colors cursor-pointer ${
+                    shapeSettings.shape === opt.id
+                      ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+
+            {!openShape && (
+              <div className="space-y-1">
+                <div className="text-[11px] text-[#8a8a8a]">Style</div>
+                <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                  {(['stroke', 'fill', 'both'] as ShapeDrawMode[]).map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => toolStoreActions.updateShapeSettings({ mode: m })}
+                      className={`py-1 rounded text-[10px] capitalize transition-colors cursor-pointer ${
+                        shapeSettings.mode === m
+                          ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                          : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                      }`}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {(openShape || shapeSettings.mode !== 'fill') && (
+              <CompactSlider
+                label="Stroke"
+                valueLabel={`${shapeSettings.strokeWidth}px`}
+                min={1}
+                max={120}
+                value={shapeSettings.strokeWidth}
+                onChange={(v) => toolStoreActions.updateShapeSettings({ strokeWidth: v })}
+              />
+            )}
+
+            <CompactSlider
+              label="Opacity"
+              valueLabel={`${Math.round(shapeSettings.opacity * 100)}%`}
+              min={5}
+              max={100}
+              value={Math.round(shapeSettings.opacity * 100)}
+              onChange={(v) => toolStoreActions.updateShapeSettings({ opacity: v / 100 })}
+            />
+
+            {!openShape && shapeSettings.mode !== 'stroke' && (
+              <div className="space-y-1.5">
+                <div className="text-[11px] text-[#8a8a8a]">Fill Color</div>
+                <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                  {(
+                    [
+                      ['primary', 'Primary'],
+                      ['secondary', 'Sub'],
+                      ['custom', 'Custom'],
+                    ] as Array<[ShapeFillColorMode, string]>
+                  ).map(([m, lbl]) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => toolStoreActions.updateShapeSettings({ fillColorMode: m })}
+                      className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                        shapeSettings.fillColorMode === m
+                          ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                          : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                      }`}
+                    >
+                      {lbl}
+                    </button>
+                  ))}
+                </div>
+                {shapeSettings.fillColorMode === 'custom' && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] text-[#8a8a8a] font-mono">
+                      {shapeSettings.customFillColor}
+                    </span>
+                    <input
+                      type="color"
+                      value={shapeSettings.customFillColor}
+                      onChange={(e) =>
+                        toolStoreActions.updateShapeSettings({ customFillColor: e.target.value })
+                      }
+                      className="w-6 h-5 bg-transparent border-0 cursor-pointer"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {shapeSettings.shape === 'rounded-rect' && (
+              <CompactSlider
+                label="Corner Radius"
+                valueLabel={`${shapeSettings.cornerRadius}px`}
+                min={0}
+                max={200}
+                value={shapeSettings.cornerRadius}
+                onChange={(v) => toolStoreActions.updateShapeSettings({ cornerRadius: v })}
+              />
+            )}
+
+            {(shapeSettings.shape === 'polygon' || shapeSettings.shape === 'star') && (
+              <CompactSlider
+                label={shapeSettings.shape === 'star' ? 'Points' : 'Sides'}
+                valueLabel={`${shapeSettings.polygonSides}`}
+                min={3}
+                max={12}
+                value={shapeSettings.polygonSides}
+                onChange={(v) => toolStoreActions.updateShapeSettings({ polygonSides: v })}
+              />
+            )}
+
+            {shapeSettings.shape === 'star' && (
+              <CompactSlider
+                label="Inner Ratio"
+                valueLabel={`${Math.round(shapeSettings.starInnerRatio * 100)}%`}
+                min={15}
+                max={85}
+                value={Math.round(shapeSettings.starInnerRatio * 100)}
+                onChange={(v) => toolStoreActions.updateShapeSettings({ starInnerRatio: v / 100 })}
+              />
+            )}
+
+            {(openShape || shapeSettings.mode !== 'fill') && (
+              <div className="space-y-2 pt-1 border-t border-[#2c2c2c]">
+                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                  <span>Dashed Line</span>
+                  <input
+                    type="checkbox"
+                    checked={shapeSettings.dashed}
+                    onChange={(e) =>
+                      toolStoreActions.updateShapeSettings({ dashed: e.target.checked })
+                    }
+                  />
+                </label>
+                {shapeSettings.dashed && (
+                  <>
+                    <CompactSlider
+                      label="Dash Length"
+                      valueLabel={`${shapeSettings.dashLength}px`}
+                      min={2}
+                      max={100}
+                      value={shapeSettings.dashLength}
+                      onChange={(v) => toolStoreActions.updateShapeSettings({ dashLength: v })}
+                    />
+                    <CompactSlider
+                      label="Dash Gap"
+                      valueLabel={`${shapeSettings.dashGap}px`}
+                      min={2}
+                      max={100}
+                      value={shapeSettings.dashGap}
+                      onChange={(v) => toolStoreActions.updateShapeSettings({ dashGap: v })}
+                    />
+                  </>
+                )}
+
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-[#8a8a8a]">Cap</span>
+                  <select
+                    value={shapeSettings.lineCap}
+                    onChange={(e) =>
+                      toolStoreActions.updateShapeSettings({
+                        lineCap: e.target.value as 'round' | 'butt' | 'square',
+                      })
+                    }
+                    className="px-1.5 py-0.5 text-[11px] bg-[#161616] text-[#e5e5e5] rounded cursor-pointer"
+                  >
+                    <option value="round">Round</option>
+                    <option value="butt">Flat</option>
+                    <option value="square">Square</option>
+                  </select>
+                </div>
+
+                {!openShape && (
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-[#8a8a8a]">Corner</span>
+                    <select
+                      value={shapeSettings.lineJoin}
+                      onChange={(e) =>
+                        toolStoreActions.updateShapeSettings({
+                          lineJoin: e.target.value as 'miter' | 'round' | 'bevel',
+                        })
+                      }
+                      className="px-1.5 py-0.5 text-[11px] bg-[#161616] text-[#e5e5e5] rounded cursor-pointer"
+                    >
+                      <option value="miter">Sharp</option>
+                      <option value="round">Round</option>
+                      <option value="bevel">Bevel</option>
+                    </select>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="space-y-1.5 pt-1 border-t border-[#2c2c2c]">
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Anti-aliasing</span>
+                <input
+                  type="checkbox"
+                  checked={shapeSettings.antiAlias}
+                  onChange={(e) =>
+                    toolStoreActions.updateShapeSettings({ antiAlias: e.target.checked })
+                  }
+                />
+              </label>
+              <label
+                className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer"
+                title="Lock 1:1 aspect ratio or 15° angle increments (or hold Shift while dragging)"
+              >
+                <span>Constrain (Shift)</span>
+                <input
+                  type="checkbox"
+                  checked={shapeSettings.constrainAspect}
+                  onChange={(e) =>
+                    toolStoreActions.updateShapeSettings({ constrainAspect: e.target.checked })
+                  }
+                />
+              </label>
+              <label
+                className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer"
+                title="Draw symmetrically from center (or hold Alt while dragging)"
+              >
+                <span>From Center (Alt)</span>
+                <input
+                  type="checkbox"
+                  checked={shapeSettings.fromCenter}
+                  onChange={(e) =>
+                    toolStoreActions.updateShapeSettings({ fromCenter: e.target.checked })
+                  }
+                />
+              </label>
+            </div>
+          </div>
+        );
+      }
+
       if (currentTool === 'liquify') {
         const activeMode = liquifySettings.mode ?? 'push';
         return (
@@ -413,6 +682,19 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                 checked={liquifySettings.usePressure ?? true}
                 onChange={(e) =>
                   toolStoreActions.updateLiquifySettings({ usePressure: e.target.checked })
+                }
+              />
+            </label>
+            <label
+              className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer"
+              title="Apply Liquify simultaneously to all visible unlocked layers (or multi-selected layers / active folder)"
+            >
+              <span>Multi-layer</span>
+              <input
+                type="checkbox"
+                checked={liquifySettings.multiLayer ?? false}
+                onChange={(e) =>
+                  toolStoreActions.updateLiquifySettings({ multiLayer: e.target.checked })
                 }
               />
             </label>

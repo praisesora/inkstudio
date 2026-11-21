@@ -389,7 +389,7 @@ describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in 
     dom.cleanup();
   });
 
-  it('renders BrushSizePalette, StatusBar (live pointer-stat + rotation reset), and DocumentTabBar (dirty *) in modern and vintage-manga themes', () => {
+  it('renders BrushSizePalette, StatusBar (live pointer-stat + rotation reset), and DocumentTabBar (dirty *) in modern theme', () => {
     const onSelectSize = vi.fn();
     const onResetRotation = vi.fn();
     const onCloseDocument = vi.fn();
@@ -428,7 +428,7 @@ describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in 
       },
     ];
 
-    for (const theme of ['modern', 'vintage-manga'] as const) {
+    for (const theme of ['modern'] as const) {
       act(() => {
         if (!root) root = createRoot(dom.container as unknown as Element);
         root.render(

@@ -6,6 +6,7 @@ import {
   ZOOM_PRESETS,
   formatZoomPercent,
   VIEWPORT_FIT_PADDING,
+  computeSmoothRotationDelta,
 } from '../../hooks/useCanvasNavigation';
 
 function createMockViewport(width: number, height: number): HTMLDivElement {
@@ -70,5 +71,23 @@ describe('Canvas Navigation & Adaptive Zoom Engine', () => {
     expect(calculateAdaptiveZoom(undefined, viewport)).toBe(1.0);
     expect(calculateAdaptiveZoom({ width: 0, height: 0 }, viewport)).toBe(1.0);
     expect(calculateAdaptiveZoom({ width: 1000, height: 1000 }, null)).toBe(1.0);
+  });
+
+  it('computes continuous rotation deltas across 180-deg boundary and damps center singularities', () => {
+    // Crossing the -180/+180 branch cut at radius 150px
+    const cx = 500;
+    const cy = 400;
+    const d1 = computeSmoothRotationDelta(cx - 150, cy - 10, cx - 150, cy + 10, cx, cy);
+    expect(d1).toBeLessThan(0);
+    expect(Math.abs(d1)).toBeCloseTo(7.628, 2);
+
+    // Exact 90 deg rotation outside damping radius
+    const d90 = computeSmoothRotationDelta(cx + 120, cy, cx, cy + 120, cx, cy);
+    expect(d90).toBeCloseTo(90, 4);
+
+    // Near center (r=10px), delta is smoothly damped instead of snapping wildly
+    const dNearCenter = computeSmoothRotationDelta(cx + 10, cy, cx, cy + 10, cx, cy);
+    expect(dNearCenter).toBeGreaterThan(0);
+    expect(dNearCenter).toBeLessThan(10);
   });
 });

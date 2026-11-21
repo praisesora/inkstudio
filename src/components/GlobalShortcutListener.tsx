@@ -182,6 +182,12 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
             Math.min(500, Math.round(stepBrushSizePreset(toolState.liquifySettings.size, dir)))
           );
           toolStoreActions.updateLiquifySettings({ size: nextSize });
+        } else if (toolState.tool === 'shape') {
+          const nextWidth = Math.max(
+            1,
+            Math.min(120, Math.round(stepBrushSizePreset(toolState.shapeSettings.strokeWidth, dir)))
+          );
+          toolStoreActions.updateShapeSettings({ strokeWidth: nextWidth });
         } else {
           const nextSize = stepBrushSizePreset(toolState.brushSettings.size, dir);
           toolStoreActions.updateBrushSettings({ size: nextSize });

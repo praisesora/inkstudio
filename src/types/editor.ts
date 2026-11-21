@@ -1,5 +1,12 @@
 import { PerspectiveRuler } from './perspective';
 import type { SparseTileGrid } from '../utils/tileEngine';
+export type {
+  ShapeKind,
+  ShapeDrawMode,
+  ShapeFillColorMode,
+  ShapeSettings,
+  ShapeDragPreview,
+} from '../utils/shapeEngine';
 
 export type ToolType =
   | 'brush'
@@ -12,6 +19,7 @@ export type ToolType =
   | 'select-pen'
   | 'select-eraser'
   | 'fill'
+  | 'shape'
   | 'text'
   | 'frame'
   | 'balloon'
@@ -367,6 +375,7 @@ export type HistoryActionType =
   | 'clear'
   | 'transform'
   | 'fill'
+  | 'shape'
   | 'text'
   | 'balloon'
   | 'frame'
@@ -396,6 +405,7 @@ export interface LiquifySettings {
   strength: number;
   hardness: number;
   usePressure: boolean;
+  multiLayer?: boolean;
 }
 
 export type FillMethod = 'refer-all' | 'refer-active' | 'refer-reference' | 'lasso';

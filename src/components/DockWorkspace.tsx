@@ -198,7 +198,7 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
   side,
   col,
   group,
-  themePreset,
+  themePreset: _themePreset,
   draggingPanelId,
   onStartDragPanel,
   onEndDragPanel,
@@ -207,7 +207,6 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
   const [menuOpen, setMenuOpen] = useState(false);
   const [isDragOverTab, setIsDragOverTab] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const isVintage = themePreset === 'vintage-manga';
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -249,9 +248,7 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
     <div
       data-testid={`dock-group-${group.id}`}
       style={{ flexGrow: group.heightRatio, flexBasis: 0 }}
-      className={`flex flex-col min-h-[72px] overflow-hidden ${
-        isVintage ? 'bg-[#363638]' : 'bg-[#202020]'
-      }`}
+      className="flex flex-col min-h-[72px] overflow-hidden bg-[#202020]"
     >
       {/* Palette Tab Header Bar (Draggable!) */}
       <div
@@ -265,8 +262,6 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
         className={`h-6 flex items-center justify-between px-1 shrink-0 select-none relative transition-colors ${
           isDragOverTab
             ? 'bg-[var(--accent-subtle)] ring-1 ring-inset ring-[var(--accent)]'
-            : isVintage
-            ? 'bg-gradient-to-b from-[#49494d] to-[#3a3a3d] border-b border-[#232325]'
             : 'bg-[#1a1a1a] border-b border-white/[0.06]'
         }`}
       >
@@ -291,11 +286,7 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
                 title={`${meta.title} — Drag tab to move palette`}
                 className={`h-5 px-1.5 rounded-sm flex items-center gap-1 text-[10px] transition-colors shrink-0 cursor-grab active:cursor-grabbing ${
                   isActive
-                    ? isVintage
-                      ? 'bg-[#337bb5] text-white font-medium'
-                      : 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
-                    : isVintage
-                    ? 'text-[#b0b0b6] hover:text-white hover:bg-[#4e4e52]'
+                    ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
                     : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#262626]'
                 }`}
               >
@@ -327,11 +318,7 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
               <div
                 className={`absolute top-6 ${
                   side === 'left' ? 'left-0' : 'right-0'
-                } w-44 rounded-md shadow-2xl p-1 z-50 text-[11px] ${
-                  isVintage
-                    ? 'bg-[#333336] border border-[#202022] text-[#e5e5e5]'
-                    : 'bg-[#202020] border border-white/[0.1] text-[#e5e5e5]'
-                }`}
+                } w-44 rounded-md shadow-2xl p-1 z-50 text-[11px] bg-[#202020] border border-white/[0.1] text-[#e5e5e5]`}
               >
                 <div className="px-2 py-0.5 text-[10px] text-[#8a8a8a] truncate">
                   {DOCK_PANEL_META[activePanelId].title}
@@ -448,7 +435,6 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
   const openPopover = useWorkspaceStore((s) => s.openPopover);
   const colRef = useRef<HTMLDivElement>(null);
   const [dragOverSplitIdx, setDragOverSplitIdx] = useState<number | null>(null);
-  const isVintage = themePreset === 'vintage-manga';
 
   const activePopoverPanelId =
     col.collapsed && openPopover?.colId === col.id ? openPopover.panelId : null;
@@ -531,11 +517,7 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
       <div
         data-testid={`dock-column-${col.id}`}
         data-collapsed="true"
-        className={`relative w-[30px] h-full flex flex-col items-center py-1 gap-1 shrink-0 select-none z-20 ${
-          isVintage
-            ? 'bg-[#333336] border-x border-[#232325]'
-            : 'bg-[#1c1c1c] border-x border-white/[0.04]'
-        }`}
+        className="relative w-[30px] h-full flex flex-col items-center py-1 gap-1 shrink-0 select-none z-20 bg-[#1c1c1c] border-x border-white/[0.04]"
       >
         {/* Expand Column Button */}
         <button
@@ -576,9 +558,7 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
                 aria-pressed={isOpen}
                 className={`relative w-6 h-7 rounded flex items-center justify-center transition-colors cursor-pointer shrink-0 ${
                   isOpen
-                    ? isVintage
-                      ? 'bg-[#337bb5] text-white'
-                      : 'bg-[#2c2c2c] text-[var(--accent)]'
+                    ? 'bg-[#2c2c2c] text-[var(--accent)]'
                     : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
                 }`}
               >
@@ -587,7 +567,7 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
                     className={`absolute top-1 bottom-1 w-[2px] rounded-full ${
                       side === 'left' ? 'left-0' : 'right-0'
                     }`}
-                    style={{ backgroundColor: isVintage ? '#38bdf8' : 'var(--accent)' }}
+                    style={{ backgroundColor: 'var(--accent)' }}
                   />
                 )}
                 {renderPanelIcon(pid, 'w-3.5 h-3.5')}
@@ -601,21 +581,11 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
           <div
             data-testid={`dock-popover-${activePopoverPanelId}`}
             style={{ width: popoverWidth }}
-            className={`absolute top-1 bottom-1 z-40 flex flex-col rounded-md shadow-[0_12px_36px_rgba(0,0,0,0.75)] overflow-hidden ${
+            className={`absolute top-1 bottom-1 z-40 flex flex-col rounded-md shadow-[0_12px_36px_rgba(0,0,0,0.75)] overflow-hidden bg-[#202020] border border-white/[0.12] ${
               side === 'left' ? 'left-[32px]' : 'right-[32px]'
-            } ${
-              isVintage
-                ? 'bg-[#363638] border border-[#202022]'
-                : 'bg-[#202020] border border-white/[0.12]'
             }`}
           >
-            <div
-              className={`h-7 px-2 flex items-center justify-between shrink-0 ${
-                isVintage
-                  ? 'bg-gradient-to-b from-[#49494d] to-[#3a3a3d] border-b border-[#232325]'
-                  : 'bg-[#1a1a1a] border-b border-white/[0.08]'
-              }`}
-            >
+            <div className="h-7 px-2 flex items-center justify-between shrink-0 bg-[#1a1a1a] border-b border-white/[0.08]">
               <div className="flex items-center gap-1.5 min-w-0">
                 {renderPanelIcon(activePopoverPanelId, 'w-3.5 h-3.5 text-[var(--accent)]')}
                 <span className="text-[11px] font-medium text-[#e5e5e5] truncate">
@@ -661,18 +631,12 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
       data-testid={`dock-column-${col.id}`}
       data-collapsed="false"
       style={{ width: col.width }}
-      className={`relative h-full flex flex-col shrink-0 overflow-hidden z-10 ${
-        isVintage ? 'bg-[#262628]' : 'bg-[#161616]'
-      }`}
+      className="relative h-full flex flex-col shrink-0 overflow-hidden z-10 bg-[#161616]"
     >
       {/* Slim CSP Column Collapse Bar */}
       <div
-        className={`h-4 px-1 flex items-center shrink-0 ${
+        className={`h-4 px-1 flex items-center shrink-0 bg-[#181818] border-b border-white/[0.04] ${
           side === 'left' ? 'justify-end' : 'justify-start'
-        } ${
-          isVintage
-            ? 'bg-[#2e2e31] border-b border-[#202022]'
-            : 'bg-[#181818] border-b border-white/[0.04]'
         }`}
       >
         <button
@@ -723,11 +687,7 @@ const DockColumnView: React.FC<DockColumnViewProps> = React.memo(({
               <div
                 onPointerDown={(e) => handleStartGroupSplitResize(e, grp, col.groups[idx + 1])}
                 title="Drag to resize stacked palettes"
-                className={`h-1 shrink-0 cursor-row-resize transition-colors ${
-                  isVintage
-                    ? 'bg-[#232325] hover:bg-[#38bdf8]/60'
-                    : 'bg-[#161616] hover:bg-[var(--accent)]/50'
-                }`}
+                className="h-1 shrink-0 cursor-row-resize transition-colors bg-[#161616] hover:bg-[var(--accent)]/50"
               />
             )}
           </React.Fragment>
@@ -788,8 +748,6 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
   const [draggingPanelId, setDraggingPanelId] = useState<DockPanelId | null>(null);
   const [edgeDropSide, setEdgeDropSide] = useState<DockSide | null>(null);
   const workspaceRef = useRef<HTMLDivElement>(null);
-
-  const isVintage = themePreset === 'vintage-manga';
 
   // Close collapsed-strip popover on Escape or outside click on canvas
   useEffect(() => {
@@ -930,9 +888,7 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
       ref={workspaceRef}
       data-testid="dock-workspace"
       data-palettes-hidden={String(palettesHidden)}
-      className={`flex flex-1 min-h-0 overflow-hidden relative gap-px ${
-        isVintage ? 'bg-[#232325]' : 'bg-[#161616]'
-      }`}
+      className="flex flex-1 min-h-0 overflow-hidden relative gap-px bg-[#161616]"
     >
       {/* Left Dock Zone */}
       {!palettesHidden && (

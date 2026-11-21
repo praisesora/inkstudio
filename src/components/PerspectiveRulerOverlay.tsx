@@ -16,11 +16,8 @@ import { canvasToScreen, screenToCanvas } from '../utils/canvasUtils';
 import { CanvasDimensions } from '../types/editor';
 import { CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
 import {
-  Lock,
-  Unlock,
   Eye,
   EyeOff,
-  Magnet,
   ChevronDown,
   X,
 } from 'lucide-react';
@@ -482,8 +479,7 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
                   className="pointer-events-auto absolute -translate-x-1/2 -translate-y-1/2 cursor-grab active:cursor-grabbing z-30"
                   style={{ left: `${edgePos.x}px`, top: `${edgePos.y}px` }}
                 >
-                  <div className="flex items-center space-x-1 px-2 py-0.5 bg-white text-black border border-black/80 rounded-md shadow-lg text-[10px] font-mono font-bold hover:bg-neutral-100 transition-transform hover:scale-105 active:scale-95">
-                    <span>⊙</span>
+                  <div className="flex items-center space-x-1 px-2 py-0.5 bg-white text-black border border-black/80 rounded shadow-lg text-[10px] font-mono font-semibold hover:bg-neutral-100 transition-transform hover:scale-105 active:scale-95">
                     <span>{vp.label}</span>
                     <span className="text-[9px] text-neutral-500 font-normal">
                       {Math.round(dist)}px
@@ -496,18 +492,18 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
         </>
       )}
 
-      {/* Floating Perspective Ruler Toolbar (Minimalist CSP Style) */}
+      {/* Floating Perspective Ruler Toolbar */}
       <div
-        className="pointer-events-auto absolute top-3 right-4 z-40 bg-[#1e1e20]/90 backdrop-blur-md border border-[#3e3e42] rounded-md shadow-2xl p-1.5 flex items-center space-x-1.5 text-xs text-[#cccccc] select-none font-sans"
+        className="pointer-events-auto absolute top-3 right-4 z-40 bg-[#202020]/95 backdrop-blur-md border border-white/[0.1] rounded-md shadow-2xl p-1 flex items-center space-x-1 text-[11px] text-[#e5e5e5] select-none font-sans"
       >
         {/* Toggle Ruler Visibility */}
         <button
           onClick={() => onUpdateRuler({ ...ruler, enabled: !ruler.enabled })}
           title={ruler.enabled ? 'Hide Perspective Ruler' : 'Show Perspective Ruler'}
-          className={`p-1.5 rounded transition-colors ${
+          className={`p-1 rounded transition-colors cursor-pointer ${
             ruler.enabled
-              ? 'bg-[#3b82f6]/20 text-[#38bdf8] border border-[#3b82f6]/40'
-              : 'text-[#888888] hover:text-white hover:bg-[#2e2e32]'
+              ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
           }`}
         >
           {ruler.enabled ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
@@ -517,20 +513,19 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
         <button
           onClick={() => onUpdateRuler({ ...ruler, snapEnabled: !ruler.snapEnabled })}
           title={`Perspective Snapping: ${ruler.snapEnabled ? 'ENABLED' : 'DISABLED'} (Hold Alt to freehand)`}
-          className={`flex items-center space-x-1 px-2 py-1 rounded font-medium transition-colors ${
+          className={`px-2 py-1 rounded font-medium transition-colors cursor-pointer ${
             ruler.snapEnabled
-              ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-500/40'
-              : 'bg-[#2a2a2e] text-[#888888] hover:text-[#cccccc]'
+              ? 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+              : 'bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
           }`}
         >
-          <Magnet className="w-3.5 h-3.5" />
-          <span>Snap {ruler.snapEnabled ? 'ON' : 'OFF'}</span>
+          Snap {ruler.snapEnabled ? 'ON' : 'OFF'}
         </button>
 
-        <div className="w-px h-4 bg-[#3e3e42]" />
+        <div className="w-px h-4 bg-white/[0.08]" />
 
         {/* 1P / 2P / 3P Mode Selector */}
-        <div className="flex bg-[#141416] p-0.5 rounded border border-[#333338]">
+        <div className="flex bg-[#161616] p-0.5 rounded border border-white/[0.06]">
           {(['1-point', '2-point', '3-point'] as PerspectiveType[]).map((mode) => {
             const label = mode === '1-point' ? '1P' : mode === '2-point' ? '2P' : '3P';
             const isActive = ruler.type === mode;
@@ -539,10 +534,10 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
                 key={mode}
                 onClick={() => handleSwitchType(mode)}
                 title={`${label} Perspective`}
-                className={`px-2 py-0.5 text-[11px] font-semibold rounded transition-colors ${
+                className={`px-2 py-0.5 text-[11px] font-medium rounded transition-colors cursor-pointer ${
                   isActive
-                    ? 'bg-[#38bdf8] text-black shadow-sm'
-                    : 'text-[#999999] hover:text-white'
+                    ? 'bg-[var(--accent)] text-[var(--accent-contrast)]'
+                    : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                 }`}
               >
                 {label}
@@ -553,10 +548,10 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
 
         {/* Ray Count Stepper */}
         <div
-          className="flex items-center space-x-1 px-1.5 py-1 rounded bg-[#2a2a2e] text-[#cccccc] text-[11px]"
+          className="flex items-center space-x-1 px-1.5 py-0.5 rounded bg-[#161616] border border-white/[0.06] text-[#e5e5e5] text-[11px]"
           title="Number of Guide Rays per Vanishing Point"
         >
-          <span className="text-[10px] text-[#888888] select-none font-medium">Lines:</span>
+          <span className="text-[10px] text-[#8a8a8a] select-none">Lines</span>
           <button
             onClick={() =>
               onUpdateRuler({
@@ -565,12 +560,12 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
               })
             }
             disabled={(ruler.guideRayCount || 6) <= 2}
-            className="w-4 h-4 flex items-center justify-center rounded bg-[#1e1e20] hover:bg-[#38383e] disabled:opacity-30 disabled:pointer-events-none text-white font-bold text-xs"
+            className="w-4 h-4 flex items-center justify-center rounded bg-[#202020] hover:bg-[#2c2c2c] disabled:opacity-30 disabled:pointer-events-none text-[#e5e5e5] font-mono text-xs cursor-pointer"
             title="Decrease Guide Rays"
           >
             -
           </button>
-          <span className="w-4 text-center font-mono font-semibold text-white text-[11px]">
+          <span className="w-4 text-center font-mono text-[#e5e5e5] text-[11px]">
             {ruler.guideRayCount || 6}
           </span>
           <button
@@ -581,7 +576,7 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
               })
             }
             disabled={(ruler.guideRayCount || 6) >= 16}
-            className="w-4 h-4 flex items-center justify-center rounded bg-[#1e1e20] hover:bg-[#38383e] disabled:opacity-30 disabled:pointer-events-none text-white font-bold text-xs"
+            className="w-4 h-4 flex items-center justify-center rounded bg-[#202020] hover:bg-[#2c2c2c] disabled:opacity-30 disabled:pointer-events-none text-[#e5e5e5] font-mono text-xs cursor-pointer"
             title="Increase Guide Rays"
           >
             +
@@ -596,14 +591,13 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
               ? 'Ruler Locked (Handles frozen to prevent misclicks while inking)'
               : 'Ruler Unlocked (Drag handles or eye level to adjust perspective)'
           }
-          className={`flex items-center space-x-1 px-2 py-1 rounded font-medium transition-colors ${
+          className={`px-2 py-1 rounded font-medium transition-colors cursor-pointer ${
             ruler.locked
-              ? 'bg-[#f59e0b]/20 text-amber-400 border border-[#f59e0b]/40'
-              : 'bg-[#2a2a2e] text-[#cccccc] hover:text-white'
+              ? 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+              : 'bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
           }`}
         >
-          {ruler.locked ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
-          <span>{ruler.locked ? 'Locked' : 'Edit'}</span>
+          {ruler.locked ? 'Locked' : 'Edit'}
         </button>
 
         {/* Presets Dropdown */}
@@ -611,41 +605,41 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
           <button
             onClick={() => setIsPresetsOpen((prev) => !prev)}
             title="Preset Perspective Angles"
-            className="flex items-center space-x-1 px-2 py-1 rounded bg-[#2a2a2e] text-[#cccccc] hover:text-white transition-colors"
+            className="flex items-center space-x-1 px-2 py-1 rounded bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
             <span>Presets</span>
             <ChevronDown className="w-3 h-3" />
           </button>
 
           {isPresetsOpen && (
-            <div className="absolute right-0 top-full mt-1.5 w-48 bg-[#1f1f23] border border-[#3e3e44] rounded shadow-2xl py-1 z-50 text-[11px]">
+            <div className="absolute right-0 top-full mt-1.5 w-48 bg-[#202020] border border-white/[0.1] rounded-md shadow-2xl py-1 z-50 text-[11px]">
               <button
                 onClick={() => handleApplyPreset('1p-center')}
-                className="w-full text-left px-3 py-1.5 hover:bg-[#2d2d34] flex items-center justify-between"
+                className="w-full text-left px-3 py-1.5 hover:bg-[#2c2c2c] text-[#e5e5e5] flex items-center justify-between cursor-pointer"
               >
                 <span>1-Point Center</span>
-                <span className="text-[10px] text-[#777777]">1 VP</span>
+                <span className="text-[10px] text-[#8a8a8a]">1 VP</span>
               </button>
               <button
                 onClick={() => handleApplyPreset('2p-wide')}
-                className="w-full text-left px-3 py-1.5 hover:bg-[#2d2d34] flex items-center justify-between"
+                className="w-full text-left px-3 py-1.5 hover:bg-[#2c2c2c] text-[#e5e5e5] flex items-center justify-between cursor-pointer"
               >
                 <span>2-Point Street (Wide)</span>
-                <span className="text-[10px] text-[#777777]">2 VPs</span>
+                <span className="text-[10px] text-[#8a8a8a]">2 VPs</span>
               </button>
               <button
                 onClick={() => handleApplyPreset('3p-birds')}
-                className="w-full text-left px-3 py-1.5 hover:bg-[#2d2d34] flex items-center justify-between"
+                className="w-full text-left px-3 py-1.5 hover:bg-[#2c2c2c] text-[#e5e5e5] flex items-center justify-between cursor-pointer"
               >
                 <span>3-Point Bird's-Eye</span>
-                <span className="text-[10px] text-[#777777]">High Angle</span>
+                <span className="text-[10px] text-[#8a8a8a]">High Angle</span>
               </button>
               <button
                 onClick={() => handleApplyPreset('3p-worms')}
-                className="w-full text-left px-3 py-1.5 hover:bg-[#2d2d34] flex items-center justify-between"
+                className="w-full text-left px-3 py-1.5 hover:bg-[#2c2c2c] text-[#e5e5e5] flex items-center justify-between cursor-pointer"
               >
                 <span>3-Point Worm's-Eye</span>
-                <span className="text-[10px] text-[#777777]">Low Angle</span>
+                <span className="text-[10px] text-[#8a8a8a]">Low Angle</span>
               </button>
             </div>
           )}
@@ -656,7 +650,7 @@ export const PerspectiveRulerOverlay: React.FC<PerspectiveRulerOverlayProps> = (
           <button
             onClick={onRemoveRuler}
             title="Remove Perspective Ruler from Canvas"
-            className="p-1 rounded text-[#888888] hover:text-red-400 hover:bg-red-500/10 transition-colors ml-0.5"
+            className="p-1 rounded text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>

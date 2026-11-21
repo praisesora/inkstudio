@@ -18,7 +18,6 @@ import {
   Compass,
   Link2,
   SlidersHorizontal,
-  Sparkles,
   Frame,
   Type,
   MessageSquare,
@@ -1581,10 +1580,9 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                       onOpenLayerStylesModal(targetLayer.id);
                       setContextMenu(null);
                     }}
-                    className="w-full text-left px-2.5 py-1 rounded hover:bg-[#2c2c2c] flex items-center gap-1.5 cursor-pointer"
+                    className="w-full text-left px-2.5 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer"
                   >
-                    <Sparkles className="w-3 h-3 text-[#8a8a8a]" />
-                    <span>Layer Styles...</span>
+                    Layer Styles...
                   </button>
                 )}
 

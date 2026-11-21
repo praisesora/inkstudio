@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { X, RotateCcw, Check, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { X, Trash2 } from 'lucide-react';
 import {
   AdjustmentLayerData,
   CurvesAdjustmentData,
@@ -442,25 +442,22 @@ export const AdjustmentModal: React.FC<AdjustmentModalProps> = ({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs select-none">
-      <div className="bg-[#1c1c1c] border border-[#383838] rounded-lg shadow-2xl w-[480px] max-w-[95vw] overflow-hidden flex flex-col text-[#cccccc] text-xs">
+      <div className="bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl w-[480px] max-w-[95vw] overflow-hidden flex flex-col text-[#e5e5e5] text-xs">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-[#2d2d2d] bg-[#222222]">
-          <div className="flex items-center space-x-2">
-            <SlidersHorizontal className="w-4 h-4 text-blue-400" />
-            <span className="font-semibold text-white text-sm">
-              {editingLayerId ? 'Edit Adjustment Layer' : 'New Adjustment Layer'}
-            </span>
-          </div>
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/[0.06] bg-[#1a1a1a]">
+          <span className="font-medium text-[#e5e5e5] text-xs">
+            {editingLayerId ? 'Edit Adjustment Layer' : 'New Adjustment Layer'}
+          </span>
           <button
             onClick={onClose}
-            className="p-1 text-[#888888] hover:text-white rounded hover:bg-[#333333] transition-colors"
+            className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] rounded hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
-            <X className="w-4 h-4" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         {/* Tab Selector */}
-        <div className="flex border-b border-[#2d2d2d] bg-[#1e1e1e] p-1 gap-1">
+        <div className="flex border-b border-white/[0.06] bg-[#161616] p-1 gap-1">
           <button
             onClick={() => setActiveTab('curves')}
             className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors ${
@@ -976,21 +973,19 @@ export const AdjustmentModal: React.FC<AdjustmentModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-[#2d2d2d] bg-[#202020]">
+        <div className="flex items-center justify-between px-4 py-2.5 border-t border-white/[0.06] bg-[#1a1a1a]">
           <div className="flex items-center space-x-3">
             <button
               onClick={handleResetCurrent}
-              className="flex items-center space-x-1 px-2.5 py-1 text-[#888888] hover:text-white hover:bg-[#333333] rounded transition-colors"
+              className="px-2.5 py-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
             >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Reset</span>
+              Reset
             </button>
-            <label className="flex items-center space-x-1.5 text-xs text-[#888888] cursor-pointer">
+            <label className="flex items-center space-x-1.5 text-xs text-[#8a8a8a] cursor-pointer">
               <input
                 type="checkbox"
                 checked={previewEnabled}
                 onChange={(e) => setPreviewEnabled(e.target.checked)}
-                className="rounded bg-[#222222] border-[#444444] text-blue-500"
               />
               <span>Preview</span>
             </label>
@@ -999,16 +994,15 @@ export const AdjustmentModal: React.FC<AdjustmentModalProps> = ({
           <div className="flex items-center space-x-2">
             <button
               onClick={onClose}
-              className="px-3 py-1.5 text-xs text-[#aaaaaa] hover:text-white hover:bg-[#333333] rounded transition-colors"
+              className="px-3 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               onClick={handleApply}
-              className="flex items-center space-x-1 px-4 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white font-medium rounded shadow-sm transition-colors"
+              className="px-4 py-1.5 text-xs bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium rounded transition-opacity cursor-pointer"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>{editingLayerId ? 'Update' : 'Create Layer'}</span>
+              {editingLayerId ? 'Update' : 'Create Layer'}
             </button>
           </div>
         </div>

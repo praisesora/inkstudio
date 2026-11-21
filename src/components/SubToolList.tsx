@@ -7,7 +7,6 @@ import {
   Trash2,
   Loader2,
   FolderDown,
-  Sparkles,
   ChevronDown,
   ChevronRight,
 } from 'lucide-react';
@@ -270,7 +269,7 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
                             className="w-3 h-3 object-contain shrink-0 brightness-125"
                           />
                         ) : (
-                          <Sparkles className="w-3 h-3 shrink-0 opacity-80" />
+                          <Paintbrush className="w-3 h-3 shrink-0 opacity-70" />
                         )}
                         <span className="text-[11px] truncate leading-tight">{brush.name}</span>
                       </div>

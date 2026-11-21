@@ -1,14 +1,9 @@
 import React, { useRef, useLayoutEffect, useEffect, useMemo } from 'react';
 import { TransformSession, Point2D, TransformMode } from '../types/editor';
 import {
-  Check,
-  X,
   FlipHorizontal,
   FlipVertical,
   RotateCcw,
-  BoxSelect,
-  Grid3X3,
-  Square,
 } from 'lucide-react';
 import {
   renderPerspectiveQuad,
@@ -651,7 +646,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
 
       {/* 3. Floating Transform Toolbar (Pinned below transform boundary) */}
       <div
-        className="absolute z-40 bg-[#18191b] border border-[#33353b] rounded shadow-2xl px-2 py-1 flex items-center space-x-1.5 whitespace-nowrap select-none text-xs"
+        className="absolute z-40 bg-[#202020]/95 backdrop-blur-md border border-white/[0.1] rounded-md shadow-2xl px-1.5 py-1 flex items-center space-x-1.5 whitespace-nowrap select-none text-xs"
         style={{
           left: `${nonAffineBounds.minX + nonAffineBounds.width / 2}px`,
           top: `${nonAffineBounds.maxY}px`,
@@ -661,61 +656,58 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         onPointerDown={(e) => e.stopPropagation()}
       >
         {/* Mode Switchers */}
-        <div className="flex items-center space-x-0.5 bg-[#202226] p-0.5 rounded border border-[#2b2d31]">
+        <div className="flex items-center space-x-0.5 bg-[#161616] p-0.5 rounded border border-white/[0.06]">
           <button
             onClick={() => handleSwitchMode('affine')}
             title="Free Transform (Affine Scale & Rotate)"
-            className={`px-1.5 py-1 rounded text-[11px] font-medium flex items-center space-x-1 cursor-pointer transition-colors ${
+            className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
               mode === 'affine'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                : 'text-[#888888] hover:text-white'
+                ? 'bg-[var(--accent)] text-[var(--accent-contrast)]'
+                : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
-            <BoxSelect className="w-3.5 h-3.5" />
-            <span>Free</span>
+            Free
           </button>
 
           <button
             onClick={() => handleSwitchMode('perspective')}
             title="Perspective Quad (4-Point Homography)"
-            className={`px-1.5 py-1 rounded text-[11px] font-medium flex items-center space-x-1 cursor-pointer transition-colors ${
+            className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
               mode === 'perspective'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                : 'text-[#888888] hover:text-white'
+                ? 'bg-[var(--accent)] text-[var(--accent-contrast)]'
+                : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
-            <Square className="w-3.5 h-3.5" />
-            <span>Perspective</span>
+            Perspective
           </button>
 
           <button
             onClick={() => handleSwitchMode('mesh')}
             title="Mesh Warp (Catmull-Rom Bezier Lattice)"
-            className={`px-1.5 py-1 rounded text-[11px] font-medium flex items-center space-x-1 cursor-pointer transition-colors ${
+            className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
               mode === 'mesh'
-                ? 'bg-[#293d45] text-[#5ce1e6] border border-[#3e5e6b]'
-                : 'text-[#888888] hover:text-white'
+                ? 'bg-[var(--accent)] text-[var(--accent-contrast)]'
+                : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
-            <Grid3X3 className="w-3.5 h-3.5" />
-            <span>Mesh Warp</span>
+            Mesh
           </button>
         </div>
 
         {/* Mesh Grid Density Selector (when in mesh mode) */}
         {mode === 'mesh' && (
           <>
-            <div className="w-px h-4 bg-[#33353b]" />
-            <div className="flex items-center space-x-1 text-[11px] text-[#aaaaaa]">
-              <span>Grid:</span>
+            <div className="w-px h-4 bg-white/[0.08]" />
+            <div className="flex items-center space-x-1 text-[11px] text-[#8a8a8a]">
+              <span>Grid</span>
               {[3, 4, 5, 6, 8].map((size) => (
                 <button
                   key={size}
                   onClick={() => handleChangeMeshGrid(size)}
                   className={`px-1 py-0.5 rounded cursor-pointer transition-colors ${
                     (session.meshCols || 4) === size
-                      ? 'bg-cyan-500/30 text-cyan-300 font-bold'
-                      : 'hover:text-white hover:bg-[#25272a]'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-medium'
+                      : 'hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
                   }`}
                 >
                   {size}x{size}
@@ -725,36 +717,36 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
           </>
         )}
 
-        <div className="w-px h-4 bg-[#33353b]" />
+        <div className="w-px h-4 bg-white/[0.08]" />
 
         {/* Apply */}
         <button
           onClick={onApply}
           title="Apply Transform (Enter)"
-          className="px-2 py-1 bg-[#234b3e] hover:bg-[#2b604f] text-[#55eaab] border border-[#2e6e58] rounded text-xs font-semibold flex items-center space-x-1 cursor-pointer transition-colors"
+          className="px-2.5 py-1 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-[11px] font-medium cursor-pointer transition-opacity"
         >
-          <Check className="w-3.5 h-3.5" />
-          <span>Apply</span>
+          Apply
         </button>
 
         {/* Cancel */}
         <button
           onClick={onCancel}
           title="Cancel Transform (Esc)"
-          className="px-2 py-1 bg-[#3a2024] hover:bg-[#4d282e] text-[#f87171] border border-[#6b2c34] rounded text-xs font-semibold flex items-center space-x-1 cursor-pointer transition-colors"
+          className="px-2 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-[11px] cursor-pointer transition-colors"
         >
-          <X className="w-3.5 h-3.5" />
-          <span>Cancel</span>
+          Cancel
         </button>
 
-        <div className="w-px h-4 bg-[#33353b]" />
+        <div className="w-px h-4 bg-white/[0.08]" />
 
         {/* Flip Horizontal */}
         <button
           onClick={handleFlipH}
           title="Flip Horizontal"
-          className={`p-1 text-[#8c9099] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer ${
-            session.flipH ? 'bg-cyan-500/20 text-cyan-300' : ''
+          className={`p-1 rounded transition-colors cursor-pointer ${
+            session.flipH
+              ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
           }`}
         >
           <FlipHorizontal className="w-3.5 h-3.5" />
@@ -764,8 +756,10 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         <button
           onClick={handleFlipV}
           title="Flip Vertical"
-          className={`p-1 text-[#8c9099] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer ${
-            session.flipV ? 'bg-cyan-500/20 text-cyan-300' : ''
+          className={`p-1 rounded transition-colors cursor-pointer ${
+            session.flipV
+              ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
           }`}
         >
           <FlipVertical className="w-3.5 h-3.5" />
@@ -775,7 +769,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         <button
           onClick={handleReset}
           title="Reset Transform"
-          className="p-1 text-[#8c9099] hover:text-white hover:bg-[#2b2d31] rounded transition-colors cursor-pointer"
+          className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
         >
           <RotateCcw className="w-3.5 h-3.5" />
         </button>

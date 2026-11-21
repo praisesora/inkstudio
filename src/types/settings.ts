@@ -21,7 +21,7 @@ export interface ResizeCanvasOptions {
   backgroundColor?: string;
 }
 
-export type ThemePreset = 'vintage-manga' | 'modern';
+export type ThemePreset = 'modern';
 
 export type ModernAccentColor = 'neutral' | 'blue' | 'burgundy' | 'green' | 'purple' | 'orange' | 'custom';
 
@@ -384,7 +384,7 @@ export function loadAppSettings(): AppSettings {
     const legacyName = localStorage.getItem('sora_paint_nickname') || '';
     if (raw) {
       const parsed = JSON.parse(raw);
-      const validTheme: ThemePreset = parsed.themePreset === 'vintage-manga' ? 'vintage-manga' : 'modern';
+      const validTheme: ThemePreset = 'modern';
       const validAccent: ModernAccentColor = [
         'neutral',
         'blue',

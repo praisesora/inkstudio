@@ -35,7 +35,7 @@ describe('settings theme & accent system', () => {
     expect(resolveModernAccentColor(settings.modernAccent)).toBe(DEFAULT_ACCENT_HEX);
   });
 
-  it('correctly loads and persists modern theme with presets', () => {
+  it('correctly loads and persists modern theme with presets and coerces legacy vintage-manga', () => {
     saveAppSettings({
       ...DEFAULT_APP_SETTINGS,
       themePreset: 'modern',
@@ -45,6 +45,12 @@ describe('settings theme & accent system', () => {
     const loaded = loadAppSettings();
     expect(loaded.themePreset).toBe('modern');
     expect(loaded.modernAccent).toBe('burgundy');
+
+    localStorage.setItem(
+      'ink_studio_app_settings',
+      JSON.stringify({ themePreset: 'vintage-manga', modernAccent: 'blue' })
+    );
+    expect(loadAppSettings().themePreset).toBe('modern');
   });
 
   it('correctly resolves preset accent hex codes', () => {

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import {
   CanvasColorMode,
   CanvasDimensions,
@@ -6,18 +6,27 @@ import {
   ComicFrame,
   FrameDivideMode,
   LayerItem,
+  ShapeDragPreview,
   SpeechBalloon,
   TextLayerData,
   TextSettings,
+  TileDelta,
 } from '../../types/editor';
 import { documentStore } from '../../utils/documentStore';
+import { TileFormat } from '../../utils/tileEngine';
 import {
   executeFloodFill,
   compositeVisibleLayers,
   compositeReferenceLayers,
   executeLassoFill,
 } from '../../utils/floodFill';
-import { applyLiquifyStep, createLiquifySelectionMask, DirtyRect } from '../../utils/liquifyEngine';
+import {
+  applyLiquifyStep,
+  createLiquifySelectionMask,
+  resolveLiquifyTargetLayers,
+  DirtyRect,
+} from '../../utils/liquifyEngine';
+import { rasterizeShapeToCanvas, resolveShapeFillColor } from '../../utils/shapeEngine';
 import { applyLayerEffects } from '../../utils/layerEffectsEngine';
 import { createSelectionMask } from '../../utils/tonalEngine';
 import { get2DContext, sampleCompositedColor } from '../../utils/canvasUtils';
@@ -53,9 +62,11 @@ export interface UseShapeAndFillToolsParams {
   layers: LayerItem[];
   activeLayer: LayerItem | undefined;
   activeLayerId: string;
+  selectedLayerIds?: string[];
   selection: CanvasSelection | null;
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   layerSourceCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
+  materializeLayerCanvas?: (layerId: string) => HTMLCanvasElement | null;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   getEffectiveOpacity: (layer: LayerItem) => number;
   getActiveCanvas: () => HTMLCanvasElement | null;
@@ -87,6 +98,7 @@ export interface UseShapeAndFillToolsResult {
   activeBalloon: SpeechBalloon | null;
   setActiveBalloon: React.Dispatch<React.SetStateAction<SpeechBalloon | null>>;
   frameDragPreview: FrameDragPreview | null;
+  shapeDragPreview: ShapeDragPreview | null;
   openLayerForEditing: (layer: LayerItem) => boolean;
   isPipetteSamplingRef: React.MutableRefObject<boolean>;
   handleSampleColor: (pt: { x: number; y: number }) => void;
@@ -105,15 +117,39 @@ export interface UseShapeAndFillToolsResult {
   ) => boolean;
 }
 
+interface LiquifyLayerSession {
+  layer: LayerItem;
+  layerId: string;
+  isTone: boolean;
+  sourceCanvas?: HTMLCanvasElement;
+  displayCanvas: HTMLCanvasElement;
+  workCanvas: HTMLCanvasElement;
+  initialImageData: ImageData | null;
+  beforeTileSnapshot: Map<string, { format: TileFormat; data: Uint8Array | null }>;
+  dirtyRect: DirtyRect | null;
+}
+
+function mergeDirtyRects(a: DirtyRect | null, b: DirtyRect | null): DirtyRect | null {
+  if (!a) return b ? { ...b } : null;
+  if (!b) return a;
+  const minX = Math.min(a.x, b.x);
+  const minY = Math.min(a.y, b.y);
+  const maxX = Math.max(a.x + a.width, b.x + b.width);
+  const maxY = Math.max(a.y + a.height, b.y + b.height);
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+}
+
 export function useShapeAndFillTools({
   dimensions,
   colorMode,
   layers,
   activeLayer,
   activeLayerId,
+  selectedLayerIds = [],
   selection,
   layerCanvasesRef,
   layerSourceCanvasesRef,
+  materializeLayerCanvas,
   isLayerEffectivelyVisible,
   getEffectiveOpacity,
   getActiveCanvas,
@@ -132,10 +168,68 @@ export function useShapeAndFillTools({
   const [activeBalloon, setActiveBalloon] = useState<SpeechBalloon | null>(null);
   const [editingBalloonLayerId, setEditingBalloonLayerId] = useState<string | null>(null);
   const [frameDragPreview, setFrameDragPreview] = useState<FrameDragPreview | null>(null);
+  const [shapeDragPreview, setShapeDragPreview] = useState<ShapeDragPreview | null>(null);
 
   const isPipetteSamplingRef = useRef<boolean>(false);
   const lassoFillPointsRef = useRef<Array<{ x: number; y: number }>>([]);
   const frameStartRef = useRef<{ x: number; y: number } | null>(null);
+  const shapeDragRef = useRef<{
+    start: { x: number; y: number };
+    end: { x: number; y: number };
+    shiftKey: boolean;
+    altKey: boolean;
+    spaceHeld: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!shapeDragPreview) return;
+    const handleKeyDown = (ev: KeyboardEvent) => {
+      if (!shapeDragRef.current) return;
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        shapeDragRef.current = null;
+        setShapeDragPreview(null);
+        return;
+      }
+      if (ev.key === ' ' || ev.code === 'Space') {
+        shapeDragRef.current.spaceHeld = true;
+      }
+      if (ev.key === 'Shift' || ev.key === 'Alt') {
+        shapeDragRef.current.shiftKey = ev.shiftKey;
+        shapeDragRef.current.altKey = ev.altKey;
+        setShapeDragPreview({
+          start: { ...shapeDragRef.current.start },
+          end: { ...shapeDragRef.current.end },
+          shiftKey: ev.shiftKey,
+          altKey: ev.altKey,
+          settings: useToolStore.getState().shapeSettings,
+        });
+      }
+    };
+    const handleKeyUp = (ev: KeyboardEvent) => {
+      if (!shapeDragRef.current) return;
+      if (ev.key === ' ' || ev.code === 'Space') {
+        shapeDragRef.current.spaceHeld = false;
+      }
+      if (ev.key === 'Shift' || ev.key === 'Alt') {
+        shapeDragRef.current.shiftKey = ev.shiftKey;
+        shapeDragRef.current.altKey = ev.altKey;
+        setShapeDragPreview({
+          start: { ...shapeDragRef.current.start },
+          end: { ...shapeDragRef.current.end },
+          shiftKey: ev.shiftKey,
+          altKey: ev.altKey,
+          settings: useToolStore.getState().shapeSettings,
+        });
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, [shapeDragPreview]);
 
   const openLayerForEditing = useCallback(
     (layer: LayerItem): boolean => {
@@ -183,9 +277,7 @@ export function useShapeAndFillTools({
 
   const isLiquifyingRef = useRef<boolean>(false);
   const prevLiquifyPointRef = useRef<{ x: number; y: number } | null>(null);
-  const liquifyBeforeImageDataRef = useRef<ImageData | null>(null);
-  const liquifyInitialImageDataRef = useRef<ImageData | null>(null);
-  const liquifyDirtyRectRef = useRef<DirtyRect | null>(null);
+  const liquifySessionsRef = useRef<LiquifyLayerSession[]>([]);
   const liquifyRafIdRef = useRef<number | null>(null);
   const liquifyLastPointerPosRef = useRef<{
     pt: { x: number; y: number };
@@ -270,69 +362,83 @@ export function useShapeAndFillTools({
     setEditingBalloonLayerId(null);
   }, [editingBalloonLayerId, deleteLayer]);
 
-  const startLiquifyLoop = useCallback(
-    (canvas: HTMLCanvasElement, sourceCanvas: HTMLCanvasElement | undefined, isTone: boolean) => {
-      if (liquifyRafIdRef.current) cancelAnimationFrame(liquifyRafIdRef.current);
+  const syncLiquifySessionDirty = useCallback(
+    (session: LiquifyLayerSession, dirty: DirtyRect) => {
+      if (dirty.width <= 0 || dirty.height <= 0) return;
+      session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
+      const grid = documentStore.getActiveTileGrid();
+      const isMono =
+        colorMode === 'monochrome' || session.layer.expressionColor === 'monochrome';
+      const targetFormat: TileFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
 
-      const tick = () => {
-        if (!isLiquifyingRef.current || !liquifyLastPointerPosRef.current) {
-          liquifyRafIdRef.current = null;
-          return;
+      if (session.isTone && session.sourceCanvas) {
+        applyLayerEffects(
+          session.sourceCanvas,
+          session.displayCanvas,
+          session.layer,
+          dimensions.dpi ?? 600,
+          dirty
+        );
+        const sCtx = get2DContext(session.sourceCanvas);
+        if (sCtx) {
+          const subData = sCtx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
+          grid.writeImageData(session.layerId, subData, dirty.x, dirty.y, targetFormat);
         }
-        const { pt, pressure } = liquifyLastPointerPosRef.current;
-        const liquifySettings = useToolStore.getState().liquifySettings;
+      } else {
+        const dCtx = get2DContext(session.workCanvas);
+        if (dCtx) {
+          const subData = dCtx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
+          grid.writeImageData(session.layerId, subData, dirty.x, dirty.y, targetFormat);
+        }
+      }
+    },
+    [colorMode, dimensions.dpi]
+  );
+
+  const startLiquifyLoop = useCallback(() => {
+    if (liquifyRafIdRef.current) cancelAnimationFrame(liquifyRafIdRef.current);
+
+    const tick = () => {
+      if (
+        !isLiquifyingRef.current ||
+        !liquifyLastPointerPosRef.current ||
+        liquifySessionsRef.current.length === 0
+      ) {
+        liquifyRafIdRef.current = null;
+        return;
+      }
+      const { pt, pressure } = liquifyLastPointerPosRef.current;
+      const liquifySettings = useToolStore.getState().liquifySettings;
+      let anyDirty = false;
+
+      for (const session of liquifySessionsRef.current) {
         const dirty = applyLiquifyStep({
-          canvas,
-          sourceCanvas: isTone ? sourceCanvas : undefined,
+          canvas: session.workCanvas,
+          sourceCanvas: session.isTone ? session.sourceCanvas : undefined,
           cx: pt.x,
           cy: pt.y,
           prevX: pt.x,
           prevY: pt.y,
           settings: liquifySettings,
           pressure,
-          initialImageData: liquifyInitialImageDataRef.current,
+          initialImageData: session.initialImageData,
           selectionMask: liquifySelectionMaskRef.current,
         });
-
         if (dirty) {
-          if (activeLayer?.toneEnabled && sourceCanvas) {
-            const displayCanvas = layerCanvasesRef.current.get(activeLayerId);
-            if (displayCanvas) {
-              applyLayerEffects(
-                sourceCanvas,
-                displayCanvas,
-                activeLayer,
-                dimensions.dpi ?? 600,
-                dirty
-              );
-            }
-          } else {
-            const dCtx = get2DContext(canvas);
-            if (dCtx && dirty.width > 0 && dirty.height > 0) {
-              const subData = dCtx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
-              const isMono =
-                colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              documentStore
-                .getActiveTileGrid()
-                .writeImageData(
-                  activeLayerId,
-                  subData,
-                  dirty.x,
-                  dirty.y,
-                  isMono ? 'monochrome-1bit' : 'color-32bit'
-                );
-            }
-          }
-          documentStore.getActiveTileGrid().notifyChange(true);
+          syncLiquifySessionDirty(session, dirty);
+          anyDirty = true;
         }
+      }
 
-        liquifyRafIdRef.current = requestAnimationFrame(tick);
-      };
+      if (anyDirty) {
+        documentStore.getActiveTileGrid().notifyChange(true);
+      }
 
       liquifyRafIdRef.current = requestAnimationFrame(tick);
-    },
-    [activeLayer, activeLayerId, colorMode, dimensions.dpi, layerCanvasesRef]
-  );
+    };
+
+    liquifyRafIdRef.current = requestAnimationFrame(tick);
+  }, [syncLiquifySessionDirty]);
 
   const handleShapeFillPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>, pt: { x: number; y: number }): boolean => {
@@ -343,6 +449,7 @@ export function useShapeAndFillTools({
         textSettings,
         balloonSettings,
         liquifySettings,
+        shapeSettings,
       } = useToolStore.getState();
 
       if (tool === 'pipette') {
@@ -357,37 +464,122 @@ export function useShapeAndFillTools({
         return true;
       }
 
-      if (tool === 'liquify') {
+      if (tool === 'shape') {
         e.preventDefault();
         if (
           !activeLayer ||
+          activeLayer.type !== 'raster' ||
           activeLayer.locked ||
-          (activeLayer && !isLayerEffectivelyVisible(activeLayer))
+          !isLayerEffectivelyVisible(activeLayer)
         ) {
+          showToast?.('Select an unlocked, visible raster layer to draw shapes');
           return true;
         }
-        const targetLayerId = activeLayerId;
-        const isTone = Boolean(
-          activeLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-        );
-        const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-        const displayCanvas = layerCanvasesRef.current.get(targetLayerId);
-        const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-        if (!canvas) return true;
+        try {
+          (e.target as HTMLElement).setPointerCapture(e.pointerId);
+        } catch {
+          // Ignore pointer capture errors
+        }
+        shapeDragRef.current = {
+          start: pt,
+          end: pt,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          spaceHeld: false,
+        };
+        setShapeDragPreview({
+          start: pt,
+          end: pt,
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          settings: shapeSettings,
+        });
+        return true;
+      }
 
-        const ctx = get2DContext(canvas);
-        if (!ctx) return true;
+      if (tool === 'liquify') {
+        e.preventDefault();
+        const isMulti = Boolean(liquifySettings.multiLayer);
+        const targetLayers = resolveLiquifyTargetLayers(
+          layers,
+          activeLayer,
+          selectedLayerIds,
+          isLayerEffectivelyVisible,
+          isMulti
+        );
+        if (targetLayers.length === 0) {
+          return true;
+        }
+
+        const grid = documentStore.getActiveTileGrid();
+        const needInitialImage = liquifySettings.mode === 'reconstruct';
+        const sessions: LiquifyLayerSession[] = [];
+
+        for (const layer of targetLayers) {
+          const targetId = layer.id;
+          const displayCanvas =
+            layerCanvasesRef.current.get(targetId) ?? materializeLayerCanvas?.(targetId) ?? null;
+          if (!displayCanvas) continue;
+
+          const sourceCanvas = layerSourceCanvasesRef.current?.get(targetId);
+          const isTone = Boolean(layer.toneEnabled && sourceCanvas);
+          const workCanvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
+
+          // Skip strictly blank layers in multi-layer mode to avoid wasted work
+          if (
+            isMulti &&
+            targetLayers.length > 1 &&
+            (workCanvas as unknown as { __isBlank?: boolean }).__isBlank &&
+            !grid.hasLayerTiles(targetId)
+          ) {
+            continue;
+          }
+
+          const ctx = get2DContext(workCanvas);
+          if (!ctx) continue;
+
+          const isMono = colorMode === 'monochrome' || layer.expressionColor === 'monochrome';
+          const targetFormat: TileFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+          if (
+            !grid.hasLayerTiles(targetId) &&
+            !(workCanvas as unknown as { __isBlank?: boolean }).__isBlank
+          ) {
+            grid.ingestCanvas(targetId, workCanvas, targetFormat);
+          }
+
+          const beforeTileSnapshot = grid.snapshotTilesInRect(targetId, {
+            x: 0,
+            y: 0,
+            width: workCanvas.width,
+            height: workCanvas.height,
+          });
+          const initialImageData = needInitialImage
+            ? ctx.getImageData(0, 0, workCanvas.width, workCanvas.height)
+            : null;
+
+          sessions.push({
+            layer,
+            layerId: targetId,
+            isTone,
+            sourceCanvas,
+            displayCanvas,
+            workCanvas,
+            initialImageData,
+            beforeTileSnapshot,
+            dirtyRect: null,
+          });
+        }
+
+        if (sessions.length === 0) return true;
 
         isLiquifyingRef.current = true;
         prevLiquifyPointRef.current = pt;
-        liquifyBeforeImageDataRef.current = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        liquifyInitialImageDataRef.current = liquifyBeforeImageDataRef.current;
+        liquifySessionsRef.current = sessions;
         liquifySelectionMaskRef.current = createLiquifySelectionMask(
           selection,
-          canvas.width,
-          canvas.height
+          sessions[0].workCanvas.width,
+          sessions[0].workCanvas.height
         );
-        liquifyDirtyRectRef.current = null;
         liquifyLastPointerPosRef.current = { pt, pressure: e.pressure || 1.0 };
 
         try {
@@ -404,45 +596,29 @@ export function useShapeAndFillTools({
           mode === 'twirl-ccw' ||
           mode === 'reconstruct'
         ) {
-          const dirty = applyLiquifyStep({
-            canvas,
-            sourceCanvas: isTone ? sourceCanvas : undefined,
-            cx: pt.x,
-            cy: pt.y,
-            prevX: pt.x,
-            prevY: pt.y,
-            settings: liquifySettings,
-            pressure: e.pressure || 1.0,
-            initialImageData: liquifyInitialImageDataRef.current,
-            selectionMask: liquifySelectionMaskRef.current,
-          });
-          if (dirty) {
-            liquifyDirtyRectRef.current = dirty;
-            if (activeLayer?.toneEnabled && sourceCanvas && displayCanvas) {
-              applyLayerEffects(
-                sourceCanvas,
-                displayCanvas,
-                activeLayer,
-                dimensions.dpi ?? 600,
-                dirty
-              );
-            } else if (dirty.width > 0 && dirty.height > 0) {
-              const subData = ctx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
-              const isMono =
-                colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              documentStore
-                .getActiveTileGrid()
-                .writeImageData(
-                  targetLayerId,
-                  subData,
-                  dirty.x,
-                  dirty.y,
-                  isMono ? 'monochrome-1bit' : 'color-32bit'
-                );
+          let anyDirty = false;
+          for (const session of sessions) {
+            const dirty = applyLiquifyStep({
+              canvas: session.workCanvas,
+              sourceCanvas: session.isTone ? session.sourceCanvas : undefined,
+              cx: pt.x,
+              cy: pt.y,
+              prevX: pt.x,
+              prevY: pt.y,
+              settings: liquifySettings,
+              pressure: e.pressure || 1.0,
+              initialImageData: session.initialImageData,
+              selectionMask: liquifySelectionMaskRef.current,
+            });
+            if (dirty) {
+              syncLiquifySessionDirty(session, dirty);
+              anyDirty = true;
             }
-            documentStore.getActiveTileGrid().notifyChange(true);
           }
-          startLiquifyLoop(canvas, sourceCanvas, isTone);
+          if (anyDirty) {
+            grid.notifyChange(true);
+          }
+          startLiquifyLoop();
         }
         return true;
       }
@@ -586,13 +762,16 @@ export function useShapeAndFillTools({
       handleSampleColor,
       activeLayer,
       activeLayerId,
+      selectedLayerIds,
       isLayerEffectivelyVisible,
       layerSourceCanvasesRef,
       layerCanvasesRef,
+      materializeLayerCanvas,
       selection,
       dimensions,
       colorMode,
       startLiquifyLoop,
+      syncLiquifySessionDirty,
       getActiveCanvas,
       layers,
       updateLayerThumbnail,
@@ -604,7 +783,7 @@ export function useShapeAndFillTools({
 
   const handleShapeFillPointerMove = useCallback(
     (e: React.PointerEvent<HTMLElement>): boolean => {
-      const { tool, fillSettings, liquifySettings } = useToolStore.getState();
+      const { tool, fillSettings, liquifySettings, shapeSettings } = useToolStore.getState();
 
       if (tool === 'pipette') {
         if (isPipetteSamplingRef.current) {
@@ -614,109 +793,79 @@ export function useShapeAndFillTools({
         return true;
       }
 
+      if (tool === 'shape') {
+        if (!shapeDragRef.current) return true;
+        const pt = getCanvasCoords(e);
+        if (shapeDragRef.current.spaceHeld) {
+          const dx = pt.x - shapeDragRef.current.end.x;
+          const dy = pt.y - shapeDragRef.current.end.y;
+          shapeDragRef.current.start = {
+            x: shapeDragRef.current.start.x + dx,
+            y: shapeDragRef.current.start.y + dy,
+          };
+        }
+        shapeDragRef.current.end = pt;
+        shapeDragRef.current.shiftKey = e.shiftKey;
+        shapeDragRef.current.altKey = e.altKey;
+        setShapeDragPreview({
+          start: { ...shapeDragRef.current.start },
+          end: { ...pt },
+          shiftKey: e.shiftKey,
+          altKey: e.altKey,
+          settings: shapeSettings,
+        });
+        return true;
+      }
+
       if (tool === 'liquify') {
-        if (!isLiquifyingRef.current) return true;
+        if (!isLiquifyingRef.current || liquifySessionsRef.current.length === 0) return true;
         const pt = getCanvasCoords(e);
         const pressure = e.pressure || 1.0;
         liquifyLastPointerPosRef.current = { pt, pressure };
-
-        const targetLayerId = activeLayerId;
-        const isTone = Boolean(
-          activeLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-        );
-        const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-        const displayCanvas = layerCanvasesRef.current.get(targetLayerId);
-        const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-        if (!canvas) return true;
 
         const prev = prevLiquifyPointRef.current || pt;
         const dist = Math.hypot(pt.x - prev.x, pt.y - prev.y);
         const stepDist = Math.max(2, (liquifySettings.size / 2) * 0.25);
         const numSteps = Math.max(1, Math.ceil(dist / stepDist));
+        let anyDirty = false;
 
-        let overallDirty: DirtyRect | null = null;
-        for (let i = 1; i <= numSteps; i++) {
-          const t = i / numSteps;
-          const cx = prev.x + (pt.x - prev.x) * t;
-          const cy = prev.y + (pt.y - prev.y) * t;
-          const px = prev.x + (pt.x - prev.x) * ((i - 1) / numSteps);
-          const py = prev.y + (pt.y - prev.y) * ((i - 1) / numSteps);
+        for (const session of liquifySessionsRef.current) {
+          let layerDirty: DirtyRect | null = null;
+          for (let i = 1; i <= numSteps; i++) {
+            const t = i / numSteps;
+            const cx = prev.x + (pt.x - prev.x) * t;
+            const cy = prev.y + (pt.y - prev.y) * t;
+            const px = prev.x + (pt.x - prev.x) * ((i - 1) / numSteps);
+            const py = prev.y + (pt.y - prev.y) * ((i - 1) / numSteps);
 
-          const dirty = applyLiquifyStep({
-            canvas,
-            sourceCanvas: isTone ? sourceCanvas : undefined,
-            cx,
-            cy,
-            prevX: px,
-            prevY: py,
-            settings: liquifySettings,
-            pressure,
-            initialImageData: liquifyInitialImageDataRef.current,
-            selectionMask: liquifySelectionMaskRef.current,
-          });
+            const dirty = applyLiquifyStep({
+              canvas: session.workCanvas,
+              sourceCanvas: session.isTone ? session.sourceCanvas : undefined,
+              cx,
+              cy,
+              prevX: px,
+              prevY: py,
+              settings: liquifySettings,
+              pressure,
+              initialImageData: session.initialImageData,
+              selectionMask: liquifySelectionMaskRef.current,
+            });
 
-          if (dirty) {
-            if (!overallDirty) {
-              overallDirty = { ...dirty };
-            } else {
-              const minX = Math.min(overallDirty.x, dirty.x);
-              const minY = Math.min(overallDirty.y, dirty.y);
-              const maxX = Math.max(overallDirty.x + overallDirty.width, dirty.x + dirty.width);
-              const maxY = Math.max(overallDirty.y + overallDirty.height, dirty.y + dirty.height);
-              overallDirty = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+            if (dirty) {
+              layerDirty = mergeDirtyRects(layerDirty, dirty);
             }
+          }
+
+          if (layerDirty) {
+            syncLiquifySessionDirty(session, layerDirty);
+            anyDirty = true;
           }
         }
 
         prevLiquifyPointRef.current = pt;
 
-        if (overallDirty) {
-          if (activeLayer?.toneEnabled && sourceCanvas && displayCanvas) {
-            applyLayerEffects(
-              sourceCanvas,
-              displayCanvas,
-              activeLayer,
-              dimensions.dpi ?? 600,
-              overallDirty
-            );
-          } else if (overallDirty.width > 0 && overallDirty.height > 0) {
-            const cCtx = get2DContext(canvas);
-            if (cCtx) {
-              const subData = cCtx.getImageData(
-                overallDirty.x,
-                overallDirty.y,
-                overallDirty.width,
-                overallDirty.height
-              );
-              const isMono =
-                colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              documentStore
-                .getActiveTileGrid()
-                .writeImageData(
-                  targetLayerId,
-                  subData,
-                  overallDirty.x,
-                  overallDirty.y,
-                  isMono ? 'monochrome-1bit' : 'color-32bit'
-                );
-            }
-          }
+        if (anyDirty) {
           documentStore.getActiveTileGrid().notifyChange(true);
-          if (!liquifyDirtyRectRef.current) {
-            liquifyDirtyRectRef.current = overallDirty;
-          } else {
-            const cur = liquifyDirtyRectRef.current;
-            const minX = Math.min(cur.x, overallDirty.x);
-            const minY = Math.min(cur.y, overallDirty.y);
-            const maxX = Math.max(cur.x + cur.width, overallDirty.x + overallDirty.width);
-            const maxY = Math.max(cur.y + cur.height, overallDirty.y + overallDirty.height);
-            liquifyDirtyRectRef.current = {
-              x: minX,
-              y: minY,
-              width: maxX - minX,
-              height: maxY - minY,
-            };
-          }
         }
         return true;
       }
@@ -738,22 +887,20 @@ export function useShapeAndFillTools({
 
       return false;
     },
-    [
-      getCanvasCoords,
-      handleSampleColor,
-      activeLayerId,
-      activeLayer,
-      layerSourceCanvasesRef,
-      layerCanvasesRef,
-      dimensions.dpi,
-      colorMode,
-    ]
+    [getCanvasCoords, handleSampleColor, syncLiquifySessionDirty]
   );
 
   const handleShapeFillPointerUp = useCallback(
     (e: React.PointerEvent<HTMLElement>, pt: { x: number; y: number }): boolean => {
-      const { tool, primaryColor, fillSettings, frameSettings, liquifySettings } =
-        useToolStore.getState();
+      const {
+        tool,
+        primaryColor,
+        secondaryColor,
+        fillSettings,
+        frameSettings,
+        liquifySettings,
+        shapeSettings,
+      } = useToolStore.getState();
 
       if (tool === 'pipette') {
         try {
@@ -764,6 +911,105 @@ export function useShapeAndFillTools({
         if (isPipetteSamplingRef.current) {
           isPipetteSamplingRef.current = false;
           handleSampleColor(pt);
+        }
+        return true;
+      }
+
+      if (tool === 'shape') {
+        try {
+          (e.target as HTMLElement).releasePointerCapture(e.pointerId);
+        } catch {
+          // Ignore release errors
+        }
+        const drag = shapeDragRef.current;
+        shapeDragRef.current = null;
+        setShapeDragPreview(null);
+        if (!drag) return true;
+
+        const canvas = getActiveCanvas();
+        if (
+          !canvas ||
+          !activeLayer ||
+          activeLayer.type !== 'raster' ||
+          activeLayer.locked ||
+          !isLayerEffectivelyVisible(activeLayer)
+        ) {
+          return true;
+        }
+
+        const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+        const isTone = Boolean(activeLayer.toneEnabled && sourceCanvas);
+        const workCanvas = isTone && sourceCanvas ? sourceCanvas : canvas;
+        const ctx = get2DContext(workCanvas);
+        if (!ctx) return true;
+
+        const isMono =
+          colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
+        const targetFormat: TileFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+        const grid = documentStore.getActiveTileGrid();
+        if (
+          !grid.hasLayerTiles(activeLayerId) &&
+          !(workCanvas as unknown as { __isBlank?: boolean }).__isBlank
+        ) {
+          grid.ingestCanvas(activeLayerId, workCanvas, targetFormat);
+        }
+        const beforeSnapshot = grid.snapshotTilesInRect(activeLayerId, {
+          x: 0,
+          y: 0,
+          width: workCanvas.width,
+          height: workCanvas.height,
+        });
+
+        const fillColor = resolveShapeFillColor(shapeSettings, primaryColor, secondaryColor);
+        const finalPreview: ShapeDragPreview = {
+          start: drag.start,
+          end: pt,
+          shiftKey: e.shiftKey || drag.shiftKey,
+          altKey: e.altKey || drag.altKey,
+          settings: shapeSettings,
+        };
+
+        const dirty = rasterizeShapeToCanvas(
+          canvas,
+          finalPreview,
+          primaryColor,
+          fillColor,
+          selection,
+          colorMode,
+          isMono,
+          isTone ? sourceCanvas : null
+        );
+
+        if (dirty && dirty.width > 0 && dirty.height > 0) {
+          (canvas as unknown as { __isBlank?: boolean }).__isBlank = false;
+          if (sourceCanvas) {
+            (sourceCanvas as unknown as { __isBlank?: boolean }).__isBlank = false;
+          }
+          if (isTone && sourceCanvas) {
+            applyLayerEffects(
+              sourceCanvas,
+              canvas,
+              activeLayer,
+              dimensions.dpi ?? 600,
+              dirty
+            );
+          }
+          const subData = ctx.getImageData(dirty.x, dirty.y, dirty.width, dirty.height);
+          grid.writeImageData(activeLayerId, subData, dirty.x, dirty.y, targetFormat);
+          const deltas = grid.computeDeltasFromSnapshot(beforeSnapshot, activeLayerId, dirty);
+          const shapeName =
+            shapeSettings.shape.charAt(0).toUpperCase() + shapeSettings.shape.slice(1);
+          pushHistoryStep(
+            'shape',
+            `Shape: ${shapeName}`,
+            null,
+            null,
+            activeLayerId,
+            dirty,
+            deltas.length > 0 ? deltas : undefined
+          );
+          grid.notifyChange(true);
+          updateLayerThumbnail(activeLayerId, true);
         }
         return true;
       }
@@ -782,36 +1028,50 @@ export function useShapeAndFillTools({
 
         if (isLiquifyingRef.current) {
           isLiquifyingRef.current = false;
-          const targetLayerId = activeLayerId;
-          const isTone = Boolean(
-            activeLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-          );
-          const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-          const displayCanvas = layerCanvasesRef.current.get(targetLayerId);
-          const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
+          const sessions = liquifySessionsRef.current;
+          const grid = documentStore.getActiveTileGrid();
+          const allDeltas: TileDelta[] = [];
+          let combinedDirty: DirtyRect | null = null;
+          let modifiedCount = 0;
+          let primaryTargetId = activeLayerId;
 
-          if (canvas && liquifyBeforeImageDataRef.current) {
-            const ctx = get2DContext(canvas);
-            const afterImageData = ctx?.getImageData(0, 0, canvas.width, canvas.height);
-            if (afterImageData) {
-              const modeLabel =
-                liquifySettings.mode.charAt(0).toUpperCase() + liquifySettings.mode.slice(1);
-              pushHistoryStep(
-                'liquify',
-                `Liquify: ${modeLabel}`,
-                liquifyBeforeImageDataRef.current,
-                afterImageData,
-                targetLayerId
-              );
-              documentStore.getActiveTileGrid().notifyChange(true);
-              updateLayerThumbnail(targetLayerId, true);
+          for (const session of sessions) {
+            if (!session.dirtyRect) continue;
+            modifiedCount++;
+            primaryTargetId = session.layerId;
+            combinedDirty = mergeDirtyRects(combinedDirty, session.dirtyRect);
+            const deltas = grid.computeDeltasFromSnapshot(
+              session.beforeTileSnapshot,
+              session.layerId,
+              session.dirtyRect
+            );
+            for (const d of deltas) {
+              allDeltas.push(d);
             }
+            updateLayerThumbnail(session.layerId, true);
           }
 
-          liquifyBeforeImageDataRef.current = null;
-          liquifyInitialImageDataRef.current = null;
+          if (allDeltas.length > 0) {
+            const modeLabel =
+              liquifySettings.mode.charAt(0).toUpperCase() + liquifySettings.mode.slice(1);
+            const stepLabel =
+              modifiedCount > 1
+                ? `Liquify (${modifiedCount} layers): ${modeLabel}`
+                : `Liquify: ${modeLabel}`;
+            pushHistoryStep(
+              'liquify',
+              stepLabel,
+              null,
+              null,
+              primaryTargetId,
+              combinedDirty ?? undefined,
+              allDeltas
+            );
+            grid.notifyChange(true);
+          }
+
+          liquifySessionsRef.current = [];
           liquifySelectionMaskRef.current = null;
-          liquifyDirtyRectRef.current = null;
           prevLiquifyPointRef.current = null;
           liquifyLastPointerPosRef.current = null;
         }
@@ -941,6 +1201,8 @@ export function useShapeAndFillTools({
       updateLayerThumbnail,
       getActiveCanvas,
       dimensions.dpi,
+      selection,
+      colorMode,
       createFrameFolder,
       divideFrameFolder,
       showToast,
@@ -953,6 +1215,7 @@ export function useShapeAndFillTools({
     activeBalloon,
     setActiveBalloon,
     frameDragPreview,
+    shapeDragPreview,
     openLayerForEditing,
     isPipetteSamplingRef,
     handleSampleColor,

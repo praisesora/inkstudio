@@ -217,7 +217,6 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
     themePreset = 'modern',
     throttleMs = NAVIGATOR_PREVIEW_THROTTLE_MS,
   }) => {
-    const isVintage = themePreset === 'vintage-manga';
 
     const stageRef = useRef<HTMLDivElement | null>(null);
     const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -582,21 +581,17 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
 
     const m = metricsRef.current;
 
-    const btnBase = isVintage
-      ? 'h-5 px-1 rounded text-[10px] flex items-center justify-center text-[#d0d0d5] hover:text-white hover:bg-[#4e4e52] transition-colors cursor-pointer'
-      : 'h-5 px-1 rounded text-[10px] flex items-center justify-center text-[#a3a3a3] hover:text-[#f5f5f5] hover:bg-[#2c2c2c] transition-colors cursor-pointer';
+    const btnBase =
+      'h-5 px-1 rounded text-[10px] flex items-center justify-center text-[#a3a3a3] hover:text-[#f5f5f5] hover:bg-[#2c2c2c] transition-colors cursor-pointer';
 
-    const btnActive = isVintage
-      ? 'bg-[#337bb5] text-white'
-      : 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-inset ring-[var(--accent-border)]';
+    const btnActive =
+      'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-inset ring-[var(--accent-border)]';
 
     return (
       <div
         data-testid="navigator-panel"
         data-theme-preset={themePreset}
-        className={`flex flex-col h-full min-h-0 select-none ${
-          isVintage ? 'bg-[#363638] text-[#e5e5e5]' : 'bg-[#202020] text-[#e5e5e5]'
-        }`}
+        className="flex flex-col h-full min-h-0 select-none bg-[#202020] text-[#e5e5e5]"
       >
         {/* Interactive Canvas Preview Stage */}
         <div
@@ -606,9 +601,9 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
           onPointerMove={handleStagePointerMove}
           onPointerUp={finishStageDrag}
           onPointerCancel={finishStageDrag}
-          className={`relative flex-1 min-h-[76px] overflow-hidden ${
+          className={`relative flex-1 min-h-[76px] overflow-hidden bg-[#141414] ${
             isDraggingFrame ? 'cursor-grabbing' : 'cursor-grab'
-          } ${isVintage ? 'bg-[#252527]' : 'bg-[#141414]'}`}
+          }`}
           title="Click or drag red viewport frame to pan canvas"
         >
           <canvas
@@ -632,13 +627,7 @@ export const NavigatorPanel: React.FC<NavigatorPanelProps> = React.memo(
         </div>
 
         {/* Compact Control Bar */}
-        <div
-          className={`shrink-0 px-1.5 py-1 flex flex-col gap-1 border-t ${
-            isVintage
-              ? 'bg-[#313134] border-[#232325]'
-              : 'bg-[#1b1b1b] border-white/[0.06]'
-          }`}
-        >
+        <div className="shrink-0 px-1.5 py-1 flex flex-col gap-1 border-t bg-[#1b1b1b] border-white/[0.06]">
           {/* Row 1: Zoom Controls */}
           <div className="flex items-center gap-1">
             <button

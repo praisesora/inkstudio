@@ -1,13 +1,11 @@
 import React, { useRef, useState } from 'react';
 import { TextSettings } from '../types/editor';
 import {
-  Check,
   Bold,
   Italic,
   AlignLeft,
   AlignCenter,
   AlignRight,
-  GripHorizontal,
 } from 'lucide-react';
 
 interface TextEditorOverlayProps {
@@ -130,7 +128,7 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
 
       {/* Floating Tool Panel */}
       <div
-        className="w-80 bg-[#1e1f22] border border-[#383a40] rounded-md shadow-2xl overflow-hidden flex flex-col"
+        className="w-80 bg-[#202020]/95 backdrop-blur-md border border-white/[0.1] rounded-md shadow-2xl overflow-hidden flex flex-col"
         style={{
           transform: `scale(${(flipX ? -1 : 1) * (zoom > 0 ? 1 / zoom : 1)}, ${(flipY ? -1 : 1) * (zoom > 0 ? 1 / zoom : 1)})`,
           transformOrigin: 'top left',
@@ -141,26 +139,23 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
           onPointerDown={handleDragDown}
           onPointerMove={handleDragMove}
           onPointerUp={handleDragUp}
-          className="bg-[#18191c] px-3 py-1.5 border-b border-[#2b2d31] flex items-center justify-between cursor-move text-xs text-[#999999]"
+          className="bg-[#1a1a1a] px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between cursor-move text-xs text-[#8a8a8a]"
         >
-          <div className="flex items-center space-x-1.5 font-medium text-white">
-            <GripHorizontal className="w-3.5 h-3.5 text-[#777777]" />
-            <span>Manga Text Tool</span>
-          </div>
+          <span className="font-medium text-[#e5e5e5]">Text Tool</span>
 
           <div className="flex items-center space-x-1">
             <button
               onClick={() => setActiveTab('text')}
-              className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${
-                activeTab === 'text' ? 'bg-[#2b2d31] text-white' : 'text-[#888888] hover:text-[#cccccc]'
+              className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                activeTab === 'text' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
               }`}
             >
               Content
             </button>
             <button
               onClick={() => setActiveTab('style')}
-              className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${
-                activeTab === 'style' ? 'bg-[#2b2d31] text-white' : 'text-[#888888] hover:text-[#cccccc]'
+              className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
+                activeTab === 'style' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
               }`}
             >
               Style
@@ -252,8 +247,10 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, bold: !prev.bold }))}
                   title="Bold"
-                  className={`p-1.5 rounded transition-colors ${
-                    settings.bold ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40' : 'text-[#888888] hover:text-white hover:bg-[#2b2d31]'
+                  className={`p-1.5 rounded transition-colors cursor-pointer ${
+                    settings.bold
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)]'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
                   }`}
                 >
                   <Bold className="w-3.5 h-3.5" />
@@ -261,8 +258,10 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, italic: !prev.italic }))}
                   title="Italic"
-                  className={`p-1.5 rounded transition-colors ${
-                    settings.italic ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40' : 'text-[#888888] hover:text-white hover:bg-[#2b2d31]'
+                  className={`p-1.5 rounded transition-colors cursor-pointer ${
+                    settings.italic
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)]'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
                   }`}
                 >
                   <Italic className="w-3.5 h-3.5" />
@@ -270,12 +269,14 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
               </div>
 
               {/* Writing Direction (Horizontal vs Vertical Manga Tate-gaki) */}
-              <div className="flex items-center space-x-1 bg-[#141517] p-0.5 rounded border border-[#2b2d31]">
+              <div className="flex items-center space-x-1 bg-[#161616] p-0.5 rounded border border-white/[0.06]">
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, writingMode: 'horizontal-tb' }))}
                   title="Horizontal Layout (Left-to-Right)"
-                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
-                    settings.writingMode !== 'vertical-rl' ? 'bg-[#2b2d31] text-cyan-300' : 'text-[#888888] hover:text-white'
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                    settings.writingMode !== 'vertical-rl'
+                      ? 'bg-[#2c2c2c] text-[#e5e5e5]'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                   }`}
                 >
                   Horiz
@@ -283,34 +284,36 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, writingMode: 'vertical-rl' }))}
                   title="Vertical Layout (Manga Tate-gaki: Right-to-Left columns)"
-                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors ${
-                    settings.writingMode === 'vertical-rl' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40' : 'text-[#888888] hover:text-white'
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors cursor-pointer ${
+                    settings.writingMode === 'vertical-rl'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)]'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                   }`}
                 >
-                  Vert 縦
+                  Vert
                 </button>
               </div>
 
               {/* Alignments */}
-              <div className="flex items-center space-x-1 bg-[#141517] p-0.5 rounded border border-[#2b2d31]">
+              <div className="flex items-center space-x-1 bg-[#161616] p-0.5 rounded border border-white/[0.06]">
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, align: 'left' }))}
                   title="Align Left"
-                  className={`p-1 rounded ${settings.align === 'left' ? 'bg-[#2b2d31] text-white' : 'text-[#888888] hover:text-white'}`}
+                  className={`p-1 rounded cursor-pointer ${settings.align === 'left' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'}`}
                 >
                   <AlignLeft className="w-3 h-3" />
                 </button>
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, align: 'center' }))}
                   title="Align Center"
-                  className={`p-1 rounded ${settings.align === 'center' ? 'bg-[#2b2d31] text-white' : 'text-[#888888] hover:text-white'}`}
+                  className={`p-1 rounded cursor-pointer ${settings.align === 'center' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'}`}
                 >
                   <AlignCenter className="w-3 h-3" />
                 </button>
                 <button
                   onClick={() => onUpdateSettings((prev) => ({ ...prev, align: 'right' }))}
                   title="Align Right"
-                  className={`p-1 rounded ${settings.align === 'right' ? 'bg-[#2b2d31] text-white' : 'text-[#888888] hover:text-white'}`}
+                  className={`p-1 rounded cursor-pointer ${settings.align === 'right' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'}`}
                 >
                   <AlignRight className="w-3 h-3" />
                 </button>
@@ -364,21 +367,20 @@ export const TextEditorOverlay: React.FC<TextEditorOverlayProps> = ({
         )}
 
         {/* Footer Confirm / Cancel */}
-        <div className="px-3 py-2 bg-[#18191c] border-t border-[#2b2d31] flex items-center justify-between">
-          <span className="text-[10px] text-[#777777]">Ctrl+Enter to Apply</span>
+        <div className="px-3 py-2 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-between">
+          <span className="text-[10px] text-[#8a8a8a]">Ctrl+Enter to Apply</span>
           <div className="flex items-center space-x-2">
             <button
               onClick={onCancel}
-              className="px-2.5 py-1 bg-[#2b2d31] hover:bg-[#383a40] text-[#cccccc] rounded text-xs transition-colors cursor-pointer"
+              className="px-2.5 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               onClick={onConfirm}
-              className="px-3 py-1 bg-[#234b3e] hover:bg-[#2b604f] text-[#55eaab] border border-[#2e6e58] rounded text-xs font-semibold flex items-center space-x-1 transition-colors cursor-pointer"
+              className="px-3 py-1 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>Apply</span>
+              Apply
             </button>
           </div>
         </div>

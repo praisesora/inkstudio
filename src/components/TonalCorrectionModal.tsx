@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { X, RotateCcw, Check, SlidersHorizontal, Sparkles } from 'lucide-react';
+import { X } from 'lucide-react';
 import {
   TonalCorrectionType,
   BrightnessContrastParams,
@@ -315,10 +315,9 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
 
       {/* Floating Dialog */}
       <div
-        className="relative pointer-events-auto w-[360px] bg-[#252526] border border-[#3e3e3e] rounded-[4px] shadow-2xl flex flex-col text-xs text-[#cccccc] select-none"
+        className="relative pointer-events-auto w-[360px] bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl flex flex-col text-xs text-[#e5e5e5] select-none"
         style={{
           transform: `translate(${pos.x}px, ${pos.y}px)`,
-          boxShadow: '0 12px 32px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4)',
         }}
       >
         {/* Draggable Title Header */}
@@ -326,16 +325,13 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
           onPointerDown={handleDragPointerDown}
           onPointerMove={handleDragPointerMove}
           onPointerUp={handleDragPointerUp}
-          className="h-9 px-3.5 bg-[#2d2d2d] border-b border-[#383838] flex items-center justify-between cursor-move rounded-t-[4px]"
+          className="h-9 px-3.5 bg-[#1a1a1a] border-b border-white/[0.06] flex items-center justify-between cursor-move rounded-t-lg"
         >
-          <div className="flex items-center space-x-2">
-            <SlidersHorizontal className="w-3.5 h-3.5 text-[#5ce1e6]" />
-            <span className="font-medium text-[#e0e0e0]">{getTitle()}</span>
-          </div>
+          <span className="font-medium text-[#e5e5e5]">{getTitle()}</span>
           <button
             type="button"
             onClick={onClose}
-            className="p-1 rounded hover:bg-[#3e3e3e] text-[#888888] hover:text-white transition-colors"
+            className="p-1 rounded hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
@@ -611,10 +607,9 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   <button
                     type="button"
                     onClick={handleAutoLevels}
-                    className="flex items-center space-x-1 text-[#5ce1e6] hover:underline"
+                    className="text-[var(--accent)] hover:underline cursor-pointer"
                   >
-                    <Sparkles className="w-3 h-3" />
-                    <span>Auto</span>
+                    Auto
                   </button>
                 </div>
                 <div className="grid grid-cols-3 gap-2">
@@ -751,25 +746,23 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
         </div>
 
         {/* Modal Footer Controls */}
-        <div className="p-3 bg-[#2d2d2d] border-t border-[#383838] flex items-center justify-between rounded-b-[4px]">
+        <div className="px-3.5 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-between rounded-b-lg">
           <div className="flex items-center space-x-3">
-            <label className="flex items-center space-x-1.5 cursor-pointer text-[#cccccc] hover:text-white">
+            <label className="flex items-center space-x-1.5 cursor-pointer text-[#cccccc] hover:text-[#e5e5e5]">
               <input
                 type="checkbox"
                 checked={preview}
                 onChange={(e) => setPreview(e.target.checked)}
-                className="w-3.5 h-3.5 rounded bg-[#1e1e1e] border-[#3e3e3e] text-[#007acc] focus:ring-0"
               />
               <span className="text-[11px]">Preview</span>
             </label>
             <button
               type="button"
               onClick={handleReset}
-              className="flex items-center space-x-1 text-[11px] text-[#888888] hover:text-[#cccccc] transition-colors"
+              className="text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
               title="Reset parameters"
             >
-              <RotateCcw className="w-3 h-3" />
-              <span>Reset</span>
+              Reset
             </button>
           </div>
 
@@ -777,17 +770,16 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             <button
               type="button"
               onClick={onClose}
-              className="px-3 py-1 bg-[#3a3a3c] hover:bg-[#454548] text-[#cccccc] hover:text-white rounded-[2px] text-xs transition-colors"
+              className="px-3 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="button"
               onClick={() => onApply(type, currentParams)}
-              className="px-3 py-1 bg-[#007acc] hover:bg-[#0098ff] text-white rounded-[2px] text-xs font-medium flex items-center space-x-1 transition-colors shadow-sm"
+              className="px-3.5 py-1 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
             >
-              <Check className="w-3.5 h-3.5" />
-              <span>OK</span>
+              OK
             </button>
           </div>
         </div>

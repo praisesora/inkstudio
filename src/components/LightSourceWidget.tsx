@@ -1,5 +1,5 @@
 import React, { useRef, useEffect, useCallback, useState } from 'react';
-import { Sun, RotateCcw } from 'lucide-react';
+import { RotateCcw } from 'lucide-react';
 
 export interface LightSettings {
   azimuth: number; // 0 to 360 degrees (horizontal)
@@ -14,12 +14,14 @@ interface LightSourceWidgetProps {
   settings: LightSettings;
   onChange: (settings: LightSettings) => void;
   onReset: () => void;
+  embedded?: boolean;
 }
 
 export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
   settings,
   onChange,
   onReset,
+  embedded = false,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const isDraggingRef = useRef<boolean>(false);
@@ -223,19 +225,20 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
 
   return (
     <div
-      className="bg-[#1b1e24]/95 border border-[#3b82f6]/40 rounded-lg p-2.5 shadow-2xl backdrop-blur-md w-60 text-xs text-gray-200 select-none"
+      className={
+        embedded
+          ? 'bg-[#161616] border border-white/[0.06] rounded-md p-2.5 w-full text-xs text-[#e5e5e5] select-none'
+          : 'bg-[#202020]/95 border border-white/[0.1] rounded-lg p-2.5 shadow-2xl backdrop-blur-md w-60 text-xs text-[#e5e5e5] select-none'
+      }
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <div className="flex items-center justify-between border-b border-white/10 pb-1.5 mb-2">
-        <div className="flex items-center space-x-1.5 font-medium text-sky-400">
-          <Sun className="w-3.5 h-3.5 text-amber-400" />
-          <span className="text-[11px] font-semibold uppercase tracking-wider">Light Source</span>
-        </div>
+      <div className="flex items-center justify-between border-b border-white/[0.06] pb-1.5 mb-2">
+        <span className="text-[11px] font-medium text-[#e5e5e5]">Light Source</span>
         <div className="flex items-center space-x-1">
           <button
             type="button"
             onClick={() => setActiveTab(activeTab === 'sphere' ? 'sliders' : 'sphere')}
-            className="text-[10px] px-1.5 py-0.5 rounded bg-white/10 hover:bg-white/20 text-gray-300"
+            className="text-[10px] px-1.5 py-0.5 rounded bg-[#2c2c2c] hover:bg-[#383838] text-[#cccccc] cursor-pointer"
           >
             {activeTab === 'sphere' ? 'Sliders' : 'Sphere'}
           </button>
@@ -243,7 +246,7 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
             type="button"
             onClick={onReset}
             title="Reset Light to Default (Top-Right Front)"
-            className="p-1 rounded text-gray-400 hover:text-white hover:bg-white/10"
+            className="p-1 rounded text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer"
           >
             <RotateCcw className="w-3 h-3" />
           </button>
@@ -256,42 +259,42 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
           <div className="relative group cursor-crosshair">
             <canvas
               ref={canvasRef}
-              width={140}
-              height={140}
+              width={132}
+              height={132}
               onPointerDown={handlePointerDown}
-              className="rounded-full shadow-inner border border-white/10"
+              className="rounded-full border border-white/[0.1]"
               style={{ touchAction: 'none' }}
             />
             <div className="absolute inset-0 pointer-events-none flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity">
-              <span className="text-[9px] bg-black/60 px-1.5 py-0.5 rounded text-gray-300">
-                Drag to angle light
+              <span className="text-[9px] bg-black/70 px-1.5 py-0.5 rounded text-[#e5e5e5]">
+                Drag to angle
               </span>
             </div>
           </div>
 
           {/* Front / Back Light Toggle */}
-          <div className="flex items-center justify-between w-full mt-2 px-1">
+          <div className="flex items-center justify-between w-full mt-2 px-0.5">
             <button
               type="button"
               onClick={() => onChange({ ...settings, isBacklit: !settings.isBacklit })}
-              className={`text-[10px] px-2 py-0.5 rounded font-medium transition-colors ${
+              className={`text-[10px] px-2 py-0.5 rounded font-medium transition-colors cursor-pointer ${
                 settings.isBacklit
-                  ? 'bg-rose-600/30 text-rose-300 border border-rose-500/50'
-                  : 'bg-sky-600/30 text-sky-300 border border-sky-500/50'
+                  ? 'bg-[var(--accent-subtle)] text-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+                  : 'bg-[#2c2c2c] text-[#cccccc] hover:text-[#e5e5e5]'
               }`}
             >
-              {settings.isBacklit ? 'Backlight Mode' : 'Front Light'}
+              {settings.isBacklit ? 'Backlight' : 'Front Light'}
             </button>
-            <span className="text-[10px] font-mono text-gray-400">
-              {settings.azimuth}° | {settings.elevation}°
+            <span className="text-[10px] font-mono text-[#8a8a8a]">
+              {settings.azimuth}° / {settings.elevation}°
             </span>
           </div>
         </div>
       ) : (
         <div className="space-y-2 py-1">
           {/* Azimuth (Horizontal) */}
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-gray-400">Azimuth</span>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] text-[#8a8a8a] w-14">Azimuth</span>
             <input
               type="range"
               min="0"
@@ -299,14 +302,14 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
               step="2"
               value={settings.azimuth}
               onChange={(e) => onChange({ ...settings, azimuth: parseInt(e.target.value, 10) })}
-              className="w-28 accent-amber-400 cursor-pointer h-1.5"
+              className="flex-1"
             />
-            <span className="text-[10px] font-mono w-7 text-right">{settings.azimuth}°</span>
+            <span className="text-[10px] font-mono w-7 text-right text-[#e5e5e5]">{settings.azimuth}°</span>
           </div>
 
           {/* Elevation (Vertical) */}
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-gray-400">Elevation</span>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[10px] text-[#8a8a8a] w-14">Elevation</span>
             <input
               type="range"
               min="-85"
@@ -314,17 +317,17 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
               step="1"
               value={settings.elevation}
               onChange={(e) => onChange({ ...settings, elevation: parseInt(e.target.value, 10) })}
-              className="w-28 accent-amber-400 cursor-pointer h-1.5"
+              className="flex-1"
             />
-            <span className="text-[10px] font-mono w-7 text-right">{settings.elevation}°</span>
+            <span className="text-[10px] font-mono w-7 text-right text-[#e5e5e5]">{settings.elevation}°</span>
           </div>
         </div>
       )}
 
       {/* Common Controls: Intensity & Ambient Fill */}
-      <div className="mt-2.5 pt-2 border-t border-white/10 space-y-1.5">
-        <div className="flex items-center justify-between">
-          <span className="text-[10px] text-gray-400">Intensity</span>
+      <div className="mt-2.5 pt-2 border-t border-white/[0.06] space-y-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[10px] text-[#8a8a8a] w-14">Intensity</span>
           <input
             type="range"
             min="0.2"
@@ -332,13 +335,13 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
             step="0.05"
             value={settings.intensity}
             onChange={(e) => onChange({ ...settings, intensity: parseFloat(e.target.value) })}
-            className="w-28 accent-blue-500 cursor-pointer h-1.5"
+            className="flex-1"
           />
-          <span className="text-[10px] font-mono w-7 text-right">{Math.round(settings.intensity * 100)}%</span>
+          <span className="text-[10px] font-mono w-8 text-right text-[#e5e5e5]">{Math.round(settings.intensity * 100)}%</span>
         </div>
 
-        <div className="flex items-center justify-between">
-          <span className="text-[10px] text-gray-400">Shadow Fill</span>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[10px] text-[#8a8a8a] w-14">Fill</span>
           <input
             type="range"
             min="0.1"
@@ -346,26 +349,26 @@ export const LightSourceWidget: React.FC<LightSourceWidgetProps> = ({
             step="0.05"
             value={settings.ambientIntensity}
             onChange={(e) => onChange({ ...settings, ambientIntensity: parseFloat(e.target.value) })}
-            className="w-28 accent-emerald-500 cursor-pointer h-1.5"
+            className="flex-1"
           />
-          <span className="text-[10px] font-mono w-7 text-right">
+          <span className="text-[10px] font-mono w-8 text-right text-[#e5e5e5]">
             {Math.round(settings.ambientIntensity * 100)}%
           </span>
         </div>
 
         {/* Color Presets */}
         <div className="flex items-center justify-between pt-1">
-          <span className="text-[10px] text-gray-400">Color</span>
-          <div className="flex items-center space-x-1">
+          <span className="text-[10px] text-[#8a8a8a]">Tint</span>
+          <div className="flex items-center space-x-1.5">
             {colorPresets.map((preset) => (
               <button
                 key={preset.label}
                 type="button"
                 onClick={() => onChange({ ...settings, color: preset.color })}
                 title={preset.label}
-                className={`w-4 h-4 rounded-full border transition-transform ${
+                className={`w-4 h-4 rounded-full border transition-transform cursor-pointer ${
                   settings.color.toLowerCase() === preset.color.toLowerCase()
-                    ? 'scale-110 border-sky-400 ring-1 ring-sky-400'
+                    ? 'scale-110 border-[var(--accent)] ring-1 ring-[var(--accent)]'
                     : 'border-white/30 hover:scale-105'
                 }`}
                 style={{ backgroundColor: preset.color }}

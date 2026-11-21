@@ -89,7 +89,6 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   onSelectAppView,
 }) => {
   const isRotated = Math.abs(rotation % 360) > 0.05;
-  const isVintage = themePreset === 'vintage-manga';
 
   const resolvedHandlers = useMemo<WorkspaceCommandHandlers>(
     () =>
@@ -126,11 +125,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({
     <header
       data-tauri-drag-region
       data-theme-preset={themePreset}
-      className={`h-[36px] px-2 flex items-center justify-between gap-2 select-none z-40 shrink-0 ${
-        isVintage
-          ? 'bg-gradient-to-b from-[#49494d] to-[#363638] border-b border-[#232325] text-[#f0f0f4]'
-          : 'bg-[#202020] text-[#e5e5e5]'
-      }`}
+      className="h-[36px] px-2 flex items-center justify-between gap-2 select-none z-40 shrink-0 bg-[#202020] text-[#e5e5e5]"
     >
       {/* Left: App Icon (Home Toggle) + Menu Bar */}
       <div
@@ -209,11 +204,9 @@ export const Header: React.FC<HeaderProps> = React.memo(({
 
         {/* Compact Zoom Control */}
         <div
-          className={`h-6 flex items-center rounded px-0.5 ${
-            isVintage
-              ? 'bg-[#2b2b2e] border border-[#202022]'
-              : 'bg-[#161616]'
-          } ${!hasOpenDocument ? 'opacity-40 pointer-events-none' : ''}`}
+          className={`h-6 flex items-center rounded px-0.5 bg-[#161616] ${
+            !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
+          }`}
         >
           <button
             type="button"
@@ -244,9 +237,9 @@ export const Header: React.FC<HeaderProps> = React.memo(({
         {/* Non-Destructive View Flip Controls (CSP-style Mirror View) */}
         {(onToggleFlipHorizontal || onToggleFlipVertical) && (
           <div
-            className={`h-6 flex items-center rounded px-0.5 gap-0.5 ${
-              isVintage ? 'bg-[#2b2b2e] border border-[#202022]' : 'bg-[#161616]'
-            } ${!hasOpenDocument ? 'opacity-40 pointer-events-none' : ''}`}
+            className={`h-6 flex items-center rounded px-0.5 gap-0.5 bg-[#161616] ${
+              !hasOpenDocument ? 'opacity-40 pointer-events-none' : ''
+            }`}
           >
             {onToggleFlipHorizontal && (
               <button

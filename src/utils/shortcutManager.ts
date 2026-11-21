@@ -131,6 +131,15 @@ export const DEFAULT_COMMANDS: readonly CommandDefinition[] = [
     springLoaded: true,
   },
   {
+    id: 'tool.shape',
+    label: 'Geometric Shapes',
+    description: 'Draw lines, rectangles, ellipses, triangles, polygons, stars, and arrows',
+    category: 'Tools',
+    defaultShortcut: 'U',
+    toolId: 'shape',
+    springLoaded: true,
+  },
+  {
     id: 'tool.text',
     label: 'Text Tool',
     description: 'Place and edit manga typography',

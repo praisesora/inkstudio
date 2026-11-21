@@ -1,11 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { SpeechBalloon } from '../types/editor';
 import {
-  MessageSquare,
-  Sparkles,
-  Cloud,
-  Square,
-  Check,
   Trash2,
 } from 'lucide-react';
 import { getBalloonHandles, BalloonHandle, renderSpeechBalloon } from '../utils/balloonEngine';
@@ -316,7 +311,7 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
 
       {/* Floating Balloon Inspector Panel */}
       <div
-        className="absolute pointer-events-auto bg-[#1e1f22] border border-[#383a40] rounded-md shadow-2xl p-2.5 w-72 text-xs text-[#cccccc] flex flex-col space-y-2 select-none"
+        className="absolute pointer-events-auto bg-[#202020]/95 backdrop-blur-md border border-white/[0.1] rounded-md shadow-2xl p-2.5 w-72 text-xs text-[#e5e5e5] flex flex-col space-y-2 select-none"
         style={{
           left: `${bounds.x + bounds.width + 15}px`,
           top: `${bounds.y}px`,
@@ -325,24 +320,21 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
         }}
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-[#2b2d31] pb-1.5">
-          <div className="flex items-center space-x-1.5 text-white font-medium">
-            <MessageSquare className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Speech Balloon</span>
-          </div>
+        <div className="flex items-center justify-between border-b border-white/[0.06] pb-1.5">
+          <span className="text-[#e5e5e5] font-medium">Speech Balloon</span>
           <div className="flex items-center space-x-1">
             <button
               onClick={() => setActiveTab('shape')}
-              className={`px-1.5 py-0.5 rounded text-[10px] ${
-                activeTab === 'shape' ? 'bg-[#2b2d31] text-white' : 'text-[#888888]'
+              className={`px-1.5 py-0.5 rounded text-[10px] cursor-pointer ${
+                activeTab === 'shape' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a]'
               }`}
             >
               Shape
             </button>
             <button
               onClick={() => setActiveTab('text')}
-              className={`px-1.5 py-0.5 rounded text-[10px] ${
-                activeTab === 'text' ? 'bg-[#2b2d31] text-white' : 'text-[#888888]'
+              className={`px-1.5 py-0.5 rounded text-[10px] cursor-pointer ${
+                activeTab === 'text' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a]'
               }`}
             >
               Text
@@ -353,65 +345,34 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
         {activeTab === 'shape' ? (
           <div className="space-y-2">
             <div>
-              <label className="text-[10px] text-[#888888] block mb-1">Shape Preset:</label>
+              <label className="text-[10px] text-[#8a8a8a] block mb-1">Shape Preset</label>
               <div className="grid grid-cols-4 gap-1">
-                <button
-                  onClick={() => onUpdateBalloon((p) => ({ ...p, shape: 'ellipse' }))}
-                  className={`p-1 rounded flex flex-col items-center border ${
-                    balloon.shape === 'ellipse'
-                      ? 'border-cyan-400 bg-cyan-500/10 text-cyan-300'
-                      : 'border-[#2e3036] text-[#888888] hover:text-white'
-                  }`}
-                  title="Ellipse (Standard)"
-                >
-                  <div className="w-4 h-3 rounded-full border border-current my-0.5" />
-                  <span className="text-[9px]">Ellipse</span>
-                </button>
-
-                <button
-                  onClick={() => onUpdateBalloon((p) => ({ ...p, shape: 'rounded-rect' }))}
-                  className={`p-1 rounded flex flex-col items-center border ${
-                    balloon.shape === 'rounded-rect'
-                      ? 'border-cyan-400 bg-cyan-500/10 text-cyan-300'
-                      : 'border-[#2e3036] text-[#888888] hover:text-white'
-                  }`}
-                  title="Rounded Rectangle"
-                >
-                  <Square className="w-3.5 h-3.5 my-0.5" />
-                  <span className="text-[9px]">Box</span>
-                </button>
-
-                <button
-                  onClick={() => onUpdateBalloon((p) => ({ ...p, shape: 'jagged-flash' }))}
-                  className={`p-1 rounded flex flex-col items-center border ${
-                    balloon.shape === 'jagged-flash'
-                      ? 'border-cyan-400 bg-cyan-500/10 text-cyan-300'
-                      : 'border-[#2e3036] text-[#888888] hover:text-white'
-                  }`}
-                  title="Jagged Flash (Shout / Action)"
-                >
-                  <Sparkles className="w-3.5 h-3.5 my-0.5 text-amber-400" />
-                  <span className="text-[9px]">Flash</span>
-                </button>
-
-                <button
-                  onClick={() => onUpdateBalloon((p) => ({ ...p, shape: 'thought' }))}
-                  className={`p-1 rounded flex flex-col items-center border ${
-                    balloon.shape === 'thought'
-                      ? 'border-cyan-400 bg-cyan-500/10 text-cyan-300'
-                      : 'border-[#2e3036] text-[#888888] hover:text-white'
-                  }`}
-                  title="Thought Bubble (Cloud)"
-                >
-                  <Cloud className="w-3.5 h-3.5 my-0.5 text-sky-400" />
-                  <span className="text-[9px]">Thought</span>
-                </button>
+                {(
+                  [
+                    ['ellipse', 'Ellipse'],
+                    ['rounded-rect', 'Box'],
+                    ['jagged-flash', 'Flash'],
+                    ['thought', 'Thought'],
+                  ] as const
+                ).map(([shapeId, lbl]) => (
+                  <button
+                    key={shapeId}
+                    onClick={() => onUpdateBalloon((p) => ({ ...p, shape: shapeId }))}
+                    className={`py-1 rounded text-[10px] border cursor-pointer transition-colors ${
+                      balloon.shape === shapeId
+                        ? 'border-[var(--accent-border)] bg-[var(--accent-subtle)] text-[var(--accent)] font-medium'
+                        : 'border-white/[0.06] bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5]'
+                    }`}
+                  >
+                    {lbl}
+                  </button>
+                ))}
               </div>
             </div>
 
             <div className="flex items-center justify-between text-[11px]">
-              <span className="text-[#888888]">Border Width:</span>
-              <div className="flex items-center space-x-1">
+              <span className="text-[#8a8a8a]">Border Width</span>
+              <div className="flex items-center space-x-1.5">
                 <input
                   type="range"
                   min={1}
@@ -420,9 +381,9 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
                   onChange={(e) =>
                     onUpdateBalloon((p) => ({ ...p, strokeWidth: Number(e.target.value) }))
                   }
-                  className="w-24 accent-cyan-400"
+                  className="w-24"
                 />
-                <span className="font-mono text-cyan-400 w-6 text-right">
+                <span className="font-mono text-[#e5e5e5] w-6 text-right">
                   {balloon.strokeWidth}px
                 </span>
               </div>
@@ -435,38 +396,38 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
               onChange={(e) => onUpdateBalloon((p) => ({ ...p, text: e.target.value }))}
               placeholder="Balloon dialogue text..."
               rows={2}
-              className="w-full bg-[#141517] text-white text-xs border border-[#383a40] rounded p-1.5 focus:border-cyan-500 focus:outline-none resize-none"
+              className="w-full bg-[#161616] text-[#e5e5e5] text-xs border border-white/[0.08] rounded p-1.5 resize-none"
             />
 
             <div className="flex items-center justify-between">
-              <span className="text-[11px] text-[#888888]">Direction:</span>
+              <span className="text-[11px] text-[#8a8a8a]">Direction</span>
               <div className="flex space-x-1">
                 <button
                   onClick={() => onUpdateBalloon((p) => ({ ...p, vertical: false }))}
-                  className={`px-2 py-0.5 rounded text-[10px] ${
+                  className={`px-2 py-0.5 rounded text-[10px] cursor-pointer ${
                     !balloon.vertical
-                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                      : 'bg-[#141517] text-[#888888]'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)]'
+                      : 'bg-[#161616] text-[#8a8a8a]'
                   }`}
                 >
                   Horizontal
                 </button>
                 <button
                   onClick={() => onUpdateBalloon((p) => ({ ...p, vertical: true }))}
-                  className={`px-2 py-0.5 rounded text-[10px] ${
+                  className={`px-2 py-0.5 rounded text-[10px] cursor-pointer ${
                     balloon.vertical
-                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                      : 'bg-[#141517] text-[#888888]'
+                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)] border border-[var(--accent-border)]'
+                      : 'bg-[#161616] text-[#8a8a8a]'
                   }`}
                 >
-                  Vertical 縦
+                  Vertical
                 </button>
               </div>
             </div>
 
             <div className="flex items-center justify-between text-[11px]">
-              <span className="text-[#888888]">Font Size:</span>
-              <div className="flex items-center space-x-1">
+              <span className="text-[#8a8a8a]">Font Size</span>
+              <div className="flex items-center space-x-1.5">
                 <input
                   type="range"
                   min={12}
@@ -475,18 +436,18 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
                   onChange={(e) =>
                     onUpdateBalloon((p) => ({ ...p, fontSize: Number(e.target.value) }))
                   }
-                  className="w-24 accent-cyan-400"
+                  className="w-24"
                 />
-                <span className="font-mono text-cyan-400 w-6 text-right">{balloon.fontSize}px</span>
+                <span className="font-mono text-[#e5e5e5] w-6 text-right">{balloon.fontSize}px</span>
               </div>
             </div>
           </div>
         )}
 
-        <div className="flex items-center justify-between pt-1.5 border-t border-[#2b2d31]">
+        <div className="flex items-center justify-between pt-1.5 border-t border-white/[0.06]">
           <button
             onClick={onDeleteBalloon}
-            className="p-1 text-rose-400 hover:bg-rose-500/20 rounded transition-colors"
+            className="p-1 text-[#8a8a8a] hover:text-rose-400 hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
             title="Delete Balloon"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -494,10 +455,9 @@ export const SpeechBalloonOverlay: React.FC<SpeechBalloonOverlayProps> = ({
 
           <button
             onClick={onConfirmBalloon}
-            className="px-2.5 py-1 bg-[#234b3e] hover:bg-[#2b604f] text-[#55eaab] border border-[#2e6e58] rounded text-xs font-semibold flex items-center space-x-1"
+            className="px-3 py-1 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
           >
-            <Check className="w-3.5 h-3.5" />
-            <span>Apply Balloon</span>
+            Apply Balloon
           </button>
         </div>
       </div>

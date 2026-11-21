@@ -1,4 +1,4 @@
-import { CanvasSelection } from '../types/editor';
+import { CanvasSelection, LayerItem, isFolderLikeLayer } from '../types/editor';
 
 export type LiquifyMode =
   | 'push'
@@ -16,6 +16,7 @@ export interface LiquifySettings {
   strength: number; // 1 to 100
   hardness: number; // 0 to 100
   usePressure: boolean;
+  multiLayer?: boolean;
 }
 
 export interface DirtyRect {
@@ -571,4 +572,84 @@ export function createLiquifySelectionMask(
   }
 
   return null;
+}
+
+function isLayerOrAncestorLocked(layer: LayerItem, layerMap: Map<string, LayerItem>): boolean {
+  let current: LayerItem | undefined = layer;
+  let guard = 0;
+  while (current && guard < 32) {
+    if (current.locked) return true;
+    if (!current.parentId) break;
+    current = layerMap.get(current.parentId);
+    guard++;
+  }
+  return false;
+}
+
+function isDescendantOfAny(
+  layer: LayerItem,
+  ancestorIds: Set<string>,
+  layerMap: Map<string, LayerItem>
+): boolean {
+  let parentId: string | null | undefined = layer.parentId;
+  let guard = 0;
+  while (parentId && guard < 32) {
+    if (ancestorIds.has(parentId)) return true;
+    parentId = layerMap.get(parentId)?.parentId;
+    guard++;
+  }
+  return false;
+}
+
+/**
+ * Resolves the raster layers targeted by a Liquify stroke.
+ * - Single-layer mode: active layer only (if visible, unlocked raster).
+ * - Multi-layer mode:
+ *   - If 2+ layers are explicitly selected: all visible, unlocked raster layers in that selection
+ *     (expanding any selected folders to their descendants).
+ *   - Else if activeLayer is a folder/frame-folder: all visible, unlocked raster descendants.
+ *   - Else: all visible, unlocked raster layers in the document.
+ */
+export function resolveLiquifyTargetLayers(
+  layers: LayerItem[],
+  activeLayer: LayerItem | undefined,
+  selectedLayerIds: string[],
+  isLayerEffectivelyVisible: (layer: LayerItem) => boolean,
+  multiLayer: boolean
+): LayerItem[] {
+  const layerMap = new Map<string, LayerItem>();
+  for (const l of layers) {
+    layerMap.set(l.id, l);
+  }
+
+  const isEditableRaster = (l: LayerItem): boolean =>
+    l.type === 'raster' &&
+    isLayerEffectivelyVisible(l) &&
+    !isLayerOrAncestorLocked(l, layerMap);
+
+  if (!multiLayer) {
+    return activeLayer && isEditableRaster(activeLayer) ? [activeLayer] : [];
+  }
+
+  if (selectedLayerIds.length > 1) {
+    const selectedSet = new Set(selectedLayerIds);
+    const selectedFolders = new Set(
+      layers.filter((l) => selectedSet.has(l.id) && isFolderLikeLayer(l)).map((l) => l.id)
+    );
+    return layers.filter(
+      (l) =>
+        isEditableRaster(l) &&
+        (selectedSet.has(l.id) ||
+          (selectedFolders.size > 0 && isDescendantOfAny(l, selectedFolders, layerMap)))
+    );
+  }
+
+  if (activeLayer && isFolderLikeLayer(activeLayer)) {
+    const folderSet = new Set([activeLayer.id]);
+    return layers.filter(
+      (l) => isEditableRaster(l) && isDescendantOfAny(l, folderSet, layerMap)
+    );
+  }
+
+  return layers.filter(isEditableRaster);
 }

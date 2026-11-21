@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { X, Check, Sparkles } from 'lucide-react';
+import { X } from 'lucide-react';
 import { HalftoneDotShape, applyScreentoneCPU } from '../utils/screentoneEngine';
 
 export interface SimpleToneSettings {
@@ -123,21 +123,16 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs select-none"
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <div className="bg-[#1e1f22] border border-[#383a40] rounded-lg shadow-2xl w-96 flex flex-col overflow-hidden text-[#cccccc] animate-in fade-in zoom-in-95 duration-150">
+      <div className="bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl w-96 flex flex-col overflow-hidden text-[#e5e5e5]">
         {/* Header */}
-        <div className="px-4 py-3 bg-[#2b2d31] border-b border-[#383a40] flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <Sparkles className="w-4 h-4 text-amber-400" />
-            <h2 className="text-xs font-semibold text-white tracking-wide uppercase">
-              Simple Tone Settings
-            </h2>
-          </div>
+        <div className="px-4 py-2.5 bg-[#1a1a1a] border-b border-white/[0.06] flex items-center justify-between">
+          <h2 className="text-xs font-medium text-[#e5e5e5]">Simple Tone Settings</h2>
           <button
             onClick={onClose}
-            className="text-[#999999] hover:text-white p-1 rounded hover:bg-[#35373c] transition-colors"
+            className="text-[#8a8a8a] hover:text-[#e5e5e5] p-1 rounded hover:bg-[#2c2c2c] transition-colors cursor-pointer"
             title="Cancel (Esc)"
           >
-            <X className="w-4 h-4" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
@@ -147,12 +142,12 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
           <div className="flex gap-4">
             {/* Swatch Preview */}
             <div className="flex flex-col items-center">
-              <span className="text-[10px] text-[#999999] mb-1 font-medium">Preview</span>
-              <div className="w-[120px] h-[120px] rounded border border-[#383a40] bg-white overflow-hidden shadow-inner flex items-center justify-center">
+              <span className="text-[10px] text-[#8a8a8a] mb-1">Preview</span>
+              <div className="w-[120px] h-[120px] rounded border border-white/[0.08] bg-white overflow-hidden flex items-center justify-center">
                 <canvas ref={previewCanvasRef} className="w-full h-full" />
               </div>
-              <span className="text-[9px] text-[#777777] font-mono mt-1">
-                {frequency}L • {densityType === 'specified' ? `${density}%` : 'Lum'}
+              <span className="text-[9px] text-[#8a8a8a] font-mono mt-1">
+                {frequency}L · {densityType === 'specified' ? `${density}%` : 'Lum'}
               </span>
             </div>
 
@@ -160,29 +155,25 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
             <div className="flex-1 space-y-3">
               {/* Dot Shape */}
               <div>
-                <label className="text-[10px] text-[#999999] font-medium block mb-1">
-                  Dot Shape:
-                </label>
+                <label className="text-[10px] text-[#8a8a8a] block mb-1">Dot Shape</label>
                 <select
                   value={dotShape}
                   onChange={(e) => setDotShape(e.target.value as HalftoneDotShape)}
-                  className="w-full bg-[#252526] border border-[#3a3a3a] text-[#cccccc] text-xs rounded px-2 py-1 outline-none cursor-pointer hover:border-[#555555] focus:border-amber-400"
+                  className="w-full bg-[#161616] border border-white/[0.08] text-[#e5e5e5] text-xs rounded px-2 py-1 cursor-pointer"
                 >
-                  <option value="circle">Circle (Standard CSP)</option>
-                  <option value="euclidean">Euclidean (Classic Halftone)</option>
+                  <option value="circle">Circle (Standard)</option>
+                  <option value="euclidean">Euclidean (Halftone)</option>
                   <option value="line">Line (Hatching)</option>
                 </select>
               </div>
 
               {/* Density Mode */}
               <div>
-                <label className="text-[10px] text-[#999999] font-medium block mb-1">
-                  Density Mode:
-                </label>
+                <label className="text-[10px] text-[#8a8a8a] block mb-1">Density Mode</label>
                 <select
                   value={densityType}
                   onChange={(e) => setDensityType(e.target.value as 'specified' | 'image')}
-                  className="w-full bg-[#252526] border border-[#3a3a3a] text-[#cccccc] text-xs rounded px-2 py-1 outline-none cursor-pointer hover:border-[#555555] focus:border-amber-400"
+                  className="w-full bg-[#161616] border border-white/[0.08] text-[#e5e5e5] text-xs rounded px-2 py-1 cursor-pointer"
                 >
                   <option value="specified">Use specified density</option>
                   <option value="image">Use image brightness</option>
@@ -192,8 +183,8 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
               {/* Angle */}
               <div>
                 <div className="flex items-center justify-between text-[10px] mb-1">
-                  <span className="text-[#999999] font-medium">Angle:</span>
-                  <span className="font-mono text-amber-300 font-bold">{angle}°</span>
+                  <span className="text-[#8a8a8a]">Angle</span>
+                  <span className="font-mono text-[#e5e5e5]">{angle}°</span>
                 </div>
                 <input
                   type="range"
@@ -202,16 +193,16 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                   step="1"
                   value={angle}
                   onChange={(e) => setAngle(parseInt(e.target.value, 10))}
-                  className="w-full cursor-pointer h-1.5 accent-amber-400"
+                  className="w-full"
                 />
-                <div className="flex items-center justify-between text-[8px] text-[#666666] font-mono mt-0.5">
+                <div className="flex items-center justify-between text-[9px] text-[#8a8a8a] font-mono mt-0.5">
                   {ANGLE_PRESETS.map((p) => (
                     <button
                       key={p}
                       type="button"
                       onClick={() => setAngle(p)}
-                      className={`hover:text-amber-300 transition-colors ${
-                        angle === p ? 'text-amber-400 font-bold' : ''
+                      className={`hover:text-[#e5e5e5] transition-colors cursor-pointer ${
+                        angle === p ? 'text-[var(--accent)] font-semibold' : ''
                       }`}
                     >
                       {p}°
@@ -224,9 +215,9 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
 
           {/* Density Slider & Presets (when specified) */}
           {densityType === 'specified' && (
-            <div className="p-2.5 bg-[#252526] rounded border border-[#383a40]">
+            <div className="p-2.5 bg-[#161616] rounded border border-white/[0.06]">
               <div className="flex items-center justify-between text-xs mb-1.5">
-                <span className="text-[#cccccc] font-medium">Density:</span>
+                <span className="text-[#cccccc]">Density</span>
                 <div className="flex items-center space-x-1">
                   <input
                     type="number"
@@ -237,9 +228,9 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                       const v = parseInt(e.target.value, 10);
                       if (!isNaN(v)) setDensity(Math.max(1, Math.min(100, v)));
                     }}
-                    className="w-12 bg-[#1e1f22] border border-[#383a40] text-amber-300 font-mono text-xs rounded px-1.5 py-0.5 text-right outline-none focus:border-amber-400"
+                    className="w-12 bg-[#202020] border border-white/[0.08] text-[#e5e5e5] font-mono text-xs rounded px-1.5 py-0.5 text-right"
                   />
-                  <span className="text-xs text-[#888888] font-mono">%</span>
+                  <span className="text-xs text-[#8a8a8a] font-mono">%</span>
                 </div>
               </div>
               <input
@@ -249,16 +240,16 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                 step="1"
                 value={density}
                 onChange={(e) => setDensity(parseInt(e.target.value, 10))}
-                className="w-full cursor-pointer h-1.5 accent-amber-400 mb-1.5"
+                className="w-full mb-1.5"
               />
-              <div className="flex items-center justify-between text-[9px] text-[#888888] font-mono">
+              <div className="flex items-center justify-between text-[9px] text-[#8a8a8a] font-mono">
                 {DENSITY_PRESETS.map((p) => (
                   <button
                     key={p}
                     type="button"
                     onClick={() => setDensity(p)}
-                    className={`hover:text-amber-300 px-1 py-0.5 rounded transition-colors ${
-                      density === p ? 'bg-amber-500/20 text-amber-400 font-bold' : ''
+                    className={`hover:text-[#e5e5e5] px-1 py-0.5 rounded transition-colors cursor-pointer ${
+                      density === p ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-semibold' : ''
                     }`}
                   >
                     {p}%
@@ -269,9 +260,9 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
           )}
 
           {/* Frequency (Lines / LPI) */}
-          <div className="p-2.5 bg-[#252526] rounded border border-[#383a40]">
+          <div className="p-2.5 bg-[#161616] rounded border border-white/[0.06]">
             <div className="flex items-center justify-between text-xs mb-1.5">
-              <span className="text-[#cccccc] font-medium">Number of screen lines (LPI):</span>
+              <span className="text-[#cccccc]">Screen Frequency (LPI)</span>
               <div className="flex items-center space-x-1">
                 <input
                   type="number"
@@ -283,9 +274,9 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                     const v = parseFloat(e.target.value);
                     if (!isNaN(v)) setFrequency(Math.max(20, Math.min(85, v)));
                   }}
-                  className="w-12 bg-[#1e1f22] border border-[#383a40] text-amber-300 font-mono text-xs rounded px-1.5 py-0.5 text-right outline-none focus:border-amber-400"
+                  className="w-12 bg-[#202020] border border-white/[0.08] text-[#e5e5e5] font-mono text-xs rounded px-1.5 py-0.5 text-right"
                 />
-                <span className="text-xs text-[#888888] font-mono">L</span>
+                <span className="text-xs text-[#8a8a8a] font-mono">L</span>
               </div>
             </div>
             <input
@@ -295,16 +286,16 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
               step="1"
               value={frequency}
               onChange={(e) => setFrequency(parseFloat(e.target.value))}
-              className="w-full cursor-pointer h-1.5 accent-amber-400 mb-1.5"
+              className="w-full mb-1.5"
             />
-            <div className="flex items-center justify-between text-[9px] text-[#888888] font-mono">
+            <div className="flex items-center justify-between text-[9px] text-[#8a8a8a] font-mono">
               {FREQUENCY_PRESETS.map((p) => (
                 <button
                   key={p}
                   type="button"
                   onClick={() => setFrequency(p)}
-                  className={`hover:text-amber-300 px-1 py-0.5 rounded transition-colors ${
-                    frequency === p ? 'bg-amber-500/20 text-amber-400 font-bold' : ''
+                  className={`hover:text-[#e5e5e5] px-1 py-0.5 rounded transition-colors cursor-pointer ${
+                    frequency === p ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-semibold' : ''
                   }`}
                 >
                   {p}
@@ -315,11 +306,11 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-3 bg-[#2b2d31] border-t border-[#383a40] flex items-center justify-end space-x-2">
+        <div className="px-4 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-end space-x-2">
           <button
             type="button"
             onClick={onClose}
-            className="px-3 py-1.5 rounded bg-[#35373c] hover:bg-[#3f4147] text-[#cccccc] hover:text-white transition-colors cursor-pointer text-xs font-medium"
+            className="px-3 py-1.5 rounded bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] transition-colors cursor-pointer text-xs"
           >
             Cancel
           </button>
@@ -334,10 +325,9 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                 densityType,
               })
             }
-            className="px-4 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-black font-semibold transition-colors cursor-pointer text-xs flex items-center space-x-1 shadow-md"
+            className="px-4 py-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium transition-opacity cursor-pointer text-xs"
           >
-            <Check className="w-3.5 h-3.5 stroke-[2.5]" />
-            <span>OK</span>
+            OK
           </button>
         </div>
       </div>
