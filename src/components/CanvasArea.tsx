@@ -145,6 +145,7 @@ interface CanvasAreaProps {
   activeLayerId?: string;
   colorMode?: CanvasColorMode;
   tileGrid?: SparseTileGrid;
+  isExternalFileDropActive?: boolean;
 }
 
 export function extractCoalescedEvents(e: React.PointerEvent<HTMLElement>): PointerEvent[] {
@@ -316,6 +317,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   activeLayerId,
   colorMode = 'color',
   tileGrid = globalTileGrid,
+  isExternalFileDropActive = false,
 }) => {
   const tileGridRef = useRef<SparseTileGrid>(tileGrid);
   tileGridRef.current = tileGrid;
@@ -1268,6 +1270,10 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
     }
   };
 
+  const handleCanvasPointerCancel = (e: React.PointerEvent<HTMLElement>) => {
+    handleCanvasPointerUp(e);
+  };
+
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
     const modSettings = useUiStore.getState().appSettings.modifierKeys;
     if (modSettings.rightClick !== 'none' || modSettings.stylusButton1 !== 'none') {
@@ -1342,6 +1348,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   return (
     <main
       ref={viewportRef}
+      data-drop-zone="canvas"
       onPointerDown={handleViewportPointerDown}
       onContextMenu={handleContextMenu}
       className="flex-1 bg-[#161616] overflow-hidden relative select-none canvas-viewport"
@@ -1673,6 +1680,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           onPointerDown={handleCanvasPointerDown}
           onPointerMove={handleCanvasPointerMove}
           onPointerUp={handleCanvasPointerUp}
+          onPointerCancel={handleCanvasPointerCancel}
+          onLostPointerCapture={handleCanvasPointerCancel}
           onPointerEnter={onPointerEnter}
           onPointerLeave={onPointerLeave}
           onContextMenu={handleContextMenu}
@@ -2057,6 +2066,17 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           onDeleteCel={onDeleteAnimationCel || (() => {})}
           onSelectCelLayer={onSelectCelLayer}
         />
+      )}
+
+      {isExternalFileDropActive && (
+        <div
+          data-testid="canvas-file-drop-overlay"
+          className="pointer-events-none absolute inset-2 z-50 rounded-md border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/8 flex items-center justify-center"
+        >
+          <div className="px-3.5 py-2 rounded-md bg-[#161616]/95 border border-[var(--accent)]/60 text-xs font-medium text-[#f5f5f5] shadow-xl">
+            Drop image to import as layer
+          </div>
+        </div>
       )}
     </main>
   );

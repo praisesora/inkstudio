@@ -10,6 +10,7 @@
  */
 
 import { TileDelta } from '../types/editor';
+import { yieldToMain } from './asyncCompression';
 
 export const TILE_SIZE = 256;
 export const TILE_PIXELS = TILE_SIZE * TILE_SIZE; // 65,536 pixels
@@ -770,14 +771,23 @@ export function unpackTileWriteBatch(buffer: Uint8Array | ArrayBuffer): TileWrit
  * Direct raw binary IPC with high-throughput LZ4 compression and atomic file index tables.
  */
 export class TauriScratchDiskDriver implements IScratchDiskDriver {
+  private invokePromise: Promise<typeof import('@tauri-apps/api/core').invoke> | null = null;
+
+  private getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
+    if (!this.invokePromise) {
+      this.invokePromise = import('@tauri-apps/api/core').then((m) => m.invoke);
+    }
+    return this.invokePromise;
+  }
+
   public async init(sessionId: string): Promise<void> {
-    const { invoke } = await import('@tauri-apps/api/core');
+    const invoke = await this.getInvoke();
     await invoke('scratch_disk_init', { sessionId });
   }
 
   public async writeTiles(sessionId: string, tiles: TileWritePayload[]): Promise<number> {
     if (tiles.length === 0) return 0;
-    const { invoke } = await import('@tauri-apps/api/core');
+    const invoke = await this.getInvoke();
     const packed = packTileWriteBatch(tiles);
     return invoke<number>('scratch_disk_write_tiles', packed, {
       headers: {
@@ -787,7 +797,7 @@ export class TauriScratchDiskDriver implements IScratchDiskDriver {
   }
 
   public async readTile(sessionId: string, layerId: string, tileX: number, tileY: number): Promise<Uint8Array> {
-    const { invoke } = await import('@tauri-apps/api/core');
+    const invoke = await this.getInvoke();
     const raw = await invoke<ArrayBuffer | Uint8Array | number[]>('scratch_disk_read_tile', undefined, {
       headers: {
         'x-session-id': encodeURIComponent(sessionId),
@@ -802,7 +812,7 @@ export class TauriScratchDiskDriver implements IScratchDiskDriver {
   }
 
   public async clear(sessionId: string): Promise<void> {
-    const { invoke } = await import('@tauri-apps/api/core');
+    const invoke = await this.getInvoke();
     await invoke('scratch_disk_clear', { sessionId });
   }
 }
@@ -1025,10 +1035,12 @@ export class TileMemoryManager {
     return this.evictionPromise;
   }
 
+  private static readonly MAX_EVICT_BATCH_TILES = 32;
+
   private async performEvictionPass(): Promise<number> {
     // 1. First drop any in-memory LOD > 0 tiles (they can always be re-downsampled on demand with 0 IO)
     let droppedLodBytes = 0;
-    for (const tile of this.grid.getAllTiles()) {
+    for (const tile of this.grid.tilesIterable()) {
       if (tile.lod > 0 && tile.data !== null) {
         this.activeBytes -= tile.data.byteLength;
         droppedLodBytes += tile.data.byteLength;
@@ -1044,7 +1056,7 @@ export class TileMemoryManager {
 
     // 2. Gather candidate LOD 0 tiles with active data
     const candidates: TileBuffer[] = [];
-    for (const tile of this.grid.getAllTiles()) {
+    for (const tile of this.grid.tilesIterable()) {
       if (tile.lod === 0 && tile.data !== null) {
         candidates.push(tile);
       }
@@ -1114,38 +1126,54 @@ export class TileMemoryManager {
     }
 
     if (toEvict.length > 0) {
-      await this.evictTiles(toEvict);
-      return toEvict.length;
+      try {
+        await this.evictTiles(toEvict);
+        return toEvict.length;
+      } catch (err) {
+        console.warn('[TileMemoryManager] Eviction write failed; aborting pass:', err);
+        return 0;
+      }
     }
 
     return droppedLodBytes > 0 ? 1 : 0;
   }
 
   public async evictTiles(tiles: TileBuffer[]): Promise<void> {
-    const payloads: TileWritePayload[] = [];
-    const validTiles: TileBuffer[] = [];
+    if (tiles.length === 0) return;
 
-    for (const tile of tiles) {
-      if (tile.data !== null) {
-        payloads.push({
-          layerId: tile.layerId,
-          tileX: tile.tileX,
-          tileY: tile.tileY,
-          data: tile.data,
-        });
-        validTiles.push(tile);
-      }
-    }
+    const batchSize = TileMemoryManager.MAX_EVICT_BATCH_TILES;
+    for (let start = 0; start < tiles.length; start += batchSize) {
+      const end = Math.min(tiles.length, start + batchSize);
+      const payloads: TileWritePayload[] = [];
+      const validTiles: TileBuffer[] = [];
 
-    if (payloads.length > 0) {
-      await this.driver.writeTiles(this.sessionId, payloads);
-      for (const tile of validTiles) {
-        if (tile.data) {
-          this.activeBytes = Math.max(0, this.activeBytes - tile.data.byteLength);
-          tile.data = null;
-          tile.isPagedToDisk = true;
-          tile.dirty = false;
+      for (let i = start; i < end; i++) {
+        const tile = tiles[i];
+        if (tile.data !== null) {
+          payloads.push({
+            layerId: tile.layerId,
+            tileX: tile.tileX,
+            tileY: tile.tileY,
+            data: tile.data,
+          });
+          validTiles.push(tile);
         }
+      }
+
+      if (payloads.length > 0) {
+        await this.driver.writeTiles(this.sessionId, payloads);
+        for (const tile of validTiles) {
+          if (tile.data) {
+            this.activeBytes = Math.max(0, this.activeBytes - tile.data.byteLength);
+            tile.data = null;
+            tile.isPagedToDisk = true;
+            tile.dirty = false;
+          }
+        }
+      }
+
+      if (end < tiles.length) {
+        await yieldToMain();
       }
     }
   }
@@ -1159,7 +1187,7 @@ export class TileMemoryManager {
     let freed = 0;
 
     // 1. Drop regenerable LOD > 0 tiles first (zero disk I/O)
-    for (const tile of this.grid.getAllTiles()) {
+    for (const tile of this.grid.tilesIterable()) {
       if (tile.lod > 0 && tile.data !== null) {
         const sz = tile.data.byteLength;
         this.activeBytes = Math.max(0, this.activeBytes - sz);
@@ -1174,7 +1202,7 @@ export class TileMemoryManager {
 
     // 2. Evict LOD 0 tiles oldest-first to scratch disk
     const lod0: TileBuffer[] = [];
-    for (const tile of this.grid.getAllTiles()) {
+    for (const tile of this.grid.tilesIterable()) {
       if (tile.lod === 0 && tile.data !== null) {
         lod0.push(tile);
       }
@@ -3171,6 +3199,10 @@ export class SparseTileGrid {
     this.notifyChange(true);
   }
 
+  public tilesIterable(): IterableIterator<TileBuffer> {
+    return this.tiles.values();
+  }
+
   public getAllTiles(): TileBuffer[] {
     return Array.from(this.tiles.values());
   }
@@ -3224,28 +3256,39 @@ const BYTE_TO_FORMAT: TileFormat[] = [
   'color-32bit',
 ];
 
+const _sharedTileEncoder = new TextEncoder();
+
+function encodeLayerIdCached(cache: Map<string, Uint8Array>, layerId: string): Uint8Array {
+  let bytes = cache.get(layerId);
+  if (!bytes) {
+    bytes = _sharedTileEncoder.encode(layerId);
+    cache.set(layerId, bytes);
+  }
+  return bytes;
+}
+
 export function serializeSparseTileGrid(grid: SparseTileGrid): Uint8Array {
-  const encoder = new TextEncoder();
-  const tiles = grid.getAllTiles().filter((t) => (t.lod ?? 0) === 0);
+  const layerKeyCache = new Map<string, Uint8Array>();
   const layerFormats = grid.getAllLayerFormats();
 
   let totalBytes = 4 + 1 + 4;
 
   const encodedFormats: Array<{ keyBytes: Uint8Array; format: TileFormat }> = [];
   for (const [layerId, fmt] of layerFormats.entries()) {
-    const keyBytes = encoder.encode(layerId);
+    const keyBytes = encodeLayerIdCached(layerKeyCache, layerId);
     encodedFormats.push({ keyBytes, format: fmt });
     totalBytes += 2 + keyBytes.length + 1;
   }
 
   totalBytes += 4;
 
-  const encodedTiles: Array<{ keyBytes: Uint8Array; tile: TileBuffer }> = [];
-  for (let i = 0; i < tiles.length; i++) {
-    const t = tiles[i];
-    const keyBytes = encoder.encode(t.layerId);
-    encodedTiles.push({ keyBytes, tile: t });
-    const dataLen = t.data ? t.data.byteLength : 0;
+  const encodedTiles: Array<{ keyBytes: Uint8Array; tile: TileBuffer; data: Uint8Array | null }> = [];
+  for (const t of grid.tilesIterable()) {
+    if ((t.lod ?? 0) !== 0) continue;
+    const keyBytes = encodeLayerIdCached(layerKeyCache, t.layerId);
+    const data = t.data;
+    encodedTiles.push({ keyBytes, tile: t, data });
+    const dataLen = data ? data.byteLength : 0;
     totalBytes += 2 + keyBytes.length + 4 + 4 + 1 + 4 + 4 + dataLen;
   }
 
@@ -3288,12 +3331,127 @@ export function serializeSparseTileGrid(grid: SparseTileGrid): Uint8Array {
     view.setUint32(offset, t.version, true);
     offset += 4;
 
-    const dataLen = t.data ? t.data.byteLength : 0;
+    const data = item.data;
+    const dataLen = data ? data.byteLength : 0;
     view.setUint32(offset, dataLen, true);
     offset += 4;
-    if (t.data) {
-      out.set(t.data, offset);
+    if (data) {
+      out.set(data, offset);
       offset += dataLen;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Time-sliced asynchronous SparseTileGrid serializer for background recovery checkpoints.
+ * Yields to the browser event loop every ~4ms and supports cooperative cancellation
+ * if the user resumes drawing mid-snapshot. Produces identical INKG v1 output.
+ */
+export async function serializeSparseTileGridAsync(
+  grid: SparseTileGrid,
+  options?: { shouldAbort?: () => boolean; chunkBudgetMs?: number }
+): Promise<Uint8Array | null> {
+  if (options?.shouldAbort?.()) return null;
+
+  const budgetMs = options?.chunkBudgetMs ?? 4;
+  const layerKeyCache = new Map<string, Uint8Array>();
+  const layerFormats = grid.getAllLayerFormats();
+
+  let totalBytes = 4 + 1 + 4;
+
+  const encodedFormats: Array<{ keyBytes: Uint8Array; format: TileFormat }> = [];
+  for (const [layerId, fmt] of layerFormats.entries()) {
+    const keyBytes = encodeLayerIdCached(layerKeyCache, layerId);
+    encodedFormats.push({ keyBytes, format: fmt });
+    totalBytes += 2 + keyBytes.length + 1;
+  }
+
+  totalBytes += 4;
+
+  // Capture immutable per-tile references (data ref + metadata) before yielding
+  const encodedTiles: Array<{
+    keyBytes: Uint8Array;
+    tileX: number;
+    tileY: number;
+    formatByte: number;
+    version: number;
+    data: Uint8Array | null;
+  }> = [];
+
+  for (const t of grid.tilesIterable()) {
+    if ((t.lod ?? 0) !== 0) continue;
+    const keyBytes = encodeLayerIdCached(layerKeyCache, t.layerId);
+    const data = t.data;
+    encodedTiles.push({
+      keyBytes,
+      tileX: t.tileX,
+      tileY: t.tileY,
+      formatByte: FORMAT_TO_BYTE[t.format] ?? 2,
+      version: t.version,
+      data,
+    });
+    const dataLen = data ? data.byteLength : 0;
+    totalBytes += 2 + keyBytes.length + 4 + 4 + 1 + 4 + 4 + dataLen;
+  }
+
+  if (options?.shouldAbort?.()) return null;
+
+  const out = new Uint8Array(totalBytes);
+  const view = new DataView(out.buffer, out.byteOffset, totalBytes);
+
+  let offset = 0;
+  out[offset++] = 0x49; // 'I'
+  out[offset++] = 0x4e; // 'N'
+  out[offset++] = 0x4b; // 'K'
+  out[offset++] = 0x47; // 'G'
+  out[offset++] = 1; // Version
+
+  view.setUint32(offset, encodedFormats.length, true);
+  offset += 4;
+
+  for (const item of encodedFormats) {
+    view.setUint16(offset, item.keyBytes.length, true);
+    offset += 2;
+    out.set(item.keyBytes, offset);
+    offset += item.keyBytes.length;
+    out[offset++] = FORMAT_TO_BYTE[item.format] ?? 2;
+  }
+
+  view.setUint32(offset, encodedTiles.length, true);
+  offset += 4;
+
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let sliceStart = now();
+
+  for (let i = 0; i < encodedTiles.length; i++) {
+    const item = encodedTiles[i];
+    view.setUint16(offset, item.keyBytes.length, true);
+    offset += 2;
+    out.set(item.keyBytes, offset);
+    offset += item.keyBytes.length;
+
+    view.setInt32(offset, item.tileX, true);
+    offset += 4;
+    view.setInt32(offset, item.tileY, true);
+    offset += 4;
+    out[offset++] = item.formatByte;
+    view.setUint32(offset, item.version, true);
+    offset += 4;
+
+    const dataLen = item.data ? item.data.byteLength : 0;
+    view.setUint32(offset, dataLen, true);
+    offset += 4;
+    if (item.data) {
+      out.set(item.data, offset);
+      offset += dataLen;
+    }
+
+    if ((i & 15) === 15 && i + 1 < encodedTiles.length && now() - sliceStart >= budgetMs) {
+      await yieldToMain();
+      if (options?.shouldAbort?.()) return null;
+      sliceStart = now();
     }
   }
 
@@ -3379,14 +3537,13 @@ export function deserializeSparseTileGrid(grid: SparseTileGrid, buffer: Uint8Arr
 }
 
 export function serializeTileDeltas(deltas: TileDelta[]): Uint8Array {
-  const encoder = new TextEncoder();
   let totalBytes = 2 + 1 + 4;
-  const encodedKeys: Uint8Array[] = [];
+  const encodedKeys: Uint8Array[] = new Array(deltas.length);
 
   for (let i = 0; i < deltas.length; i++) {
     const d = deltas[i];
-    const keyBytes = encoder.encode(d.key);
-    encodedKeys.push(keyBytes);
+    const keyBytes = _sharedTileEncoder.encode(d.key);
+    encodedKeys[i] = keyBytes;
 
     totalBytes += 2 + keyBytes.length;
     totalBytes += 1;
@@ -3439,6 +3596,88 @@ export function serializeTileDeltas(deltas: TileDelta[]): Uint8Array {
       offset += d.afterData.byteLength;
     } else {
       out[offset++] = 0;
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Time-sliced asynchronous TileDelta serializer for large multi-tile operations
+ * (full-canvas fills, filters, transforms, clears). Yields every ~4ms so UI stays responsive.
+ */
+export async function serializeTileDeltasAsync(
+  deltas: TileDelta[],
+  chunkBudgetMs: number = 4
+): Promise<Uint8Array> {
+  if (deltas.length <= 16) {
+    return serializeTileDeltas(deltas);
+  }
+
+  let totalBytes = 2 + 1 + 4;
+  const encodedKeys: Uint8Array[] = new Array(deltas.length);
+
+  for (let i = 0; i < deltas.length; i++) {
+    const d = deltas[i];
+    const keyBytes = _sharedTileEncoder.encode(d.key);
+    encodedKeys[i] = keyBytes;
+
+    totalBytes += 2 + keyBytes.length + 1 + 1 + 1;
+    if (d.beforeData && d.beforeData.byteLength > 0) {
+      totalBytes += 4 + d.beforeData.byteLength;
+    }
+    if (d.afterData && d.afterData.byteLength > 0) {
+      totalBytes += 4 + d.afterData.byteLength;
+    }
+  }
+
+  const out = new Uint8Array(totalBytes);
+  const view = new DataView(out.buffer, out.byteOffset, totalBytes);
+
+  let offset = 0;
+  out[offset++] = 0x54; // 'T'
+  out[offset++] = 0x44; // 'D'
+  out[offset++] = 1; // Version
+  view.setUint32(offset, deltas.length, true);
+  offset += 4;
+
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  let sliceStart = now();
+
+  for (let i = 0; i < deltas.length; i++) {
+    const d = deltas[i];
+    const keyBytes = encodedKeys[i];
+
+    view.setUint16(offset, keyBytes.length, true);
+    offset += 2;
+    out.set(keyBytes, offset);
+    offset += keyBytes.length;
+
+    out[offset++] = FORMAT_TO_BYTE[d.format] ?? 2;
+
+    if (d.beforeData && d.beforeData.byteLength > 0) {
+      out[offset++] = 1;
+      view.setUint32(offset, d.beforeData.byteLength, true);
+      offset += 4;
+      out.set(d.beforeData, offset);
+      offset += d.beforeData.byteLength;
+    } else {
+      out[offset++] = 0;
+    }
+
+    if (d.afterData && d.afterData.byteLength > 0) {
+      out[offset++] = 1;
+      view.setUint32(offset, d.afterData.byteLength, true);
+      offset += 4;
+      out.set(d.afterData, offset);
+      offset += d.afterData.byteLength;
+    } else {
+      out[offset++] = 0;
+    }
+
+    if ((i & 7) === 7 && i + 1 < deltas.length && now() - sliceStart >= chunkBudgetMs) {
+      await yieldToMain();
+      sliceStart = now();
     }
   }
 

@@ -13,6 +13,11 @@ import { isTauriEnvironment } from '../hooks/useMultiplayer';
 import { updaterService } from '../services/updaterService';
 import { useDocumentStore } from '../stores/useDocumentStore';
 import { useUpdaterStore } from '../stores/useUpdaterStore';
+import {
+  hasStructuredChangelogMarkdown,
+  parseChangelogSections,
+} from '../utils/changelog';
+import { ChangelogBox } from './ChangelogBox';
 
 export interface UpdateModalProps {
   hasActiveCollabSession: boolean;
@@ -226,14 +231,34 @@ export const UpdateModal: React.FC<UpdateModalProps> = ({
                 )}
               </div>
 
-              {/* Scrollable plain-text release notes */}
+              {/* Scrollable release notes (structured Markdown or plain-text fallback) */}
               <div className="space-y-1.5">
                 <div className="text-[11px] font-medium text-[#e5e5e5]">Release Notes</div>
-                <div className="bg-[#161616] rounded p-3 max-h-44 overflow-y-auto border border-[#2c2c2c] select-text">
-                  <pre className="whitespace-pre-wrap break-words font-sans text-[11px] leading-relaxed text-[#e5e5e5]/90">
-                    {releaseNotes?.trim() || 'Bug fixes and performance improvements.'}
-                  </pre>
-                </div>
+                {(() => {
+                  const rawNotes = releaseNotes?.trim() || '';
+                  if (rawNotes && hasStructuredChangelogMarkdown(rawNotes)) {
+                    const sections = parseChangelogSections(rawNotes);
+                    if (sections.length > 0) {
+                      return (
+                        <ChangelogBox
+                          entry={{
+                            version: availableVersion || '',
+                            sections,
+                            rawBody: rawNotes,
+                          }}
+                          maxHeightClass="max-h-48"
+                        />
+                      );
+                    }
+                  }
+                  return (
+                    <div className="bg-[#161616] rounded p-3 max-h-44 overflow-y-auto border border-[#2c2c2c] select-text">
+                      <pre className="whitespace-pre-wrap break-words font-sans text-[11px] leading-relaxed text-[#e5e5e5]/90">
+                        {rawNotes || 'Bug fixes and performance improvements.'}
+                      </pre>
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Download progress bar */}

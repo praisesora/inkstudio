@@ -99,7 +99,7 @@ export async function openFile(file: File): Promise<LoadedDocument> {
     return await parsePsdFile(buffer, file.name);
   }
 
-  if (ext === '.clip' || ext === '.csp') {
+  if (ext === '.clip' || ext === '.csp' || ext === '.lip') {
     const { parseCspFile } = await import('./cspParser');
     const buffer = await file.arrayBuffer();
     return await parseCspFile(buffer, file.name);

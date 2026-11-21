@@ -361,7 +361,7 @@ export function useDrawingHistory({
           if (win?.requestIdleCallback) {
             idleCallbackIdRef.current = win.requestIdleCallback(runTasks, { timeout: 1200 });
           } else {
-            idleCallbackIdRef.current = setTimeout(runTasks, 64);
+            idleCallbackIdRef.current = setTimeout(runTasks, 32);
           }
         };
         const runTasks = () => {
@@ -370,13 +370,27 @@ export function useDrawingHistory({
             scheduleRun();
             return;
           }
-          const tasks = pendingHistoryTasksRef.current.splice(0);
-          for (const t of tasks) {
+          const sliceBudgetMs = 6;
+          const start = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          while (pendingHistoryTasksRef.current.length > 0) {
+            if (isDrawingRef.current) {
+              break;
+            }
+            const nextTask = pendingHistoryTasksRef.current.shift();
+            if (!nextTask) break;
             try {
-              t();
+              nextTask();
             } catch (err) {
               console.warn('[History] Error running idle history task:', err);
             }
+            const elapsed =
+              (typeof performance !== 'undefined' ? performance.now() : Date.now()) - start;
+            if (elapsed >= sliceBudgetMs && pendingHistoryTasksRef.current.length > 0) {
+              break;
+            }
+          }
+          if (pendingHistoryTasksRef.current.length > 0) {
+            scheduleRun();
           }
         };
         scheduleRun();

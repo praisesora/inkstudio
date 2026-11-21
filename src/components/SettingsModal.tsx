@@ -20,6 +20,8 @@ import {
 import { isTauriEnvironment } from '../hooks/useMultiplayer';
 import { updaterService } from '../services/updaterService';
 import { useUpdaterStore } from '../stores/useUpdaterStore';
+import { getChangelogForVersion } from '../utils/changelog';
+import { ChangelogBox } from './ChangelogBox';
 import {
   AppSettings,
   DEFAULT_APP_SETTINGS,
@@ -947,6 +949,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <p className="text-xs text-[#8a8a8a] leading-relaxed">
                   Collaborative Drawing Studio supporting layered PSD/CSP workflows, GPU tile compositing, stylus pressure dynamics, vector inking, and real-time multiplayer drawing.
                 </p>
+
+                {(() => {
+                  const activeVer = runtimeAppVersion || APP_VERSION;
+                  const changelogEntry =
+                    getChangelogForVersion(activeVer) ?? getChangelogForVersion();
+                  if (!changelogEntry) return null;
+                  return (
+                    <section className="space-y-2 pt-2 border-t border-[#2c2c2c]">
+                      <div className="flex items-center justify-between">
+                        <h3 className="text-xs font-medium text-[#e5e5e5]">
+                          What&apos;s New in v{changelogEntry.version}
+                        </h3>
+                      </div>
+                      <ChangelogBox entry={changelogEntry} maxHeightClass="max-h-48" />
+                    </section>
+                  );
+                })()}
 
                 {isDesktopTauri && (
                   <section className="space-y-2.5 pt-2 border-t border-[#2c2c2c]">

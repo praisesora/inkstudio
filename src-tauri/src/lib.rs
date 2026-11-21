@@ -92,7 +92,7 @@ fn sanitize_id(raw: &str) -> String {
 
 const ALLOWED_DOCUMENT_EXTS: &[&str] = &[
     "sora", "ink", "inkb", "psd", "psb", "clip", "csp", "sut", "png", "jpg", "jpeg", "webp", "bmp",
-    "gif", "svg", "glb", "gltf", "obj",
+    "gif", "svg", "avif", "ico", "glb", "gltf", "obj",
 ];
 
 const DELETE_ALLOWED_EXTS: &[&str] = &[
@@ -379,6 +379,19 @@ async fn read_file_from_disk(app: tauri::AppHandle, path: String) -> Result<Vec<
 }
 
 #[tauri::command]
+async fn read_file_binary(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let allowed_dirs = get_allowed_base_dirs(&app);
+    let (canonical, _) = validate_read_path(&path, &allowed_dirs).await?;
+    let bytes = tokio::fs::read(&canonical)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+#[tauri::command]
 async fn recovery_init_session(
     app: tauri::AppHandle,
     session_id: String,
@@ -555,7 +568,7 @@ pub fn run() {
                 app.handle()
                     .plugin(tauri_plugin_updater::Builder::new().build())?;
                 if let Some(main_window) = app.get_webview_window("main") {
-                    let _ = main_window.set_fullscreen(true);
+                    let _ = main_window.maximize();
                 }
             }
             Ok(())
@@ -580,6 +593,7 @@ pub fn run() {
             clear_undo_tile_cache,
             delete_file_from_disk,
             read_file_from_disk,
+            read_file_binary,
             recovery_init_session,
             recovery_append_wal_entry,
             recovery_checkpoint,

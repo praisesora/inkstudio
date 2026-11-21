@@ -8,7 +8,8 @@
 
 import { zlibSync, unzlibSync } from 'fflate';
 import { TileDelta, HistoryItem } from '../types/editor';
-import { serializeTileDeltas, deserializeTileDeltas } from './tileEngine';
+import { serializeTileDeltas, serializeTileDeltasAsync, deserializeTileDeltas } from './tileEngine';
+import { zlibAsync, unzlibAsync, yieldToMain } from './asyncCompression';
 
 export const MAX_RAM_UNDO_STEPS = 15;
 const MAX_DECOMPRESSED_UNDO_BYTES = 128 * 1024 * 1024;
@@ -47,11 +48,46 @@ export function decompressTileDeltasPayload(payload: Uint8Array): TileDelta[] {
   return deserializeTileDeltas(payload);
 }
 
+/**
+ * Off-main-thread async variant of compressTileDeltasPayload (uses pooled Web Worker).
+ */
+export async function compressTileDeltasPayloadAsync(deltas: TileDelta[]): Promise<Uint8Array> {
+  const serialized = await serializeTileDeltasAsync(deltas);
+  return zlibAsync(serialized, { level: 1, transfer: true });
+}
+
+/**
+ * Off-main-thread async variant of decompressTileDeltasPayload (uses pooled Web Worker).
+ */
+export async function decompressTileDeltasPayloadAsync(payload: Uint8Array): Promise<TileDelta[]> {
+  if (payload.length >= 2 && payload[0] === 0x78) {
+    try {
+      const raw = await unzlibAsync(payload, { maxOutputBytes: MAX_DECOMPRESSED_UNDO_BYTES });
+      if (raw.byteLength <= MAX_DECOMPRESSED_UNDO_BYTES) {
+        return deserializeTileDeltas(raw);
+      }
+    } catch {
+      // Fallback if byte 0 happened to be 0x78 in an uncompressed stream
+    }
+  }
+  return deserializeTileDeltas(payload);
+}
+
 export class UndoCacheManager {
   private sessionId: string;
   private ramItems: Set<string> = new Set();
   private diskCachedIds: Set<string> = new Set();
   private compressedRamCache: Map<string, Uint8Array> = new Map();
+  private inFlightOffloads: Map<string, Promise<void>> = new Map();
+  private keepInRamIds: Set<string> = new Set();
+  private invokePromise: Promise<typeof import('@tauri-apps/api/core').invoke> | null = null;
+
+  private getInvoke(): Promise<typeof import('@tauri-apps/api/core').invoke> {
+    if (!this.invokePromise) {
+      this.invokePromise = import('@tauri-apps/api/core').then((m) => m.invoke);
+    }
+    return this.invokePromise;
+  }
 
   constructor(sessionId?: string) {
     this.sessionId = sessionId || `session-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
@@ -131,51 +167,77 @@ export class UndoCacheManager {
   public async offloadAllToDisk(allHistory: HistoryItem[], maxCount?: number): Promise<number> {
     this.pruneOrphanedIds(allHistory);
     let offloaded = 0;
+    const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+    let sliceStart = now();
+
     for (const item of allHistory) {
       if (maxCount !== undefined && offloaded >= maxCount) break;
       if (item.tileDeltas && item.tileDeltas.length > 0) {
         await this.offloadToDisk(item);
         this.ramItems.delete(item.id);
         offloaded++;
+        if (now() - sliceStart >= 16) {
+          await yieldToMain();
+          sliceStart = now();
+        }
       }
     }
     return offloaded;
   }
 
   /**
-   * Offload a single history item's tile deltas to disk via Tauri IPC (with fast zlib compression),
+   * Offload a single history item's tile deltas to disk via Tauri IPC (with off-main-thread Worker zlib),
    * or to a compact zlib-compressed RAM buffer when running in a browser environment.
    */
   public async offloadToDisk(item: HistoryItem): Promise<void> {
     if (!item.tileDeltas || item.tileDeltas.length === 0) return;
 
-    const compressed = compressTileDeltasPayload(item.tileDeltas);
-
-    if (isTauriEnvironment()) {
-      try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const payload =
-          compressed.byteOffset === 0 && compressed.byteLength === compressed.buffer.byteLength
-            ? compressed
-            : compressed.slice();
-        await invoke('save_undo_tile_cache', payload, {
-          headers: {
-            'x-session-id': encodeURIComponent(this.sessionId),
-            'x-state-id': encodeURIComponent(item.id),
-          },
-        });
-        this.diskCachedIds.add(item.id);
-        this.ramItems.delete(item.id);
-        item.tileDeltas = undefined;
-        return;
-      } catch (err) {
-        console.warn('[UndoCache] Failed to offload tile deltas to disk, using compressed RAM fallback:', err);
-      }
+    const existing = this.inFlightOffloads.get(item.id);
+    if (existing) {
+      return existing;
     }
 
-    this.compressedRamCache.set(item.id, compressed);
-    this.ramItems.delete(item.id);
-    item.tileDeltas = undefined;
+    this.keepInRamIds.delete(item.id);
+    const deltasToOffload = item.tileDeltas;
+
+    const job = (async () => {
+      const compressed = await compressTileDeltasPayloadAsync(deltasToOffload);
+
+      if (isTauriEnvironment()) {
+        try {
+          const invoke = await this.getInvoke();
+          const payload =
+            compressed.byteOffset === 0 && compressed.byteLength === compressed.buffer.byteLength
+              ? compressed
+              : compressed.slice();
+          await invoke('save_undo_tile_cache', payload, {
+            headers: {
+              'x-session-id': encodeURIComponent(this.sessionId),
+              'x-state-id': encodeURIComponent(item.id),
+            },
+          });
+          this.diskCachedIds.add(item.id);
+          if (!this.keepInRamIds.delete(item.id)) {
+            this.ramItems.delete(item.id);
+            item.tileDeltas = undefined;
+          }
+          return;
+        } catch (err) {
+          console.warn('[UndoCache] Failed to offload tile deltas to disk, using compressed RAM fallback:', err);
+        }
+      }
+
+      this.compressedRamCache.set(item.id, compressed);
+      if (!this.keepInRamIds.delete(item.id)) {
+        this.ramItems.delete(item.id);
+        item.tileDeltas = undefined;
+      }
+    })().finally(() => {
+      this.inFlightOffloads.delete(item.id);
+    });
+
+    this.inFlightOffloads.set(item.id, job);
+    return job;
   }
 
   /**
@@ -183,12 +245,23 @@ export class UndoCacheManager {
    */
   public async resolveDeltas(item: HistoryItem): Promise<TileDelta[] | null> {
     if (item.tileDeltas && item.tileDeltas.length > 0) {
+      if (this.inFlightOffloads.has(item.id)) {
+        this.keepInRamIds.add(item.id);
+      }
       return item.tileDeltas;
+    }
+
+    const inFlight = this.inFlightOffloads.get(item.id);
+    if (inFlight) {
+      await inFlight;
+      if (item.tileDeltas && item.tileDeltas.length > 0) {
+        return item.tileDeltas;
+      }
     }
 
     const compressedInRam = this.compressedRamCache.get(item.id);
     if (compressedInRam) {
-      const deltas = decompressTileDeltasPayload(compressedInRam);
+      const deltas = await decompressTileDeltasPayloadAsync(compressedInRam);
       this.compressedRamCache.delete(item.id);
       item.tileDeltas = deltas;
       this.ramItems.add(item.id);
@@ -197,7 +270,7 @@ export class UndoCacheManager {
 
     if (this.diskCachedIds.has(item.id) && isTauriEnvironment()) {
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
+        const invoke = await this.getInvoke();
         const rawData = await invoke<ArrayBuffer | Uint8Array | number[]>('load_undo_tile_cache', undefined, {
           headers: {
             'x-session-id': encodeURIComponent(this.sessionId),
@@ -212,7 +285,7 @@ export class UndoCacheManager {
               ? new Uint8Array(rawData)
               : new Uint8Array(rawData);
           if (u8.length > 0) {
-            const deltas = decompressTileDeltasPayload(u8);
+            const deltas = await decompressTileDeltasPayloadAsync(u8);
             item.tileDeltas = deltas;
             this.ramItems.add(item.id);
             return deltas;
@@ -233,9 +306,11 @@ export class UndoCacheManager {
     this.ramItems.clear();
     this.diskCachedIds.clear();
     this.compressedRamCache.clear();
+    this.inFlightOffloads.clear();
+    this.keepInRamIds.clear();
     if (isTauriEnvironment()) {
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
+        const invoke = await this.getInvoke();
         await invoke('clear_undo_tile_cache', { sessionId: this.sessionId });
       } catch (err) {
         console.warn('[UndoCache] Failed to clear disk cache:', err);

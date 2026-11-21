@@ -1241,11 +1241,71 @@ h3 {
 
 .release-notes {
   margin: 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg-canvas);
+  border: 1px solid var(--border);
   font-size: 12.5px;
-  color: var(--text-muted);
-  white-space: pre-line;
-  max-height: 150px;
+  color: #c8c8c8;
+  max-height: 260px;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.release-notes-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.release-notes-heading {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-primary);
+}
+
+.release-notes-heading--new {
+  color: var(--emerald);
+}
+
+.release-notes-heading--improvements {
+  color: #38bdf8;
+}
+
+.release-notes-heading--fixes {
+  color: #fbbf24;
+}
+
+.release-notes-heading--other {
+  color: #a0a0a0;
+}
+
+.release-notes-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  line-height: 1.5;
+}
+
+.release-notes-para {
+  margin: 0;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+.release-notes-code {
+  font-size: 11px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
 }
 
 .release-assets-inline {

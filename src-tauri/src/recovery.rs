@@ -222,18 +222,37 @@ pub async fn append_wal_entry(
     if payload.len() > MAX_WAL_FRAME_PAYLOAD_BYTES {
         return Err("WAL payload exceeds 64 MB safety ceiling".to_string());
     }
+
+    // Build WAL frame and compute CRC32 outside WAL_IO_LOCK (and off Tokio worker threads for large payloads)
+    let frame = if payload.len() >= 262_144 {
+        let owned = payload.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let mut frame = Vec::with_capacity(13 + owned.len());
+            frame.extend_from_slice(WAL_MAGIC);
+            frame.push(entry_type);
+            frame.extend_from_slice(&(owned.len() as u32).to_le_bytes());
+            let crc = compute_crc32(&owned);
+            frame.extend_from_slice(&crc.to_le_bytes());
+            frame.extend_from_slice(&owned);
+            frame
+        })
+        .await
+        .map_err(|e| format!("WAL framing worker failed: {}", e))?
+    } else {
+        let mut frame = Vec::with_capacity(13 + payload.len());
+        frame.extend_from_slice(WAL_MAGIC);
+        frame.push(entry_type);
+        frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        let crc = compute_crc32(payload);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    };
+
     let _wal_guard = WAL_IO_LOCK.lock().await;
     let safe_id = sanitize_session_id(session_id);
     let session_dir = get_recovery_root(app).join(&safe_id);
     let wal_path = session_dir.join("journal.wal");
-
-    let mut frame = Vec::with_capacity(13 + payload.len());
-    frame.extend_from_slice(WAL_MAGIC);
-    frame.push(entry_type);
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    let crc = compute_crc32(payload);
-    frame.extend_from_slice(&crc.to_le_bytes());
-    frame.extend_from_slice(payload);
 
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)

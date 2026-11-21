@@ -22,6 +22,7 @@ import {
 import { CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
 import { TextPlacementSession, FrameDragPreview } from '../hooks/drawing/useShapeAndFillTools';
 import { AutoAction } from '../utils/autoActionEngine';
+import { ExternalFileDropTarget } from '../utils/fileDropImport';
 import {
   documentStoreActions,
   selectHasOpenDocument,
@@ -116,6 +117,7 @@ interface CanvasAreaContainerProps {
   onAddAnimationCel: (frameIndex: number) => void;
   onDeleteAnimationCel: (frameIndex: number) => void;
   onSelectCelLayer: (layerId: string) => void;
+  isExternalFileDropActive?: boolean;
 }
 
 /**
@@ -284,6 +286,7 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       onDeleteAnimationCel={props.onDeleteAnimationCel}
       onSelectCelLayer={props.onSelectCelLayer}
       softProofSettings={softProofSettings}
+      isExternalFileDropActive={props.isExternalFileDropActive}
     />
   );
 });
@@ -421,6 +424,7 @@ export interface AppShellProps {
   onEditVectorLayer?: (layer: LayerItem) => void;
   onRasterizeLayer?: (layerId: string) => void;
   onPlayAutoAction?: (action: AutoAction) => void;
+  externalFileDropTarget?: ExternalFileDropTarget | null;
   children?: React.ReactNode;
 }
 
@@ -510,6 +514,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     onEditVectorLayer,
     onRasterizeLayer,
     onPlayAutoAction,
+    externalFileDropTarget = null,
     children,
   }) => {
     const dimensions = useDocumentStore((s) => s.dimensions);
@@ -782,6 +787,14 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         onOpenLayerStylesModal: handleOpenLayerStylesModal,
         onEditVectorLayer,
         onRasterizeLayer,
+        externalFileDropIndicator:
+          externalFileDropTarget?.zone === 'layers'
+            ? {
+                active: true,
+                targetLayerId: externalFileDropTarget.targetLayerId,
+                position: externalFileDropTarget.position,
+              }
+            : null,
       }),
       [
         hasOpenDocument,
@@ -841,6 +854,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         handleOpenLayerStylesModal,
         onEditVectorLayer,
         onRasterizeLayer,
+        externalFileDropTarget,
       ]
     );
 
@@ -867,7 +881,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         <input
           ref={fileInputRef}
           type="file"
-          accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.svg,.psd,.psb,.clip,.csp,.sora,.ink,.inkb,.sut"
+          accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.svg,.psd,.psb,.clip,.csp,.lip,.sora,.ink,.inkb,.sut"
           onChange={handleFileInputChange}
           className="hidden"
         />
@@ -964,7 +978,10 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
               )}
 
               <div className="flex flex-col flex-1 min-w-0 min-h-0 overflow-hidden relative">
-                <CanvasAreaContainer {...canvasProps} />
+                <CanvasAreaContainer
+                  {...canvasProps}
+                  isExternalFileDropActive={externalFileDropTarget?.zone === 'canvas'}
+                />
               </div>
 
               {showStatusBar && (

@@ -19,6 +19,8 @@ import {
   GITHUB_REPO_URL,
   openExternalUrl,
 } from '../utils/externalLinks';
+import { getChangelogForVersion } from '../utils/changelog';
+import { ChangelogBox } from './ChangelogBox';
 import { DiscordIcon } from './DiscordIcon';
 
 export interface AboutModalProps {
@@ -70,6 +72,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({
   }
 
   const version = runtimeAppVersion || APP_VERSION;
+  const changelogEntry = getChangelogForVersion(version) ?? getChangelogForVersion();
   const envLabel = isDesktopTauri ? 'Desktop' : 'Web';
   const buildInfo = `Ink Studio v${version} (${envLabel})`;
 
@@ -102,7 +105,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="bg-[#202020] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.8)] w-full max-w-md flex flex-col overflow-hidden text-xs text-[#e5e5e5] border border-[#2c2c2c]"
+        className="bg-[#202020] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.8)] w-full max-w-lg max-h-[85vh] flex flex-col overflow-hidden text-xs text-[#e5e5e5] border border-[#2c2c2c]"
       >
         {/* Header */}
         <div className="h-10 px-4 flex items-center justify-between bg-[#161616] border-b border-[#2c2c2c] shrink-0">
@@ -124,7 +127,7 @@ export const AboutModal: React.FC<AboutModalProps> = ({
         </div>
 
         {/* Body */}
-        <div className="p-5 space-y-4">
+        <div className="p-5 space-y-4 overflow-y-auto min-h-0">
           {/* App identity */}
           <div className="flex items-center gap-3.5">
             <div className="w-12 h-12 rounded-lg bg-[#161616] border border-[#2c2c2c] flex items-center justify-center shrink-0">
@@ -208,6 +211,18 @@ export const AboutModal: React.FC<AboutModalProps> = ({
               </span>
             </div>
           </div>
+
+          {/* What's New / Changelog */}
+          {changelogEntry && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-medium text-[#e5e5e5]">
+                  What&apos;s New in v{changelogEntry.version}
+                </span>
+              </div>
+              <ChangelogBox entry={changelogEntry} maxHeightClass="max-h-40" />
+            </div>
+          )}
 
           {/* Links & actions */}
           <div className="flex flex-wrap items-center gap-2">

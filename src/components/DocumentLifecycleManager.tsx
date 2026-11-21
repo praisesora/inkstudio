@@ -339,13 +339,14 @@ export function useDocumentLifecycle({
         resetZoomAndCenter(doc.dimensions);
         resetHistory(newDocId);
 
+        const topEditableLayer = doc.layers.find((l) => l.type === 'raster');
         const newDoc: DocumentTab = {
           id: newDocId,
           name: doc.name,
           dimensions: doc.dimensions,
           colorMode: doc.colorMode,
           layers: doc.layers,
-          activeLayerId: doc.layers[0]?.id || 'layer-1',
+          activeLayerId: topEditableLayer?.id || doc.layers[0]?.id || 'layer-1',
           perspectiveRuler: doc.perspectiveRuler ?? null,
         };
 

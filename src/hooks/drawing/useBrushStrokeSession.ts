@@ -50,6 +50,7 @@ import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../../types/per
 import { PerspectiveSnapSession } from '../../utils/perspectiveSnapping';
 import { StraightRulerSnapSession } from '../../utils/straightRulerMath';
 import { useToolStore, useUiStore } from '../../stores';
+import { recoveryService } from '../../services/recoveryService';
 import { evaluateGlobalPressureCurve, isLinearPressureCurve } from '../../utils/pressureCurve';
 import {
   DraftCanvasElement,
@@ -338,6 +339,7 @@ export function useBrushStrokeSession({
       if (drawRafIdRef.current !== null) {
         cancelAnimationFrame(drawRafIdRef.current);
       }
+      recoveryService.setDrawingActive(false);
     };
   }, [viewportRef, disabled, activeSessionId]);
 
@@ -400,7 +402,15 @@ export function useBrushStrokeSession({
     }
     strokePipelineRef.current.abortStroke();
     frameGpuDabsRef.current.length = 0;
+    if (activePointerIdRef.current !== null && interactionRef.current) {
+      try {
+        interactionRef.current.releasePointerCapture(activePointerIdRef.current);
+      } catch {
+        // Ignore release errors when capture already ended
+      }
+    }
     isDrawingRef.current = false;
+    recoveryService.setDrawingActive(false);
     activePointerIdRef.current = null;
     allStrokePointsRef.current = [];
     stabilizedPointRef.current = null;
@@ -1430,13 +1440,16 @@ export function useBrushStrokeSession({
       if (isDrawingRef.current) {
         abortActiveStroke();
       }
-      flushPendingHistoryTasks();
 
       const dims = dimensionsRef.current;
       const currentLayerIdCheck = activeLayerIdRef.current;
       if (!currentLayerIdCheck || dims.width <= 0 || dims.height <= 0) return;
 
       const canvas = getCachedLayerCanvas();
+      const activeLayerPre = (layersRef.current || []).find((l) => l.id === currentLayerIdCheck);
+      if (isMaskModeRef.current || canvas !== null || Boolean(activeLayerPre?.toneEnabled)) {
+        flushPendingHistoryTasks();
+      }
       if (isMaskModeRef.current && !canvas) return;
 
       if (viewportRef.current) {
@@ -1566,6 +1579,7 @@ export function useBrushStrokeSession({
       }
       activePointerIdRef.current = e.pointerId;
       isDrawingRef.current = true;
+      recoveryService.setDrawingActive(true);
 
       const firstEvent = e.nativeEvent;
       const rawStartPoint = getCanvasPoint(firstEvent);
@@ -3222,6 +3236,7 @@ export function useBrushStrokeSession({
       strokePipelineRef.current.abortStroke();
       frameGpuDabsRef.current.length = 0;
       isDrawingRef.current = false;
+      recoveryService.setDrawingActive(false);
       activePointerIdRef.current = null;
       allStrokePointsRef.current = [];
       stabilizedPointRef.current = null;

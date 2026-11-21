@@ -174,6 +174,11 @@ export interface RightSidebarProps {
   onOpenFile?: () => void;
   hideColorPanel?: boolean;
   dockedMode?: 'full' | 'layers' | 'history';
+  externalFileDropIndicator?: {
+    active: boolean;
+    targetLayerId?: string;
+    position?: 'above' | 'below' | 'inside';
+  } | null;
 }
 
 const ClipToLayerIcon: React.FC<{ className?: string }> = ({ className = 'w-3 h-3' }) => (
@@ -261,6 +266,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onOpenFile,
   hideColorPanel = false,
   dockedMode = 'full',
+  externalFileDropIndicator = null,
 }) => {
   const [bottomTab, setBottomTab] = useState<'layers' | 'history'>(
     dockedMode === 'history' ? 'history' : 'layers'
@@ -532,7 +538,10 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
       )}
 
       {/* 2. Spacious Layers / History Panel */}
-      <section className={`flex-1 ${isDockedSingle ? 'min-h-0' : 'min-h-[70%]'} flex flex-col bg-[#202020] overflow-hidden`}>
+      <section
+        data-drop-zone={effectiveTab === 'layers' && hasOpenDocument ? 'layers' : undefined}
+        className={`relative flex-1 ${isDockedSingle ? 'min-h-0' : 'min-h-[70%]'} flex flex-col bg-[#202020] overflow-hidden`}
+      >
         {/* Header Bar: Layers / History Switch + Quick Layer Actions */}
         <div className="h-7 px-1.5 flex items-center justify-between shrink-0">
           {isDockedSingle ? (
@@ -816,9 +825,18 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     const isFrameFolder = layer.type === 'frame-folder';
                     const isInsideFolder = Boolean(layer.parentId);
                     const isTarget = dropIndicator?.id === layer.id;
-                    const isDropInside = isTarget && dropIndicator.position === 'inside';
-                    const isDropAbove = isTarget && dropIndicator.position === 'above';
-                    const isDropBelow = isTarget && dropIndicator.position === 'below';
+                    const isExternalTarget =
+                      Boolean(externalFileDropIndicator?.active) &&
+                      externalFileDropIndicator?.targetLayerId === layer.id;
+                    const isDropInside =
+                      (isTarget && dropIndicator.position === 'inside') ||
+                      (isExternalTarget && externalFileDropIndicator?.position === 'inside');
+                    const isDropAbove =
+                      (isTarget && dropIndicator.position === 'above') ||
+                      (isExternalTarget && externalFileDropIndicator?.position === 'above');
+                    const isDropBelow =
+                      (isTarget && dropIndicator.position === 'below') ||
+                      (isExternalTarget && externalFileDropIndicator?.position === 'below');
                     const isBeingDragged =
                       draggedLayerId === layer.id ||
                       (draggedLayerId !== null &&
@@ -835,6 +853,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                       <div
                         key={layer.id}
                         data-layer-id={layer.id}
+                        data-layer-folder={isFolder ? 'true' : 'false'}
                         onPointerDown={(e) => handleLayerPointerDown(e, layer.id)}
                         onClick={(e) => {
                           if (justDraggedRef.current) return;
@@ -1437,6 +1456,17 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                 );
               })
             )}
+          </div>
+        )}
+
+        {effectiveTab === 'layers' && hasOpenDocument && externalFileDropIndicator?.active && (
+          <div
+            data-testid="layers-file-drop-overlay"
+            className="pointer-events-none absolute inset-0 z-40 rounded-xs border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/8 flex items-end justify-center p-2"
+          >
+            <span className="px-2 py-0.5 rounded bg-[#161616]/95 border border-[var(--accent)]/60 text-[10px] font-medium text-[#f5f5f5] shadow-md">
+              Drop image to import layer
+            </span>
           </div>
         )}
       </section>

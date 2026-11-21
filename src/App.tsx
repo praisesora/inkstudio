@@ -25,6 +25,7 @@ import { useLayerManager } from './hooks/useLayerManager';
 import { useCollabSync } from './hooks/useCollabSync';
 import { useTonalAndFilterActions } from './hooks/useTonalAndFilterActions';
 import { useAppMenuSections } from './hooks/useAppMenuSections';
+import { useExternalFileDrop } from './hooks/useExternalFileDrop';
 import {
   autoActionStoreActions,
   documentStoreActions,
@@ -54,6 +55,7 @@ export function App() {
   const activeEditTarget = useDocumentStore((s) => s.activeEditTarget);
   const animationTimeline = useDocumentStore((s) => s.animationTimeline);
   const isWebtoonMode = useUiStore((s) => s.isWebtoonMode);
+  const appView = useUiStore((s) => s.appView);
 
   // Delayed silent startup check for desktop Tauri updates (never blocks startup or crash recovery)
   useEffect(() => {
@@ -1019,6 +1021,17 @@ export function App() {
     ]
   );
 
+  const handleMarkActiveDocumentDirty = useCallback(() => {
+    documentStoreActions.markDocumentDirty(activeDocumentId, true);
+  }, [activeDocumentId]);
+
+  const externalFileDrop = useExternalFileDrop({
+    enabled: hasOpenDocument && appView === 'workspace',
+    importImageFileAsLayer: layerMgr.importImageFileAsLayer,
+    onMarkDirty: handleMarkActiveDocumentDirty,
+    showToast,
+  });
+
   return (
     <AppShell
       fileInputRef={docLifecycle.fileInputRef}
@@ -1105,6 +1118,7 @@ export function App() {
       onEditVectorLayer={shapeFillTools.openLayerForEditing}
       onRasterizeLayer={handleRasterizeLayer}
       onPlayAutoAction={handlePlayAutoAction}
+      externalFileDropTarget={externalFileDrop.activeDropTarget}
     >
       <DocumentLifecycleManager
         layers={layerMgr.layers}

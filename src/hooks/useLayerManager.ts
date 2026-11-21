@@ -27,6 +27,7 @@ import { documentStore } from '../utils/documentStore';
 import { recoveryService } from '../services/recoveryService';
 import { divideFramesInFolder, Point2D } from '../utils/frameEngine';
 import { syncVectorObjectLayerToGrid } from '../utils/vectorLayerRenderer';
+import { LayerInsertTarget, sanitizeImportedLayerName } from '../utils/fileDropImport';
 
 interface UseLayerManagerProps {
   dimensions: CanvasDimensions;
@@ -2337,7 +2338,8 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       blendMode: BlendMode = 'normal',
       opacity: number = 1,
       customId?: string,
-      layerOverrides?: Partial<LayerItem>
+      layerOverrides?: Partial<LayerItem>,
+      insertTarget?: LayerInsertTarget
     ) => {
       const newId = customId || `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const grid = activeTileGridRef.current;
@@ -2349,9 +2351,58 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
       const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions: dims }, true);
 
       setLayers((prev) => {
-        const activeIdx = prev.findIndex((l) => l.id === activeLayerId);
-        const activeItem = prev[activeIdx];
-        const defaultParentId = activeItem?.type === 'folder' ? activeItem.id : (activeItem?.parentId || null);
+        const getSubtreeEndIndex = (list: LayerItem[], folderIndex: number): number => {
+          const folderId = list[folderIndex].id;
+          const subtreeIds = new Set<string>([folderId]);
+          let endIdx = folderIndex + 1;
+          while (endIdx < list.length) {
+            const item = list[endIdx];
+            if (item.parentId && subtreeIds.has(item.parentId)) {
+              subtreeIds.add(item.id);
+              endIdx++;
+            } else {
+              break;
+            }
+          }
+          return endIdx;
+        };
+
+        let insertIdx = 0;
+        let resolvedParentId: string | null = null;
+        let expandFolderId: string | null = null;
+
+        const targetIdx = insertTarget?.targetLayerId
+          ? prev.findIndex((l) => l.id === insertTarget.targetLayerId)
+          : -1;
+
+        if (targetIdx >= 0) {
+          const targetItem = prev[targetIdx];
+          const pos = insertTarget?.position || (isFolderLikeLayer(targetItem) ? 'inside' : 'above');
+          if (pos === 'inside' && isFolderLikeLayer(targetItem)) {
+            resolvedParentId = targetItem.id;
+            insertIdx = targetIdx + 1;
+            if (targetItem.collapsed) expandFolderId = targetItem.id;
+          } else if (pos === 'below') {
+            resolvedParentId = targetItem.parentId;
+            insertIdx = isFolderLikeLayer(targetItem)
+              ? getSubtreeEndIndex(prev, targetIdx)
+              : targetIdx + 1;
+          } else {
+            resolvedParentId = targetItem.parentId;
+            insertIdx = targetIdx;
+          }
+        } else {
+          const activeIdx = prev.findIndex((l) => l.id === activeLayerIdRef.current);
+          const activeItem = activeIdx >= 0 ? prev[activeIdx] : undefined;
+          if (activeItem && isFolderLikeLayer(activeItem)) {
+            resolvedParentId = activeItem.id;
+            insertIdx = activeIdx + 1;
+            if (activeItem.collapsed) expandFolderId = activeItem.id;
+          } else {
+            resolvedParentId = activeItem?.parentId || null;
+            insertIdx = activeIdx >= 0 ? activeIdx : 0;
+          }
+        }
 
         const newLayer: LayerItem = {
           id: newId,
@@ -2362,21 +2413,23 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
           blendMode,
           locked: false,
           collapsed: false,
-          parentId: layerOverrides?.parentId !== undefined ? layerOverrides.parentId : defaultParentId,
+          parentId: layerOverrides?.parentId !== undefined ? layerOverrides.parentId : resolvedParentId,
           thumbnailUrl: thumb,
           ...layerOverrides,
         };
 
-        const insertIdx = activeIdx >= 0 ? activeIdx : 0;
-        const nextLayers = [...prev];
+        const nextLayers = expandFolderId
+          ? prev.map((l) => (l.id === expandFolderId ? { ...l, collapsed: false } : l))
+          : [...prev];
         nextLayers.splice(insertIdx, 0, newLayer);
+        layersRef.current = nextLayers;
         return nextLayers;
       });
 
       setActiveLayerId(newId);
       return newId;
     },
-    [activeLayerId, setActiveLayerId]
+    [setActiveLayerId]
   );
 
   // Fill selection with non-destructive Clip Studio Paint screentone layer
@@ -2637,40 +2690,84 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     return { success: false };
   }, [_dimensions, pasteLayerFromCanvas]);
 
+  // Import an image file directly as a centered/fitted raster layer
+  const importImageFileAsLayer = useCallback(
+    async (file: File, insertTarget?: LayerInsertTarget): Promise<{ id: string; name: string }> => {
+      const decodeImage = (): Promise<HTMLImageElement> =>
+        new Promise((resolve, reject) => {
+          const canUseObjectUrl = typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function';
+          if (canUseObjectUrl) {
+            const url = URL.createObjectURL(file);
+            const img = new Image();
+            img.onload = () => {
+              URL.revokeObjectURL(url);
+              resolve(img);
+            };
+            img.onerror = () => {
+              URL.revokeObjectURL(url);
+              reject(new Error(`Failed to decode image "${file.name}".`));
+            };
+            img.src = url;
+            return;
+          }
+
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error(`Failed to decode image "${file.name}".`));
+            img.src = e.target?.result as string;
+          };
+          reader.onerror = () => reject(new Error(`Failed to read file "${file.name}".`));
+          reader.readAsDataURL(file);
+        });
+
+      const img = await decodeImage();
+      const natW = img.naturalWidth || img.width;
+      const natH = img.naturalHeight || img.height;
+      if (natW <= 0 || natH <= 0) {
+        throw new Error(`Image "${file.name}" has invalid dimensions.`);
+      }
+
+      const dims = dimensionsRef.current;
+      const offscreen = document.createElement('canvas');
+      offscreen.width = dims.width;
+      offscreen.height = dims.height;
+      const ctx = offscreen.getContext('2d');
+      if (ctx) {
+        const scale = Math.min(1, dims.width / natW, dims.height / natH);
+        const dw = Math.max(1, Math.round(natW * scale));
+        const dh = Math.max(1, Math.round(natH * scale));
+        const dx = Math.round((dims.width - dw) / 2);
+        const dy = Math.round((dims.height - dh) / 2);
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(img, dx, dy, dw, dh);
+      }
+
+      const layerName = sanitizeImportedLayerName(file.name);
+      const id = pasteLayerFromCanvas(
+        offscreen,
+        layerName,
+        'normal',
+        1,
+        undefined,
+        undefined,
+        insertTarget
+      );
+      releaseTemporaryCanvas(offscreen);
+      return { id, name: layerName };
+    },
+    [pasteLayerFromCanvas]
+  );
+
   // Paste a photo from file
   const pasteLayerFromFile = useCallback(
-    async (file: File): Promise<string> => {
-      return new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            const offscreen = document.createElement('canvas');
-            offscreen.width = _dimensions.width;
-            offscreen.height = _dimensions.height;
-            const ctx = offscreen.getContext('2d');
-            if (ctx) {
-              const scale = Math.min(1, Math.min(_dimensions.width / img.naturalWidth, _dimensions.height / img.naturalHeight));
-              const dw = Math.round(img.naturalWidth * scale);
-              const dh = Math.round(img.naturalHeight * scale);
-              const dx = Math.round((_dimensions.width - dw) / 2);
-              const dy = Math.round((_dimensions.height - dh) / 2);
-              ctx.drawImage(img, dx, dy, dw, dh);
-            }
-
-            const layerName = file.name.replace(/\.[^/.]+$/, '') || 'Pasted Image';
-            pasteLayerFromCanvas(offscreen, layerName);
-            releaseTemporaryCanvas(offscreen);
-            resolve(layerName);
-          };
-          img.onerror = () => reject(new Error('Failed to decode image file.'));
-          img.src = e.target?.result as string;
-        };
-        reader.onerror = () => reject(new Error('Failed to read file.'));
-        reader.readAsDataURL(file);
-      });
+    async (file: File, insertTarget?: LayerInsertTarget): Promise<string> => {
+      const { name } = await importImageFileAsLayer(file, insertTarget);
+      return name;
     },
-    [_dimensions, pasteLayerFromCanvas]
+    [importImageFileAsLayer]
   );
 
   // Resize canvas dimensions (content scaling or anchor expansion/crop)
@@ -3158,6 +3255,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     pasteLayer,
     pasteLayerFromCanvas,
     fillScreentoneSelection,
+    importImageFileAsLayer,
     pasteLayerFromFile,
     resizeCanvas,
     toggleVisibility,

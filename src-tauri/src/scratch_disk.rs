@@ -182,6 +182,13 @@ pub async fn init_scratch_disk(session_id: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+struct CompressedTileWrite {
+    tile_x: i32,
+    tile_y: i32,
+    uncompressed_len: u32,
+    compressed: Vec<u8>,
+}
+
 pub async fn write_tiles(
     session_id: &str,
     tiles: Vec<TileWritePayload>,
@@ -189,6 +196,33 @@ pub async fn write_tiles(
     if tiles.is_empty() {
         return Ok(0);
     }
+
+    // Validate & LZ4-compress tiles off Tokio async worker threads and BEFORE acquiring SCRATCH_IO_LOCK
+    let compressed_by_layer = tokio::task::spawn_blocking(move || -> Result<(usize, HashMap<String, Vec<CompressedTileWrite>>), String> {
+        let mut grouped: HashMap<String, Vec<CompressedTileWrite>> = HashMap::new();
+        let count = tiles.len();
+        for tile in tiles {
+            if tile.data.len() > MAX_UNCOMPRESSED_TILE_BYTES {
+                return Err("Tile uncompressed payload exceeds 4 MB safety ceiling".to_string());
+            }
+            let uncompressed_len = tile.data.len() as u32;
+            let compressed = lz4_flex::compress_prepend_size(&tile.data);
+            grouped
+                .entry(tile.layer_id)
+                .or_default()
+                .push(CompressedTileWrite {
+                    tile_x: tile.tile_x,
+                    tile_y: tile.tile_y,
+                    uncompressed_len,
+                    compressed,
+                });
+        }
+        Ok((count, grouped))
+    })
+    .await
+    .map_err(|e| format!("Scratch disk LZ4 compression worker failed: {}", e))??;
+
+    let (count_written, tiles_by_layer) = compressed_by_layer;
 
     let _io_guard = SCRATCH_IO_LOCK.lock().await;
 
@@ -198,17 +232,6 @@ pub async fn write_tiles(
             .await
             .map_err(|e| format!("Failed to create scratch dir: {}", e))?;
     }
-
-    // Group tiles by layer
-    let mut tiles_by_layer: HashMap<String, Vec<TileWritePayload>> = HashMap::new();
-    for tile in tiles {
-        tiles_by_layer
-            .entry(tile.layer_id.clone())
-            .or_default()
-            .push(tile);
-    }
-
-    let count_written = tiles_by_layer.values().map(|v| v.len()).sum();
 
     for (layer_id, layer_tiles) in tiles_by_layer {
         let safe_name = sanitize_layer_id(&layer_id);
@@ -245,12 +268,7 @@ pub async fn write_tiles(
         let mut new_entries: Vec<TileIndexEntry> = Vec::with_capacity(layer_tiles.len());
 
         for tile in layer_tiles {
-            if tile.data.len() > MAX_UNCOMPRESSED_TILE_BYTES {
-                return Err("Tile uncompressed payload exceeds 4 MB safety ceiling".to_string());
-            }
-            let uncompressed_len = tile.data.len() as u32;
-            let compressed = lz4_flex::compress_prepend_size(&tile.data);
-            let compressed_len = compressed.len() as u32;
+            let compressed_len = tile.compressed.len() as u32;
 
             let write_offset = if let Some(prev) = existing_layer_entries.get(&(tile.tile_x, tile.tile_y)) {
                 if compressed_len <= prev.compressed_len {
@@ -279,7 +297,7 @@ pub async fn write_tiles(
             };
 
             bucket_file
-                .write_all(&compressed)
+                .write_all(&tile.compressed)
                 .await
                 .map_err(|e| format!("Failed to write to bucket file: {}", e))?;
 
@@ -288,7 +306,7 @@ pub async fn write_tiles(
                 tile_y: tile.tile_y,
                 offset: write_offset,
                 compressed_len,
-                uncompressed_len,
+                uncompressed_len: tile.uncompressed_len,
             });
         }
 
@@ -454,6 +472,10 @@ pub async fn read_tile(
         .await
         .map_err(|e| format!("Failed to read compressed tile bytes: {}", e))?;
 
+    // Release file/IO mutex before CPU decompression
+    drop(bucket_file);
+    drop(_io_guard);
+
     if compressed_buf.len() < 4 {
         return Err("Corrupt LZ4 tile header".to_string());
     }
@@ -462,9 +484,18 @@ pub async fn read_tile(
         return Err("LZ4 declared uncompressed size exceeds 4 MB safety ceiling".to_string());
     }
 
-    // 3. Decompress using LZ4
-    let decompressed = lz4_flex::decompress_size_prepended(&compressed_buf)
-        .map_err(|e| format!("LZ4 decompression failed: {}", e))?;
+    // 3. Decompress using LZ4 (offload large tiles to blocking pool)
+    let decompressed = if declared_uncompressed >= 131_072 {
+        tokio::task::spawn_blocking(move || {
+            lz4_flex::decompress_size_prepended(&compressed_buf)
+                .map_err(|e| format!("LZ4 decompression failed: {}", e))
+        })
+        .await
+        .map_err(|e| format!("LZ4 decompression worker failed: {}", e))??
+    } else {
+        lz4_flex::decompress_size_prepended(&compressed_buf)
+            .map_err(|e| format!("LZ4 decompression failed: {}", e))?
+    };
 
     Ok(decompressed)
 }

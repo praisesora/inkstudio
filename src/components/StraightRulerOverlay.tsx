@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useState, useCallback } from 'react';
 import { Lock, Unlock, Magnet, Crosshair, X, Move, RotateCw } from 'lucide-react';
 import { StraightRuler } from '../types/perspective';
 import { CanvasDimensions } from '../types/editor';
@@ -47,6 +47,8 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
 
   const [dragMode, setDragMode] = useState<'move' | 'rotate-left' | 'rotate-right' | null>(null);
   const dragMetaRef = useRef<{
+    pointerId: number | null;
+    capturedEl: HTMLElement | null;
     startDocX: number;
     startDocY: number;
     initialRulerX: number;
@@ -54,6 +56,8 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
     initialAngle: number;
     startPointerAngle: number;
   }>({
+    pointerId: null,
+    capturedEl: null,
     startDocX: 0,
     startDocY: 0,
     initialRulerX: 0,
@@ -253,7 +257,7 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
     ctx.restore();
   }, [getLiveCamera, viewportRef]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     render();
   }, [render, ruler, dimensions, pan, zoom, rotation, flipX, flipY]);
 
@@ -279,13 +283,17 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
 
   const startHandleDrag = (
     mode: 'move' | 'rotate-left' | 'rotate-right',
-    e: React.PointerEvent
+    e: React.PointerEvent<HTMLDivElement>
   ) => {
-    if (ruler.locked) return;
+    if (ruler.locked || e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
     const vp = viewportRef.current;
     if (!vp) return;
+    const targetEl = e.currentTarget;
+    try {
+      targetEl.setPointerCapture(e.pointerId);
+    } catch {}
     const vRect = vp.getBoundingClientRect();
     const cam = getLiveCamera();
     const docPt = screenToCanvas(
@@ -302,6 +310,8 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
     const startPointerAngle =
       (Math.atan2(docPt.y - ruler.y, docPt.x - ruler.x) * 180) / Math.PI;
     dragMetaRef.current = {
+      pointerId: e.pointerId,
+      capturedEl: targetEl,
       startDocX: docPt.x,
       startDocY: docPt.y,
       initialRulerX: ruler.x,
@@ -315,6 +325,8 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
   useEffect(() => {
     if (!dragMode) return;
     const handleMove = (e: PointerEvent) => {
+      const m = dragMetaRef.current;
+      if (m.pointerId !== null && e.pointerId !== m.pointerId) return;
       const vp = viewportRef.current;
       if (!vp) return;
       const p = propsRef.current;
@@ -332,7 +344,6 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
         cam.flipX,
         cam.flipY
       );
-      const m = dragMetaRef.current;
 
       if (dragMode === 'move') {
         p.onUpdateRuler({
@@ -341,8 +352,10 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
           y: m.initialRulerY + (docPt.y - m.startDocY),
         });
       } else {
-        const curPointerAngle =
-          (Math.atan2(docPt.y - p.ruler.y, docPt.x - p.ruler.x) * 180) / Math.PI;
+        const dx = docPt.x - p.ruler.x;
+        const dy = docPt.y - p.ruler.y;
+        if (Math.hypot(dx, dy) < 1e-3) return;
+        const curPointerAngle = (Math.atan2(dy, dx) * 180) / Math.PI;
         const delta = curPointerAngle - m.startPointerAngle;
         const rawNext = m.initialAngle + delta;
         const nextAngle = e.shiftKey
@@ -355,7 +368,24 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
       }
     };
 
-    const handleUp = () => {
+    const releaseCapture = () => {
+      const m = dragMetaRef.current;
+      if (m.capturedEl && m.pointerId !== null) {
+        try {
+          if (m.capturedEl.hasPointerCapture(m.pointerId)) {
+            m.capturedEl.releasePointerCapture(m.pointerId);
+          }
+        } catch {}
+      }
+      m.capturedEl = null;
+      m.pointerId = null;
+    };
+
+    const handleUp = (e: PointerEvent) => {
+      if (dragMetaRef.current.pointerId !== null && e.pointerId !== dragMetaRef.current.pointerId) {
+        return;
+      }
+      releaseCapture();
       setDragMode(null);
     };
 
@@ -366,6 +396,7 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
       window.removeEventListener('pointermove', handleMove);
       window.removeEventListener('pointerup', handleUp);
       window.removeEventListener('pointercancel', handleUp);
+      releaseCapture();
     };
   }, [dragMode, getLiveCamera, viewportRef]);
 
@@ -420,9 +451,11 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
             data-testid="straight-ruler-move-handle"
             onPointerDown={(e) => startHandleDrag('move', e)}
             title="Drag to move ruler"
-            className="absolute top-0 left-0 w-7 h-7 rounded-full bg-[#1a1a1a]/90 border-2 border-sky-400 text-sky-300 shadow-lg flex items-center justify-center cursor-move pointer-events-auto hover:scale-110 transition-transform"
+            className="absolute top-0 left-0 pointer-events-auto cursor-move group"
           >
-            <Move className="w-3.5 h-3.5" />
+            <div className="w-7 h-7 rounded-full bg-[#1a1a1a]/90 border-2 border-sky-400 text-sky-300 shadow-lg flex items-center justify-center transition-transform duration-100 group-hover:scale-110 group-active:scale-95">
+              <Move className="w-3.5 h-3.5" />
+            </div>
           </div>
 
           <div
@@ -430,9 +463,11 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
             data-testid="straight-ruler-rotate-left"
             onPointerDown={(e) => startHandleDrag('rotate-left', e)}
             title="Drag to rotate ruler (hold Shift for 15° snap)"
-            className="absolute top-0 left-0 w-6 h-6 rounded-full bg-[#1a1a1a]/90 border-2 border-sky-400 text-sky-300 shadow-lg flex items-center justify-center cursor-grab active:cursor-grabbing pointer-events-auto hover:scale-110 transition-transform"
+            className="absolute top-0 left-0 pointer-events-auto cursor-grab active:cursor-grabbing group"
           >
-            <RotateCw className="w-3 h-3" />
+            <div className="w-6 h-6 rounded-full bg-[#1a1a1a]/90 border-2 border-sky-400 text-sky-300 shadow-lg flex items-center justify-center transition-transform duration-100 group-hover:scale-110 group-active:scale-95">
+              <RotateCw className="w-3 h-3" />
+            </div>
           </div>
 
           <div
@@ -440,9 +475,11 @@ export const StraightRulerOverlay: React.FC<StraightRulerOverlayProps> = ({
             data-testid="straight-ruler-rotate-right"
             onPointerDown={(e) => startHandleDrag('rotate-right', e)}
             title="Drag to rotate ruler (hold Shift for 15° snap)"
-            className="absolute top-0 left-0 w-6 h-6 rounded-full bg-[#1a1a1a]/90 border-2 border-sky-400 text-sky-300 shadow-lg flex items-center justify-center cursor-grab active:cursor-grabbing pointer-events-auto hover:scale-110 transition-transform"
+            className="absolute top-0 left-0 pointer-events-auto cursor-grab active:cursor-grabbing group"
           >
-            <RotateCw className="w-3 h-3" />
+            <div className="w-6 h-6 rounded-full bg-[#1a1a1a]/90 border-2 border-sky-400 text-sky-300 shadow-lg flex items-center justify-center transition-transform duration-100 group-hover:scale-110 group-active:scale-95">
+              <RotateCw className="w-3 h-3" />
+            </div>
           </div>
         </>
       )}

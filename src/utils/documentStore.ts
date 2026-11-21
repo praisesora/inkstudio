@@ -142,7 +142,6 @@ export class DocumentStore {
   private driver: IScratchDiskDriver;
   private offloadInactiveUndoOnSwitch: boolean;
   private tileBudgetPromise: Promise<void> | null = null;
-  private needsAnotherTileBudgetPass: boolean = false;
 
   constructor(options?: DocumentStoreOptions) {
     const budgetMb = options?.totalTileBudgetMb ?? 1024;
@@ -316,7 +315,6 @@ export class DocumentStore {
    */
   public async enforceSharedTileBudget(): Promise<void> {
     if (this.tileBudgetPromise) {
-      this.needsAnotherTileBudgetPass = true;
       return this.tileBudgetPromise;
     }
 
@@ -327,7 +325,6 @@ export class DocumentStore {
     this.tileBudgetPromise = (async () => {
       try {
         while (this.getTotalActiveTileBytes() > this.totalTileBudgetBytes) {
-          this.needsAnotherTileBudgetPass = false;
           const targetBytes = this.totalTileBudgetBytes * 0.9;
           let bytesToFree = this.getTotalActiveTileBytes() - targetBytes;
           let freedTotal = 0;
@@ -357,13 +354,12 @@ export class DocumentStore {
             }
           }
 
-          if (freedTotal <= 0 && !this.needsAnotherTileBudgetPass) {
+          if (freedTotal <= 0) {
             break;
           }
         }
       } finally {
         this.tileBudgetPromise = null;
-        this.needsAnotherTileBudgetPass = false;
       }
     })();
 

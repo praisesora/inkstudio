@@ -15,6 +15,8 @@ import {
   createDefaultPerspectiveQuad,
   createDefaultMeshPoints,
   evaluateMeshSurface,
+  expandTriangleOutward,
+  renderMeshWarp,
 } from '../transformEngine';
 
 describe('Selection Boundary Modifiers and Wand', () => {
@@ -169,6 +171,71 @@ describe('Perspective and Mesh Transformation Engine', () => {
     const mid = evaluateMeshSurface(mesh, 0.5, 0.5);
     expect(mid.x).toBeCloseTo(50, 1);
     expect(mid.y).toBeCloseTo(50, 1);
+  });
+
+  it('expands adjacent quad triangles strictly outward across their shared diagonal', () => {
+    const expand = 0.75;
+    // Unit quad (0,0)-(100,0)-(100,80)-(0,80) split along (100,0)-(0,80)
+    const t1 = expandTriangleOutward(0, 0, 100, 0, 0, 80, expand);
+    const t2 = expandTriangleOutward(100, 0, 100, 80, 0, 80, expand);
+    expect(t1).not.toBeNull();
+    expect(t2).not.toBeNull();
+
+    // Shared diagonal line: (100, 0) -> (0, 80); unit normal pointing toward t2 (+x, +y)
+    const len = Math.hypot(100, 80);
+    const nx = 80 / len;
+    const ny = 100 / len;
+    const signedDistToDiag = (x: number, y: number) => (x - 100) * nx + y * ny;
+
+    // t1 diagonal endpoints (indices 2,3 and 4,5) must shift outward into t2 (+expand)
+    expect(signedDistToDiag(t1![2], t1![3])).toBeCloseTo(expand, 5);
+    expect(signedDistToDiag(t1![4], t1![5])).toBeCloseTo(expand, 5);
+
+    // t2 diagonal endpoints (indices 0,1 and 4,5) must shift outward into t1 (-expand)
+    expect(signedDistToDiag(t2![0], t2![1])).toBeCloseTo(-expand, 5);
+    expect(signedDistToDiag(t2![4], t2![5])).toBeCloseTo(-expand, 5);
+  });
+
+  it('expands reversed-winding (flipped) triangles outward and rejects degenerate triangles', () => {
+    const expand = 0.75;
+    // Reversed winding of (0,0)-(100,0)-(0,100) -> (0,0)-(0,100)-(100,0)
+    const flipped = expandTriangleOutward(0, 0, 0, 100, 100, 0, expand);
+    expect(flipped).not.toBeNull();
+    const invSqrt2 = Math.SQRT1_2;
+    const dist = (x: number, y: number) => (x + y - 100) * invSqrt2;
+    expect(dist(flipped![2], flipped![3])).toBeCloseTo(expand, 5);
+    expect(dist(flipped![4], flipped![5])).toBeCloseTo(expand, 5);
+
+    // Collinear / zero-area triangle returns null
+    expect(expandTriangleOutward(0, 0, 50, 50, 100, 100, expand)).toBeNull();
+  });
+
+  it('falls back to Canvas2D triangle rendering cleanly when WebGL is unavailable', () => {
+    const clipCalls: number[][] = [];
+    const mockCtx = {
+      save: vi.fn(),
+      restore: vi.fn(),
+      beginPath: vi.fn(),
+      moveTo: vi.fn((x: number, y: number) => clipCalls.push([x, y])),
+      lineTo: vi.fn((x: number, y: number) => clipCalls.push([x, y])),
+      closePath: vi.fn(),
+      clip: vi.fn(),
+      transform: vi.fn(),
+      drawImage: vi.fn(),
+    } as unknown as CanvasRenderingContext2D;
+
+    const src = { width: 100, height: 100 } as HTMLCanvasElement;
+    const quad = createDefaultPerspectiveQuad(0, 0, 100, 100, 0);
+    const mesh = createDefaultMeshPoints(quad, 3, 3);
+    renderMeshWarp(mockCtx, src, mesh, 2);
+
+    // (3-1)*2 = 4 cells per axis -> 16 cells -> 32 triangles -> 96 vertices
+    expect(mockCtx.drawImage).toHaveBeenCalledTimes(32);
+    expect(clipCalls.length).toBe(96);
+    for (const [x, y] of clipCalls) {
+      expect(Number.isFinite(x)).toBe(true);
+      expect(Number.isFinite(y)).toBe(true);
+    }
   });
 });
 

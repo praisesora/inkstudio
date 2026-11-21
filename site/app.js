@@ -418,6 +418,81 @@
     container.appendChild(list);
   }
 
+  function appendInlineCodeText(parent, text) {
+    const parts = String(text || '').split(/(`[^`]+`)/g);
+    for (const part of parts) {
+      if (!part) continue;
+      if (part.length >= 2 && part.startsWith('`') && part.endsWith('`')) {
+        parent.appendChild(el('code', 'release-notes-code mono', part.slice(1, -1)));
+      } else {
+        parent.appendChild(document.createTextNode(part));
+      }
+    }
+  }
+
+  function renderReleaseNotesBody(body) {
+    const container = el('div', 'release-notes');
+    const lines = String(body || '').replace(/\r\n/g, '\n').split('\n');
+    const headingToneMap = {
+      new: 'new',
+      improvements: 'improvements',
+      'bug fixes': 'fixes',
+      other: 'other',
+    };
+
+    let currentSection = null;
+    let currentList = null;
+
+    function ensureSection() {
+      if (!currentSection) {
+        currentSection = el('div', 'release-notes-section');
+        container.appendChild(currentSection);
+      }
+      return currentSection;
+    }
+
+    for (const rawLine of lines) {
+      const trimmed = rawLine.trim();
+      if (!trimmed) {
+        currentList = null;
+        continue;
+      }
+
+      const headingMatch = /^#{2,4}\s+(.+)$/.exec(trimmed);
+      if (headingMatch) {
+        const title = headingMatch[1].trim();
+        const tone = headingToneMap[title.toLowerCase()] || 'default';
+        currentSection = el('div', 'release-notes-section');
+        currentSection.appendChild(
+          el('div', `release-notes-heading release-notes-heading--${tone}`, title)
+        );
+        container.appendChild(currentSection);
+        currentList = null;
+        continue;
+      }
+
+      const bulletMatch = /^[-*]\s+(.+)$/.exec(trimmed);
+      if (bulletMatch) {
+        const sec = ensureSection();
+        if (!currentList) {
+          currentList = el('ul', 'release-notes-list');
+          sec.appendChild(currentList);
+        }
+        const li = el('li', '');
+        appendInlineCodeText(li, bulletMatch[1].trim());
+        currentList.appendChild(li);
+        continue;
+      }
+
+      currentList = null;
+      const p = el('p', 'release-notes-para');
+      appendInlineCodeText(p, trimmed);
+      ensureSection().appendChild(p);
+    }
+
+    return container;
+  }
+
   function renderReleaseHistory() {
     const host = document.getElementById('release-history');
     if (!host) return;
@@ -456,8 +531,7 @@
       card.appendChild(top);
 
       if (rel.body) {
-        const cleanBody = rel.body.length > 520 ? `${rel.body.slice(0, 520)}...` : rel.body;
-        card.appendChild(el('p', 'release-notes', cleanBody));
+        card.appendChild(renderReleaseNotesBody(rel.body));
       }
 
       if (rel.assets.length > 0) {
