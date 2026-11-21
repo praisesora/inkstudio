@@ -22,8 +22,8 @@ Download the latest build from the [Ink Studio website](https://praisesora.githu
 
 | Action | Formats |
 | --- | --- |
-| Open | `.sora`, `.ink`, `.psd`, `.psb`, `.clip`, `.csp`, `.png`, `.jpg`, `.webp`, `.gif`, `.bmp`, `.svg` |
-| Save / Save As | `.sora`, `.ink` (native layered project), `.psd` (layered), `.png`, `.jpg`, `.webp` |
+| Open | `.ink`, `.sora` (legacy read-only import), `.psd`, `.psb`, `.clip`, `.csp`, `.png`, `.jpg`, `.webp`, `.gif`, `.bmp`, `.svg` |
+| Save / Save As | `.ink` (native layered project), `.psd` (layered), `.png`, `.jpg`, `.webp` |
 | Import | `.sut` (Clip Studio Paint brushes), `.glb`, `.gltf`, `.obj` (3D models) |
 | Export | `.png`, Webtoon chapter slices (`.zip`), Animation (`.gif`, `.apng`, `.webm`, `.mp4`, `.zip`), Time-lapse (`.webm`, `.mp4`) |
 

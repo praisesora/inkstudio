@@ -6,7 +6,7 @@ Ink Studio is designed to work locally on your device. **Ink Studio does not col
 
 All data created or managed by Ink Studio stays on your computer, including:
 
-- Native project files (`.sora`, `.ink`) and exported artwork
+- Native project files (`.ink`) and exported artwork
 - Application settings, custom shortcuts, brush presets, and workspace layouts
 - Temporary LZ4-compressed scratch disk files and write-ahead log (WAL) crash recovery data
 

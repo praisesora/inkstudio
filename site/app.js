@@ -3,7 +3,6 @@
 (() => {
   const REPO = 'praisesora/inkstudio';
   const RELEASES_PAGE_URL = `https://github.com/${REPO}/releases`;
-  const LATEST_PAGE_URL = `https://github.com/${REPO}/releases/latest`;
   const API_URL = `https://api.github.com/repos/${REPO}/releases?per_page=8`;
   const DOWNLOAD_PREFIX = `https://github.com/${REPO}/releases/`;
   const CACHE_KEY = 'inkstudio_releases_v1';
@@ -268,7 +267,6 @@
 
   function renderHeaderAndHero() {
     const latest = getLatestStable();
-    const headerVer = document.getElementById('header-version');
     const heroPill = document.getElementById('hero-release-pill');
     const primaryBtn = document.getElementById('primary-download-btn');
     const primaryLabel = document.getElementById('primary-download-label');
@@ -276,19 +274,17 @@
     const syncStatus = document.getElementById('sync-status');
 
     if (!latest) {
-      if (headerVer) headerVer.textContent = 'releases';
-      if (heroPill) heroPill.textContent = 'Tauri v2 · Rust';
+      if (heroPill) heroPill.textContent = 'Tauri + Rust';
       if (primaryBtn) primaryBtn.href = RELEASES_PAGE_URL;
       if (primaryLabel) primaryLabel.textContent = 'View GitHub Releases';
-      if (primaryMeta) primaryMeta.textContent = 'No public release published yet · Build from source available below';
+      if (primaryMeta) primaryMeta.textContent = 'No public release published yet · Build from source below';
       if (syncStatus) syncStatus.textContent = 'Waiting for first published release';
       return;
     }
 
-    if (headerVer) headerVer.textContent = latest.tag;
-    if (heroPill) heroPill.textContent = `${latest.tag} · ${formatDate(latest.publishedAt) || 'Latest'}`;
+    if (heroPill) heroPill.textContent = `${latest.tag} (${formatDate(latest.publishedAt) || 'Latest'})`;
     if (syncStatus) {
-      syncStatus.textContent = `Latest: ${latest.tag} (${formatDate(latest.publishedAt)})`;
+      syncStatus.textContent = `Latest: ${latest.tag} · ${formatDate(latest.publishedAt)}`;
     }
 
     const visitorOs = detectVisitorOS();
@@ -361,7 +357,7 @@
           'No published release artifacts found yet. Once a GitHub Release is published, installers appear here automatically.'
         )
       );
-      const link = el('a', 'btn btn-panel btn-sm', 'Open GitHub Releases');
+      const link = el('a', 'btn btn-secondary btn-sm', 'Open GitHub Releases');
       link.href = RELEASES_PAGE_URL;
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
@@ -404,7 +400,7 @@
 
       const btn = el(
         'a',
-        `btn ${asset.recommended ? 'btn-accent' : 'btn-panel'} btn-sm`,
+        `btn ${asset.recommended ? 'btn-primary' : 'btn-secondary'} btn-sm`,
         'Download'
       );
       btn.href = asset.url;
@@ -418,14 +414,16 @@
     container.appendChild(list);
   }
 
-  function appendInlineCodeText(parent, text) {
-    const parts = String(text || '').split(/(`[^`]+`)/g);
-    for (const part of parts) {
-      if (!part) continue;
-      if (part.length >= 2 && part.startsWith('`') && part.endsWith('`')) {
-        parent.appendChild(el('code', 'release-notes-code mono', part.slice(1, -1)));
+  function appendInlineFormattedText(parent, text) {
+    const tokens = String(text || '').split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+    for (const token of tokens) {
+      if (!token) continue;
+      if (token.length >= 2 && token.startsWith('`') && token.endsWith('`')) {
+        parent.appendChild(el('code', 'release-notes-code mono', token.slice(1, -1)));
+      } else if (token.length >= 4 && token.startsWith('**') && token.endsWith('**')) {
+        parent.appendChild(el('strong', 'release-notes-strong', token.slice(2, -2)));
       } else {
-        parent.appendChild(document.createTextNode(part));
+        parent.appendChild(document.createTextNode(token));
       }
     }
   }
@@ -479,14 +477,14 @@
           sec.appendChild(currentList);
         }
         const li = el('li', '');
-        appendInlineCodeText(li, bulletMatch[1].trim());
+        appendInlineFormattedText(li, bulletMatch[1].trim());
         currentList.appendChild(li);
         continue;
       }
 
       currentList = null;
       const p = el('p', 'release-notes-para');
-      appendInlineCodeText(p, trimmed);
+      appendInlineFormattedText(p, trimmed);
       ensureSection().appendChild(p);
     }
 
@@ -499,7 +497,7 @@
     host.textContent = '';
 
     if (releaseState.releases.length === 0) {
-      const card = el('div', 'panel release-item');
+      const card = el('div', 'release-item');
       card.appendChild(
         el(
           'p',
@@ -512,7 +510,7 @@
     }
 
     for (const rel of releaseState.releases.slice(0, 5)) {
-      const card = el('article', 'panel release-item');
+      const card = el('article', 'release-item');
       const top = el('div', 'release-top');
 
       const titleGroup = el('div', 'release-title-group');
@@ -584,231 +582,115 @@
   }
 
   /* --------------------------------------------------------------------------
-   * Interactive Hero Studio Canvas
+   * Interactive Studio Canvas (Clean Empty Manga Manuscript + Blank Sheet)
    * -------------------------------------------------------------------------- */
   function initStudioCanvas() {
     const paperCanvas = document.getElementById('canvas-paper');
-    const toneCanvas = document.getElementById('canvas-tone');
-    const inkCanvas = document.getElementById('canvas-ink');
+    const guidesCanvas = document.getElementById('canvas-guides');
+    const panelsCanvas = document.getElementById('canvas-panels');
     const userCanvas = document.getElementById('canvas-user');
-    if (!paperCanvas || !toneCanvas || !inkCanvas || !userCanvas) return;
+    if (!paperCanvas || !guidesCanvas || !panelsCanvas || !userCanvas) return;
 
     const W = userCanvas.width;
     const H = userCanvas.height;
 
     const layerMap = {
       paper: paperCanvas,
-      tone: toneCanvas,
-      ink: inkCanvas,
+      guides: guidesCanvas,
+      panels: panelsCanvas,
       user: userCanvas,
     };
 
-    // 1. Paper layer with subtle manga manuscript crop marks
+    // 1. Clean manuscript paper base
     const pCtx = paperCanvas.getContext('2d');
     if (pCtx) {
-      pCtx.fillStyle = '#f8f8f6';
+      pCtx.fillStyle = '#fafaf8';
       pCtx.fillRect(0, 0, W, H);
+    }
 
-      // Subtle print guide lines (classic manga non-photo blue)
-      pCtx.strokeStyle = 'rgba(56, 189, 248, 0.28)';
-      pCtx.lineWidth = 1;
-      pCtx.strokeRect(28, 24, W - 56, H - 48);
+    // 2. Authentic manga manuscript print guides (non-photo blue bleed/trim + tombo crop marks)
+    const gCtx = guidesCanvas.getContext('2d');
+    if (gCtx) {
+      // Subtle non-photo blue trim rectangle
+      gCtx.strokeStyle = 'rgba(59, 130, 246, 0.22)';
+      gCtx.lineWidth = 1;
+      gCtx.strokeRect(30.5, 24.5, W - 61, H - 49);
 
-      // Corner crop ticks
-      pCtx.strokeStyle = 'rgba(22, 22, 22, 0.25)';
-      const m = 18;
-      const t = 10;
+      // Subtle inner safe-area frame (matches outer panel bounds)
+      gCtx.strokeStyle = 'rgba(59, 130, 246, 0.14)';
+      gCtx.setLineDash([4, 4]);
+      gCtx.strokeRect(56.5, 48.5, W - 113, H - 97);
+      gCtx.setLineDash([]);
+
+      // Japanese-style manga corner registration marks (tombo)
+      gCtx.strokeStyle = 'rgba(20, 20, 20, 0.24)';
+      gCtx.lineWidth = 1;
+      const mx = 22;
+      const my = 18;
+      const len = 10;
       const corners = [
-        [m, m, 1, 1],
-        [W - m, m, -1, 1],
-        [m, H - m, 1, -1],
-        [W - m, H - m, -1, -1],
+        [mx, my, 1, 1],
+        [W - mx, my, -1, 1],
+        [mx, H - my, 1, -1],
+        [W - mx, H - my, -1, -1],
       ];
       for (const [cx, cy, dx, dy] of corners) {
-        pCtx.beginPath();
-        pCtx.moveTo(cx, cy + dy * t);
-        pCtx.lineTo(cx, cy);
-        pCtx.lineTo(cx + dx * t, cy);
-        pCtx.stroke();
+        gCtx.beginPath();
+        gCtx.moveTo(cx + 0.5, cy + dy * len + 0.5);
+        gCtx.lineTo(cx + 0.5, cy + 0.5);
+        gCtx.lineTo(cx + dx * len + 0.5, cy + 0.5);
+        gCtx.stroke();
       }
+
+      // Subtle center-edge crop ticks
+      gCtx.beginPath();
+      gCtx.moveTo(W / 2 + 0.5, 10);
+      gCtx.lineTo(W / 2 + 0.5, 20);
+      gCtx.moveTo(W / 2 + 0.5, H - 20);
+      gCtx.lineTo(W / 2 + 0.5, H - 10);
+      gCtx.moveTo(12, H / 2 + 0.5);
+      gCtx.lineTo(22, H / 2 + 0.5);
+      gCtx.moveTo(W - 22, H / 2 + 0.5);
+      gCtx.lineTo(W - 12, H / 2 + 0.5);
+      gCtx.stroke();
     }
 
-    // 2. Screentone layer (60L dot halftone gradient in top panel + shadow wedge)
-    const tCtx = toneCanvas.getContext('2d');
-    if (tCtx) {
-      tCtx.fillStyle = '#262626';
-      // Upper-left manga panel sky tone
-      for (let y = 52; y < 290; y += 7) {
-        const progress = 1 - (y - 52) / 238;
-        const r = Math.max(0.6, progress * 2.2);
-        for (let x = 52; x < 548; x += 7) {
-          const offset = ((y / 7) % 2) * 3.5;
-          tCtx.beginPath();
-          tCtx.arc(x + offset, y, r, 0, Math.PI * 2);
-          tCtx.fill();
-        }
-      }
-      // Lower-right shadow tone
-      for (let y = 328; y < 528; y += 6) {
-        for (let x = 584; x < 908; x += 6) {
-          if (x - 584 > (528 - y) * 1.1) {
-            tCtx.beginPath();
-            tCtx.arc(x, y, 1.35, 0, Math.PI * 2);
-            tCtx.fill();
-          }
-        }
-      }
-    }
+    // 3. Clean, completely empty manga panel frames
+    const bCtx = panelsCanvas.getContext('2d');
+    if (bCtx) {
+      bCtx.strokeStyle = '#141414';
+      bCtx.lineWidth = 2.5;
+      bCtx.lineJoin = 'miter';
 
-    // 3. Crisp manga panel layout + perspective lines + speech balloon
-    const iCtx = inkCanvas.getContext('2d');
-    if (iCtx) {
-      iCtx.strokeStyle = '#161616';
-      iCtx.fillStyle = '#161616';
-      iCtx.lineJoin = 'miter';
-
-      // Panel 1 (Top Left — main wide panel)
-      iCtx.lineWidth = 3;
-      iCtx.strokeRect(48, 48, 504, 248);
-
-      // Perspective vanishing point inside Panel 1
-      iCtx.save();
-      iCtx.beginPath();
-      iCtx.rect(48, 48, 504, 248);
-      iCtx.clip();
-
-      // Horizon & subtle perspective guides
-      const vpX = 270;
-      const vpY = 205;
-      iCtx.strokeStyle = 'rgba(59, 130, 246, 0.35)';
-      iCtx.lineWidth = 1;
-      for (let a = -6; a <= 6; a += 1) {
-        iCtx.beginPath();
-        iCtx.moveTo(vpX, vpY);
-        iCtx.lineTo(vpX + Math.cos(a * 0.24) * 520, vpY + Math.sin(a * 0.24) * 520);
-        iCtx.stroke();
-      }
-      iCtx.beginPath();
-      iCtx.moveTo(48, vpY);
-      iCtx.lineTo(552, vpY);
-      iCtx.stroke();
-
-      // Stylized architectural silhouettes (crisp manga ink blocks)
-      iCtx.fillStyle = '#161616';
-      iCtx.beginPath();
-      iCtx.moveTo(48, 296);
-      iCtx.lineTo(48, 122);
-      iCtx.lineTo(156, 166);
-      iCtx.lineTo(156, 296);
-      iCtx.closePath();
-      iCtx.fill();
-
-      iCtx.beginPath();
-      iCtx.moveTo(552, 296);
-      iCtx.lineTo(552, 92);
-      iCtx.lineTo(418, 152);
-      iCtx.lineTo(418, 296);
-      iCtx.closePath();
-      iCtx.fill();
-
-      // Window highlights on right building
-      iCtx.fillStyle = '#f8f8f6';
-      for (let row = 0; row < 4; row += 1) {
-        for (let col = 0; col < 3; col += 1) {
-          const wx = 440 + col * 32;
-          const wy = 166 + row * 28 - col * 6;
-          iCtx.fillRect(wx, wy, 14, 14);
-        }
-      }
-
-      // Dynamic ink speedlines
-      iCtx.strokeStyle = '#161616';
-      iCtx.lineWidth = 1.5;
-      for (let k = 0; k < 14; k += 1) {
-        const angle = -2.6 + k * 0.14;
-        iCtx.beginPath();
-        iCtx.moveTo(vpX + Math.cos(angle) * 145, vpY + Math.sin(angle) * 145);
-        iCtx.lineTo(vpX + Math.cos(angle) * 320, vpY + Math.sin(angle) * 320);
-        iCtx.stroke();
-      }
-      iCtx.restore();
-
-      // Panel 2 (Right Tall — clean sketch area)
-      iCtx.strokeStyle = '#161616';
-      iCtx.lineWidth = 3;
-      iCtx.strokeRect(576, 48, 336, 484);
-
-      // Speech balloon in Panel 2 top
-      iCtx.fillStyle = '#ffffff';
-      iCtx.beginPath();
-      iCtx.ellipse(744, 126, 118, 44, 0, 0, Math.PI * 2);
-      iCtx.fill();
-      iCtx.lineWidth = 2.4;
-      iCtx.stroke();
-
-      // Balloon tail
-      iCtx.beginPath();
-      iCtx.moveTo(695, 165);
-      iCtx.lineTo(668, 198);
-      iCtx.lineTo(722, 169);
-      iCtx.closePath();
-      iCtx.fill();
-      iCtx.beginPath();
-      iCtx.moveTo(695, 165);
-      iCtx.lineTo(668, 198);
-      iCtx.lineTo(722, 169);
-      iCtx.stroke();
-
-      iCtx.fillStyle = '#161616';
-      iCtx.font = '700 15px Inter, -apple-system, sans-serif';
-      iCtx.textAlign = 'center';
-      iCtx.fillText('DRAW HERE.', 744, 122);
-      iCtx.font = '500 11px ui-monospace, monospace';
-      iCtx.fillStyle = '#525252';
-      iCtx.fillText('PRESSURE + STABILIZER', 744, 141);
-
-      // Panel 3 (Bottom Left — open drafting canvas)
-      iCtx.strokeStyle = '#161616';
-      iCtx.lineWidth = 3;
-      iCtx.strokeRect(48, 318, 504, 214);
-
-      // Subtle wireframe reference cube inside Panel 3
-      iCtx.strokeStyle = 'rgba(22, 22, 22, 0.24)';
-      iCtx.lineWidth = 1.25;
-      iCtx.strokeRect(92, 370, 84, 84);
-      iCtx.strokeRect(122, 348, 84, 84);
-      const edges = [
-        [92, 370, 122, 348],
-        [176, 370, 206, 348],
-        [92, 454, 122, 432],
-        [176, 454, 206, 432],
+      // Balanced 4-panel manga page layout (empty frames ready to draw in)
+      // Live area: x = 56..904 (848px), y = 48..552 (504px)
+      const frames = [
+        [56, 48, 498, 240],   // Top-left wide panel
+        [56, 312, 240, 240],  // Bottom-left panel
+        [314, 312, 240, 240], // Bottom-middle panel
+        [572, 48, 332, 504],  // Right tall panel
       ];
-      for (const [x1, y1, x2, y2] of edges) {
-        iCtx.beginPath();
-        iCtx.moveTo(x1, y1);
-        iCtx.lineTo(x2, y2);
-        iCtx.stroke();
-      }
 
-      iCtx.fillStyle = 'rgba(22, 22, 22, 0.45)';
-      iCtx.font = '500 10px ui-monospace, monospace';
-      iCtx.textAlign = 'left';
-      iCtx.fillText('3D REF / PERSPECTIVE SNAP', 92, 476);
+      for (const [x, y, w, h] of frames) {
+        bCtx.strokeRect(x, y, w, h);
+      }
     }
 
-    // 4. Interactive User Drawing Layer
+    // 4. Interactive User Drawing Layer (smooth quadratic ink strokes)
     const ctx = userCanvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
     const state = {
       tool: 'brush',
-      color: '#161616',
-      size: 6,
-      smooth: 0.55,
+      color: '#141414',
+      size: 5,
+      smooth: 0.5,
       opacity: 1,
       drawing: false,
       lastX: 0,
       lastY: 0,
+      midX: 0,
+      midY: 0,
       smoothX: 0,
       smoothY: 0,
       lastPressure: 0.5,
@@ -827,9 +709,36 @@
     const smoothReadout = document.getElementById('smooth-readout');
     const opacityReadout = document.getElementById('opacity-readout');
     const swatchIndicator = document.getElementById('active-swatch-indicator');
+    const panelsEyeBtn = document.querySelector('.layer-eye[data-layer="panels"]');
+    const templateBtns = document.querySelectorAll('.template-btn[data-template]');
+
+    function syncTemplateButtons() {
+      const panelsVisible = panelsCanvas.style.visibility !== 'hidden';
+      templateBtns.forEach((btn) => {
+        const isActive =
+          (btn.dataset.template === 'manga' && panelsVisible) ||
+          (btn.dataset.template === 'blank' && !panelsVisible);
+        btn.classList.toggle('active', isActive);
+        btn.setAttribute('aria-pressed', String(isActive));
+      });
+    }
+
+    function setPanelsVisible(visible) {
+      panelsCanvas.style.visibility = visible ? 'visible' : 'hidden';
+      if (panelsEyeBtn) {
+        panelsEyeBtn.classList.toggle('active', visible);
+      }
+      syncTemplateButtons();
+    }
+
+    templateBtns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        setPanelsVisible(btn.dataset.template === 'manga');
+      });
+    });
 
     function pushHistory() {
-      if (state.history.length >= 25) state.history.shift();
+      if (state.history.length >= 30) state.history.shift();
       state.history.push(ctx.getImageData(0, 0, W, H));
     }
 
@@ -878,7 +787,7 @@
         if (statusCoords) {
           statusCoords.textContent =
             pendingStatus.x !== null
-              ? `${Math.round(pendingStatus.x)}, ${Math.round(pendingStatus.y)}px`
+              ? `${Math.round(pendingStatus.x)}, ${Math.round(pendingStatus.y)} px`
               : '— , —';
         }
         const pct = Math.round((pendingStatus.pressure || 0) * 100);
@@ -887,12 +796,12 @@
       });
     }
 
-    function drawSegment(x0, y0, x1, y1, pressure) {
+    function strokeCurve(x0, y0, cx, cy, x1, y1, pressure) {
       ctx.save();
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      const widthScale = 0.35 + pressure * 0.95;
-      ctx.lineWidth = Math.max(1, state.size * widthScale);
+      const widthScale = 0.35 + pressure * 0.9;
+      ctx.lineWidth = Math.max(0.8, state.size * widthScale);
 
       if (state.tool === 'eraser') {
         ctx.globalCompositeOperation = 'destination-out';
@@ -906,7 +815,7 @@
 
       ctx.beginPath();
       ctx.moveTo(x0, y0);
-      ctx.lineTo(x1, y1);
+      ctx.quadraticCurveTo(cx, cy, x1, y1);
       ctx.stroke();
       ctx.restore();
     }
@@ -920,10 +829,12 @@
       state.drawing = true;
       state.lastX = pt.x;
       state.lastY = pt.y;
+      state.midX = pt.x;
+      state.midY = pt.y;
       state.smoothX = pt.x;
       state.smoothY = pt.y;
       state.lastPressure = pressure;
-      drawSegment(pt.x, pt.y, pt.x + 0.1, pt.y + 0.1, pressure);
+      strokeCurve(pt.x, pt.y, pt.x, pt.y, pt.x + 0.05, pt.y + 0.05, pressure);
       scheduleStatus(pt.x, pt.y, pressure);
     });
 
@@ -944,9 +855,13 @@
       const alpha = 1 - state.smooth * 0.82;
       const nextX = state.smoothX + (pt.x - state.smoothX) * alpha;
       const nextY = state.smoothY + (pt.y - state.smoothY) * alpha;
+      const nextMidX = (state.lastX + nextX) * 0.5;
+      const nextMidY = (state.lastY + nextY) * 0.5;
       const pressure = state.lastPressure * 0.6 + rawPressure * 0.4;
 
-      drawSegment(state.lastX, state.lastY, nextX, nextY, pressure);
+      strokeCurve(state.midX, state.midY, state.lastX, state.lastY, nextMidX, nextMidY, pressure);
+      state.midX = nextMidX;
+      state.midY = nextMidY;
       state.lastX = nextX;
       state.lastY = nextY;
       state.smoothX = nextX;
@@ -957,6 +872,15 @@
 
     const endStroke = () => {
       if (!state.drawing) return;
+      strokeCurve(
+        state.midX,
+        state.midY,
+        state.lastX,
+        state.lastY,
+        state.lastX,
+        state.lastY,
+        state.lastPressure
+      );
       state.drawing = false;
       scheduleStatus(state.lastX, state.lastY, 0);
     };
@@ -998,7 +922,7 @@
         const val = Number(smoothSlider.value);
         state.smooth = val / 100;
         if (smoothReadout) smoothReadout.textContent = `${val}%`;
-        if (statusSmooth) statusSmooth.textContent = val > 0 ? 'Bézier' : 'Direct';
+        if (statusSmooth) statusSmooth.textContent = val > 0 ? 'Stabilized' : 'Direct';
       });
     }
 
@@ -1017,6 +941,7 @@
         if (!target) return;
         const visible = btn.classList.toggle('active');
         target.style.visibility = visible ? 'visible' : 'hidden';
+        if (key === 'panels') syncTemplateButtons();
       });
     });
 
@@ -1036,10 +961,10 @@
       if (key === 'b') setTool('brush');
       else if (key === 'e') setTool('eraser');
       else if (key === '[' && sizeSlider) {
-        sizeSlider.value = String(Math.max(2, state.size - 2));
+        sizeSlider.value = String(Math.max(1, state.size - 2));
         sizeSlider.dispatchEvent(new Event('input'));
       } else if (key === ']' && sizeSlider) {
-        sizeSlider.value = String(Math.min(42, state.size + 2));
+        sizeSlider.value = String(Math.min(36, state.size + 2));
         sizeSlider.dispatchEvent(new Event('input'));
       }
     });
