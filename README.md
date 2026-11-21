@@ -2,11 +2,11 @@
 
 Desktop digital painting, illustration, and manga application with real-time multiplayer collaboration, built with Tauri, React, TypeScript, and Rust.
 
-[Releases](https://github.com/praisesora/inkstudio/releases) · [Latest Download](https://github.com/praisesora/inkstudio/releases/latest) · [Issues](https://github.com/praisesora/inkstudio/issues) · [Privacy](./PRIVACY.md) · [Code Signing](./CODE_SIGNING_POLICY.md) · [License](./LICENSE)
+[Website](https://praisesora.github.io/inkstudio/) · [Releases](https://github.com/praisesora/inkstudio/releases) · [Latest Download](https://github.com/praisesora/inkstudio/releases/latest) · [Issues](https://github.com/praisesora/inkstudio/issues) · [Privacy](./PRIVACY.md) · [Code Signing](./CODE_SIGNING_POLICY.md) · [License](./LICENSE)
 
 ## Download
 
-Prebuilt Windows installers with automatic in-app updates are published on the [Releases](https://github.com/praisesora/inkstudio/releases) page. macOS and Linux binaries can be built from source using the instructions below.
+Download the latest build from the [Ink Studio website](https://praisesora.github.io/inkstudio/) or the [Releases](https://github.com/praisesora/inkstudio/releases) page. Prebuilt Windows installers include automatic in-app updates; macOS and Linux binaries can be built from source using the instructions below.
 
 Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). See our [Code Signing Policy](./CODE_SIGNING_POLICY.md) and [Privacy Policy](./PRIVACY.md).
 
