@@ -1053,28 +1053,9 @@ h3 {
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
   flex-wrap: wrap;
-}
-
-.signing-note {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 11px;
-  color: var(--text-muted);
-}
-
-.signing-note a {
-  color: var(--text-primary);
-  text-decoration: underline;
-  text-decoration-color: rgba(229, 229, 229, 0.35);
-  text-underline-offset: 2px;
-}
-
-.signing-note a:hover {
-  text-decoration-color: var(--text-primary);
 }
 
 /* Feature Grid */
