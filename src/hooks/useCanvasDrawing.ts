@@ -43,6 +43,7 @@ export function useCanvasDrawing({
   onCollabStrokeFinish,
   onCollabCursorMove,
   perspectiveRuler = null,
+  straightRuler = null,
   onActiveConstraintAxisChange,
   activeSessionId = null,
   tileGrid,
@@ -82,6 +83,7 @@ export function useCanvasDrawing({
   const onCollabStrokeFinishRef = useRef(onCollabStrokeFinish);
   const onCollabCursorMoveRef = useRef(onCollabCursorMove);
   const rulerRef = useRef(perspectiveRuler);
+  const straightRulerRef = useRef(straightRuler);
   const onActiveConstraintAxisChangeRef = useRef(onActiveConstraintAxisChange);
 
   useEffect(() => {
@@ -108,6 +110,7 @@ export function useCanvasDrawing({
     onCollabStrokeFinishRef.current = onCollabStrokeFinish;
     onCollabCursorMoveRef.current = onCollabCursorMove;
     rulerRef.current = perspectiveRuler;
+    straightRulerRef.current = straightRuler;
     onActiveConstraintAxisChangeRef.current = onActiveConstraintAxisChange;
   }, [
     navigation,
@@ -132,6 +135,7 @@ export function useCanvasDrawing({
     onCollabStrokeFinish,
     onCollabCursorMove,
     perspectiveRuler,
+    straightRuler,
     onActiveConstraintAxisChange,
   ]);
 
@@ -215,6 +219,7 @@ export function useCanvasDrawing({
     predictedCanvasRef,
     activeTileGridRef: history.activeTileGridRef,
     rulerRef,
+    straightRulerRef,
     onActiveConstraintAxisChangeRef,
     onUpdateLayerThumbnail,
     onUpdateMaskThumbnailRef,
@@ -235,6 +240,7 @@ export function useCanvasDrawing({
     isDrawingRef,
     getActiveCanvas,
     pushHistoryStep: history.pushHistoryStep,
+    flushPendingHistoryTasks: history.flushPendingHistoryTasks,
     handlePointerDown: brushSession.handlePointerDown,
     handlePointerMove: brushSession.handlePointerMove,
     handlePointerUp: brushSession.handlePointerUp,

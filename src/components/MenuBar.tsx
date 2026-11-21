@@ -34,7 +34,7 @@ export const MenuBar: React.FC<MenuBarProps> = React.memo(({ sections = DEFAULT_
 
   const containerRef = useRef<HTMLDivElement>(null);
   const buttonRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
-  const itemRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
+  const itemRefs = useRef<Map<string, HTMLElement>>(new Map());
   const menuPortalRef = useRef<HTMLDivElement>(null);
   const submenuPortalRef = useRef<HTMLDivElement>(null);
   const submenuTimerRef = useRef<number | null>(null);
@@ -379,6 +379,71 @@ export const MenuBar: React.FC<MenuBarProps> = React.memo(({ sections = DEFAULT_
                   const isFocused = focusedIndex === idx && !item.disabled;
                   const itemKey = item.id || `item-${idx}`;
 
+                  const itemClassName = `w-full flex items-center justify-between px-2 py-1.5 rounded text-left transition-colors ${
+                    item.disabled
+                      ? 'text-[#8a8a8a]/40 cursor-not-allowed'
+                      : isSubmenuOpen || isFocused
+                      ? item.danger
+                        ? 'bg-red-500/15 text-red-300 cursor-pointer'
+                        : 'bg-[#2c2c2c] text-[#e5e5e5] cursor-pointer'
+                      : item.danger
+                      ? 'text-red-400 hover:bg-red-500/15 hover:text-red-300 cursor-pointer'
+                      : 'text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
+                  }`;
+
+                  const itemInner = (
+                    <>
+                      <span className="flex items-center gap-2 min-w-0">
+                        {activeSectionHasCheckables && (
+                          <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                            {item.checked ? (
+                              <Check className="w-3 h-3 text-[var(--accent)]" />
+                            ) : null}
+                          </span>
+                        )}
+                        {item.icon && (
+                          <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                            {item.icon}
+                          </span>
+                        )}
+                        <span className="truncate">{item.label}</span>
+                      </span>
+                      {hasSubmenu ? (
+                        <ChevronRight className="w-3 h-3 text-[#8a8a8a] ml-3 shrink-0" />
+                      ) : (
+                        item.shortcut && (
+                          <span className="ml-4 font-mono text-[10px] text-[#8a8a8a] shrink-0">
+                            {item.shortcut}
+                          </span>
+                        )
+                      )}
+                    </>
+                  );
+
+                  if (item.href && !item.disabled) {
+                    return (
+                      <a
+                        key={itemKey}
+                        ref={(el) => {
+                          if (el && item.id) itemRefs.current.set(item.id, el);
+                          else if (item.id) itemRefs.current.delete(item.id);
+                        }}
+                        href={item.href}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        role="menuitem"
+                        onMouseEnter={() => handleItemMouseEnter(item, idx)}
+                        onClick={(e) => {
+                          e.preventDefault();
+                          handleItemClick(item);
+                        }}
+                        className={itemClassName}
+                      >
+                        {itemInner}
+                      </a>
+                    );
+                  }
+
                   return (
                     <button
                       key={itemKey}
@@ -393,37 +458,9 @@ export const MenuBar: React.FC<MenuBarProps> = React.memo(({ sections = DEFAULT_
                       disabled={item.disabled}
                       onMouseEnter={() => handleItemMouseEnter(item, idx)}
                       onClick={() => handleItemClick(item)}
-                      className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-left transition-colors ${
-                        item.disabled
-                          ? 'text-[#8a8a8a]/40 cursor-not-allowed'
-                          : isSubmenuOpen || isFocused
-                          ? item.danger
-                            ? 'bg-red-500/15 text-red-300 cursor-pointer'
-                            : 'bg-[#2c2c2c] text-[#e5e5e5] cursor-pointer'
-                          : item.danger
-                          ? 'text-red-400 hover:bg-red-500/15 hover:text-red-300 cursor-pointer'
-                          : 'text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
-                      }`}
+                      className={itemClassName}
                     >
-                      <span className="flex items-center gap-2 min-w-0">
-                        {activeSectionHasCheckables && (
-                          <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
-                            {item.checked ? (
-                              <Check className="w-3 h-3 text-[var(--accent)]" />
-                            ) : null}
-                          </span>
-                        )}
-                        <span className="truncate">{item.label}</span>
-                      </span>
-                      {hasSubmenu ? (
-                        <ChevronRight className="w-3 h-3 text-[#8a8a8a] ml-3 shrink-0" />
-                      ) : (
-                        item.shortcut && (
-                          <span className="ml-4 font-mono text-[10px] text-[#8a8a8a] shrink-0">
-                            {item.shortcut}
-                          </span>
-                        )
-                      )}
+                      {itemInner}
                     </button>
                   );
                 })

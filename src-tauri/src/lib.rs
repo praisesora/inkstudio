@@ -91,8 +91,8 @@ fn sanitize_id(raw: &str) -> String {
 }
 
 const ALLOWED_DOCUMENT_EXTS: &[&str] = &[
-    "sora", "ink", "psd", "psb", "clip", "csp", "sut", "png", "jpg", "jpeg", "webp", "bmp", "gif",
-    "svg", "glb", "gltf", "obj",
+    "sora", "ink", "inkb", "psd", "psb", "clip", "csp", "sut", "png", "jpg", "jpeg", "webp", "bmp",
+    "gif", "svg", "glb", "gltf", "obj",
 ];
 
 const DELETE_ALLOWED_EXTS: &[&str] = &[
@@ -522,6 +522,25 @@ async fn timelapse_export_ffmpeg(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Disable Windows 11 WebView2 Shell Handwriting / DirectInk overlay so stylus input on
+    // sidebar text fields (e.g. layer rename) never draws ink strokes over the UI.
+    #[cfg(target_os = "windows")]
+    {
+        const HANDWRITING_DISABLE_FLAG: &str =
+            "--disable-features=StylusHandwritingWin,StylusHandwriting,msAbydos,msAbydosHandwritingAttr,msAbydosGestureSupport";
+        let merged = match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+            Ok(existing) if !existing.trim().is_empty() => {
+                if existing.contains("StylusHandwritingWin") {
+                    existing
+                } else {
+                    format!("{} {}", existing, HANDWRITING_DISABLE_FLAG)
+                }
+            }
+            _ => HANDWRITING_DISABLE_FLAG.to_string(),
+        };
+        std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
+    }
+
     // Register any document files explicitly passed via OS file association / CLI args.
     for arg in std::env::args_os().skip(1) {
         register_allowed_path(Path::new(&arg));
@@ -532,8 +551,13 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             #[cfg(desktop)]
-            app.handle()
-                .plugin(tauri_plugin_updater::Builder::new().build())?;
+            {
+                app.handle()
+                    .plugin(tauri_plugin_updater::Builder::new().build())?;
+                if let Some(main_window) = app.get_webview_window("main") {
+                    let _ = main_window.set_fullscreen(true);
+                }
+            }
             Ok(())
         })
         .on_window_event(|_window, event| {

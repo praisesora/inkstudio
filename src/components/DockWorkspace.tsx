@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import {
   ChevronsLeft,
   ChevronsRight,
@@ -194,7 +195,7 @@ interface DockGroupViewProps {
   renderPanelBody: (panelId: DockPanelId, containerWidth: number) => React.ReactNode;
 }
 
-const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
+export const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
   side,
   col,
   group,
@@ -205,19 +206,69 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
   renderPanelBody,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
   const [isDragOverTab, setIsDragOverTab] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const triggerBtnRef = useRef<HTMLButtonElement>(null);
+  const portalMenuRef = useRef<HTMLDivElement>(null);
+
+  const computeMenuPosition = useCallback(() => {
+    const btn = triggerBtnRef.current;
+    if (!btn || typeof window === 'undefined') return null;
+    const rect = btn.getBoundingClientRect();
+    const menuWidth = 176; // w-44
+    const estMenuHeight = 168;
+    const pad = 8;
+
+    // Right-align to the button on the right dock; on the left dock prefer extending rightwards
+    // out from the button (above the canvas) while clamping cleanly inside the viewport.
+    let left = side === 'left' ? rect.left : rect.right - menuWidth;
+    if (left + menuWidth > window.innerWidth - pad) {
+      left = rect.right - menuWidth;
+    }
+    left = Math.max(pad, Math.min(window.innerWidth - menuWidth - pad, left));
+
+    let top = rect.bottom + 4;
+    if (top + estMenuHeight > window.innerHeight - pad && rect.top - estMenuHeight - 4 >= pad) {
+      top = rect.top - estMenuHeight - 4;
+    } else {
+      top = Math.max(pad, Math.min(window.innerHeight - estMenuHeight - pad, top));
+    }
+
+    return { top, left };
+  }, [side]);
 
   useEffect(() => {
     if (!menuOpen) return;
     const handleOutside = (e: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
-        setMenuOpen(false);
+      const target = e.target as Node;
+      if (
+        menuRef.current?.contains(target) ||
+        portalMenuRef.current?.contains(target)
+      ) {
+        return;
       }
+      setMenuOpen(false);
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false);
+    };
+    const handleReposition = () => {
+      const next = computeMenuPosition();
+      if (next) setMenuPos(next);
+      else setMenuOpen(false);
     };
     window.addEventListener('mousedown', handleOutside);
-    return () => window.removeEventListener('mousedown', handleOutside);
-  }, [menuOpen]);
+    window.addEventListener('keydown', handleKey);
+    window.addEventListener('resize', handleReposition);
+    window.addEventListener('scroll', handleReposition, true);
+    return () => {
+      window.removeEventListener('mousedown', handleOutside);
+      window.removeEventListener('keydown', handleKey);
+      window.removeEventListener('resize', handleReposition);
+      window.removeEventListener('scroll', handleReposition, true);
+    };
+  }, [menuOpen, computeMenuPosition]);
 
   const activePanelId = group.panelIds.includes(group.activePanelId)
     ? group.activePanelId
@@ -305,8 +356,17 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
         {!isCompactToolOnly && (
           <div className="relative shrink-0" ref={menuRef}>
             <button
+              ref={triggerBtnRef}
               type="button"
-              onClick={() => setMenuOpen((v) => !v)}
+              onClick={() => {
+                setMenuOpen((prev) => {
+                  if (!prev) {
+                    setMenuPos(computeMenuPosition());
+                    return true;
+                  }
+                  return false;
+                });
+              }}
               data-testid={`dock-menu-btn-${activePanelId}`}
               title="Palette Dock Options"
               className="w-5 h-5 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer"
@@ -314,92 +374,100 @@ const DockGroupView: React.FC<DockGroupViewProps> = React.memo(({
               <MoreHorizontal className="w-3 h-3" />
             </button>
 
-            {menuOpen && (
-              <div
-                className={`absolute top-6 ${
-                  side === 'left' ? 'left-0' : 'right-0'
-                } w-44 rounded-md shadow-2xl p-1 z-50 text-[11px] bg-[#202020] border border-white/[0.1] text-[#e5e5e5]`}
-              >
-                <div className="px-2 py-0.5 text-[10px] text-[#8a8a8a] truncate">
-                  {DOCK_PANEL_META[activePanelId].title}
-                </div>
-                <div className="my-0.5 h-px bg-white/[0.08]" />
+            {menuOpen &&
+              typeof document !== 'undefined' &&
+              createPortal(
+                <div
+                  ref={portalMenuRef}
+                  data-testid={`dock-menu-popover-${activePanelId}`}
+                  style={{
+                    position: 'fixed',
+                    top: menuPos?.top ?? 0,
+                    left: menuPos?.left ?? 0,
+                  }}
+                  className="w-44 rounded-md shadow-2xl p-1 z-[1000] text-[11px] bg-[#202020] border border-white/[0.1] text-[#e5e5e5]"
+                >
+                  <div className="px-2 py-0.5 text-[10px] text-[#8a8a8a] truncate">
+                    {DOCK_PANEL_META[activePanelId].title}
+                  </div>
+                  <div className="my-0.5 h-px bg-white/[0.08]" />
 
-                {side === 'right' ? (
+                  {side === 'right' ? (
+                    <button
+                      type="button"
+                      data-testid={`move-to-left-${activePanelId}`}
+                      onClick={() => {
+                        workspaceStoreActions.movePanel(activePanelId, { side: 'left' });
+                        setMenuOpen(false);
+                      }}
+                      className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer text-left"
+                    >
+                      <ArrowLeftToLine className="w-3 h-3 text-[var(--accent)]" />
+                      <span>Move to Left Dock</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      data-testid={`move-to-right-${activePanelId}`}
+                      onClick={() => {
+                        workspaceStoreActions.movePanel(activePanelId, { side: 'right' });
+                        setMenuOpen(false);
+                      }}
+                      className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer text-left"
+                    >
+                      <ArrowRightToLine className="w-3 h-3 text-[var(--accent)]" />
+                      <span>Move to Right Dock</span>
+                    </button>
+                  )}
+
                   <button
                     type="button"
-                    data-testid={`move-to-left-${activePanelId}`}
                     onClick={() => {
-                      workspaceStoreActions.movePanel(activePanelId, { side: 'left' });
+                      workspaceStoreActions.movePanel(activePanelId, { side });
                       setMenuOpen(false);
                     }}
                     className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer text-left"
                   >
-                    <ArrowLeftToLine className="w-3 h-3 text-[var(--accent)]" />
-                    <span>Move to Left Dock</span>
+                    {side === 'left' ? (
+                      <PanelLeft className="w-3 h-3 text-[#8a8a8a]" />
+                    ) : (
+                      <PanelRight className="w-3 h-3 text-[#8a8a8a]" />
+                    )}
+                    <span>Move to New Column</span>
                   </button>
-                ) : (
+
                   <button
                     type="button"
-                    data-testid={`move-to-right-${activePanelId}`}
                     onClick={() => {
-                      workspaceStoreActions.movePanel(activePanelId, { side: 'right' });
+                      workspaceStoreActions.toggleColumnCollapsed(col.id, true);
                       setMenuOpen(false);
                     }}
                     className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer text-left"
                   >
-                    <ArrowRightToLine className="w-3 h-3 text-[var(--accent)]" />
-                    <span>Move to Right Dock</span>
+                    {side === 'left' ? (
+                      <ChevronsLeft className="w-3 h-3 text-[#8a8a8a]" />
+                    ) : (
+                      <ChevronsRight className="w-3 h-3 text-[#8a8a8a]" />
+                    )}
+                    <span>Collapse Dock Strip</span>
                   </button>
-                )}
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    workspaceStoreActions.movePanel(activePanelId, { side });
-                    setMenuOpen(false);
-                  }}
-                  className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer text-left"
-                >
-                  {side === 'left' ? (
-                    <PanelLeft className="w-3 h-3 text-[#8a8a8a]" />
-                  ) : (
-                    <PanelRight className="w-3 h-3 text-[#8a8a8a]" />
-                  )}
-                  <span>Move to New Column</span>
-                </button>
+                  <div className="my-0.5 h-px bg-white/[0.08]" />
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    workspaceStoreActions.toggleColumnCollapsed(col.id, true);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer text-left"
-                >
-                  {side === 'left' ? (
-                    <ChevronsLeft className="w-3 h-3 text-[#8a8a8a]" />
-                  ) : (
-                    <ChevronsRight className="w-3 h-3 text-[#8a8a8a]" />
-                  )}
-                  <span>Collapse Dock Strip</span>
-                </button>
-
-                <div className="my-0.5 h-px bg-white/[0.08]" />
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    workspaceStoreActions.togglePanelVisibility(activePanelId);
-                    setMenuOpen(false);
-                  }}
-                  className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] text-rose-400 cursor-pointer text-left"
-                >
-                  <X className="w-3 h-3" />
-                  <span>Close Palette</span>
-                </button>
-              </div>
-            )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      workspaceStoreActions.togglePanelVisibility(activePanelId);
+                      setMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-1.5 px-2 py-1 rounded hover:bg-[#2c2c2c] text-rose-400 cursor-pointer text-left"
+                  >
+                    <X className="w-3 h-3" />
+                    <span>Close Palette</span>
+                  </button>
+                </div>,
+                document.body
+              )}
           </div>
         )}
       </div>

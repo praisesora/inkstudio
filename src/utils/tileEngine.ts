@@ -110,6 +110,18 @@ export function parseTileKey(key: string): { layerId: string; tileX: number; til
   };
 }
 
+let nextGlobalTileVersion = 1;
+
+export function allocateTileVersion(): number {
+  return ++nextGlobalTileVersion;
+}
+
+export function reserveTileVersion(version: number): void {
+  if (Number.isFinite(version) && version > nextGlobalTileVersion) {
+    nextGlobalTileVersion = Math.floor(version);
+  }
+}
+
 /**
  * Allocate a new TileBuffer with zero-initialized memory.
  */
@@ -129,7 +141,7 @@ export function createTileBuffer(
     format,
     data: new Uint8Array(size),
     dirty: true,
-    version: 1,
+    version: allocateTileVersion(),
     isPagedToDisk: false,
     lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
     lod,
@@ -963,7 +975,7 @@ export class TileMemoryManager {
           }
           tile.isPagedToDisk = true;
           tile.dirty = true;
-          tile.version++;
+          tile.version = allocateTileVersion();
           this.touchTile(tile);
           void this.checkBudgetAndEvict();
           this.grid.bumpLayerVersion(tile.layerId);
@@ -1022,6 +1034,7 @@ export class TileMemoryManager {
         droppedLodBytes += tile.data.byteLength;
         tile.data = null;
         tile.dirty = true;
+        tile.version = allocateTileVersion();
       }
     }
 
@@ -1153,6 +1166,7 @@ export class TileMemoryManager {
         freed += sz;
         tile.data = null;
         tile.dirty = true;
+        tile.version = allocateTileVersion();
       }
     }
 
@@ -1774,7 +1788,7 @@ export class SparseTileGrid {
 
         tile.solidColorU32 = undefined;
         tile.dirty = true;
-        tile.version++;
+        tile.version = allocateTileVersion();
         this.markLodAncestorsDirty(layerId, tx, ty);
       }
     }
@@ -1870,6 +1884,9 @@ export class SparseTileGrid {
 
         // Erasing or alpha-locking against an empty tile is a no-op
         if ((compositeOp === 'destination-out' || compositeOp === 'source-atop') && (!existingTile || !existingTile.data)) {
+          if (existingTile && existingTile.data === null && existingTile.isPagedToDisk && this.memoryManager) {
+            void this.memoryManager.requestTileData(existingTile);
+          }
           continue;
         }
 
@@ -2139,7 +2156,7 @@ export class SparseTileGrid {
 
         tile.solidColorU32 = undefined;
         tile.dirty = true;
-        tile.version++;
+        tile.version = allocateTileVersion();
         this.markLodAncestorsDirty(layerId, tx, ty);
         anyModified = true;
       }
@@ -2271,6 +2288,11 @@ export class SparseTileGrid {
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return canvas;
     if (!resized) {
+      if (typeof ctx.resetTransform === 'function') {
+        ctx.resetTransform();
+      } else {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+      }
       ctx.clearRect(0, 0, w, h);
     }
 
@@ -2611,7 +2633,7 @@ export class SparseTileGrid {
       this.memoryManager?.notifyTileAllocated(tile);
     }
     tile.dirty = true;
-    tile.version++;
+    tile.version = allocateTileVersion();
     this.dirtyLodTiles.delete(key);
     return tile;
   }
@@ -2764,7 +2786,7 @@ export class SparseTileGrid {
           }
         }
         tile.dirty = true;
-        tile.version++;
+        tile.version = allocateTileVersion();
         this.markLodAncestorsDirty(layerId, tx, ty);
       }
     }
@@ -2826,7 +2848,7 @@ export class SparseTileGrid {
           }
         }
         tile.dirty = true;
-        tile.version++;
+        tile.version = allocateTileVersion();
         this.markLodAncestorsDirty(layerId, tx, ty);
       }
     }
@@ -2916,7 +2938,7 @@ export class SparseTileGrid {
         format: srcTile.format,
         data: clonedData,
         dirty: true,
-        version: 1,
+        version: allocateTileVersion(),
         isPagedToDisk: false,
         lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
         lod: 0,
@@ -3123,7 +3145,7 @@ export class SparseTileGrid {
         tile.format = delta.format;
         this.setLayerFormat(layerId, delta.format);
         tile.dirty = true;
-        tile.version++;
+        tile.version = allocateTileVersion();
         this.markLodAncestorsDirty(layerId, tileX, tileY);
         this.bumpLayerVersion(layerId);
       }
@@ -3165,6 +3187,12 @@ export class SparseTileGrid {
       }
     }
     for (const tile of tiles) {
+      if (tile.version > 0) {
+        reserveTileVersion(tile.version);
+      } else {
+        tile.version = allocateTileVersion();
+      }
+      tile.dirty = true;
       this.tiles.set(getTileKey(tile.layerId, tile.tileX, tile.tileY, tile.lod ?? 0), tile);
       if ((tile.lod ?? 0) === 0) {
         this.registerLod0Tile(tile);

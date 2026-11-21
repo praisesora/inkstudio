@@ -16,6 +16,8 @@ import {
   formatFileSize,
 } from '../utils/recentDocumentsManager';
 import { DeleteDocumentModal } from './DeleteDocumentModal';
+import { DiscordIcon } from './DiscordIcon';
+import { DISCORD_INVITE_URL, openExternalUrl } from '../utils/externalLinks';
 import { ThemePreset } from '../types/settings';
 
 interface WelcomeScreenProps {
@@ -124,6 +126,21 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
               <FolderOpen className="w-3.5 h-3.5 text-[#8a8a8a]" />
               <span>Open...</span>
             </button>
+
+            <a
+              href={DISCORD_INVITE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternalUrl(DISCORD_INVITE_URL);
+              }}
+              title="Join Ink Studio on Discord"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-[#202020] hover:bg-[#2c2c2c] text-xs font-medium text-[#e5e5e5] transition-colors cursor-pointer"
+            >
+              <DiscordIcon className="w-3.5 h-3.5 text-[#5865F2]" />
+              <span>Discord</span>
+            </a>
           </div>
         </div>
 

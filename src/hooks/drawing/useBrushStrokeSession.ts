@@ -46,8 +46,9 @@ import {
 import { GpuDab } from '../../utils/webglBrushEngine';
 import { PaintReservoir, LayerPixelSampler } from '../../utils/colorMixingEngine';
 import { applyLayerEffects } from '../../utils/layerEffectsEngine';
-import { PerspectiveRuler, ConstraintAxis } from '../../types/perspective';
+import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../../types/perspective';
 import { PerspectiveSnapSession } from '../../utils/perspectiveSnapping';
+import { StraightRulerSnapSession } from '../../utils/straightRulerMath';
 import { useToolStore, useUiStore } from '../../stores';
 import { evaluateGlobalPressureCurve, isLinearPressureCurve } from '../../utils/pressureCurve';
 import {
@@ -88,6 +89,7 @@ export interface UseBrushStrokeSessionParams {
   predictedCanvasRef?: React.RefObject<HTMLCanvasElement | null>;
   activeTileGridRef: React.MutableRefObject<SparseTileGrid>;
   rulerRef: React.MutableRefObject<PerspectiveRuler | null | undefined>;
+  straightRulerRef?: React.MutableRefObject<StraightRuler | null | undefined>;
   onActiveConstraintAxisChangeRef: React.MutableRefObject<
     ((axis: ConstraintAxis | null) => void) | undefined
   >;
@@ -165,6 +167,7 @@ export function useBrushStrokeSession({
   predictedCanvasRef,
   activeTileGridRef,
   rulerRef,
+  straightRulerRef,
   onActiveConstraintAxisChangeRef,
   onUpdateLayerThumbnail,
   onUpdateMaskThumbnailRef,
@@ -217,6 +220,7 @@ export function useBrushStrokeSession({
   }, [getPredictedCanvas]);
 
   const snapSessionRef = useRef(new PerspectiveSnapSession());
+  const straightSnapSessionRef = useRef(new StraightRulerSnapSession());
   const lastEmittedAxisRef = useRef<ConstraintAxis | null>(null);
   const emitConstraintAxisChange = useCallback(
     (newAxis: ConstraintAxis | null) => {
@@ -409,6 +413,7 @@ export function useBrushStrokeSession({
     layerPixelSamplerRef.current = null;
     activeReservoirRef.current = null;
     snapSessionRef.current.endStroke();
+    straightSnapSessionRef.current.endStroke();
     emitConstraintAxisChange(null);
   }, [
     activeTileGridRef,
@@ -1565,12 +1570,30 @@ export function useBrushStrokeSession({
       const firstEvent = e.nativeEvent;
       const rawStartPoint = getCanvasPoint(firstEvent);
       const isAltOverride = e.altKey;
-      const startPoint = snapSessionRef.current.snapPoint(
+      const activeStraightRuler = straightRulerRef?.current ?? null;
+      const straightStart = straightSnapSessionRef.current.startStrokePoint(
         rawStartPoint,
-        rulerRef.current ?? null,
+        activeStraightRuler,
+        zoomRef.current || 1.0,
         isAltOverride
       );
-      emitConstraintAxisChange(snapSessionRef.current.getActiveAxis());
+      let startPoint = straightStart;
+      if (straightSnapSessionRef.current.isActive()) {
+        snapSessionRef.current.endStroke();
+        emitConstraintAxisChange(null);
+      } else {
+        snapSessionRef.current.startStroke(
+          rawStartPoint,
+          rulerRef.current ?? null,
+          isAltOverride
+        );
+        startPoint = snapSessionRef.current.snapPoint(
+          rawStartPoint,
+          rulerRef.current ?? null,
+          isAltOverride
+        );
+        emitConstraintAxisChange(snapSessionRef.current.getActiveAxis());
+      }
 
       const strokeColor = resolveStrokeColor(bs, isEraser, isBgEraser, isMonochrome, mode);
       const strokeHardness = isMonochrome ? 1.0 : bs.hardness ?? 1.0;
@@ -2029,6 +2052,7 @@ export function useBrushStrokeSession({
       rotationRef,
       rulerRef,
       selectionRef,
+      straightRulerRef,
       viewportRef,
       zoomRef,
     ]
@@ -2083,6 +2107,7 @@ export function useBrushStrokeSession({
       const isAltOverride = e.altKey;
       const isShiftKey = e.shiftKey;
       const ruler = rulerRef.current ?? null;
+      const activeStraightRuler = straightRulerRef?.current ?? null;
       const curPan = panRef.current;
       const curZoom = zoomRef.current;
       const curRot = rotationRef.current;
@@ -2109,26 +2134,39 @@ export function useBrushStrokeSession({
           curFlipY
         );
 
-        const snapRes = snapSessionRef.current.processPoint(scratch, ruler, isAltOverride);
-        let cx = snapRes.x;
-        let cy = snapRes.y;
-        if (snapRes.axis) {
-          emitConstraintAxisChange(snapRes.axis);
-        } else if (
-          !isShiftLineStrokeRef.current &&
-          isShiftKey &&
-          useUiStore.getState().appSettings.modifierKeys.shift === 'straight-line' &&
-          !ruler?.enabled &&
-          allStrokePointsRef.current.length > 0
-        ) {
-          const originPt = allStrokePointsRef.current[0];
-          const dx = cx - originPt.x;
-          const dy = cy - originPt.y;
-          const dist = Math.hypot(dx, dy);
-          if (dist > 0.5) {
-            const snapAngle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
-            cx = originPt.x + Math.cos(snapAngle) * dist;
-            cy = originPt.y + Math.sin(snapAngle) * dist;
+        let cx = scratch.x;
+        let cy = scratch.y;
+        const straightRes = straightSnapSessionRef.current.processPoint(
+          scratch,
+          activeStraightRuler,
+          isAltOverride
+        );
+        if (straightRes.snapped) {
+          cx = straightRes.x;
+          cy = straightRes.y;
+        } else {
+          const snapRes = snapSessionRef.current.processPoint(scratch, ruler, isAltOverride);
+          cx = snapRes.x;
+          cy = snapRes.y;
+          if (snapRes.axis) {
+            emitConstraintAxisChange(snapRes.axis);
+          } else if (
+            !isShiftLineStrokeRef.current &&
+            isShiftKey &&
+            useUiStore.getState().appSettings.modifierKeys.shift === 'straight-line' &&
+            !ruler?.enabled &&
+            !(activeStraightRuler?.enabled && activeStraightRuler?.snapEnabled) &&
+            allStrokePointsRef.current.length > 0
+          ) {
+            const originPt = allStrokePointsRef.current[0];
+            const dx = cx - originPt.x;
+            const dy = cy - originPt.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist > 0.5) {
+              const snapAngle = Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+              cx = originPt.x + Math.cos(snapAngle) * dist;
+              cy = originPt.y + Math.sin(snapAngle) * dist;
+            }
           }
         }
 
@@ -2210,6 +2248,7 @@ export function useBrushStrokeSession({
       panRef,
       rotationRef,
       rulerRef,
+      straightRulerRef,
       zoomRef,
     ]
   );
@@ -2476,6 +2515,7 @@ export function useBrushStrokeSession({
                 const bakeCanvas = getReusableBakeCanvas(dw, dh);
                 const bCtx = bakeCanvas.getContext('2d', { alpha: true });
                 if (bCtx) {
+                  bCtx.resetTransform();
                   bCtx.clearRect(0, 0, dw, dh);
                   bCtx.save();
                   bCtx.translate(-sx, -sy);
@@ -2563,6 +2603,7 @@ export function useBrushStrokeSession({
                 const bakeCanvas = getReusableBakeCanvas(dw, dh);
                 const bCtxBake = bakeCanvas.getContext('2d', { alpha: true });
                 if (bCtxBake) {
+                  bCtxBake.resetTransform();
                   bCtxBake.clearRect(0, 0, dw, dh);
                   bCtxBake.save();
                   bCtxBake.translate(-sx, -sy);
@@ -2663,20 +2704,29 @@ export function useBrushStrokeSession({
               ? { mask: activeSelection.mask, bounds: activeSelection.bounds }
               : null;
 
+            const draftOriginX = draftDocRect ? Math.round(draftDocRect.x) : 0;
+            const draftOriginY = draftDocRect ? Math.round(draftDocRect.y) : 0;
             const canDirectDraftCommit = Boolean(
               draftCanvas &&
                 draftCtx &&
-                draftScale >= 0.999 &&
+                Math.abs(draftScale - 1.0) < 1e-6 &&
                 draftDocRect &&
+                Math.abs(draftDocRect.x - draftOriginX) < 1e-6 &&
+                Math.abs(draftDocRect.y - draftOriginY) < 1e-6 &&
                 !hasWetEdge &&
                 !bs.colorMixing &&
                 (bs.postCorrection ?? 0) === 0 &&
                 !shouldTaper &&
-                sx >= draftDocRect.x &&
-                sy >= draftDocRect.y &&
-                sx + dw <= draftDocRect.x + draftCanvas.width &&
-                sy + dh <= draftDocRect.y + draftCanvas.height
+                sx >= draftOriginX &&
+                sy >= draftOriginY &&
+                sx + dw <= draftOriginX + draftCanvas.width &&
+                sy + dh <= draftOriginY + draftCanvas.height
             );
+
+            // For single taps or small strokes, ensure every tile overlapping the padded bake rect is included
+            if (dw * dh <= 4 * TILE_SIZE * TILE_SIZE) {
+              markTouchedTiles(sx, sy, sx + dw, sy + dh);
+            }
 
             if (canDirectDraftCommit && draftCanvas && draftCtx && draftDocRect) {
               // Fast path: 1:1 draft canvas already has the rendered stroke; emit only sealed tail segments
@@ -2790,8 +2840,6 @@ export function useBrushStrokeSession({
                 { format: TileFormat; data: Uint8Array | null }
               >();
               const spans = buildTouchedTileSpans(sx, sy, dw, dh);
-              const draftOriginX = Math.round(draftDocRect.x);
-              const draftOriginY = Math.round(draftDocRect.y);
               for (let i = 0; i < spans.length; i++) {
                 const sp = spans[i];
                 const spanData = draftCtx.getImageData(
@@ -2846,6 +2894,7 @@ export function useBrushStrokeSession({
               const bakeCanvas = getReusableBakeCanvas(dw, dh);
               const bCtx = get2DContext(bakeCanvas);
               if (bCtx) {
+                bCtx.resetTransform();
                 bCtx.clearRect(0, 0, dw, dh);
                 bCtx.save();
                 bCtx.translate(-sx, -sy);
@@ -3008,6 +3057,7 @@ export function useBrushStrokeSession({
                   const bakeCanvas = getReusableBakeCanvas(dw, dh);
                   const bCtx = get2DContext(bakeCanvas);
                   if (bCtx) {
+                    bCtx.resetTransform();
                     bCtx.clearRect(0, 0, dw, dh);
                     bCtx.save();
                     bCtx.translate(-sx, -sy);
@@ -3184,6 +3234,7 @@ export function useBrushStrokeSession({
       layerPixelSamplerRef.current = null;
       activeReservoirRef.current = null;
       snapSessionRef.current.endStroke();
+      straightSnapSessionRef.current.endStroke();
       emitConstraintAxisChange(null);
 
       if (isMaskModeRef.current) {

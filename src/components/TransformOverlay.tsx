@@ -110,37 +110,39 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
     };
   }, [mode, quad, meshPoints, session.x, session.y, session.width, session.height, session.rotation]);
 
-  // Synchronously draw preview in layout effect
+  // Draw affine preview only when entering affine mode or when sourceCanvas changes (zero per-frame reallocation)
   useLayoutEffect(() => {
+    if (mode !== 'affine') return;
     const canvas = previewCanvasRef.current;
     if (!canvas || !session.sourceCanvas) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    if (mode === 'affine') {
-      canvas.width = session.sourceCanvas.width;
-      canvas.height = session.sourceCanvas.height;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      try {
-        const sCtx = session.sourceCanvas.getContext('2d');
-        if (sCtx) {
-          const imgData = sCtx.getImageData(0, 0, session.sourceCanvas.width, session.sourceCanvas.height);
-          ctx.putImageData(imgData, 0, 0);
-        } else {
-          ctx.drawImage(session.sourceCanvas, 0, 0);
-        }
-      } catch {
-        ctx.drawImage(session.sourceCanvas, 0, 0);
-      }
-    } else if (mode === 'perspective') {
-      const bw = Math.max(10, nonAffineBounds.width);
-      const bh = Math.max(10, nonAffineBounds.height);
-      canvas.width = bw;
-      canvas.height = bh;
-      ctx.clearRect(0, 0, bw, bh);
+    const sw = session.sourceCanvas.width;
+    const sh = session.sourceCanvas.height;
+    if (canvas.width !== sw) canvas.width = sw;
+    if (canvas.height !== sh) canvas.height = sh;
+    ctx.clearRect(0, 0, sw, sh);
+    ctx.drawImage(session.sourceCanvas, 0, 0);
+  }, [mode, session.sourceCanvas]);
 
-      // Shift quad into local canvas coordinates
+  // Draw perspective / mesh warp preview synchronously when control points change
+  useLayoutEffect(() => {
+    if (mode !== 'perspective' && mode !== 'mesh') return;
+    const canvas = previewCanvasRef.current;
+    if (!canvas || !session.sourceCanvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const bw = Math.max(10, nonAffineBounds.width);
+    const bh = Math.max(10, nonAffineBounds.height);
+    if (canvas.width !== bw) canvas.width = bw;
+    if (canvas.height !== bh) canvas.height = bh;
+    ctx.clearRect(0, 0, bw, bh);
+
+    if (mode === 'perspective') {
       const localQuad: [Point2D, Point2D, Point2D, Point2D] = [
         { x: quad[0].x - nonAffineBounds.minX, y: quad[0].y - nonAffineBounds.minY },
         { x: quad[1].x - nonAffineBounds.minX, y: quad[1].y - nonAffineBounds.minY },
@@ -149,14 +151,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
       ];
 
       renderPerspectiveQuad(ctx, session.sourceCanvas, localQuad, 16);
-    } else if (mode === 'mesh') {
-      const bw = Math.max(10, nonAffineBounds.width);
-      const bh = Math.max(10, nonAffineBounds.height);
-      canvas.width = bw;
-      canvas.height = bh;
-      ctx.clearRect(0, 0, bw, bh);
-
-      // Shift mesh into local canvas coordinates
+    } else {
       const localMesh: Point2D[][] = meshPoints.map((row) =>
         row.map((pt) => ({
           x: pt.x - nonAffineBounds.minX,
@@ -321,6 +316,14 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
     const initW = session.width;
     const initH = session.height;
     const initRot = session.rotation;
+    const boxRect = dragMode === 'rotate' ? containerRef.current?.getBoundingClientRect() : null;
+    const centerScreenX = boxRect ? boxRect.left + boxRect.width / 2 : startX;
+    const centerScreenY = boxRect ? boxRect.top + boxRect.height / 2 : startY;
+    const startRotVec =
+      dragMode === 'rotate'
+        ? screenDeltaToCanvas(startX - centerScreenX, startY - centerScreenY)
+        : { dx: 0, dy: -1 };
+    const startAngleRad = Math.atan2(startRotVec.dy, startRotVec.dx);
 
     const handlePointerMove = (ev: PointerEvent) => {
       const { dx, dy } = screenDeltaToCanvas(ev.clientX - startX, ev.clientY - startY);
@@ -338,12 +341,12 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
           y: Math.round(initY + finalDy),
         }));
       } else if (dragMode === 'rotate') {
-        const centerX = initX + initW / 2;
-        const centerY = initY + initH / 2;
-        const cursorCanvasX = centerX + dx;
-        const cursorCanvasY = centerY + dy;
-        const angleRad = Math.atan2(cursorCanvasY - centerY, cursorCanvasX - centerX);
-        let angleDeg = (angleRad * 180) / Math.PI + 90;
+        const currVec = screenDeltaToCanvas(
+          ev.clientX - centerScreenX,
+          ev.clientY - centerScreenY
+        );
+        const angleRad = Math.atan2(currVec.dy, currVec.dx);
+        let angleDeg = initRot + ((angleRad - startAngleRad) * 180) / Math.PI;
         if (ev.shiftKey) {
           angleDeg = Math.round(angleDeg / 15) * 15;
         }
@@ -469,7 +472,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
             className="w-full h-full pointer-events-none block"
             style={{
               transform: `scale(${session.flipH ? -1 : 1}, ${session.flipV ? -1 : 1})`,
-              imageRendering: 'pixelated',
+              imageRendering: zoom > 1 ? 'pixelated' : 'auto',
             }}
           />
 

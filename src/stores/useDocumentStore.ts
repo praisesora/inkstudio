@@ -7,7 +7,8 @@ import {
   CmykStandard,
   AnimationTimeline,
 } from '../types/editor';
-import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
+import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../types/perspective';
+import { createDefaultStraightRuler } from '../utils/straightRulerMath';
 import { SavedFileInfo } from '../utils/saveManager';
 import { createStore } from './createStore';
 
@@ -29,6 +30,7 @@ export interface DocumentStoreState {
   softProofSettings: SoftProofSettings;
   animationTimeline: AnimationTimeline | null;
   perspectiveRuler: PerspectiveRuler | null;
+  straightRuler: StraightRuler | null;
   activeLockedAxis: ConstraintAxis | null;
 }
 
@@ -44,6 +46,7 @@ const createInitialDocumentState = (): DocumentStoreState => ({
   softProofSettings: { ...DEFAULT_SOFT_PROOF_SETTINGS },
   animationTimeline: null,
   perspectiveRuler: null,
+  straightRuler: null,
   activeLockedAxis: null,
 });
 
@@ -144,6 +147,38 @@ export const documentStoreActions = {
       }
       return { perspectiveRuler: next };
     });
+  },
+
+  setStraightRuler(
+    updater:
+      | StraightRuler
+      | null
+      | ((prev: StraightRuler | null) => StraightRuler | null)
+  ): void {
+    useDocumentStore.setState((prev) => {
+      const next = typeof updater === 'function' ? updater(prev.straightRuler) : updater;
+      if (prev.activeDocumentId) {
+        return {
+          straightRuler: next,
+          documents: prev.documents.map((d) =>
+            d.id === prev.activeDocumentId ? { ...d, straightRuler: next } : d
+          ),
+        };
+      }
+      return { straightRuler: next };
+    });
+  },
+
+  toggleStraightRuler(centerX?: number, centerY?: number): StraightRuler {
+    const state = useDocumentStore.getState();
+    const cx = centerX ?? state.dimensions.width * 0.5;
+    const cy = centerY ?? state.dimensions.height * 0.5;
+    const prev = state.straightRuler;
+    const next: StraightRuler = prev
+      ? { ...prev, enabled: !prev.enabled }
+      : createDefaultStraightRuler(cx, cy);
+    documentStoreActions.setStraightRuler(next);
+    return next;
   },
 
   setActiveLockedAxis(newAxis: ConstraintAxis | null): void {

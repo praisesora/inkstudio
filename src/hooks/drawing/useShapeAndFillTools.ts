@@ -67,6 +67,7 @@ export interface UseShapeAndFillToolsParams {
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   layerSourceCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   materializeLayerCanvas?: (layerId: string) => HTMLCanvasElement | null;
+  flushPendingHistoryTasks?: () => void;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   getEffectiveOpacity: (layer: LayerItem) => number;
   getActiveCanvas: () => HTMLCanvasElement | null;
@@ -150,6 +151,7 @@ export function useShapeAndFillTools({
   layerCanvasesRef,
   layerSourceCanvasesRef,
   materializeLayerCanvas,
+  flushPendingHistoryTasks,
   isLayerEffectivelyVisible,
   getEffectiveOpacity,
   getActiveCanvas,
@@ -634,6 +636,7 @@ export function useShapeAndFillTools({
         const py = Math.floor(pt.y);
         if (px < 0 || px >= dimensions.width || py < 0 || py >= dimensions.height) return true;
 
+        flushPendingHistoryTasks?.();
         const canvas = getActiveCanvas();
         if (
           !canvas ||
@@ -643,16 +646,24 @@ export function useShapeAndFillTools({
           return true;
         }
 
+        const grid = documentStore.getActiveTileGrid();
+        const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+        if (!activeLayer?.toneEnabled) {
+          grid.renderLayerToCanvas(activeLayerId, canvas);
+        }
+        if (sourceCanvas) {
+          grid.renderLayerToCanvas(activeLayerId, sourceCanvas);
+        }
+
         const ctx = get2DContext(canvas);
         if (!ctx) return true;
         const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
 
         let refCanvas: HTMLCanvasElement;
         if (fillSettings.method === 'refer-all') {
-          refCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions);
+          refCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions, grid);
         } else if (fillSettings.method === 'refer-reference') {
-          refCanvas = compositeReferenceLayers(layers, layerCanvasesRef.current, dimensions);
+          refCanvas = compositeReferenceLayers(layers, layerCanvasesRef.current, dimensions, grid);
         } else {
           refCanvas = canvas;
         }
@@ -675,6 +686,12 @@ export function useShapeAndFillTools({
             selectionMask: selMask,
           }
         );
+        (canvas as unknown as { __isBlank?: boolean; __isSolidWhite?: boolean }).__isBlank = false;
+        (canvas as unknown as { __isSolidWhite?: boolean }).__isSolidWhite = false;
+        if (sourceCanvas) {
+          (sourceCanvas as unknown as { __isBlank?: boolean }).__isBlank = false;
+          (sourceCanvas as unknown as { __isSolidWhite?: boolean }).__isSolidWhite = false;
+        }
         if (activeLayer?.toneEnabled && sourceCanvas) {
           applyLayerEffects(
             sourceCanvas,
@@ -688,7 +705,7 @@ export function useShapeAndFillTools({
         const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         updateLayerThumbnail(activeLayerId, true);
         pushHistoryStep('fill', 'Bucket Fill', beforeImageData, afterImageData, activeLayerId);
-        documentStore.getActiveTileGrid().notifyChange(true);
+        grid.notifyChange(true);
         return true;
       }
 
@@ -767,6 +784,7 @@ export function useShapeAndFillTools({
       layerSourceCanvasesRef,
       layerCanvasesRef,
       materializeLayerCanvas,
+      flushPendingHistoryTasks,
       selection,
       dimensions,
       colorMode,
@@ -1085,14 +1103,28 @@ export function useShapeAndFillTools({
       ) {
         const pts = [...lassoFillPointsRef.current];
         lassoFillPointsRef.current = [];
+        flushPendingHistoryTasks?.();
         const canvas = getActiveCanvas();
         if (!canvas) return true;
+        const grid = documentStore.getActiveTileGrid();
+        const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+        if (!activeLayer?.toneEnabled) {
+          grid.renderLayerToCanvas(activeLayerId, canvas);
+        }
+        if (sourceCanvas) {
+          grid.renderLayerToCanvas(activeLayerId, sourceCanvas);
+        }
         const ctx = get2DContext(canvas);
         if (!ctx) return true;
         const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
 
         executeLassoFill(canvas, pts, primaryColor, sourceCanvas);
+        (canvas as unknown as { __isBlank?: boolean }).__isBlank = false;
+        (canvas as unknown as { __isSolidWhite?: boolean }).__isSolidWhite = false;
+        if (sourceCanvas) {
+          (sourceCanvas as unknown as { __isBlank?: boolean }).__isBlank = false;
+          (sourceCanvas as unknown as { __isSolidWhite?: boolean }).__isSolidWhite = false;
+        }
         if (activeLayer?.toneEnabled && sourceCanvas) {
           applyLayerEffects(sourceCanvas, canvas, activeLayer, dimensions.dpi ?? 600);
         }
@@ -1100,7 +1132,7 @@ export function useShapeAndFillTools({
         const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         updateLayerThumbnail(activeLayerId, true);
         pushHistoryStep('fill', 'Lasso Fill', beforeImageData, afterImageData, activeLayerId);
-        documentStore.getActiveTileGrid().notifyChange(true);
+        grid.notifyChange(true);
         return true;
       }
 
@@ -1200,6 +1232,7 @@ export function useShapeAndFillTools({
       pushHistoryStep,
       updateLayerThumbnail,
       getActiveCanvas,
+      flushPendingHistoryTasks,
       dimensions.dpi,
       selection,
       colorMode,

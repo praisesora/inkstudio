@@ -19,13 +19,7 @@ import {
 import { globalTimelapseManager } from '../utils/timelapseEngine';
 import { saveRecentDocument, RecentDocument } from '../utils/recentDocumentsManager';
 import { enforceColorMode } from '../utils/colorUtils';
-import { parseSutFile } from '../utils/sutParser';
-import {
-  deleteCustomBrush,
-  loadCustomBrushes,
-  prepareBrushSettingsForCsp,
-  saveCustomBrush,
-} from '../utils/brushStorage';
+import { importBrushFile, isSupportedBrushFileName } from '../utils/inkbBrushFormat';
 import { documentStore } from '../utils/documentStore';
 import { shortcutManager } from '../utils/shortcutManager';
 import { recoveryService, CrashedSessionInfo } from '../services/recoveryService';
@@ -190,6 +184,7 @@ export function useDocumentLifecycle({
       };
 
       documentStoreActions.setPerspectiveRuler(null);
+      documentStoreActions.setStraightRuler(null);
       documentStoreActions.setDocuments((prev) => [...prev, newDoc]);
       documentStoreActions.setActiveDocumentId(newDocId);
       uiStoreActions.setAppView('workspace');
@@ -311,25 +306,13 @@ export function useDocumentLifecycle({
 
   const handleProcessFile = useCallback(
     async (file: File) => {
-      if (file.name.toLowerCase().endsWith('.sut')) {
+      if (isSupportedBrushFileName(file.name)) {
         try {
-          uiStoreActions.setLoading(true, `Importing CSP Brush: ${file.name}...`);
-          const buffer = await file.arrayBuffer();
-          const parsedBrush = await parseSutFile(buffer, file.name);
-          const existing = (await loadCustomBrushes()).filter(
-            (b) =>
-              b.name.toLowerCase() === parsedBrush.name.toLowerCase() || b.id === parsedBrush.id
-          );
-          for (const old of existing) {
-            await deleteCustomBrush(old.id).catch(() => {});
-          }
-          await saveCustomBrush(parsedBrush);
-          toolStoreActions.setToolRaw('brush');
-          const fullSettings = await prepareBrushSettingsForCsp(parsedBrush);
-          toolStoreActions.updateBrushSettings(fullSettings);
-          showToast(`Imported CSP brush "${parsedBrush.name}" successfully!`);
+          uiStoreActions.setLoading(true, `Importing Brush: ${file.name}...`);
+          const parsedBrush = await importBrushFile(file);
+          showToast(`Imported brush "${parsedBrush.name}"`);
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : 'Failed to import .sut brush.';
+          const msg = err instanceof Error ? err.message : 'Failed to import brush file.';
           showToast(msg);
         } finally {
           uiStoreActions.setLoading(false, '');
@@ -367,6 +350,7 @@ export function useDocumentLifecycle({
         };
 
         documentStoreActions.setPerspectiveRuler(doc.perspectiveRuler ?? null);
+        documentStoreActions.setStraightRuler(null);
         if (doc.animationTimeline !== undefined) {
           documentStoreActions.setAnimationTimeline(doc.animationTimeline);
         }
@@ -427,6 +411,7 @@ export function useDocumentLifecycle({
       switchDocumentSession(id, doc.layers || [], doc.activeLayerId || '', doc.dimensions);
       documentStoreActions.setActiveDocumentId(id);
       documentStoreActions.setPerspectiveRuler(doc.perspectiveRuler ?? null);
+      documentStoreActions.setStraightRuler(doc.straightRuler ?? null);
       needsAdaptiveFitRef.current = true;
       pendingFitDimsRef.current = doc.dimensions;
       resetZoomAndCenter(doc.dimensions);
@@ -445,6 +430,7 @@ export function useDocumentLifecycle({
             documentStoreActions.setColorMode(nextActive.colorMode);
             documentStoreActions.setDocumentName(nextActive.name);
             documentStoreActions.setPerspectiveRuler(nextActive.perspectiveRuler ?? null);
+            documentStoreActions.setStraightRuler(nextActive.straightRuler ?? null);
             if (nextActive.savedFileInfo && nextActive.savedFileInfo.extension) {
               documentStoreActions.setSavedFileInfo({
                 name: nextActive.savedFileInfo.name,
@@ -476,6 +462,7 @@ export function useDocumentLifecycle({
             documentStoreActions.setSavedFileInfo(null);
             clearDocument();
             documentStoreActions.setPerspectiveRuler(null);
+            documentStoreActions.setStraightRuler(null);
             uiStoreActions.setAppView('home');
           }
         }

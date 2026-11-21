@@ -20,6 +20,7 @@ import { CrashRecoveryModal } from './CrashRecoveryModal';
 import { NewCanvasModal } from './NewCanvasModal';
 import { ResizeCanvasModal } from './ResizeCanvasModal';
 import { SettingsModal } from './SettingsModal';
+import { AboutModal } from './AboutModal';
 import { TonalCorrectionModal } from './TonalCorrectionModal';
 import { AdjustmentModal } from './AdjustmentModal';
 import { LayerStylesModal } from './LayerStylesModal';
@@ -149,6 +150,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     const isNewCanvasModalOpen = useUiStore((s) => s.isNewCanvasModalOpen);
     const isResizeCanvasModalOpen = useUiStore((s) => s.isResizeCanvasModalOpen);
     const isSettingsModalOpen = useUiStore((s) => s.isSettingsModalOpen);
+    const isAboutModalOpen = useUiStore((s) => s.isAboutModalOpen);
     const appSettings = useUiStore((s) => s.appSettings);
     const tonalModalState = useUiStore((s) => s.tonalModalState);
     const adjustmentModalState = useUiStore((s) => s.adjustmentModalState);
@@ -227,6 +229,12 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           settings={appSettings}
           onUpdateSettings={handleUpdateSettings}
           onShowToast={showToast}
+        />
+
+        <AboutModal
+          isOpen={isAboutModalOpen}
+          onClose={() => uiStoreActions.setAboutModalOpen(false)}
+          showToast={showToast}
         />
 
         <TonalCorrectionModal

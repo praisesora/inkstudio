@@ -751,11 +751,30 @@ export function liftSelectionToFloating(
 ): {
   floatingCanvas: HTMLCanvasElement;
   beforeImageData: ImageData;
+  bounds: { x: number; y: number; width: number; height: number };
 } | null {
-  const b = selection.bounds;
-  if (!b || b.width <= 0 || b.height <= 0) {
+  const rawBounds = selection.bounds;
+  if (!rawBounds || rawBounds.width <= 0 || rawBounds.height <= 0) {
     return null;
   }
+
+  const cw = targetCanvas.width;
+  const ch = targetCanvas.height;
+  if (cw <= 0 || ch <= 0) {
+    return null;
+  }
+
+  // Clamp bounds to canvas integer pixel rect to prevent out-of-bounds mask wrap & offset drift
+  const bx = Math.max(0, Math.floor(rawBounds.x));
+  const by = Math.max(0, Math.floor(rawBounds.y));
+  const bx1 = Math.min(cw, Math.ceil(rawBounds.x + rawBounds.width));
+  const by1 = Math.min(ch, Math.ceil(rawBounds.y + rawBounds.height));
+  const bw = bx1 - bx;
+  const bh = by1 - by;
+  if (bw <= 0 || bh <= 0) {
+    return null;
+  }
+  const b = { x: bx, y: by, width: bw, height: bh };
 
   const targetCtx = targetCanvas.getContext('2d');
   if (!targetCtx) {
@@ -763,7 +782,7 @@ export function liftSelectionToFloating(
   }
 
   // 1. Snapshot entire targetCanvas synchronously for undo/cancel
-  const beforeImageData = targetCtx.getImageData(0, 0, targetCanvas.width, targetCanvas.height);
+  const beforeImageData = targetCtx.getImageData(0, 0, cw, ch);
 
   // 2. Extract selection rectangle pixels directly
   const extractedImageData = targetCtx.getImageData(b.x, b.y, b.width, b.height);
@@ -778,24 +797,31 @@ export function liftSelectionToFloating(
 
   floatCtx.putImageData(extractedImageData, 0, 0);
 
-  // 3. Mask floating canvas
+  // Build sub-mask once if selection has an alpha mask (reused for both extraction & erase)
+  let maskSub: HTMLCanvasElement | null = null;
   if (selection.mask && selection.maskWidth && selection.maskHeight) {
-    const maskSub = document.createElement('canvas');
+    maskSub = document.createElement('canvas');
     maskSub.width = b.width;
     maskSub.height = b.height;
     const mCtx = maskSub.getContext('2d');
     if (mCtx) {
       const mImg = mCtx.createImageData(b.width, b.height);
       const mw = selection.maskWidth;
+      const mh = selection.maskHeight;
+      const fillRgb = isBackground ? 255 : 0;
       for (let y = 0; y < b.height; y++) {
-        const srcRow = (b.y + y) * mw;
+        const sy = b.y + y;
         const dstRow = y * b.width * 4;
+        if (sy < 0 || sy >= mh) continue;
+        const srcRow = sy * mw;
         for (let x = 0; x < b.width; x++) {
-          const val = selection.mask[srcRow + (b.x + x)] ?? 0;
-          mImg.data[dstRow + x * 4] = 255;
-          mImg.data[dstRow + x * 4 + 1] = 255;
-          mImg.data[dstRow + x * 4 + 2] = 255;
-          mImg.data[dstRow + x * 4 + 3] = val;
+          const sx = b.x + x;
+          const val = sx >= 0 && sx < mw ? (selection.mask[srcRow + sx] ?? 0) : 0;
+          const off = dstRow + x * 4;
+          mImg.data[off] = fillRgb;
+          mImg.data[off + 1] = fillRgb;
+          mImg.data[off + 2] = fillRgb;
+          mImg.data[off + 3] = val;
         }
       }
       mCtx.putImageData(mImg, 0, 0);
@@ -803,6 +829,8 @@ export function liftSelectionToFloating(
       floatCtx.globalCompositeOperation = 'destination-in';
       floatCtx.drawImage(maskSub, 0, 0);
       floatCtx.restore();
+    } else {
+      maskSub = null;
     }
   } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
     floatCtx.save();
@@ -818,61 +846,41 @@ export function liftSelectionToFloating(
     floatCtx.restore();
   }
 
-  // 4. Erase selected area from base layer
+  // 4. Erase selected area from base layer using identity transform to match getImageData coords
   const eraseFromContext = (ctx: CanvasRenderingContext2D) => {
     ctx.save();
-    if (selection.mask && selection.maskWidth && selection.maskHeight) {
-      const maskCanvas = document.createElement('canvas');
-      maskCanvas.width = targetCanvas.width;
-      maskCanvas.height = targetCanvas.height;
-      const mCtx = maskCanvas.getContext('2d');
-      if (mCtx) {
-        const mImg = mCtx.createImageData(targetCanvas.width, targetCanvas.height);
-        const fillRgb = isBackground ? 255 : 0;
-        for (let i = 0; i < selection.mask.length; i++) {
-          mImg.data[i * 4] = fillRgb;
-          mImg.data[i * 4 + 1] = fillRgb;
-          mImg.data[i * 4 + 2] = fillRgb;
-          mImg.data[i * 4 + 3] = selection.mask[i];
-        }
-        mCtx.putImageData(mImg, 0, 0);
-        if (isBackground) {
-          ctx.globalCompositeOperation = 'source-over';
-          ctx.drawImage(maskCanvas, 0, 0);
-        } else {
-          ctx.globalCompositeOperation = 'destination-out';
-          ctx.drawImage(maskCanvas, 0, 0);
-        }
-      }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (maskSub) {
+      ctx.globalCompositeOperation = isBackground ? 'source-over' : 'destination-out';
+      ctx.drawImage(maskSub, b.x, b.y);
     } else if (isBackground) {
+      ctx.globalCompositeOperation = 'source-over';
       ctx.fillStyle = '#ffffff';
-      if (selection.type === 'rect') {
+      if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+        ctx.beginPath();
+        const poly = selection.polygon;
+        ctx.moveTo(poly[0].x, poly[0].y);
+        for (let i = 1; i < poly.length; i++) {
+          ctx.lineTo(poly[i].x, poly[i].y);
+        }
+        ctx.closePath();
+        ctx.fill();
+      } else {
         ctx.fillRect(b.x, b.y, b.width, b.height);
-      } else if (selection.type === 'lasso' && selection.polygon) {
-        ctx.beginPath();
-        const poly = selection.polygon;
-        ctx.moveTo(poly[0].x, poly[0].y);
-        for (let i = 1; i < poly.length; i++) {
-          ctx.lineTo(poly[i].x, poly[i].y);
-        }
-        ctx.closePath();
-        ctx.fill();
       }
+    } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.fillStyle = 'rgba(0, 0, 0, 1)';
+      ctx.beginPath();
+      const poly = selection.polygon;
+      ctx.moveTo(poly[0].x, poly[0].y);
+      for (let i = 1; i < poly.length; i++) {
+        ctx.lineTo(poly[i].x, poly[i].y);
+      }
+      ctx.closePath();
+      ctx.fill();
     } else {
-      if (selection.type === 'rect') {
-        ctx.clearRect(b.x, b.y, b.width, b.height);
-      } else if (selection.type === 'lasso' && selection.polygon) {
-        ctx.globalCompositeOperation = 'destination-out';
-        ctx.fillStyle = 'rgba(0, 0, 0, 1)';
-        ctx.beginPath();
-        const poly = selection.polygon;
-        ctx.moveTo(poly[0].x, poly[0].y);
-        for (let i = 1; i < poly.length; i++) {
-          ctx.lineTo(poly[i].x, poly[i].y);
-        }
-        ctx.closePath();
-        ctx.fill();
-      }
+      ctx.clearRect(b.x, b.y, b.width, b.height);
     }
     ctx.restore();
   };
@@ -884,7 +892,7 @@ export function liftSelectionToFloating(
     if (sCtx) eraseFromContext(sCtx);
   }
 
-  return { floatingCanvas, beforeImageData };
+  return { floatingCanvas, beforeImageData, bounds: b };
 }
 
 /**

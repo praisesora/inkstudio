@@ -371,7 +371,7 @@ export function getActivePresetId(): string {
     if (typeof localStorage === 'undefined') return DEFAULT_BRUSH_PRESET_ID;
     const saved = localStorage.getItem(STORAGE_KEY_ACTIVE_PRESET);
     if (!saved) return DEFAULT_BRUSH_PRESET_ID;
-    if (saved.startsWith('csp-') || getBuiltinBrushConfig(saved)) return saved;
+    if (saved.startsWith('csp-') || saved.startsWith('inkb-') || getBuiltinBrushConfig(saved)) return saved;
     return DEFAULT_BRUSH_PRESET_ID;
   } catch {
     return DEFAULT_BRUSH_PRESET_ID;

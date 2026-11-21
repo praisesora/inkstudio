@@ -46,3 +46,12 @@ export interface ConstraintAxis {
   dir: Vector2D;    // Normalized direction vector (Document Space)
   color?: string;
 }
+
+export interface StraightRuler {
+  enabled: boolean;        // Visible & active on canvas
+  x: number;               // Pivot X in Document Canvas Space
+  y: number;               // Pivot Y in Document Canvas Space
+  angle: number;           // Degrees (-180..180) in Document Canvas Space
+  locked: boolean;         // Frozen in place (pointer-events disabled on bar/handles)
+  snapEnabled: boolean;    // Real-time stroke snapping active
+}

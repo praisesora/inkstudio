@@ -18,7 +18,9 @@
         "height": 840,
         "minWidth": 900,
         "minHeight": 600,
-        "decorations": false
+        "fullscreen": true,
+        "decorations": false,
+        "additionalBrowserArgs": "--disable-features=StylusHandwritingWin,StylusHandwriting,msAbydos,msAbydosHandwritingAttr,msAbydosGestureSupport"
       }
     ],
     "security": {
@@ -39,6 +41,12 @@
         "ext": ["sora", "ink"],
         "name": "Ink Studio Project",
         "description": "Ink Studio Project File",
+        "role": "Editor"
+      },
+      {
+        "ext": ["inkb"],
+        "name": "Ink Studio Brush",
+        "description": "Ink Studio Brush Preset File",
         "role": "Editor"
       }
     ],

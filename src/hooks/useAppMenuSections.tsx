@@ -11,22 +11,25 @@ import {
   SoftProofSettings,
   isFolderLikeLayer,
 } from '../types/editor';
-import { PerspectiveRuler } from '../types/perspective';
+import { PerspectiveRuler, StraightRuler } from '../types/perspective';
 import { createDefaultAnimationTimeline } from '../utils/animationEngine';
 import { createDefaultPerspectiveRuler, applyWormsEyePreset } from '../utils/perspectiveMath';
-import { parseSutFile } from '../utils/sutParser';
 import {
-  deleteCustomBrush,
-  loadCustomBrushes,
-  prepareBrushSettingsForCsp,
-  saveCustomBrush,
-} from '../utils/brushStorage';
+  buildExportableBrush,
+  exportBrushToInkbFile,
+  importBrushFile,
+} from '../utils/inkbBrushFormat';
+import { getCachedCustomBrushes } from '../utils/brushStorage';
+import { DEFAULT_BRUSH_PRESET_ID } from '../utils/brushPresetManager';
+import { DiscordIcon } from '../components/DiscordIcon';
+import { DISCORD_INVITE_URL, openExternalUrl } from '../utils/externalLinks';
 import { TonalCorrectionType } from '../utils/tonalEngine';
 import { AnyFilterParams } from './useTonalAndFilterActions';
 import {
   documentStoreActions,
   toolStoreActions,
   uiStoreActions,
+  useToolStore,
   useWorkspaceStore,
   workspaceStoreActions,
 } from '../stores';
@@ -54,6 +57,7 @@ export interface UseAppMenuSectionsParams {
   flipY: boolean;
   isWebtoonMode: boolean;
   perspectiveRuler: PerspectiveRuler | null;
+  straightRuler?: StraightRuler | null;
   softProofSettings: SoftProofSettings;
   activeAnimationTimeline: AnimationTimeline | null;
   clearCanvas: () => void;
@@ -125,6 +129,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
     flipY,
     isWebtoonMode,
     perspectiveRuler,
+    straightRuler,
     softProofSettings,
     activeAnimationTimeline,
     clearCanvas,
@@ -206,35 +211,22 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             onClick: handleTriggerOpenFile,
           },
           {
-            id: 'file-import-sut',
-            label: 'Import CSP Brush (.sut)...',
+            id: 'file-import-brush',
+            label: 'Import Brush (.inkb, .sut)...',
             onClick: () => {
               const input = document.createElement('input');
               input.type = 'file';
-              input.accept = '.sut';
+              input.accept = '.inkb,.sut';
               input.onchange = async () => {
                 const file = input.files?.[0];
                 if (file) {
                   try {
-                    uiStoreActions.setLoading(true, `Importing CSP Brush: ${file.name}...`);
-                    const buffer = await file.arrayBuffer();
-                    const parsedBrush = await parseSutFile(buffer, file.name);
-                    const existing = (await loadCustomBrushes()).filter(
-                      (b) =>
-                        b.name.toLowerCase() === parsedBrush.name.toLowerCase() ||
-                        b.id === parsedBrush.id
-                    );
-                    for (const old of existing) {
-                      await deleteCustomBrush(old.id).catch(() => {});
-                    }
-                    await saveCustomBrush(parsedBrush);
-                    toolStoreActions.setToolRaw('brush');
-                    const fullSettings = await prepareBrushSettingsForCsp(parsedBrush);
-                    toolStoreActions.updateBrushSettings(fullSettings);
-                    showToast(`Imported CSP brush "${parsedBrush.name}" successfully!`);
+                    uiStoreActions.setLoading(true, `Importing Brush: ${file.name}...`);
+                    const parsedBrush = await importBrushFile(file);
+                    showToast(`Imported brush "${parsedBrush.name}"`);
                   } catch (err: unknown) {
                     const msg =
-                      err instanceof Error ? err.message : 'Failed to import .sut brush.';
+                      err instanceof Error ? err.message : 'Failed to import brush file.';
                     showToast(msg);
                   } finally {
                     uiStoreActions.setLoading(false, '');
@@ -242,6 +234,29 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
                 }
               };
               input.click();
+            },
+          },
+          {
+            id: 'file-export-brush',
+            label: 'Export Active Brush (.inkb)...',
+            onClick: async () => {
+              try {
+                const toolState = useToolStore.getState();
+                const presetId = toolState.activePresetId || DEFAULT_BRUSH_PRESET_ID;
+                const exportable = buildExportableBrush(
+                  presetId,
+                  getCachedCustomBrushes(),
+                  toolState.brushSettings
+                );
+                const result = await exportBrushToInkbFile(exportable);
+                if (result.exported) {
+                  showToast(`Exported brush "${result.fileName}"`);
+                }
+              } catch (err: unknown) {
+                const msg =
+                  err instanceof Error ? err.message : 'Failed to export brush.';
+                showToast(msg);
+              }
             },
           },
           {
@@ -1037,6 +1052,27 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           },
           { id: 'view-div-ruler', label: '', divider: true },
           {
+            id: 'view-straight-ruler',
+            label: straightRuler?.enabled ? 'Hide Straight Ruler' : 'Straight Ruler',
+            shortcut: 'R',
+            checked: Boolean(straightRuler?.enabled),
+            disabled: !hasOpenDocument,
+            onClick: () => {
+              const next = documentStoreActions.toggleStraightRuler();
+              showToast(next.enabled ? 'Straight Ruler: ON' : 'Straight Ruler: OFF');
+            },
+          },
+          {
+            id: 'view-lock-straight-ruler',
+            label: straightRuler?.locked ? 'Unlock Straight Ruler' : 'Lock Straight Ruler',
+            checked: Boolean(straightRuler?.locked),
+            disabled: !hasOpenDocument || !straightRuler?.enabled,
+            onClick: () =>
+              documentStoreActions.setStraightRuler((prev) =>
+                prev ? { ...prev, locked: !prev.locked } : null
+              ),
+          },
+          {
             id: 'view-toggle-ruler',
             label: perspectiveRuler?.enabled
               ? 'Hide Perspective Ruler'
@@ -1297,19 +1333,20 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               ]
             : []),
           {
+            id: 'help-discord',
+            label: 'Discord Community',
+            icon: <DiscordIcon className="w-3.5 h-3.5 text-[#5865F2]" />,
+            href: DISCORD_INVITE_URL,
+            onClick: () => {
+              void openExternalUrl(DISCORD_INVITE_URL);
+            },
+          },
+          { id: 'help-div-discord', label: '', divider: true },
+          {
             id: 'help-about',
             label: 'About Ink Studio',
             onClick: () => {
-              alert(
-                'Ink Studio - Professional Digital Painting & Manga Studio\n\n' +
-                  '- Full Layer Management with 17 Blend Modes\n' +
-                  '- Supports Opening PSD (Photoshop) & CSP (Clip Studio Paint) with layers\n' +
-                  '- Supports Common Images: PNG, JPG, WEBP, GIF, BMP, SVG\n' +
-                  '- Save & Save As: PSD (layered), Ink Studio Project (.sora / .ink), PNG, JPG, WebP\n' +
-                  '- Export Image: High-resolution PNG\n' +
-                  '- Color Modes: Full Color (RGB), Grayscale, and 1-bit Manga Monochrome\n' +
-                  '- CSP Sub-Tool Engine, Tablet Pressure, Tilt & Inking Stabilization'
-              );
+              uiStoreActions.setAboutModalOpen(true);
             },
           },
         ],
@@ -1367,6 +1404,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       layers,
       palettesHidden,
       perspectiveRuler,
+      straightRuler,
       redo,
       removeLayerMask,
       resetRotation,

@@ -133,6 +133,7 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
   const colorMode = useDocumentStore((s) => s.colorMode);
   const hasOpenDocument = useDocumentStore(selectHasOpenDocument);
   const perspectiveRuler = useDocumentStore((s) => s.perspectiveRuler);
+  const straightRuler = useDocumentStore((s) => s.straightRuler);
   const activeLockedAxis = useDocumentStore((s) => s.activeLockedAxis);
   const softProofSettings = useDocumentStore((s) => s.softProofSettings);
 
@@ -260,6 +261,8 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       onCancelText={props.onCancelText}
       perspectiveRuler={hasOpenDocument ? perspectiveRuler : null}
       onUpdatePerspectiveRuler={documentStoreActions.setPerspectiveRuler}
+      straightRuler={hasOpenDocument ? straightRuler : null}
+      onUpdateStraightRuler={documentStoreActions.setStraightRuler}
       activeLockedAxis={activeLockedAxis}
       is3DLayerOpen={is3DLayerOpen}
       initial3DFile={initial3DFile}
@@ -864,7 +867,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         <input
           ref={fileInputRef}
           type="file"
-          accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.svg,.psd,.psb,.clip,.csp,.sora,.ink,.sut"
+          accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.svg,.psd,.psb,.clip,.csp,.sora,.ink,.inkb,.sut"
           onChange={handleFileInputChange}
           className="hidden"
         />

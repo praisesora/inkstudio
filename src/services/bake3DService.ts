@@ -35,6 +35,128 @@ function disposeMaterialTextures(material: THREE.Material): void {
   material.dispose();
 }
 
+export interface SafeWebGLRendererOptions {
+  canvas?: HTMLCanvasElement;
+  alpha?: boolean;
+  antialias?: boolean;
+  preserveDrawingBuffer?: boolean;
+  powerPreference?: WebGLPowerPreference;
+}
+
+function isWebGLContextLike(
+  ctx: unknown
+): ctx is WebGLRenderingContext | WebGL2RenderingContext {
+  return (
+    Boolean(ctx) &&
+    typeof ctx === 'object' &&
+    typeof (ctx as WebGLRenderingContext).getShaderPrecisionFormat === 'function'
+  );
+}
+
+function hasUsableShaderPrecision(gl: WebGLRenderingContext | WebGL2RenderingContext): boolean {
+  if (typeof gl.isContextLost === 'function' && gl.isContextLost()) {
+    return false;
+  }
+  try {
+    const check = (shaderType: number): boolean =>
+      gl.getShaderPrecisionFormat(shaderType, gl.HIGH_FLOAT) !== null ||
+      gl.getShaderPrecisionFormat(shaderType, gl.MEDIUM_FLOAT) !== null ||
+      gl.getShaderPrecisionFormat(shaderType, gl.LOW_FLOAT) !== null;
+    return check(gl.VERTEX_SHADER) && check(gl.FRAGMENT_SHADER);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Safely creates a Three.js WebGLRenderer by pre-acquiring and validating a non-lost
+ * WebGL2/WebGL1 context with working shader precision formats. Prevents Three.js
+ * `Cannot read properties of null (reading 'precision')` crashes under StrictMode,
+ * context loss, or driver GPU-switching fallbacks.
+ */
+export function createSafeWebGLRenderer(
+  options: SafeWebGLRendererOptions = {}
+): THREE.WebGLRenderer {
+  const alpha = options.alpha ?? true;
+  const antialias = options.antialias ?? true;
+  const preserveDrawingBuffer = options.preserveDrawingBuffer ?? true;
+  const preferredPower = options.powerPreference ?? 'high-performance';
+
+  const attempts: Array<{ antialias: boolean; powerPreference?: WebGLPowerPreference }> = [
+    { antialias, powerPreference: preferredPower },
+    { antialias, powerPreference: 'default' },
+    { antialias: false, powerPreference: 'default' },
+  ];
+
+  let lastError: unknown = null;
+  let sawRealWebGLContext = false;
+
+  for (const attempt of attempts) {
+    const targetCanvas = options.canvas ?? document.createElement('canvas');
+    const ctxAttrs: WebGLContextAttributes = {
+      alpha,
+      antialias: attempt.antialias,
+      preserveDrawingBuffer,
+      depth: true,
+      stencil: false,
+      failIfMajorPerformanceCaveat: false,
+      ...(attempt.powerPreference ? { powerPreference: attempt.powerPreference } : {}),
+    };
+
+    const rawCtx =
+      targetCanvas.getContext('webgl2', ctxAttrs) || targetCanvas.getContext('webgl', ctxAttrs);
+
+    if (!isWebGLContextLike(rawCtx)) {
+      if (options.canvas) break;
+      continue;
+    }
+
+    sawRealWebGLContext = true;
+    if (!hasUsableShaderPrecision(rawCtx)) {
+      if (options.canvas) {
+        // Passed canvas already holds a lost/broken context; cannot switch context attributes on it
+        break;
+      }
+      continue;
+    }
+
+    try {
+      return new THREE.WebGLRenderer({
+        canvas: targetCanvas,
+        context: rawCtx,
+        alpha,
+        antialias: attempt.antialias,
+        preserveDrawingBuffer,
+        powerPreference: attempt.powerPreference,
+      });
+    } catch (err) {
+      lastError = err;
+      if (options.canvas) break;
+    }
+  }
+
+  // Fallback for mocked/headless environments where canvas.getContext does not return a WebGL context
+  if (!sawRealWebGLContext) {
+    try {
+      return new THREE.WebGLRenderer({
+        ...(options.canvas ? { canvas: options.canvas } : {}),
+        alpha,
+        antialias,
+        preserveDrawingBuffer,
+        powerPreference: preferredPower,
+      });
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    lastError instanceof Error
+      ? `WebGL initialization failed: ${lastError.message}`
+      : 'Unable to initialize a valid WebGL context for 3D rendering.'
+  );
+}
+
 /**
  * Aggressive recursive memory deallocation for Three.js scene graphs,
  * geometries, textures, materials, and WebGL rendering contexts.
@@ -119,12 +241,25 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
   const targetHeight = Math.max(1, Math.round(dimensions.height));
 
   // 1. Off-screen render buffer matching target document resolution and aspect ratio
-  const offscreenRenderer = new THREE.WebGLRenderer({
-    alpha: true,
-    antialias: true,
-    preserveDrawingBuffer: true,
-    powerPreference: 'high-performance',
-  });
+  let offscreenRenderer: THREE.WebGLRenderer;
+  let reusedActiveRenderer = false;
+  const savedActiveSize = new THREE.Vector2();
+  try {
+    offscreenRenderer = createSafeWebGLRenderer({
+      alpha: true,
+      antialias: true,
+      preserveDrawingBuffer: true,
+      powerPreference: 'high-performance',
+    });
+  } catch (err) {
+    if (activeRenderer && hasUsableShaderPrecision(activeRenderer.getContext())) {
+      offscreenRenderer = activeRenderer;
+      offscreenRenderer.getSize(savedActiveSize);
+      reusedActiveRenderer = true;
+    } else {
+      throw err;
+    }
+  }
 
   // Clamp offscreen renderer size to GPU maximum texture capability to avoid GL_OUT_OF_MEMORY
   const maxGlSize = offscreenRenderer.capabilities.maxTextureSize || 4096;
@@ -167,7 +302,7 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
 
   // 3. Immediate Memory Cleanup: Free WebGL contexts, VRAM buffers, and scene graph
   disposeThreeResources(scene, offscreenRenderer);
-  if (activeRenderer) {
+  if (activeRenderer && !reusedActiveRenderer) {
     disposeThreeResources(null, activeRenderer);
   }
 
@@ -393,12 +528,25 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   const targetHeight = Math.max(1, Math.round(dimensions.height));
   const resolvedToneCount = Math.max(1, Math.min(4, Math.round(explicitToneCount ?? toneBands ?? 2)));
 
-  const offscreenRenderer = new THREE.WebGLRenderer({
-    alpha: true,
-    antialias: false,
-    preserveDrawingBuffer: true,
-    powerPreference: 'high-performance',
-  });
+  let offscreenRenderer: THREE.WebGLRenderer;
+  let reusedActiveRenderer = false;
+  const savedActiveSize = new THREE.Vector2();
+  try {
+    offscreenRenderer = createSafeWebGLRenderer({
+      alpha: true,
+      antialias: false,
+      preserveDrawingBuffer: true,
+      powerPreference: 'high-performance',
+    });
+  } catch (err) {
+    if (activeRenderer && hasUsableShaderPrecision(activeRenderer.getContext())) {
+      offscreenRenderer = activeRenderer;
+      offscreenRenderer.getSize(savedActiveSize);
+      reusedActiveRenderer = true;
+    } else {
+      throw err;
+    }
+  }
 
   const maxGlSize = offscreenRenderer.capabilities.maxTextureSize || 4096;
   let renderWidth = targetWidth;
@@ -780,8 +928,13 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
 
   if (disposeOnComplete) {
     disposeThreeResources(scene, offscreenRenderer);
-    if (activeRenderer) {
+    if (activeRenderer && !reusedActiveRenderer) {
       disposeThreeResources(null, activeRenderer);
+    }
+  } else if (reusedActiveRenderer) {
+    offscreenRenderer.setRenderTarget(null);
+    if (savedActiveSize.x > 0 && savedActiveSize.y > 0) {
+      offscreenRenderer.setSize(savedActiveSize.x, savedActiveSize.y, false);
     }
   } else {
     try {

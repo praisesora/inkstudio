@@ -9,6 +9,7 @@ interface WindowControlsProps {
 export const WindowControls: React.FC<WindowControlsProps> = () => {
   const [isTauri, setIsTauri] = useState(false);
   const [isMaximized, setIsMaximized] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   useEffect(() => {
     const tauri = isTauriEnvironment();
@@ -17,17 +18,24 @@ export const WindowControls: React.FC<WindowControlsProps> = () => {
 
     let unlistenResize: (() => void) | undefined;
 
+    const syncWindowState = async (appWindow: Awaited<ReturnType<typeof import('@tauri-apps/api/window')['getCurrentWindow']>>) => {
+      const [max, full] = await Promise.all([
+        appWindow.isMaximized().catch(() => false),
+        appWindow.isFullscreen().catch(() => false),
+      ]);
+      setIsMaximized(max);
+      setIsFullscreen(full);
+    };
+
     const setupWindow = async () => {
       try {
         const { getCurrentWindow } = await import('@tauri-apps/api/window');
         const appWindow = getCurrentWindow();
-        const max = await appWindow.isMaximized();
-        setIsMaximized(max);
+        await syncWindowState(appWindow);
 
         unlistenResize = await appWindow.onResized(async () => {
           try {
-            const m = await appWindow.isMaximized();
-            setIsMaximized(m);
+            await syncWindowState(appWindow);
           } catch {
             // ignore
           }
@@ -42,6 +50,32 @@ export const WindowControls: React.FC<WindowControlsProps> = () => {
       if (unlistenResize) unlistenResize();
     };
   }, []);
+
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      if (e.key !== 'F11') return;
+      e.preventDefault();
+      try {
+        if (isTauri) {
+          const { getCurrentWindow } = await import('@tauri-apps/api/window');
+          const appWindow = getCurrentWindow();
+          const current = await appWindow.isFullscreen();
+          await appWindow.setFullscreen(!current);
+          setIsFullscreen(!current);
+        } else if (!document.fullscreenElement) {
+          await document.documentElement.requestFullscreen().catch(() => {});
+          setIsFullscreen(true);
+        } else {
+          await document.exitFullscreen().catch(() => {});
+          setIsFullscreen(false);
+        }
+      } catch (err) {
+        console.error('Failed to toggle fullscreen:', err);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isTauri]);
 
   const handleMinimize = useCallback(
     async (e: React.MouseEvent) => {
@@ -65,15 +99,24 @@ export const WindowControls: React.FC<WindowControlsProps> = () => {
         if (isTauri) {
           const { getCurrentWindow } = await import('@tauri-apps/api/window');
           const appWindow = getCurrentWindow();
-          await appWindow.toggleMaximize();
-          const max = await appWindow.isMaximized();
-          setIsMaximized(max);
+          if (await appWindow.isFullscreen()) {
+            await appWindow.setFullscreen(false);
+            setIsFullscreen(false);
+            const max = await appWindow.isMaximized();
+            setIsMaximized(max);
+          } else {
+            await appWindow.toggleMaximize();
+            const max = await appWindow.isMaximized();
+            setIsMaximized(max);
+          }
         } else if (!document.fullscreenElement) {
           await document.documentElement.requestFullscreen().catch(() => {});
           setIsMaximized(true);
+          setIsFullscreen(true);
         } else {
           await document.exitFullscreen().catch(() => {});
           setIsMaximized(false);
+          setIsFullscreen(false);
         }
       } catch (err) {
         console.error('Failed to toggle maximize:', err);
@@ -119,7 +162,7 @@ export const WindowControls: React.FC<WindowControlsProps> = () => {
         type="button"
         onClick={handleToggleMaximize}
         tabIndex={-1}
-        title={isMaximized ? 'Restore' : 'Maximize'}
+        title={isFullscreen ? 'Exit Fullscreen' : isMaximized ? 'Restore' : 'Maximize'}
         className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
       >
         <span className="w-2.5 h-2.5 border-[1.25px] border-current rounded-[1px]" />

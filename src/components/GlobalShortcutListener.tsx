@@ -14,13 +14,7 @@ import {
   flushPendingBrushSettingsSave,
   stepBrushSizePreset,
 } from '../utils/brushPresetManager';
-import { parseSutFile } from '../utils/sutParser';
-import {
-  deleteCustomBrush,
-  loadCustomBrushes,
-  prepareBrushSettingsForCsp,
-  saveCustomBrush,
-} from '../utils/brushStorage';
+import { importBrushFile, isSupportedBrushFileName } from '../utils/inkbBrushFormat';
 import { TonalCorrectionType } from '../utils/tonalEngine';
 import {
   SPRING_LOADED_HOLD_MS,
@@ -96,6 +90,7 @@ const NON_REPEATABLE_COMMANDS = new Set<string>([
   'view.toggleLeftPanel',
   'view.softProof',
   'view.gamutWarning',
+  'view.straightRuler',
   'view.perspectiveRuler',
   'view.perspectiveSnap',
   'anim.toggleTimeline',
@@ -238,7 +233,9 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
           if (propsRef.current.hasOpenDocument) propsRef.current.handleUndo();
         },
         'edit.redo': () => {
-          if (propsRef.current.hasOpenDocument) propsRef.current.redo();
+          const p = propsRef.current;
+          if (!p.hasOpenDocument || p.transformSession?.active) return;
+          p.redo();
         },
         'edit.copy': () => {
           if (!propsRef.current.hasOpenDocument) return;
@@ -314,6 +311,12 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         'view.flipVertical': () => {
           const p = propsRef.current;
           if (p.hasOpenDocument && !p.isSpaceDown) p.toggleFlipVertical();
+        },
+        'view.straightRuler': () => {
+          const p = propsRef.current;
+          if (!p.hasOpenDocument) return;
+          const next = documentStoreActions.toggleStraightRuler();
+          p.showToast(next.enabled ? 'Straight Ruler: ON' : 'Straight Ruler: OFF');
         },
         'view.perspectiveRuler': () => {
           const p = propsRef.current;
@@ -561,27 +564,14 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         const p = propsRef.current;
         if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
           const file = e.dataTransfer.files[0];
-          if (file.name.toLowerCase().endsWith('.sut')) {
+          if (isSupportedBrushFileName(file.name)) {
             try {
-              uiStoreActions.setLoading(true, `Importing CSP Brush: ${file.name}...`);
-              const buffer = await file.arrayBuffer();
-              const parsedBrush = await parseSutFile(buffer, file.name);
-              const existing = (await loadCustomBrushes()).filter(
-                (b) =>
-                  b.name.toLowerCase() === parsedBrush.name.toLowerCase() ||
-                  b.id === parsedBrush.id
-              );
-              for (const old of existing) {
-                await deleteCustomBrush(old.id).catch(() => {});
-              }
-              await saveCustomBrush(parsedBrush);
-              toolStoreActions.setToolRaw('brush');
-              const fullSettings = await prepareBrushSettingsForCsp(parsedBrush);
-              toolStoreActions.updateBrushSettings(fullSettings);
-              p.showToast(`Imported CSP brush "${parsedBrush.name}" successfully!`);
+              uiStoreActions.setLoading(true, `Importing Brush: ${file.name}...`);
+              const parsedBrush = await importBrushFile(file);
+              p.showToast(`Imported brush "${parsedBrush.name}"`);
             } catch (err: unknown) {
-              console.error('Failed to import CSP brush:', err);
-              const msg = err instanceof Error ? err.message : 'Failed to import .sut brush.';
+              console.error('Failed to import brush:', err);
+              const msg = err instanceof Error ? err.message : 'Failed to import brush file.';
               p.showToast(msg);
             } finally {
               uiStoreActions.setLoading(false, '');

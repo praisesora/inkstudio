@@ -1063,14 +1063,25 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                               type="text"
                               value={editingName}
                               autoFocus
+                              autoComplete="off"
+                              spellCheck={false}
+                              onFocus={(e) => e.currentTarget.select()}
                               onChange={(e) => setEditingName(e.target.value)}
                               onBlur={finishRename}
                               onKeyDown={(e) => {
+                                e.stopPropagation();
                                 if (e.key === 'Enter') finishRename();
                                 if (e.key === 'Escape') setEditingLayerId(null);
                               }}
+                              onPointerDown={(e) => {
+                                e.stopPropagation();
+                                if (e.pointerType === 'pen') {
+                                  e.preventDefault();
+                                  e.currentTarget.focus();
+                                }
+                              }}
                               onClick={(e) => e.stopPropagation()}
-                              className="bg-[#161616] rounded px-1 py-0.5 text-[11px] text-[#e5e5e5] w-full"
+                              className="bg-[#161616] rounded px-1 py-0.5 text-[11px] text-[#e5e5e5] w-full touch-none select-text"
                             />
                           ) : (
                             <span

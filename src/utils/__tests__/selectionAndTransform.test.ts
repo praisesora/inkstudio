@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   expandSelection,
   contractSelection,
@@ -7,6 +7,7 @@ import {
   maskToBounds,
   maskToSvgPath,
   floodSelectWand,
+  liftSelectionToFloating,
 } from '../selectionUtils';
 import {
   solveUnitSquareToQuad,
@@ -168,5 +169,223 @@ describe('Perspective and Mesh Transformation Engine', () => {
     const mid = evaluateMeshSurface(mesh, 0.5, 0.5);
     expect(mid.x).toBeCloseTo(50, 1);
     expect(mid.y).toBeCloseTo(50, 1);
+  });
+});
+
+interface MockPixelCanvas {
+  width: number;
+  height: number;
+  data: Uint8ClampedArray;
+  setTransformCalls: number[][];
+  getContext: (type: string) => unknown;
+}
+
+function createMockPixelCanvas(width = 16, height = 16): MockPixelCanvas {
+  let w = width;
+  let h = height;
+  let buf = new Uint8ClampedArray(w * h * 4);
+  const setTransformCalls: number[][] = [];
+  let gco = 'source-over';
+
+  const ctx = {
+    get globalCompositeOperation() {
+      return gco;
+    },
+    set globalCompositeOperation(v: string) {
+      gco = v;
+    },
+    fillStyle: '#000000',
+    save: vi.fn(),
+    restore: vi.fn(),
+    setTransform: vi.fn((...args: number[]) => {
+      setTransformCalls.push(args);
+    }),
+    createImageData(iw: number, ih: number) {
+      return { width: iw, height: ih, data: new Uint8ClampedArray(iw * ih * 4) };
+    },
+    getImageData(sx: number, sy: number, sw: number, sh: number) {
+      const out = new Uint8ClampedArray(sw * sh * 4);
+      for (let y = 0; y < sh; y++) {
+        const srcY = sy + y;
+        if (srcY < 0 || srcY >= h) continue;
+        for (let x = 0; x < sw; x++) {
+          const srcX = sx + x;
+          if (srcX < 0 || srcX >= w) continue;
+          const sOff = (srcY * w + srcX) * 4;
+          const dOff = (y * sw + x) * 4;
+          out[dOff] = buf[sOff];
+          out[dOff + 1] = buf[sOff + 1];
+          out[dOff + 2] = buf[sOff + 2];
+          out[dOff + 3] = buf[sOff + 3];
+        }
+      }
+      return { width: sw, height: sh, data: out };
+    },
+    putImageData(img: { width: number; height: number; data: Uint8ClampedArray }, dx: number, dy: number) {
+      for (let y = 0; y < img.height; y++) {
+        const ty = dy + y;
+        if (ty < 0 || ty >= h) continue;
+        for (let x = 0; x < img.width; x++) {
+          const tx = dx + x;
+          if (tx < 0 || tx >= w) continue;
+          const sOff = (y * img.width + x) * 4;
+          const dOff = (ty * w + tx) * 4;
+          buf[dOff] = img.data[sOff];
+          buf[dOff + 1] = img.data[sOff + 1];
+          buf[dOff + 2] = img.data[sOff + 2];
+          buf[dOff + 3] = img.data[sOff + 3];
+        }
+      }
+    },
+    clearRect(rx: number, ry: number, rw: number, rh: number) {
+      for (let y = Math.max(0, ry); y < Math.min(h, ry + rh); y++) {
+        for (let x = Math.max(0, rx); x < Math.min(w, rx + rw); x++) {
+          const off = (y * w + x) * 4;
+          buf[off] = 0;
+          buf[off + 1] = 0;
+          buf[off + 2] = 0;
+          buf[off + 3] = 0;
+        }
+      }
+    },
+    drawImage(src: MockPixelCanvas, dx: number, dy: number) {
+      for (let y = 0; y < src.height; y++) {
+        const ty = dy + y;
+        if (ty < 0 || ty >= h) continue;
+        for (let x = 0; x < src.width; x++) {
+          const tx = dx + x;
+          if (tx < 0 || tx >= w) continue;
+          const sOff = (y * src.width + x) * 4;
+          const dOff = (ty * w + tx) * 4;
+          const sa = src.data[sOff + 3] / 255;
+          if (gco === 'destination-in') {
+            buf[dOff + 3] = Math.round(buf[dOff + 3] * sa);
+          } else if (gco === 'destination-out') {
+            buf[dOff + 3] = Math.round(buf[dOff + 3] * (1 - sa));
+            if (buf[dOff + 3] === 0) {
+              buf[dOff] = 0;
+              buf[dOff + 1] = 0;
+              buf[dOff + 2] = 0;
+            }
+          } else {
+            buf[dOff] = src.data[sOff];
+            buf[dOff + 1] = src.data[sOff + 1];
+            buf[dOff + 2] = src.data[sOff + 2];
+            buf[dOff + 3] = src.data[sOff + 3];
+          }
+        }
+      }
+    },
+  };
+
+  const canvas: MockPixelCanvas = {
+    get width() {
+      return w;
+    },
+    set width(v: number) {
+      w = v;
+      buf = new Uint8ClampedArray(Math.max(0, w * h * 4));
+    },
+    get height() {
+      return h;
+    },
+    set height(v: number) {
+      h = v;
+      buf = new Uint8ClampedArray(Math.max(0, w * h * 4));
+    },
+    get data() {
+      return buf;
+    },
+    setTransformCalls,
+    getContext: () => ctx,
+  };
+  return canvas;
+}
+
+describe('liftSelectionToFloating integrity (no duplication or out-of-bounds artifacts)', () => {
+  it('clamps out-of-bounds rect/mask selection, resets CTM, and erases lifted pixels completely', () => {
+    const prevDoc = (globalThis as { document?: unknown }).document;
+    (globalThis as { document?: unknown }).document = {
+      createElement: () => createMockPixelCanvas(1, 1),
+    };
+
+    try {
+      const target = createMockPixelCanvas(10, 10);
+      // Paint a 4x4 purple block at (0..3, 0..3)
+      for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+          const off = (y * 10 + x) * 4;
+          target.data[off] = 144;
+          target.data[off + 1] = 93;
+          target.data[off + 2] = 156;
+          target.data[off + 3] = 255;
+        }
+      }
+
+      const mask = new Uint8Array(10 * 10);
+      for (let y = 0; y < 4; y++) {
+        for (let x = 0; x < 4; x++) {
+          mask[y * 10 + x] = 255;
+        }
+      }
+
+      const lifted = liftSelectionToFloating(target as unknown as HTMLCanvasElement, {
+        type: 'wand',
+        bounds: { x: -2, y: -2, width: 6, height: 6 },
+        mask,
+        maskWidth: 10,
+        maskHeight: 10,
+      });
+
+      expect(lifted).not.toBeNull();
+      expect(lifted!.bounds).toEqual({ x: 0, y: 0, width: 4, height: 4 });
+      expect(target.setTransformCalls).toContainEqual([1, 0, 0, 1, 0, 0]);
+
+      // Floating canvas must contain the lifted purple pixels
+      const floatCanvas = lifted!.floatingCanvas as unknown as MockPixelCanvas;
+      expect(floatCanvas.data[3]).toBe(255);
+      expect(floatCanvas.data[(3 * 4 + 3) * 4 + 3]).toBe(255);
+
+      // Base layer must have zero leftover alpha inside the lifted region (no duplicate)
+      let remainingAlpha = 0;
+      for (let i = 3; i < target.data.length; i += 4) {
+        remainingAlpha += target.data[i];
+      }
+      expect(remainingAlpha).toBe(0);
+    } finally {
+      (globalThis as { document?: unknown }).document = prevDoc;
+    }
+  });
+
+  it('falls back to rect erase when a non-lasso selection lacks mask dimensions (no duplication)', () => {
+    const prevDoc = (globalThis as { document?: unknown }).document;
+    (globalThis as { document?: unknown }).document = {
+      createElement: () => createMockPixelCanvas(1, 1),
+    };
+
+    try {
+      const target = createMockPixelCanvas(8, 8);
+      for (let y = 2; y < 6; y++) {
+        for (let x = 2; x < 6; x++) {
+          const off = (y * 8 + x) * 4;
+          target.data[off] = 144;
+          target.data[off + 3] = 255;
+        }
+      }
+
+      const lifted = liftSelectionToFloating(target as unknown as HTMLCanvasElement, {
+        type: 'wand',
+        bounds: { x: 2, y: 2, width: 4, height: 4 },
+      });
+
+      expect(lifted).not.toBeNull();
+      let remainingAlpha = 0;
+      for (let i = 3; i < target.data.length; i += 4) {
+        remainingAlpha += target.data[i];
+      }
+      expect(remainingAlpha).toBe(0);
+    } finally {
+      (globalThis as { document?: unknown }).document = prevDoc;
+    }
   });
 });

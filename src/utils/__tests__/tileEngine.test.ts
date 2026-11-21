@@ -331,5 +331,33 @@ describe('Sparse Virtual Tile Engine', () => {
     expect(blended[2]).toBeLessThanOrEqual(130);
     expect(blended[3]).toBe(255);
   });
+
+  it('assigns strictly monotonic tile versions across delete, recreate, and snapshot restore', () => {
+    const layerId = 'mono-ver-layer';
+    const first = grid.getOrCreateTile(layerId, 1, 1, 'color-32bit', 0);
+    const v1 = first.version;
+    expect(v1).toBeGreaterThan(0);
+
+    // Delete and recreate at the same (layerId, tx, ty) coordinate — version must NEVER reset to 1
+    grid.deleteTile(layerId, 1, 1, 0);
+    const recreated = grid.getOrCreateTile(layerId, 1, 1, 'color-32bit', 0);
+    expect(recreated.version).toBeGreaterThan(v1);
+
+    // Composite eraser stroke onto tile advances version monotonically
+    recreated.data![3] = 255;
+    const erasePx = new Uint8ClampedArray([0, 0, 0, 255]);
+    const mod = grid.compositeStrokeToTiles({
+      layerId,
+      strokeData: { data: erasePx, width: 1, height: 1 },
+      destX: 256,
+      destY: 256,
+      format: 'color-32bit',
+      compositeOp: 'destination-out',
+      opacity: 1.0,
+      suppressNotify: true,
+    });
+    expect(mod).toBe(true);
+    expect(recreated.version).toBeGreaterThan(v1 + 1);
+  });
 });
 

@@ -50,6 +50,7 @@ export function App() {
   const hasOpenDocument = useDocumentStore(selectHasOpenDocument);
   const softProofSettings = useDocumentStore((s) => s.softProofSettings);
   const perspectiveRuler = useDocumentStore((s) => s.perspectiveRuler);
+  const straightRuler = useDocumentStore((s) => s.straightRuler);
   const activeEditTarget = useDocumentStore((s) => s.activeEditTarget);
   const animationTimeline = useDocumentStore((s) => s.animationTimeline);
   const isWebtoonMode = useUiStore((s) => s.isWebtoonMode);
@@ -64,6 +65,7 @@ export function App() {
   const selectiveUndoRef = useRef<(peerId?: string | number, strokeId?: string) => unknown>(() => {});
   const pushHistoryStepRef = useRef<PushHistoryStepFn | null>(null);
   const getActiveCanvasRef = useRef<() => HTMLCanvasElement | null>(() => null);
+  const flushPendingHistoryTasksRef = useRef<() => void>(() => {});
   const showToast = uiStoreActions.showToast;
 
   const activeTileGrid = useMemo(
@@ -172,6 +174,10 @@ export function App() {
   });
 
   const stableGetActiveCanvas = useCallback(() => getActiveCanvasRef.current(), []);
+  const stableFlushPendingHistoryTasks = useCallback(
+    () => flushPendingHistoryTasksRef.current(),
+    []
+  );
   const stablePushHistoryStep = useCallback<PushHistoryStepFn>(
     (...args) => {
       pushHistoryStepRef.current?.(...args);
@@ -190,6 +196,9 @@ export function App() {
     layerCanvasesRef: layerMgr.layerCanvasesRef,
     layerSourceCanvasesRef: layerMgr.layerSourceCanvasesRef,
     getActiveCanvas: stableGetActiveCanvas,
+    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
+    tileGrid: activeTileGrid,
+    flushPendingHistoryTasks: stableFlushPendingHistoryTasks,
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
     pushHistoryStep: stablePushHistoryStep,
     showToast,
@@ -276,6 +285,7 @@ export function App() {
     onCollabStrokeFinish: handleCollabStrokeFinish,
     onCollabCursorMove: handleCollabCursorMove,
     perspectiveRuler: hasOpenDocument ? perspectiveRuler : null,
+    straightRuler: hasOpenDocument ? straightRuler : null,
     onActiveConstraintAxisChange: documentStoreActions.setActiveLockedAxis,
     selection: hasOpenDocument ? selectionTools.selection : null,
   });
@@ -283,8 +293,13 @@ export function App() {
   selectiveUndoRef.current = drawing.selectiveUndo;
   pushHistoryStepRef.current = drawing.pushHistoryStep;
   getActiveCanvasRef.current = drawing.getActiveCanvas;
+  flushPendingHistoryTasksRef.current = drawing.flushPendingHistoryTasks;
 
   const handleUndo = useCallback(() => {
+    if (selectionTools.transformSession?.active) {
+      selectionTools.handleCancelTransform();
+      return;
+    }
     if (collab.isConnected && collab.myPeer.id) {
       void drawing.selectiveUndo('local').then((undone) => {
         if (!undone || !multiplayerService.isConnected()) return;
@@ -317,7 +332,7 @@ export function App() {
     } else {
       drawing.undo();
     }
-  }, [collab.isConnected, collab.myPeer.id, drawing]);
+  }, [collab.isConnected, collab.myPeer.id, drawing, selectionTools]);
 
   const getCanvasCoords = useCallback(
     (e: React.PointerEvent<HTMLElement> | PointerEvent) => {
@@ -350,6 +365,7 @@ export function App() {
     layerCanvasesRef: layerMgr.layerCanvasesRef,
     layerSourceCanvasesRef: layerMgr.layerSourceCanvasesRef,
     materializeLayerCanvas: layerMgr.materializeLayerCanvas,
+    flushPendingHistoryTasks: drawing.flushPendingHistoryTasks,
     isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
     getEffectiveOpacity: layerMgr.getEffectiveOpacity,
     getActiveCanvas: drawing.getActiveCanvas,
@@ -740,6 +756,7 @@ export function App() {
   const handlePointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>, coalescedEvents?: PointerEvent[]) => {
       if (!hasOpenDocument || e.button !== 0) return;
+      if (selectionTools.transformSession?.active) return;
       const tool = useToolStore.getState().tool;
       const pt = getCanvasCoords(e);
 
@@ -824,6 +841,7 @@ export function App() {
     flipY: nav.flipY,
     isWebtoonMode,
     perspectiveRuler,
+    straightRuler,
     softProofSettings,
     activeAnimationTimeline,
     clearCanvas: drawing.clearCanvas,

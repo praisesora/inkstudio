@@ -18,10 +18,20 @@ import {
   Spline,
   MousePointer2,
   Shapes,
+  Ruler,
 } from 'lucide-react';
 import { ToolType } from '../types/editor';
 import { LiquifyIcon } from './LiquifyIcon';
-import { useToolStore, toolStoreActions, useUiStore, uiStoreActions, workspaceStoreActions } from '../stores';
+import {
+  useToolStore,
+  toolStoreActions,
+  useUiStore,
+  uiStoreActions,
+  workspaceStoreActions,
+  useDocumentStore,
+  documentStoreActions,
+  selectHasOpenDocument,
+} from '../stores';
 
 export interface ToolStripProps {
   onTransformSelection?: () => void;
@@ -36,6 +46,8 @@ export const ToolStrip: React.FC<ToolStripProps> = React.memo(
     const secondaryColor = useToolStore((s) => s.secondaryColor);
     const isTransparentColor = useToolStore((s) => s.isTransparentColor);
     const isHidden = useUiStore((s) => s.isLeftPanelHidden);
+    const hasOpenDocument = useDocumentStore(selectHasOpenDocument);
+    const straightRulerEnabled = useDocumentStore((s) => Boolean(s.straightRuler?.enabled));
 
     const handleToggleTransparent = () => {
       if (onToggleTransparentColor) {
@@ -142,6 +154,33 @@ export const ToolStrip: React.FC<ToolStripProps> = React.memo(
               </React.Fragment>
             );
           })}
+          <div className="w-4 h-px bg-[#2c2c2c] my-1" />
+          <button
+            type="button"
+            disabled={!hasOpenDocument}
+            onClick={() => {
+              if (!hasOpenDocument) return;
+              const next = documentStoreActions.toggleStraightRuler();
+              uiStoreActions.showToast(next.enabled ? 'Straight Ruler: ON' : 'Straight Ruler: OFF');
+            }}
+            title="Straight Ruler (R)"
+            data-testid="toolstrip-straight-ruler-btn"
+            className={`relative w-8 h-7 rounded flex items-center justify-center transition-colors ${
+              !hasOpenDocument
+                ? 'text-[#555] opacity-40 cursor-not-allowed'
+                : straightRulerEnabled
+                ? 'bg-[#2c2c2c] text-[var(--accent)] cursor-pointer'
+                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
+            }`}
+          >
+            {straightRulerEnabled && hasOpenDocument && (
+              <span
+                className="absolute left-0 top-1.5 bottom-1.5 w-[2px] rounded-full"
+                style={{ backgroundColor: 'var(--accent)' }}
+              />
+            )}
+            <Ruler className="w-3.5 h-3.5" />
+          </button>
         </div>
 
         {/* Bottom Color Swatches & Collapse Toggle */}

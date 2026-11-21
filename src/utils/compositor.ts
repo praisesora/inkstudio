@@ -1936,6 +1936,7 @@ export class ViewportCompositor {
   private draftTexture: WebGLTexture | null = null;
   private draftTexWidth: number = 0;
   private draftTexHeight: number = 0;
+  private draftHasMipmap: boolean = false;
   private lastDraftVersion: number = -1;
   private currentOptions: CompositorOptions | null = null;
   private currentZoom: number = 1.0;
@@ -2096,6 +2097,10 @@ export class ViewportCompositor {
         this.layerTexture = null;
         this.lutTexture = null;
         this.draftTexture = null;
+        this.draftTexWidth = 0;
+        this.draftTexHeight = 0;
+        this.draftHasMipmap = false;
+        this.lastDraftVersion = -1;
         this.stackCache.invalidateAll();
       };
       this.onContextRestoredHandler = () => {
@@ -3059,7 +3064,7 @@ export class ViewportCompositor {
     slot.lastUsed = accessTick;
     slot.lastBatchTick = batchTick;
 
-    if (slot.version !== tile.version || tile.dirty) {
+    if (slot.version !== tile.version) {
       const rgbaData = grid.getTileAsRGBA(tile);
       const srcBytes =
         rgbaData instanceof Uint8Array
@@ -3069,6 +3074,8 @@ export class ViewportCompositor {
       // Premultiply once on upload into reusable scratch buffer (TileBuffer remains straight-alpha;
       // UNPACK_PREMULTIPLY_ALPHA_WEBGL stays false for WebGL2 spec compliance on texSubImage3D).
       const uploadBytes = this.premultiplyTileBytes(srcBytes, tile);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       gl.texSubImage3D(
         gl.TEXTURE_2D_ARRAY,
@@ -3085,7 +3092,6 @@ export class ViewportCompositor {
       );
 
       slot.version = tile.version;
-      tile.dirty = false;
     }
 
     return slot.sliceIndex;
@@ -3144,8 +3150,8 @@ export class ViewportCompositor {
     slot.lastUsed = accessTick;
     const desiredTier = this.currentZoom < 0.99 ? 0 : this.currentZoom < 2.0 ? 1 : 2;
 
-    // Re-upload if dirty or version bumped (direct GPU unpack premultiplication, zero JS pixel loop)
-    if (slot.version !== tile.version || tile.dirty) {
+    // Re-upload if version changed (direct GPU unpack premultiplication, zero JS pixel loop)
+    if (slot.version !== tile.version) {
       gl.bindTexture(gl.TEXTURE_2D, slot.texture);
 
       const rgbaData = grid.getTileAsRGBA(tile);
@@ -3154,6 +3160,8 @@ export class ViewportCompositor {
           ? rgbaData
           : new Uint8Array(rgbaData.buffer, rgbaData.byteOffset, rgbaData.byteLength);
 
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       if (slot.hasStorage && typeof gl.texSubImage2D === 'function') {
         gl.texSubImage2D(
@@ -3188,7 +3196,6 @@ export class ViewportCompositor {
       slot.hasMipmap = false;
       slot.version = tile.version;
       slot.filterTier = -1; // Force filter parameter refresh
-      tile.dirty = false;
     }
 
     if (slot.filterTier !== desiredTier) {
@@ -4365,7 +4372,7 @@ export class ViewportCompositor {
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
       if (visibleTiles.length > 0) {
-        this.drawTilesFallback2D(
+        this.drawVisibleTiles(
           gl,
           visibleTiles,
           grid,
@@ -4393,9 +4400,10 @@ export class ViewportCompositor {
         opts?.activeDraftOpacity ?? 1.0,
         0,
         null,
-        maskTex,
+        draftOp === 'destination-out' ? null : maskTex,
         opts?.activeDraftVersion,
-        opts?.activeDraftSpace ?? 'document'
+        opts?.activeDraftSpace ?? 'document',
+        draftOp === 'destination-out'
       );
 
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -4439,7 +4447,72 @@ export class ViewportCompositor {
 
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-    // Batched TEXTURE_2D_ARRAY + gl.drawArraysInstanced fast path when all visible tiles fit in pool
+    if (visibleTiles.length > 0) {
+      this.drawVisibleTiles(
+        gl,
+        visibleTiles,
+        grid,
+        layer,
+        dimensions,
+        lodTileDocSize,
+        effectiveOpacity,
+        modeCode,
+        backdropTex,
+        maskTex
+      );
+    }
+
+    // WYSIWYG In-Stack Live Stroke Compositing
+    if (hasDraft && draftCanvas) {
+      if (draftOp === 'destination-out') {
+        gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
+      } else if (draftOp === 'source-atop') {
+        gl.blendFunc(gl.DST_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      }
+      this.renderActiveDraftForLayer(
+        gl,
+        draftCanvas,
+        layer,
+        dimensions,
+        effectiveOpacity * (opts?.activeDraftOpacity ?? 1.0),
+        modeCode,
+        backdropTex,
+        draftOp === 'destination-out' ? null : maskTex,
+        opts?.activeDraftVersion,
+        opts?.activeDraftSpace ?? 'document',
+        draftOp === 'destination-out'
+      );
+      if (draftOp === 'destination-out' || draftOp === 'source-atop') {
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      }
+    }
+
+    if (this.stdLocs) {
+      if (maskTex) {
+        gl.uniform1i(this.stdLocs.uMaskEnabled, 0);
+      }
+      gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
+    }
+    this.unbindSceneTextureUnits(gl);
+  }
+
+  /**
+   * Unified tile draw path used by both normal layers and isolated live Eraser/Alpha-Lock FBOs.
+   * Batches via TEXTURE_2D_ARRAY + drawArraysInstanced and orphans instanceBuffer via STREAM_DRAW
+   * to prevent ANGLE/D3D11 instance attribute read-after-write hazards across consecutive draws.
+   */
+  private drawVisibleTiles(
+    gl: WebGL2RenderingContext,
+    visibleTiles: TileBuffer[],
+    grid: SparseTileGrid,
+    layer: LayerItem,
+    dimensions: CanvasDimensions,
+    lodTileDocSize: number,
+    effectiveOpacity: number,
+    modeCode: number,
+    backdropTex: WebGLTexture | null,
+    maskTex: WebGLTexture | null
+  ): void {
     const canBatch =
       visibleTiles.length > 0 &&
       this.instancedProgram !== null &&
@@ -4453,7 +4526,6 @@ export class ViewportCompositor {
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D_ARRAY, this.tileArrayTexture);
 
-      // Adaptive filter mode for the entire array texture
       const desiredTier = this.currentZoom < 0.99 ? 0 : this.currentZoom < 2.0 ? 1 : 2;
       if (this.arrayPoolFilterTier !== desiredTier) {
         const filter = desiredTier <= 1 ? gl.LINEAR : gl.NEAREST;
@@ -4515,7 +4587,11 @@ export class ViewportCompositor {
         }
 
         gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
-        gl.bufferSubData(gl.ARRAY_BUFFER, 0, this.instanceFloatScratch.subarray(0, instanceCount * 3));
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          this.instanceFloatScratch.subarray(0, instanceCount * 3),
+          gl.STREAM_DRAW
+        );
         gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, instanceCount);
 
         if (this.instancedVao) {
@@ -4525,67 +4601,22 @@ export class ViewportCompositor {
           gl.disableVertexAttribArray(this.aInstDataLoc);
         }
         this.restoreStandardProgram(gl);
-      } else if (overflowed) {
-        this.drawTilesFallback2D(
-          gl,
-          visibleTiles,
-          grid,
-          layer,
-          dimensions,
-          lodTileDocSize,
-          effectiveOpacity,
-          modeCode,
-          backdropTex,
-          maskTex
-        );
-      }
-    } else if (visibleTiles.length > 0) {
-      // Safe fallback to per-tile TEXTURE_2D pool on overflow or missing WebGL2 array APIs
-      this.drawTilesFallback2D(
-        gl,
-        visibleTiles,
-        grid,
-        layer,
-        dimensions,
-        lodTileDocSize,
-        effectiveOpacity,
-        modeCode,
-        backdropTex,
-        maskTex
-      );
-    }
-
-    // WYSIWYG In-Stack Live Stroke Compositing
-    if (hasDraft && draftCanvas) {
-      if (draftOp === 'destination-out') {
-        gl.blendFunc(gl.ZERO, gl.ONE_MINUS_SRC_ALPHA);
-      } else if (draftOp === 'source-atop') {
-        gl.blendFunc(gl.DST_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      }
-      this.renderActiveDraftForLayer(
-        gl,
-        draftCanvas,
-        layer,
-        dimensions,
-        effectiveOpacity * (opts?.activeDraftOpacity ?? 1.0),
-        modeCode,
-        backdropTex,
-        maskTex,
-        opts?.activeDraftVersion,
-        opts?.activeDraftSpace ?? 'document'
-      );
-      if (draftOp === 'destination-out' || draftOp === 'source-atop') {
-        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+        return;
       }
     }
 
-    if (this.stdLocs) {
-      if (maskTex) {
-        gl.uniform1i(this.stdLocs.uMaskEnabled, 0);
-      }
-      gl.uniform1i(this.stdLocs.uHasBackdrop, 0);
-    }
-    this.unbindSceneTextureUnits(gl);
+    this.drawTilesFallback2D(
+      gl,
+      visibleTiles,
+      grid,
+      layer,
+      dimensions,
+      lodTileDocSize,
+      effectiveOpacity,
+      modeCode,
+      backdropTex,
+      maskTex
+    );
   }
 
   /**
@@ -4644,7 +4675,8 @@ export class ViewportCompositor {
     backdropTex: WebGLTexture | null,
     maskTex: WebGLTexture | null,
     draftVersion?: number,
-    draftSpace: 'document' | 'viewport' = 'document'
+    draftSpace: 'document' | 'viewport' = 'document',
+    isDestinationOutMask: boolean = false
   ): void {
     if (draftCanvas.width <= 0 || draftCanvas.height <= 0) return;
     if ((draftCanvas as any).__draftHasContent === false) return;
@@ -4670,6 +4702,8 @@ export class ViewportCompositor {
         gl.TEXTURE_MIN_FILTER,
         needsMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
       );
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
       if (!sizeChanged && this.draftTexWidth > 0 && typeof gl.texSubImage2D === 'function') {
         gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
@@ -4679,11 +4713,18 @@ export class ViewportCompositor {
       gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
       if (needsMipmap) {
         gl.generateMipmap(gl.TEXTURE_2D);
+        this.draftHasMipmap = true;
+      } else {
+        this.draftHasMipmap = false;
       }
       this.draftTexWidth = draftCanvas.width;
       this.draftTexHeight = draftCanvas.height;
       this.lastDraftVersion = ver;
     } else {
+      if (needsMipmap && !this.draftHasMipmap) {
+        gl.generateMipmap(gl.TEXTURE_2D);
+        this.draftHasMipmap = true;
+      }
       gl.texParameteri(
         gl.TEXTURE_2D,
         gl.TEXTURE_MIN_FILTER,
@@ -4692,10 +4733,21 @@ export class ViewportCompositor {
     }
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
 
-    const effectiveDraftLayer: LayerItem =
+    let effectiveDraftLayer: LayerItem =
       this.currentOptions?.activeDraftMonochrome && layer.expressionColor !== 'monochrome'
         ? { ...layer, expressionColor: 'monochrome' }
         : layer;
+
+    if (isDestinationOutMask) {
+      // Destination-out draft is a pure alpha eraser mask; never modulate it by screentone, tint, or mono ink-channel exclusions
+      effectiveDraftLayer = {
+        ...effectiveDraftLayer,
+        toneEnabled: false,
+        layerColorEnabled: false,
+        monoExpressBlack: true,
+        monoExpressWhite: true,
+      };
+    }
 
     if (draftSpace === 'viewport' && this.viewportDraftProgram && this.viewportDraftLocs) {
       gl.useProgram(this.viewportDraftProgram);

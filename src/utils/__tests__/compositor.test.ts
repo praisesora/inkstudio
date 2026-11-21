@@ -1486,6 +1486,70 @@ describe('Unified GPU Viewport Compositor', () => {
       expect(COMPOSITOR_INSTANCED_FRAGMENT_SHADER).toContain('texture(u_tileArrayTexture, vec3(v_texCoord, v_sliceIndex))');
       expect(COMPOSITOR_INSTANCED_FRAGMENT_SHADER).not.toContain('texelFetch');
     });
+
+    it('uses unified TEXTURE_2D_ARRAY instanced path with STREAM_DRAW buffer orphaning during live eraser strokes', () => {
+      const { gl, calls, glSpecErrors } = createMockWebGL2Context();
+      const mockCanvas = {
+        width: 800,
+        height: 600,
+        getContext: (type: string) => (type === 'webgl2' ? gl : null),
+      } as unknown as HTMLCanvasElement;
+
+      const compositor = new ViewportCompositor(mockCanvas);
+      const grid = new SparseTileGrid();
+      const dims = { width: 1024, height: 1024, dpi: 300 };
+
+      const tilePx = new Uint8ClampedArray(64 * 64 * 4);
+      tilePx.fill(255);
+      grid.writeImageData('layer-1', { data: tilePx, width: 64, height: 64 }, 10, 10, 'color-32bit');
+      grid.writeImageData('layer-1', { data: tilePx, width: 64, height: 64 }, 300, 300, 'color-32bit');
+
+      const layers: LayerItem[] = [
+        {
+          id: 'layer-1',
+          name: 'Lineart',
+          type: 'raster',
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal',
+          locked: false,
+          parentId: null,
+        },
+      ];
+
+      const mockEraserDraft = {
+        width: 256,
+        height: 256,
+        __draftHasContent: true,
+        __draftCompositeOp: 'destination-out',
+        __draftVersion: 1,
+        __draftSpace: 'document',
+        __draftDocRect: { x: 0, y: 0, width: 256, height: 256 },
+      } as unknown as HTMLCanvasElement;
+
+      const transform: ViewportTransform = { pan: { x: 400, y: 300 }, zoom: 1.0, rotation: 0 };
+
+      calls.length = 0;
+      compositor.render(layers, transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-1',
+        activeDraftLayerId: 'layer-1',
+        activeDraftCanvas: mockEraserDraft,
+        activeDraftVersion: 1,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+
+      // Live eraser isolated FBO must use drawArraysInstanced (same TEXTURE_2D_ARRAY pool as normal rendering)
+      expect(calls.some((c) => c.name === 'drawArraysInstanced')).toBe(true);
+      // Must orphan instance buffer via bufferData (STREAM_DRAW), never bufferSubData hazard
+      expect(calls.some((c) => c.name === 'bufferSubData')).toBe(false);
+      // Must not clobber tile.dirty on shared TileBuffer
+      const t00 = grid.getTile('layer-1', 0, 0, 0)!;
+      expect(t00.dirty).toBe(true);
+      expect(glSpecErrors).toEqual([]);
+    });
   });
 });
 

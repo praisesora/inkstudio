@@ -40,6 +40,7 @@ export interface UiStoreState {
   isNewCanvasModalOpen: boolean;
   isResizeCanvasModalOpen: boolean;
   isSettingsModalOpen: boolean;
+  isAboutModalOpen: boolean;
   isToneModalOpen: boolean;
   isMangaEffectsModalOpen: boolean;
   isWebtoonExportModalOpen: boolean;
@@ -94,6 +95,7 @@ const createInitialUiState = (): UiStoreState => ({
   isNewCanvasModalOpen: false,
   isResizeCanvasModalOpen: false,
   isSettingsModalOpen: false,
+  isAboutModalOpen: false,
   isToneModalOpen: false,
   isMangaEffectsModalOpen: false,
   isWebtoonExportModalOpen: false,
@@ -186,6 +188,10 @@ export const uiStoreActions = {
     useUiStore.setState({ isSettingsModalOpen: open });
   },
 
+  setAboutModalOpen(open: boolean): void {
+    useUiStore.setState({ isAboutModalOpen: open });
+  },
+
   setToneModalOpen(open: boolean): void {
     useUiStore.setState({ isToneModalOpen: open });
   },
@@ -266,6 +272,7 @@ export function selectIsAnyModalOpen(
     state.isNewCanvasModalOpen ||
     state.isResizeCanvasModalOpen ||
     state.isSettingsModalOpen ||
+    state.isAboutModalOpen ||
     state.isToneModalOpen ||
     state.isMangaEffectsModalOpen ||
     state.isWebtoonExportModalOpen ||

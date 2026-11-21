@@ -14,7 +14,7 @@ import {
 } from '../../types/editor';
 import { SparseTileGrid } from '../../utils/tileEngine';
 import { CanvasNavigationHandle } from '../useCanvasNavigation';
-import { PerspectiveRuler, ConstraintAxis } from '../../types/perspective';
+import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../../types/perspective';
 
 export interface DraftCanvasElement extends HTMLCanvasElement {
   __draftHasContent?: boolean;
@@ -98,6 +98,7 @@ export interface UseCanvasDrawingProps {
   ) => void;
   onCollabCursorMove?: (x: number, y: number, isDrawing: boolean, tool: ToolType) => void;
   perspectiveRuler?: PerspectiveRuler | null;
+  straightRuler?: StraightRuler | null;
   onActiveConstraintAxisChange?: (axis: ConstraintAxis | null) => void;
   activeSessionId?: string | null;
   tileGrid?: SparseTileGrid;

@@ -7,6 +7,7 @@ import {
   TransformSession,
 } from '../../types/editor';
 import { documentStore } from '../../utils/documentStore';
+import { SparseTileGrid } from '../../utils/tileEngine';
 import { compositeVisibleLayers } from '../../utils/floodFill';
 import {
   isPointInSelection,
@@ -45,6 +46,9 @@ export interface UseSelectionToolsParams {
   layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   layerSourceCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   getActiveCanvas: () => HTMLCanvasElement | null;
+  materializeLayerCanvas?: (layerId: string) => HTMLCanvasElement | null;
+  tileGrid?: SparseTileGrid;
+  flushPendingHistoryTasks?: () => void;
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   pushHistoryStep: PushHistoryStepFn;
   showToast: (msg: string) => void;
@@ -86,12 +90,71 @@ export function useSelectionTools({
   layerCanvasesRef,
   layerSourceCanvasesRef,
   getActiveCanvas,
+  materializeLayerCanvas,
+  tileGrid,
+  flushPendingHistoryTasks,
   updateLayerThumbnail,
   pushHistoryStep,
   showToast,
 }: UseSelectionToolsParams): UseSelectionToolsResult {
   const [selection, setSelection] = useState<CanvasSelection | null>(null);
   const [transformSession, setTransformSession] = useState<TransformSession | null>(null);
+
+  const getGrid = useCallback(
+    () => tileGrid ?? documentStore.getActiveTileGrid(),
+    [tileGrid]
+  );
+
+  const markCanvasPopulated = useCallback((c: HTMLCanvasElement | null | undefined) => {
+    if (!c) return;
+    (c as unknown as { __isBlank?: boolean }).__isBlank = false;
+    (c as unknown as { __isSolidWhite?: boolean }).__isSolidWhite = false;
+  }, []);
+
+  /**
+   * Flushes any deferred brush/history tasks and synchronizes a layer's cached 2D canvas
+   * from the authoritative SparseTileGrid so selection & transform never read stale tiles.
+   */
+  const getSyncedLayerCanvas = useCallback(
+    (layerId: string): HTMLCanvasElement | null => {
+      flushPendingHistoryTasks?.();
+      const canvas =
+        layerCanvasesRef.current.get(layerId) ??
+        materializeLayerCanvas?.(layerId) ??
+        (layerId === activeLayerId ? getActiveCanvas() : null);
+      if (!canvas) return null;
+
+      const grid = getGrid();
+      const lyr = layers.find((l) => l.id === layerId);
+      const src = layerSourceCanvasesRef.current?.get(layerId);
+      const hasTiles = grid.hasLayerTiles(layerId);
+
+      if (lyr?.toneEnabled && src) {
+        grid.renderLayerToCanvas(layerId, src);
+        if (hasTiles) markCanvasPopulated(src);
+        markCanvasPopulated(canvas);
+      } else {
+        grid.renderLayerToCanvas(layerId, canvas);
+        if (hasTiles) markCanvasPopulated(canvas);
+        if (src) {
+          grid.renderLayerToCanvas(layerId, src);
+          if (hasTiles) markCanvasPopulated(src);
+        }
+      }
+      return canvas;
+    },
+    [
+      flushPendingHistoryTasks,
+      layerCanvasesRef,
+      materializeLayerCanvas,
+      activeLayerId,
+      getActiveCanvas,
+      getGrid,
+      layers,
+      layerSourceCanvasesRef,
+      markCanvasPopulated,
+    ]
+  );
 
   const selectionMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const isSelectionPenDrawingRef = useRef<boolean>(false);
@@ -118,12 +181,18 @@ export function useSelectionTools({
   const handleCommitFloatingSelection = useCallback(() => {
     if (!selection?.floating) return;
     const targetLayerId = selection.floating.layerId || activeLayerId;
-    const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
+    const canvas =
+      layerCanvasesRef.current.get(targetLayerId) ||
+      materializeLayerCanvas?.(targetLayerId) ||
+      getActiveCanvas();
     if (!canvas) return;
 
     const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
     commitFloatingSelection(canvas, selection.floating, sourceCanvas);
+    markCanvasPopulated(canvas);
+    markCanvasPopulated(sourceCanvas);
 
+    const grid = getGrid();
     const ctx = get2DContext(canvas);
     if (ctx) {
       const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
@@ -138,17 +207,15 @@ export function useSelectionTools({
       } else {
         const lyr = layers.find((l) => l.id === targetLayerId);
         const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-        documentStore
-          .getActiveTileGrid()
-          .writeImageData(
-            targetLayerId,
-            afterData,
-            0,
-            0,
-            isMono ? 'monochrome-1bit' : 'color-32bit'
-          );
+        grid.writeImageData(
+          targetLayerId,
+          afterData,
+          0,
+          0,
+          isMono ? 'monochrome-1bit' : 'color-32bit'
+        );
       }
-      documentStore.getActiveTileGrid().notifyChange(true);
+      grid.notifyChange(true);
     }
 
     updateLayerThumbnail(targetLayerId, true);
@@ -159,8 +226,11 @@ export function useSelectionTools({
     layers,
     colorMode,
     layerCanvasesRef,
+    materializeLayerCanvas,
     getActiveCanvas,
     layerSourceCanvasesRef,
+    markCanvasPopulated,
+    getGrid,
     pushHistoryStep,
     updateLayerThumbnail,
   ]);
@@ -174,9 +244,13 @@ export function useSelectionTools({
 
   const handleClearSelection = useCallback(() => {
     if (!selection) return;
+    const grid = getGrid();
     if (selection.floating) {
       const targetLayerId = selection.floating.layerId || activeLayerId;
-      const canvas = layerCanvasesRef.current.get(targetLayerId) || getActiveCanvas();
+      const canvas =
+        layerCanvasesRef.current.get(targetLayerId) ||
+        materializeLayerCanvas?.(targetLayerId) ||
+        getActiveCanvas();
       if (canvas && selection.floating.beforeImageData) {
         const ctx = get2DContext(canvas);
         if (ctx) {
@@ -188,14 +262,14 @@ export function useSelectionTools({
             afterData,
             targetLayerId
           );
-          documentStore.getActiveTileGrid().notifyChange(true);
+          grid.notifyChange(true);
         }
       }
       setSelection(null);
       return;
     }
 
-    const canvas = getActiveCanvas();
+    const canvas = getSyncedLayerCanvas(activeLayerId);
     if (!canvas) return;
     const ctx = get2DContext(canvas);
     if (!ctx) return;
@@ -208,14 +282,16 @@ export function useSelectionTools({
       const c = get2DContext(target);
       if (!c) return;
       c.save();
+      c.setTransform(1, 0, 0, 1, 0, 0);
       if (selection.mask && selection.maskWidth && selection.maskHeight) {
         const maskCanvas = document.createElement('canvas');
-        maskCanvas.width = target.width;
-        maskCanvas.height = target.height;
+        maskCanvas.width = selection.maskWidth;
+        maskCanvas.height = selection.maskHeight;
         const mCtx = maskCanvas.getContext('2d');
         if (mCtx) {
-          const mImg = mCtx.createImageData(target.width, target.height);
-          for (let i = 0; i < selection.mask.length; i++) {
+          const mImg = mCtx.createImageData(selection.maskWidth, selection.maskHeight);
+          const count = Math.min(selection.mask.length, selection.maskWidth * selection.maskHeight);
+          for (let i = 0; i < count; i++) {
             if (isBg) {
               mImg.data[i * 4] = 255;
               mImg.data[i * 4 + 1] = 255;
@@ -265,24 +341,30 @@ export function useSelectionTools({
 
     clearOn(canvas);
     if (sourceCanvas) clearOn(sourceCanvas);
+    markCanvasPopulated(canvas);
+    markCanvasPopulated(sourceCanvas);
 
     const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     updateLayerThumbnail(activeLayerId, true);
     pushHistoryStep('clear', 'Clear Selection', beforeImageData, afterImageData, activeLayerId);
-    documentStore.getActiveTileGrid().notifyChange(true);
+    grid.notifyChange(true);
   }, [
     selection,
+    getGrid,
+    getSyncedLayerCanvas,
     getActiveCanvas,
+    materializeLayerCanvas,
     activeLayerId,
     layerCanvasesRef,
     layerSourceCanvasesRef,
+    markCanvasPopulated,
     updateLayerThumbnail,
     pushHistoryStep,
   ]);
 
   const handleFillSelectionColor = useCallback(() => {
     if (!selection) return;
-    const canvas = getActiveCanvas();
+    const canvas = getSyncedLayerCanvas(activeLayerId);
     if (!canvas) return;
     const ctx = get2DContext(canvas);
     if (!ctx) return;
@@ -295,16 +377,18 @@ export function useSelectionTools({
       const c = get2DContext(target);
       if (!c) return;
       c.save();
+      c.setTransform(1, 0, 0, 1, 0, 0);
       if (selection.mask && selection.maskWidth && selection.maskHeight) {
         const maskCanvas = document.createElement('canvas');
-        maskCanvas.width = target.width;
-        maskCanvas.height = target.height;
+        maskCanvas.width = selection.maskWidth;
+        maskCanvas.height = selection.maskHeight;
         const mCtx = maskCanvas.getContext('2d');
         if (mCtx) {
           mCtx.fillStyle = primaryColor;
-          mCtx.fillRect(0, 0, target.width, target.height);
-          const mImg = mCtx.getImageData(0, 0, target.width, target.height);
-          for (let i = 0; i < selection.mask.length; i++) {
+          mCtx.fillRect(0, 0, selection.maskWidth, selection.maskHeight);
+          const mImg = mCtx.getImageData(0, 0, selection.maskWidth, selection.maskHeight);
+          const count = Math.min(selection.mask.length, selection.maskWidth * selection.maskHeight);
+          for (let i = 0; i < count; i++) {
             mImg.data[i * 4 + 3] = Math.round((mImg.data[i * 4 + 3] * selection.mask[i]) / 255);
           }
           mCtx.putImageData(mImg, 0, 0);
@@ -337,8 +421,10 @@ export function useSelectionTools({
     };
 
     fillOn(canvas);
+    markCanvasPopulated(canvas);
     if (sourceCanvas) {
       fillOn(sourceCanvas);
+      markCanvasPopulated(sourceCanvas);
       if (activeLayer?.toneEnabled) {
         applyLayerEffects(
           sourceCanvas,
@@ -353,12 +439,15 @@ export function useSelectionTools({
     const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     updateLayerThumbnail(activeLayerId, true);
     pushHistoryStep('fill', 'Fill Selection', beforeImageData, afterImageData, activeLayerId);
+    getGrid().notifyChange(true);
   }, [
     selection,
-    getActiveCanvas,
+    getSyncedLayerCanvas,
     activeLayerId,
     activeLayer,
     layerSourceCanvasesRef,
+    markCanvasPopulated,
+    getGrid,
     dimensions.dpi,
     updateLayerThumbnail,
     pushHistoryStep,
@@ -485,31 +574,45 @@ export function useSelectionTools({
 
   const handleStartTransform = useCallback(() => {
     if (transformSession?.active) return;
-    const canvas = layerCanvasesRef.current.get(activeLayerId) || getActiveCanvas();
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
+    if (activeLayer?.locked || (activeLayer && activeLayer.type !== 'raster')) {
+      showToast('Select an unlocked raster layer to transform');
+      return;
+    }
 
-    const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
+    const grid = getGrid();
 
     if (selection) {
       let floatCanvas = selection.floating?.canvas;
-      const floatX = selection.floating?.x ?? selection.bounds.x;
-      const floatY = selection.floating?.y ?? selection.bounds.y;
+      const targetLayerId = selection.floating?.layerId || activeLayerId;
+      const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
+      const canvas = floatCanvas
+        ? layerCanvasesRef.current.get(targetLayerId) ||
+          materializeLayerCanvas?.(targetLayerId) ||
+          getActiveCanvas()
+        : getSyncedLayerCanvas(targetLayerId);
+      if (!canvas) return;
+      const ctx = get2DContext(canvas);
+      if (!ctx) return;
+
+      let floatX = selection.floating?.x ?? selection.bounds.x;
+      let floatY = selection.floating?.y ?? selection.bounds.y;
       let beforeData = selection.floating?.beforeImageData;
 
       if (!floatCanvas) {
-        const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+        const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
         const lifted = liftSelectionToFloating(canvas, selection, sourceCanvas, isBg);
         if (!lifted) return;
         floatCanvas = lifted.floatingCanvas;
+        floatX = lifted.bounds.x;
+        floatY = lifted.bounds.y;
         beforeData = lifted.beforeImageData;
-        const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-        documentStore
-          .getActiveTileGrid()
-          .ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-        documentStore.getActiveTileGrid().notifyChange(true);
-        updateLayerThumbnail(activeLayerId, true);
+        markCanvasPopulated(canvas);
+        markCanvasPopulated(sourceCanvas);
+        const targetLayer = layers.find((l) => l.id === targetLayerId);
+        const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
+        grid.ingestCanvas(targetLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+        grid.notifyChange(true);
+        updateLayerThumbnail(targetLayerId, true);
       }
 
       const quad = createDefaultPerspectiveQuad(
@@ -521,7 +624,7 @@ export function useSelectionTools({
       );
       setTransformSession({
         active: true,
-        layerId: activeLayerId,
+        layerId: targetLayerId,
         sourceCanvas: floatCanvas,
         beforeImageData: beforeData || ctx.getImageData(0, 0, canvas.width, canvas.height),
         bounds: { x: floatX, y: floatY, width: floatCanvas.width, height: floatCanvas.height },
@@ -543,7 +646,7 @@ export function useSelectionTools({
     } else {
       const isMultiLayer = selectedLayerIds && selectedLayerIds.length > 1;
       const multiTargetLayers = isMultiLayer
-        ? layers.filter((l) => selectedLayerIds.includes(l.id) && l.type === 'raster')
+        ? layers.filter((l) => selectedLayerIds.includes(l.id) && l.type === 'raster' && !l.locked)
         : [];
 
       if (isMultiLayer && multiTargetLayers.length > 1) {
@@ -556,7 +659,7 @@ export function useSelectionTools({
         let maxY = -Infinity;
 
         for (const lyr of multiTargetLayers) {
-          const c = layerCanvasesRef.current.get(lyr.id);
+          const c = getSyncedLayerCanvas(lyr.id);
           if (!c) continue;
           const cCtx = get2DContext(c);
           if (!cCtx) continue;
@@ -616,32 +719,38 @@ export function useSelectionTools({
           }
 
           const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
+          cCtx.save();
+          cCtx.setTransform(1, 0, 0, 1, 0, 0);
           if (isLayerBg) {
             cCtx.fillStyle = '#ffffff';
             cCtx.fillRect(b.x, b.y, b.width, b.height);
           } else {
             cCtx.clearRect(b.x, b.y, b.width, b.height);
           }
+          cCtx.restore();
+          markCanvasPopulated(c);
 
           const existingSrc = layerSourceCanvasesRef.current?.get(lyr.id);
           if (existingSrc) {
             const escCtx = get2DContext(existingSrc);
             if (escCtx) {
+              escCtx.save();
+              escCtx.setTransform(1, 0, 0, 1, 0, 0);
               if (isLayerBg) {
                 escCtx.fillStyle = '#ffffff';
                 escCtx.fillRect(b.x, b.y, b.width, b.height);
               } else {
                 escCtx.clearRect(b.x, b.y, b.width, b.height);
               }
+              escCtx.restore();
             }
+            markCanvasPopulated(existingSrc);
           }
           const isMono = colorMode === 'monochrome' || lyr.expressionColor === 'monochrome';
-          documentStore
-            .getActiveTileGrid()
-            .ingestCanvas(lyr.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+          grid.ingestCanvas(lyr.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           updateLayerThumbnail(lyr.id, true);
         }
-        documentStore.getActiveTileGrid().notifyChange(true);
+        grid.notifyChange(true);
 
         const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
         setTransformSession({
@@ -672,6 +781,12 @@ export function useSelectionTools({
         return;
       }
 
+      const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
+      const canvas = getSyncedLayerCanvas(activeLayerId);
+      if (!canvas) return;
+      const ctx = get2DContext(canvas);
+      if (!ctx) return;
+
       const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
       const contentBounds = getCanvasContentBounds(canvas, isBg);
       let b = contentBounds;
@@ -693,31 +808,37 @@ export function useSelectionTools({
         sCtx.putImageData(sliceData, 0, 0);
       }
 
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
       if (isBg) {
         ctx.fillStyle = '#ffffff';
         ctx.fillRect(b.x, b.y, b.width, b.height);
       } else {
         ctx.clearRect(b.x, b.y, b.width, b.height);
       }
+      ctx.restore();
+      markCanvasPopulated(canvas);
 
       const existingSourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
       if (existingSourceCanvas) {
         const escCtx = get2DContext(existingSourceCanvas);
         if (escCtx) {
+          escCtx.save();
+          escCtx.setTransform(1, 0, 0, 1, 0, 0);
           if (isBg) {
             escCtx.fillStyle = '#ffffff';
             escCtx.fillRect(b.x, b.y, b.width, b.height);
           } else {
             escCtx.clearRect(b.x, b.y, b.width, b.height);
           }
+          escCtx.restore();
         }
+        markCanvasPopulated(existingSourceCanvas);
       }
 
       const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-      documentStore
-        .getActiveTileGrid()
-        .ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-      documentStore.getActiveTileGrid().notifyChange(true);
+      grid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+      grid.notifyChange(true);
       updateLayerThumbnail(activeLayerId, true);
 
       const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
@@ -745,7 +866,11 @@ export function useSelectionTools({
     toolStoreActions.setToolRaw('transform');
   }, [
     transformSession,
+    getGrid,
+    getSyncedLayerCanvas,
+    materializeLayerCanvas,
     getActiveCanvas,
+    markCanvasPopulated,
     selection,
     activeLayerId,
     activeLayer,
@@ -760,6 +885,7 @@ export function useSelectionTools({
 
   const handleApplyTransform = useCallback(() => {
     if (!transformSession) return;
+    const grid = getGrid();
 
     if (
       transformSession.layerIds &&
@@ -767,7 +893,7 @@ export function useSelectionTools({
       transformSession.layerSourceCanvases
     ) {
       for (const lId of transformSession.layerIds) {
-        const c = layerCanvasesRef.current.get(lId);
+        const c = layerCanvasesRef.current.get(lId) || materializeLayerCanvas?.(lId);
         const sCanvas = transformSession.layerSourceCanvases.get(lId);
         if (!c || !sCanvas) continue;
         const cCtx = get2DContext(c);
@@ -775,6 +901,7 @@ export function useSelectionTools({
 
         const drawLayerTransformed = (targetCtx: CanvasRenderingContext2D) => {
           targetCtx.save();
+          targetCtx.setTransform(1, 0, 0, 1, 0, 0);
           if (transformSession.mode === 'perspective' && transformSession.perspectiveQuad) {
             renderPerspectiveQuad(targetCtx, sCanvas, transformSession.perspectiveQuad, 24);
           } else if (transformSession.mode === 'mesh' && transformSession.meshPoints) {
@@ -797,11 +924,13 @@ export function useSelectionTools({
         };
 
         drawLayerTransformed(cCtx);
+        markCanvasPopulated(c);
 
         const existingSrc = layerSourceCanvasesRef.current?.get(lId);
         if (existingSrc) {
           const sCtx = get2DContext(existingSrc);
           if (sCtx) drawLayerTransformed(sCtx);
+          markCanvasPopulated(existingSrc);
         }
 
         const lyr = layers.find((l) => l.id === lId);
@@ -817,9 +946,7 @@ export function useSelectionTools({
         const beforeDataForLayer = transformSession.layerBeforeImages?.get(lId);
         const afterDataForLayer = cCtx.getImageData(0, 0, c.width, c.height);
         const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-        documentStore
-          .getActiveTileGrid()
-          .ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+        grid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
         if (beforeDataForLayer) {
           pushHistoryStep(
             'transform',
@@ -832,13 +959,16 @@ export function useSelectionTools({
         updateLayerThumbnail(lId, true);
       }
 
-      documentStore.getActiveTileGrid().notifyChange(true);
+      grid.notifyChange(true);
       setTransformSession(null);
       toolStoreActions.setToolRaw('brush');
       return;
     }
 
-    const canvas = layerCanvasesRef.current.get(transformSession.layerId) || getActiveCanvas();
+    const canvas =
+      layerCanvasesRef.current.get(transformSession.layerId) ||
+      materializeLayerCanvas?.(transformSession.layerId) ||
+      getActiveCanvas();
     if (!canvas) return;
     const ctx = get2DContext(canvas);
     if (!ctx) return;
@@ -847,6 +977,7 @@ export function useSelectionTools({
 
     const drawTransformed = (targetCtx: CanvasRenderingContext2D) => {
       targetCtx.save();
+      targetCtx.setTransform(1, 0, 0, 1, 0, 0);
       if (transformSession.mode === 'perspective' && transformSession.perspectiveQuad) {
         renderPerspectiveQuad(
           targetCtx,
@@ -874,9 +1005,11 @@ export function useSelectionTools({
     };
 
     drawTransformed(ctx);
+    markCanvasPopulated(canvas);
     if (sourceCanvas) {
       const sCtx = get2DContext(sourceCanvas);
       if (sCtx) drawTransformed(sCtx);
+      markCanvasPopulated(sourceCanvas);
     }
 
     const layer = layers.find((l) => l.id === transformSession.layerId);
@@ -890,23 +1023,31 @@ export function useSelectionTools({
     }
 
     const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    pushHistoryStep(
-      'transform',
-      'Free Transform',
-      transformSession.beforeImageData,
-      afterImageData,
-      transformSession.layerId
-    );
-    documentStore.getActiveTileGrid().notifyChange(true);
+    if (transformSession.beforeImageData) {
+      pushHistoryStep(
+        'transform',
+        'Free Transform',
+        transformSession.beforeImageData,
+        afterImageData,
+        transformSession.layerId
+      );
+    } else {
+      const isMono = colorMode === 'monochrome' || layer?.expressionColor === 'monochrome';
+      grid.ingestCanvas(transformSession.layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+    }
+    grid.notifyChange(true);
 
     updateLayerThumbnail(transformSession.layerId, true);
     setTransformSession(null);
     toolStoreActions.setToolRaw('brush');
   }, [
     transformSession,
+    getGrid,
     colorMode,
     layerCanvasesRef,
+    materializeLayerCanvas,
     getActiveCanvas,
+    markCanvasPopulated,
     layers,
     layerSourceCanvasesRef,
     dimensions.dpi,
@@ -916,19 +1057,22 @@ export function useSelectionTools({
 
   const handleCancelTransform = useCallback(() => {
     if (!transformSession) return;
+    const grid = getGrid();
 
     if (transformSession.layerBeforeImages && transformSession.layerBeforeImages.size > 0) {
       for (const [lId, beforeData] of transformSession.layerBeforeImages.entries()) {
-        const c = layerCanvasesRef.current.get(lId);
+        const c = layerCanvasesRef.current.get(lId) || materializeLayerCanvas?.(lId);
         if (c && beforeData) {
           const ctx = get2DContext(c);
           ctx?.putImageData(beforeData, 0, 0);
+          markCanvasPopulated(c);
 
           const lyr = layers.find((l) => l.id === lId);
           const sourceCanvas = layerSourceCanvasesRef.current?.get(lId);
           if (sourceCanvas) {
             const sCtx = get2DContext(sourceCanvas);
             sCtx?.putImageData(beforeData, 0, 0);
+            markCanvasPopulated(sourceCanvas);
 
             if (lyr?.toneEnabled) {
               applyScreentone(sourceCanvas, c, {
@@ -940,28 +1084,31 @@ export function useSelectionTools({
             }
           }
           const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-          documentStore
-            .getActiveTileGrid()
-            .ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+          grid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
           updateLayerThumbnail(lId, true);
         }
       }
-      documentStore.getActiveTileGrid().notifyChange(true);
+      grid.notifyChange(true);
       setTransformSession(null);
       toolStoreActions.setToolRaw('brush');
       return;
     }
 
-    const canvas = layerCanvasesRef.current.get(transformSession.layerId) || getActiveCanvas();
+    const canvas =
+      layerCanvasesRef.current.get(transformSession.layerId) ||
+      materializeLayerCanvas?.(transformSession.layerId) ||
+      getActiveCanvas();
     if (canvas && transformSession.beforeImageData) {
       const ctx = get2DContext(canvas);
       ctx?.putImageData(transformSession.beforeImageData, 0, 0);
+      markCanvasPopulated(canvas);
 
       const layer = layers.find((l) => l.id === transformSession.layerId);
       const sourceCanvas = layerSourceCanvasesRef.current?.get(transformSession.layerId);
       if (sourceCanvas) {
         const sCtx = get2DContext(sourceCanvas);
         sCtx?.putImageData(transformSession.beforeImageData, 0, 0);
+        markCanvasPopulated(sourceCanvas);
 
         if (layer?.toneEnabled) {
           applyScreentone(sourceCanvas, canvas, {
@@ -973,19 +1120,24 @@ export function useSelectionTools({
         }
       }
       const isMono = colorMode === 'monochrome' || layer?.expressionColor === 'monochrome';
-      documentStore
-        .getActiveTileGrid()
-        .ingestCanvas(transformSession.layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-      documentStore.getActiveTileGrid().notifyChange(true);
+      grid.ingestCanvas(
+        transformSession.layerId,
+        canvas,
+        isMono ? 'monochrome-1bit' : 'color-32bit'
+      );
+      grid.notifyChange(true);
       updateLayerThumbnail(transformSession.layerId, true);
     }
     setTransformSession(null);
     toolStoreActions.setToolRaw('brush');
   }, [
     transformSession,
+    getGrid,
     colorMode,
     layerCanvasesRef,
+    materializeLayerCanvas,
     getActiveCanvas,
+    markCanvasPopulated,
     layers,
     layerSourceCanvasesRef,
     dimensions.dpi,
@@ -1008,16 +1160,17 @@ export function useSelectionTools({
 
         let sampleCanvas: HTMLCanvasElement | null = null;
         if (wandSettings.referMode === 'all') {
-          sampleCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions);
+          flushPendingHistoryTasks?.();
+          sampleCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions, getGrid());
         } else if (wandSettings.referMode === 'reference') {
           const refLayer = layers.find((l) => l.isReference && l.visible);
           if (refLayer) {
-            sampleCanvas = layerCanvasesRef.current.get(refLayer.id) || null;
+            sampleCanvas = getSyncedLayerCanvas(refLayer.id);
           } else {
-            sampleCanvas = layerCanvasesRef.current.get(activeLayerId) || getActiveCanvas();
+            sampleCanvas = getSyncedLayerCanvas(activeLayerId);
           }
         } else {
-          sampleCanvas = layerCanvasesRef.current.get(activeLayerId) || getActiveCanvas();
+          sampleCanvas = getSyncedLayerCanvas(activeLayerId);
         }
 
         if (!sampleCanvas) return true;
@@ -1133,42 +1286,43 @@ export function useSelectionTools({
       if (tool === 'select-rect' || tool === 'select-lasso') {
         e.preventDefault();
         if (selection && isPointInSelection(pt.x, pt.y, selection)) {
-          const canvas = getActiveCanvas();
-          if (!canvas) return true;
-
           if (!selection.floating) {
+            const canvas = getSyncedLayerCanvas(activeLayerId);
+            if (!canvas) return true;
             const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
             const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
             const lifted = liftSelectionToFloating(canvas, selection, sourceCanvas, isBg);
             if (lifted) {
+              markCanvasPopulated(canvas);
+              markCanvasPopulated(sourceCanvas);
+              const grid = getGrid();
               const isMono =
                 colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              documentStore
-                .getActiveTileGrid()
-                .ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-              documentStore.getActiveTileGrid().notifyChange(true);
+              grid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
+              grid.notifyChange(true);
               updateLayerThumbnail(activeLayerId, true);
               const floatingObj = {
                 canvas: lifted.floatingCanvas,
-                x: selection.bounds.x,
-                y: selection.bounds.y,
-                origX: selection.bounds.x,
-                origY: selection.bounds.y,
+                x: lifted.bounds.x,
+                y: lifted.bounds.y,
+                origX: lifted.bounds.x,
+                origY: lifted.bounds.y,
                 layerId: activeLayerId,
                 beforeImageData: lifted.beforeImageData,
               };
               setSelection({
                 ...selection,
+                bounds: lifted.bounds,
                 floating: floatingObj,
               });
               selectionDragRef.current = {
                 isDragging: true,
                 startX: pt.x,
                 startY: pt.y,
-                origFloatingX: selection.bounds.x,
-                origFloatingY: selection.bounds.y,
-                origBoundsX: selection.bounds.x,
-                origBoundsY: selection.bounds.y,
+                origFloatingX: lifted.bounds.x,
+                origFloatingY: lifted.bounds.y,
+                origBoundsX: lifted.bounds.x,
+                origBoundsY: lifted.bounds.y,
               };
             }
           } else {
@@ -1211,11 +1365,14 @@ export function useSelectionTools({
     [
       selection,
       handleCommitFloatingSelection,
+      flushPendingHistoryTasks,
+      getGrid,
+      getSyncedLayerCanvas,
+      markCanvasPopulated,
       dimensions,
       layers,
       layerCanvasesRef,
       activeLayerId,
-      getActiveCanvas,
       layerSourceCanvasesRef,
       colorMode,
       activeLayer,
@@ -1283,13 +1440,13 @@ export function useSelectionTools({
 
     if (selectRectStartRef.current) {
       const s = selectRectStartRef.current;
-      const minX = Math.floor(Math.min(s.x, pt.x));
-      const minY = Math.floor(Math.min(s.y, pt.y));
-      const w = Math.ceil(Math.abs(pt.x - s.x));
-      const h = Math.ceil(Math.abs(pt.y - s.y));
+      const x0 = Math.max(0, Math.min(dimensions.width, Math.floor(Math.min(s.x, pt.x))));
+      const y0 = Math.max(0, Math.min(dimensions.height, Math.floor(Math.min(s.y, pt.y))));
+      const x1 = Math.max(0, Math.min(dimensions.width, Math.ceil(Math.max(s.x, pt.x))));
+      const y1 = Math.max(0, Math.min(dimensions.height, Math.ceil(Math.max(s.y, pt.y))));
       setSelection({
         type: 'rect',
-        bounds: { x: minX, y: minY, width: w, height: h },
+        bounds: { x: x0, y: y0, width: Math.max(0, x1 - x0), height: Math.max(0, y1 - y0) },
       });
       return true;
     }
@@ -1310,7 +1467,7 @@ export function useSelectionTools({
     }
 
     return false;
-  }, []);
+  }, [dimensions.height, dimensions.width]);
 
   const handleSelectionPointerUp = useCallback(
     (pt: { x: number; y: number }): boolean => {
@@ -1355,16 +1512,18 @@ export function useSelectionTools({
       if (selectRectStartRef.current) {
         const s = selectRectStartRef.current;
         selectRectStartRef.current = null;
-        const minX = Math.floor(Math.min(s.x, pt.x));
-        const minY = Math.floor(Math.min(s.y, pt.y));
-        const w = Math.ceil(Math.abs(pt.x - s.x));
-        const h = Math.ceil(Math.abs(pt.y - s.y));
+        const x0 = Math.max(0, Math.min(dimensions.width, Math.floor(Math.min(s.x, pt.x))));
+        const y0 = Math.max(0, Math.min(dimensions.height, Math.floor(Math.min(s.y, pt.y))));
+        const x1 = Math.max(0, Math.min(dimensions.width, Math.ceil(Math.max(s.x, pt.x))));
+        const y1 = Math.max(0, Math.min(dimensions.height, Math.ceil(Math.max(s.y, pt.y))));
+        const w = x1 - x0;
+        const h = y1 - y0;
         if (w < 4 || h < 4) {
           setSelection(null);
         } else {
           setSelection({
             type: 'rect',
-            bounds: { x: minX, y: minY, width: w, height: h },
+            bounds: { x: x0, y: y0, width: w, height: h },
           });
         }
         return true;

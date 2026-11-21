@@ -1,4 +1,5 @@
-import { PerspectiveRuler } from './perspective';
+import type { ReactNode } from 'react';
+import { PerspectiveRuler, StraightRuler } from './perspective';
 import type { SparseTileGrid } from '../utils/tileEngine';
 export type {
   ShapeKind,
@@ -363,6 +364,7 @@ export interface DocumentTab {
   historyList?: HistoryItemMeta[];
   historyIndex?: number;
   perspectiveRuler?: PerspectiveRuler | null;
+  straightRuler?: StraightRuler | null;
   defaultFrequency?: number;
   animation?: AnimationTimeline | null;
 }
@@ -840,6 +842,8 @@ export interface MenuItem {
   id: string;
   label: string;
   shortcut?: string;
+  icon?: ReactNode;
+  href?: string;
   disabled?: boolean;
   danger?: boolean;
   divider?: boolean;

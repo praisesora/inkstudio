@@ -334,6 +334,13 @@ export const DEFAULT_COMMANDS: readonly CommandDefinition[] = [
     defaultShortcut: 'Shift+V',
   },
   {
+    id: 'view.straightRuler',
+    label: 'Straight Ruler',
+    description: 'Toggle interactive straight ruler overlay',
+    category: 'Canvas View',
+    defaultShortcut: 'R',
+  },
+  {
     id: 'view.perspectiveRuler',
     label: 'Toggle Perspective Ruler',
     description: 'Add or toggle 2-point perspective ruler',

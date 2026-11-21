@@ -4,6 +4,7 @@ import {
   PenTool,
   Pencil,
   Plus,
+  Download,
   Trash2,
   Loader2,
   FolderDown,
@@ -11,9 +12,13 @@ import {
   ChevronRight,
 } from 'lucide-react';
 import { BrushCategory, BrushPresetId, CspBrush } from '../types/editor';
-import { parseSutFile } from '../utils/sutParser';
 import {
-  saveCustomBrush,
+  buildExportableBrush,
+  exportBrushToInkbFile,
+  importBrushFile,
+  isSupportedBrushFileName,
+} from '../utils/inkbBrushFormat';
+import {
   deleteCustomBrush,
   prepareBrushSettingsForCsp,
 } from '../utils/brushStorage';
@@ -80,18 +85,10 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
       });
     };
 
-    const handleImportSut = async (file: File) => {
+    const handleImportBrush = async (file: File) => {
       setIsImportingSut(true);
       try {
-        const buffer = await file.arrayBuffer();
-        const parsedBrush = await parseSutFile(buffer, file.name);
-        const existing = customBrushes.filter(
-          (b) => b.name.toLowerCase() === parsedBrush.name.toLowerCase() || b.id === parsedBrush.id
-        );
-        for (const old of existing) {
-          await deleteCustomBrush(old.id).catch(() => {});
-        }
-        await saveCustomBrush(parsedBrush);
+        const parsedBrush = await importBrushFile(file);
         setCustomBrushes((prev) => [
           parsedBrush,
           ...prev.filter(
@@ -99,13 +96,25 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
               b.name.toLowerCase() !== parsedBrush.name.toLowerCase() && b.id !== parsedBrush.id
           ),
         ]);
-        await handleSelectCustomBrush(parsedBrush);
+        saveActivePresetId(parsedBrush.id);
       } catch (err: unknown) {
         const msg =
-          err instanceof Error ? err.message : 'Failed to import Clip Studio Paint brush file.';
+          err instanceof Error ? err.message : 'Failed to import brush file.';
         alert(msg);
       } finally {
         setIsImportingSut(false);
+      }
+    };
+
+    const handleExportBrush = async (presetId: string, e?: React.MouseEvent) => {
+      e?.stopPropagation();
+      try {
+        const liveSettings = useToolStore.getState().brushSettings;
+        const brush = buildExportableBrush(presetId, customBrushes, liveSettings);
+        await exportBrushToInkbFile(brush);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to export brush.';
+        alert(msg);
       }
     };
 
@@ -125,26 +134,35 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
 
     return (
       <>
-        <div className="px-1.5 py-1 flex items-center justify-end shrink-0">
+        <div className="px-1.5 py-1 flex items-center justify-end gap-1 shrink-0">
           <button
             type="button"
             onClick={() => sutInputRef.current?.click()}
-            title="Import CSP Brush (.sut)"
+            title="Import Brush (.inkb, .sut)"
             className="h-5 px-1.5 rounded flex items-center gap-1 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
           >
             <Plus className="w-3 h-3" />
-            <span>Import .sut</span>
+            <span>Import</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handleExportBrush(activePreset || DEFAULT_BRUSH_PRESET_ID)}
+            title="Export Active Brush (.inkb)"
+            className="h-5 px-1.5 rounded flex items-center gap-1 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+          >
+            <Download className="w-3 h-3" />
+            <span>Export</span>
           </button>
         </div>
 
         <input
           type="file"
           ref={sutInputRef}
-          accept=".sut"
+          accept=".inkb,.sut"
           className="hidden"
           onChange={(e) => {
             const file = e.target.files?.[0];
-            if (file) handleImportSut(file);
+            if (file) handleImportBrush(file);
             e.target.value = '';
           }}
         />
@@ -162,16 +180,16 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
             e.preventDefault();
             setIsDraggingFileOver(false);
             const files = Array.from(e.dataTransfer.files).filter((f) =>
-              f.name.toLowerCase().endsWith('.sut')
+              isSupportedBrushFileName(f.name)
             );
-            for (const f of files) handleImportSut(f);
+            for (const f of files) handleImportBrush(f);
           }}
           className="flex-1 overflow-y-auto px-1.5 py-0.5 space-y-1 relative min-h-[84px]"
         >
           {isDraggingFileOver && (
             <div className="absolute inset-1 bg-[#161616]/95 rounded flex flex-col items-center justify-center p-2 text-center z-30 pointer-events-none">
               <FolderDown className="w-4 h-4 text-[var(--accent)] mb-1" />
-              <span className="text-[10px] text-[#e5e5e5]">Drop .sut</span>
+              <span className="text-[10px] text-[#e5e5e5]">Drop .inkb / .sut</span>
             </div>
           )}
 
@@ -210,12 +228,11 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
                         (!activePreset && item.id === DEFAULT_BRUSH_PRESET_ID));
 
                     return (
-                      <button
+                      <div
                         key={item.id}
-                        type="button"
                         onClick={() => handleSelectBrushPreset(item.id)}
                         title={`${item.name} - ${item.desc}`}
-                        className={`w-full flex items-center gap-1.5 px-2 py-1 rounded text-left transition-colors cursor-pointer ${
+                        className={`group w-full flex items-center gap-1.5 px-2 py-1 rounded text-left transition-colors cursor-pointer ${
                           isSelected
                             ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
                             : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
@@ -225,7 +242,15 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
                         <span className="text-[11px] truncate leading-tight flex-1">
                           {item.name}
                         </span>
-                      </button>
+                        <button
+                          type="button"
+                          onClick={(e) => handleExportBrush(item.id, e)}
+                          title={`Export ${item.name} (.inkb)`}
+                          className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-[#e5e5e5] shrink-0 cursor-pointer"
+                        >
+                          <Download className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
                     );
                   })}
               </div>
@@ -273,14 +298,24 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
                         )}
                         <span className="text-[11px] truncate leading-tight">{brush.name}</span>
                       </div>
-                      <button
-                        type="button"
-                        onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
-                        title="Delete brush"
-                        className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-red-400 shrink-0 cursor-pointer"
-                      >
-                        <Trash2 className="w-2.5 h-2.5" />
-                      </button>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={(e) => handleExportBrush(brush.id, e)}
+                          title={`Export ${brush.name} (.inkb)`}
+                          className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-[#e5e5e5] shrink-0 cursor-pointer"
+                        >
+                          <Download className="w-2.5 h-2.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
+                          title="Delete brush"
+                          className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-red-400 shrink-0 cursor-pointer"
+                        >
+                          <Trash2 className="w-2.5 h-2.5" />
+                        </button>
+                      </div>
                     </div>
                   );
                 })}

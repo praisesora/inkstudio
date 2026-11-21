@@ -9,7 +9,12 @@ import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUti
 import { LayerItem, LTConversionSettings } from '../types/editor';
 import { PerspectiveRuler } from '../types/perspective';
 import { calculatePerspectiveFromCamera } from '../utils/perspectiveMath';
-import { bake3DToRasterLayer, bake3DToLineAndTone, disposeThreeResources } from '../services/bake3DService';
+import {
+  bake3DToRasterLayer,
+  bake3DToLineAndTone,
+  createSafeWebGLRenderer,
+  disposeThreeResources,
+} from '../services/bake3DService';
 import {
   createProceduralMannequin,
   findHumanoidBones,
@@ -54,9 +59,12 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   onUpdatePerspectiveRuler,
 }) => {
   const mountRef = useRef<HTMLDivElement | null>(null);
+  const canvasHostRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const loadedFileKeyRef = useRef<string | null>(null);
+  const [webglError, setWebglError] = useState<string | null>(null);
+  const [sceneReadyVersion, setSceneReadyVersion] = useState<number>(0);
 
   // Local Three.js state references
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -247,11 +255,14 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     }
   }, [gizmoMode]);
 
-  // Initialize Three.js scene strictly locally with clamped resolution
+  // Initialize Three.js scene strictly locally on a fresh canvas per lifecycle
   useEffect(() => {
-    if (!isOpen || !canvasRef.current) return;
+    if (!isOpen || !canvasHostRef.current) return;
 
-    const canvas = canvasRef.current;
+    const host = canvasHostRef.current;
+    host.replaceChildren();
+    setWebglError(null);
+
     const docAspect = dimensions.width / Math.max(1, dimensions.height);
 
     const MAX_PREVIEW = 1920;
@@ -267,8 +278,29 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       }
     }
 
+    // Create a fresh WebGL renderer & canvas so StrictMode/re-mounts never touch a force-lost context
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = createSafeWebGLRenderer({
+        alpha: true,
+        antialias: true,
+        powerPreference: 'high-performance',
+        preserveDrawingBuffer: true,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to initialize 3D WebGL context.';
+      console.error('[3D] Renderer initialization failed:', err);
+      setWebglError(msg);
+      return;
+    }
+
+    const canvas = renderer.domElement;
     canvas.width = previewW;
     canvas.height = previewH;
+    canvas.className = 'w-full h-full block';
+    canvas.style.imageRendering = 'auto';
+    host.appendChild(canvas);
+    canvasRef.current = canvas;
 
     // 1. Scene
     const scene = new THREE.Scene();
@@ -279,14 +311,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     camera.position.set(0, 0.5, 3.8);
     cameraRef.current = camera;
 
-    // 3. WebGL Renderer
-    const renderer = new THREE.WebGLRenderer({
-      canvas,
-      alpha: true,
-      antialias: true,
-      powerPreference: 'high-performance',
-      preserveDrawingBuffer: true,
-    });
+    // 3. Configure WebGL Renderer
     renderer.setSize(previewW, previewH, false);
     renderer.setPixelRatio(1);
     renderer.setClearColor(0x000000, 0);
@@ -392,6 +417,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       running = false;
     };
     canvas.addEventListener('webglcontextlost', handleContextLost, false);
+    setSceneReadyVersion((v) => v + 1);
 
     return () => {
       running = false;
@@ -406,6 +432,8 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
       transformControls.dispose();
       controls.dispose();
       disposeThreeResources(scene, renderer);
+      canvas.remove();
+      canvasRef.current = null;
       sceneRef.current = null;
       cameraRef.current = null;
       rendererRef.current = null;
@@ -666,7 +694,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
   }, []);
 
   // Canvas Pointer Events: Route dragging based on CSP active tool
-  const handleCanvasPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
+  const handleCanvasPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     const isModelMode =
       activeToolMode === 'model-move' ||
       activeToolMode === 'model-rotate-free' ||
@@ -677,8 +705,11 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     // If active tool is a model transform or if not left-clicking, handle accordingly
     if (isModelMode && e.button === 0) {
       if (controlsRef.current) controlsRef.current.enabled = false;
-      const canvas = canvasRef.current;
-      if (canvas) canvas.setPointerCapture(e.pointerId);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
 
       canvasDragRef.current = {
         startX: e.clientX,
@@ -693,7 +724,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     }
   };
 
-  const handleCanvasPointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
+  const handleCanvasPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!canvasDragRef.current) return;
     const dx = e.clientX - canvasDragRef.current.lastX;
     const dy = e.clientY - canvasDragRef.current.lastY;
@@ -705,10 +736,10 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     }
   };
 
-  const handleCanvasPointerUp = (e: React.PointerEvent<HTMLCanvasElement>) => {
+  const handleCanvasPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
     if (canvasDragRef.current) {
       try {
-        canvasRef.current?.releasePointerCapture(e.pointerId);
+        e.currentTarget.releasePointerCapture(e.pointerId);
       } catch {
         // ignore
       }
@@ -862,7 +893,7 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
         loadFromFile(initialFile);
       }
     }
-  }, [initialFile, isOpen, loadFromFile]);
+  }, [initialFile, isOpen, loadFromFile, sceneReadyVersion]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1077,8 +1108,8 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
           }
         }}
       >
-        <canvas
-          ref={canvasRef}
+        <div
+          ref={canvasHostRef}
           onPointerDown={handleCanvasPointerDown}
           onPointerMove={handleCanvasPointerMove}
           onPointerUp={handleCanvasPointerUp}
@@ -1091,12 +1122,27 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
           }`}
           style={{
             opacity,
-            imageRendering: 'auto',
           }}
         />
 
+        {webglError && (
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+            <div className="bg-[#202020]/95 border border-red-500/40 backdrop-blur-md rounded-lg px-5 py-4 flex flex-col items-center space-y-2.5 pointer-events-auto shadow-2xl text-center max-w-xs">
+              <p className="text-xs font-medium text-red-400">3D Viewport Unavailable</p>
+              <p className="text-[11px] text-[#8a8a8a] break-words">{webglError}</p>
+              <button
+                type="button"
+                onClick={onClose}
+                className="px-3 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Empty state prompt if no model is loaded */}
-        {!loadedFileName && (
+        {!webglError && !loadedFileName && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="bg-[#202020]/95 border border-white/[0.1] backdrop-blur-md rounded-lg px-6 py-5 flex flex-col items-center space-y-3 pointer-events-auto shadow-2xl text-center max-w-xs">
               <div className="w-10 h-10 rounded-md bg-[#161616] border border-white/[0.08] flex items-center justify-center text-[#8a8a8a]">

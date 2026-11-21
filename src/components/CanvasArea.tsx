@@ -21,7 +21,8 @@ import { TextEditorOverlay } from './TextEditorOverlay';
 import { SpeechBalloonOverlay } from './SpeechBalloonOverlay';
 import { SmartphoneViewportSimulator } from './SmartphoneViewportSimulator';
 import { PerspectiveRulerOverlay } from './PerspectiveRulerOverlay';
-import { PerspectiveRuler, ConstraintAxis } from '../types/perspective';
+import { StraightRulerOverlay } from './StraightRulerOverlay';
+import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../types/perspective';
 import { Local3DContainer } from './Local3DContainer';
 import { ViewportCompositor } from '../utils/compositor';
 import { SparseTileGrid, globalTileGrid } from '../utils/tileEngine';
@@ -109,6 +110,8 @@ interface CanvasAreaProps {
   onCancelText?: () => void;
   perspectiveRuler?: PerspectiveRuler | null;
   onUpdatePerspectiveRuler?: (ruler: PerspectiveRuler | null) => void;
+  straightRuler?: StraightRuler | null;
+  onUpdateStraightRuler?: (ruler: StraightRuler | null) => void;
   activeLockedAxis?: ConstraintAxis | null;
   isDrawing?: boolean;
   is3DLayerOpen?: boolean;
@@ -289,6 +292,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
   onCancelText,
   perspectiveRuler = null,
   onUpdatePerspectiveRuler,
+  straightRuler = null,
+  onUpdateStraightRuler,
   activeLockedAxis = null,
   isDrawing = false,
   is3DLayerOpen = false,
@@ -1714,6 +1719,23 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo(({
           </filter>
         </defs>
       </svg>
+
+      {/* Interactive Straight Ruler Overlay */}
+      {straightRuler && straightRuler.enabled && onUpdateStraightRuler && (
+        <StraightRulerOverlay
+          ruler={straightRuler}
+          onUpdateRuler={onUpdateStraightRuler}
+          onCloseRuler={() => onUpdateStraightRuler({ ...straightRuler, enabled: false })}
+          dimensions={dimensions}
+          pan={livePan}
+          zoom={liveZoom}
+          rotation={liveRotation}
+          flipX={liveFlipX}
+          flipY={liveFlipY}
+          navigation={navigation}
+          viewportRef={viewportRef}
+        />
+      )}
 
       {/* Interactive Perspective Ruler Overlay Layer (Clip Studio Paint style) */}
       {perspectiveRuler && onUpdatePerspectiveRuler && (

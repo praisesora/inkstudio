@@ -11,6 +11,7 @@ import { useUiStore } from '../../stores/useUiStore';
 import { BrushSizePalette } from '../../components/BrushSizePalette';
 import { StatusBar } from '../../components/StatusBar';
 import { DocumentTabBar } from '../../components/DocumentTabBar';
+import { DockGroupView } from '../../components/DockWorkspace';
 import { BrushSettings, DocumentTab } from '../../types/editor';
 
 function createMemoryStorage(): Storage {
@@ -122,6 +123,20 @@ class MiniEl extends EventTarget {
 
   removeAttribute(k: string) {
     this.attrs.delete(k);
+  }
+
+  getBoundingClientRect() {
+    return {
+      left: 220,
+      right: 240,
+      top: 48,
+      bottom: 68,
+      width: 20,
+      height: 20,
+      x: 220,
+      y: 48,
+      toJSON: () => ({}),
+    };
   }
 
   contains(target: unknown): boolean {
@@ -489,5 +504,55 @@ describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in 
       expect(statusBar?.textContent).toContain('420, 180px');
       expect(statusBar?.textContent).toContain('75%');
     }
+  });
+
+  it('portals the Sub Tool three-dot panel menu to document.body with fixed viewport-clamped positioning', () => {
+    const group = {
+      id: 'grp-subtool',
+      panelIds: ['subtool' as const],
+      activePanelId: 'subtool' as const,
+      heightRatio: 1,
+    };
+    const col = { id: 'col-left', width: 240, collapsed: false, groups: [group] };
+
+    act(() => {
+      root = createRoot(dom.container as unknown as Element);
+      root.render(
+        <DockGroupView
+          side="left"
+          col={col}
+          group={group}
+          themePreset="modern"
+          draggingPanelId={null}
+          onStartDragPanel={() => {}}
+          onEndDragPanel={() => {}}
+          renderPanelBody={(panelId) => <div data-testid={`panel-body-${panelId}`}>{panelId}</div>}
+        />
+      );
+    });
+
+    const subtoolMenuBtn = dom.container.findByAttr('data-testid', 'dock-menu-btn-subtool');
+    expect(subtoolMenuBtn).not.toBeNull();
+
+    // Open the three-dot menu via React onClick prop (MiniEl EventTarget doesn't bubble to React root)
+    const reactPropsKey = Object.keys(subtoolMenuBtn!).find((k) => k.startsWith('__reactProps'));
+    expect(reactPropsKey).toBeDefined();
+    const reactProps = (subtoolMenuBtn as unknown as Record<string, { onClick?: (e: unknown) => void }>)[
+      reactPropsKey!
+    ];
+    act(() => {
+      reactProps.onClick?.({ stopPropagation: () => {}, preventDefault: () => {} });
+    });
+
+    const body = document.body as unknown as MiniEl;
+    const popoverInBody = body.findByAttr('data-testid', 'dock-menu-popover-subtool');
+    const popoverInContainer = dom.container.findByAttr('data-testid', 'dock-menu-popover-subtool');
+
+    // Menu must be portaled into document.body (outside overflow-hidden dock container)
+    expect(popoverInBody).not.toBeNull();
+    expect(popoverInContainer).toBeNull();
+    expect(popoverInBody!.style.position).toBe('fixed');
+    expect(popoverInBody!.style.top).toBe('72px');
+    expect(popoverInBody!.style.left).toBe('220px');
   });
 });
