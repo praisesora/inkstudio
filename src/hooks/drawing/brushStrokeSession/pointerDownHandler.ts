@@ -2,6 +2,10 @@ import React from 'react';
 import { Point } from '../../../types/editor';
 import { calculateStrokeWidth, get2DContext } from '../../../utils/canvasUtils';
 import { PaintReservoir, LayerPixelSampler } from '../../../utils/colorMixingEngine';
+import {
+  isNaturalPaintBrush,
+  NaturalPaintStrokeSession,
+} from '../../../engine/NaturalPaintRenderer';
 import { useUiStore } from '../../../stores';
 import { recoveryService } from '../../../services/recoveryService';
 import { isLinearPressureCurve } from '../../../utils/pressureCurve';
@@ -316,9 +320,24 @@ export function runPointerDown(
     state.dirtyRect.maxY
   );
 
-  const isWetColor = !isEraser && Boolean(bs.colorMixing);
+  const isNaturalBrush =
+    !isEraser &&
+    !isBgEraser &&
+    !isMonochrome &&
+    !bs.isTransparentInk &&
+    !isVectorOrMask &&
+    isNaturalPaintBrush(bs);
+  const isWetColor =
+    !isEraser &&
+    bs.colorMixing !== false &&
+    (Boolean(bs.colorMixing) || (isNaturalBrush && Boolean(bs.naturalPaint?.spatialMixing)));
   state.isWetColorStroke = isWetColor;
   state.liveNeedsNotify = false;
+
+  if (state.naturalPaintSession) {
+    state.naturalPaintSession.finishAndDispose();
+    state.naturalPaintSession = null;
+  }
 
   if (isWetColor) {
     state.layerPixelSampler = new LayerPixelSampler(
@@ -330,6 +349,16 @@ export function runPointerDown(
   } else {
     state.layerPixelSampler = null;
     state.activeReservoir = null;
+  }
+
+  if (isNaturalBrush) {
+    state.naturalStrokeSeed = (state.naturalStrokeSeed + 9973) & 0x7fffffff;
+    state.naturalPaintSession = new NaturalPaintStrokeSession(
+      bs,
+      strokeColor,
+      undefined,
+      state.naturalStrokeSeed
+    );
   }
 
   const strokeId = `stroke-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;

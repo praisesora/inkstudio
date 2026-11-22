@@ -7,6 +7,12 @@
  */
 
 import { VectorKnot, VectorStroke } from '../types/editor';
+import {
+  computeBezierPathBounds,
+  isUniformWidthBezier,
+  tessellateBezierStroke,
+  traceBezierPathOnContext,
+} from './bezierEngine';
 
 export interface Point2D {
   x: number;
@@ -114,8 +120,12 @@ export function evaluateCatmullRom(
 
 /**
  * Discretize a spline stroke into fine polyline segments for accurate rendering and intersection checks.
+ * Supports both Catmull-Rom freehand strokes and true cubic Bézier paths with explicit handles.
  */
 export function tessellateStroke(stroke: VectorStroke, stepsPerSegment = 6): VectorKnot[] {
+  if (stroke.curveType === 'bezier') {
+    return tessellateBezierStroke(stroke, stepsPerSegment);
+  }
   const knots = stroke.knots;
   if (knots.length === 0) return [];
   if (knots.length === 1) return [knots[0]];
@@ -142,9 +152,13 @@ export function tessellateStroke(stroke: VectorStroke, stepsPerSegment = 6): Vec
 }
 
 /**
- * Compute axis-aligned bounding box of a list of knots.
+ * Compute axis-aligned bounding box of a list of knots (uses analytical cubic extrema for Bézier paths).
  */
-export function computeStrokeBounds(knots: VectorKnot[]): {
+export function computeStrokeBounds(
+  knots: VectorKnot[],
+  closed = false,
+  curveType?: 'catmull-rom' | 'bezier'
+): {
   minX: number;
   minY: number;
   maxX: number;
@@ -153,6 +167,13 @@ export function computeStrokeBounds(knots: VectorKnot[]): {
   if (knots.length === 0) {
     return { minX: 0, minY: 0, maxX: 0, maxY: 0 };
   }
+  const hasBezierHandles =
+    curveType === 'bezier' ||
+    knots.some((k) => Boolean(k.handleIn) || Boolean(k.handleOut));
+  if (hasBezierHandles) {
+    return computeBezierPathBounds(knots, closed);
+  }
+
   let minX = Infinity;
   let minY = Infinity;
   let maxX = -Infinity;
@@ -594,8 +615,9 @@ export function applyVectorEraser(
 }
 
 /**
- * Render a single vector stroke to a Canvas 2D context using Catmull-Rom tessellation
- * with pressure-sensitive stroke width and smooth round caps.
+ * Render a single vector stroke to a Canvas 2D context.
+ * True cubic Bézier paths (`curveType === 'bezier'`) use native `ctx.bezierCurveTo()`
+ * for filled paths and uniform-width strokes, and adaptive cubic tessellation for variable widths.
  */
 export function renderVectorStroke(
   ctx: CanvasRenderingContext2D,
@@ -603,15 +625,52 @@ export function renderVectorStroke(
 ): void {
   if (stroke.deleted || stroke.knots.length < 2) return;
 
-  const tessellated = tessellateStroke(stroke);
-  if (tessellated.length < 2) return;
-
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  ctx.globalAlpha = stroke.opacity ?? 1.0;
+
+  if (stroke.curveType === 'bezier') {
+    const closed = Boolean(stroke.closed);
+    if (closed && stroke.fillColor) {
+      traceBezierPathOnContext(ctx, stroke.knots, true);
+      ctx.fillStyle = stroke.fillColor;
+      ctx.fill();
+    }
+
+    if (stroke.baseWidth > 0 && stroke.color && stroke.color !== 'none') {
+      ctx.strokeStyle = stroke.color;
+      if (isUniformWidthBezier(stroke.knots)) {
+        traceBezierPathOnContext(ctx, stroke.knots, closed);
+        ctx.lineWidth = Math.max(0.5, stroke.knots[0]?.width ?? stroke.baseWidth);
+        ctx.stroke();
+        ctx.restore();
+        return;
+      }
+      const tessellated = tessellateBezierStroke(stroke, 8);
+      for (let i = 0; i < tessellated.length - 1; i++) {
+        const k1 = tessellated[i];
+        const k2 = tessellated[i + 1];
+        ctx.lineWidth = Math.max(0.5, (k1.width + k2.width) * 0.5);
+        ctx.beginPath();
+        ctx.moveTo(k1.x, k1.y);
+        ctx.lineTo(k2.x, k2.y);
+        ctx.stroke();
+      }
+    }
+
+    ctx.restore();
+    return;
+  }
+
+  const tessellated = tessellateStroke(stroke);
+  if (tessellated.length < 2) {
+    ctx.restore();
+    return;
+  }
+
   ctx.strokeStyle = stroke.color;
   ctx.fillStyle = stroke.color;
-  ctx.globalAlpha = stroke.opacity ?? 1.0;
 
   for (let i = 0; i < tessellated.length - 1; i++) {
     const k1 = tessellated[i];
@@ -764,10 +823,14 @@ export function reshapeVectorLine(
       const dist = Math.hypot(k.x - cursorPos.x, k.y - cursorPos.y);
       if (dist >= radius) return k;
       const factor = Math.cos((dist / radius) * (Math.PI / 2)); // Smooth cosine falloff
+      const dx = delta.x * factor;
+      const dy = delta.y * factor;
       return {
         ...k,
-        x: k.x + delta.x * factor,
-        y: k.y + delta.y * factor,
+        x: k.x + dx,
+        y: k.y + dy,
+        handleIn: k.handleIn ? { x: k.handleIn.x + dx, y: k.handleIn.y + dy } : k.handleIn,
+        handleOut: k.handleOut ? { x: k.handleOut.x + dx, y: k.handleOut.y + dy } : k.handleOut,
       };
     });
   }
@@ -776,7 +839,7 @@ export function reshapeVectorLine(
     ...stroke,
     baseWidth,
     knots,
-    bounds: computeStrokeBounds(knots),
+    bounds: computeStrokeBounds(knots, Boolean(stroke.closed), stroke.curveType),
   };
 }
 
@@ -816,17 +879,21 @@ export function pinchVectorStroke(
     const dist = Math.hypot(k.x - point.x, k.y - point.y);
     if (dist >= radius) return k;
     const factor = 0.5 * (1 + Math.cos(Math.PI * dist * invRadius));
+    const dx = delta.x * factor;
+    const dy = delta.y * factor;
     return {
       ...k,
-      x: k.x + delta.x * factor,
-      y: k.y + delta.y * factor,
+      x: k.x + dx,
+      y: k.y + dy,
+      handleIn: k.handleIn ? { x: k.handleIn.x + dx, y: k.handleIn.y + dy } : k.handleIn,
+      handleOut: k.handleOut ? { x: k.handleOut.x + dx, y: k.handleOut.y + dy } : k.handleOut,
     };
   });
 
   return {
     ...stroke,
     knots: updatedKnots,
-    bounds: computeStrokeBounds(updatedKnots),
+    bounds: computeStrokeBounds(updatedKnots, Boolean(stroke.closed), stroke.curveType),
   };
 }
 

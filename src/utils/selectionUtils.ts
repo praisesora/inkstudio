@@ -1,9 +1,15 @@
 import { CanvasDimensions, CanvasSelection, DirtyRect, LayerItem, TileDelta, WandSettings } from '../types/editor';
 import {
+  BYTES_1BIT,
+  BYTES_8BIT,
+  BYTES_32BIT,
   SparseTileGrid,
   TILE_SIZE,
   TileFormat,
   TileSnapshotEntry,
+  getTileKey,
+  packRGBATo1Bit,
+  packRGBATo8Bit,
   pixelToTileCoord,
   releaseTemporaryCanvas,
 } from './tileEngine';
@@ -1188,22 +1194,41 @@ export function clearSelectionInTileGrid(params: {
               }
             }
           }
-        } else if (maskCanvas && mCtx && selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
-          if (maskCanvas.width !== cw) maskCanvas.width = cw;
-          if (maskCanvas.height !== ch) maskCanvas.height = ch;
-          mCtx.clearRect(0, 0, cw, ch);
-          mCtx.save();
-          mCtx.translate(-cx, -cy);
-          mCtx.fillStyle = isBackground ? '#ffffff' : '#000000';
-          mCtx.beginPath();
-          mCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-          for (let i = 1; i < selection.polygon.length; i++) {
-            mCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+        } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+          if (maskCanvas && mCtx) {
+            if (maskCanvas.width !== cw) maskCanvas.width = cw;
+            if (maskCanvas.height !== ch) maskCanvas.height = ch;
+            mCtx.clearRect(0, 0, cw, ch);
+            mCtx.save();
+            mCtx.translate(-cx, -cy);
+            mCtx.fillStyle = isBackground ? '#ffffff' : '#000000';
+            mCtx.beginPath();
+            mCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+            for (let i = 1; i < selection.polygon.length; i++) {
+              mCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+            }
+            mCtx.closePath();
+            mCtx.fill();
+            mCtx.restore();
+            chunkAlpha = mCtx.getImageData(0, 0, cw, ch).data;
+          } else {
+            chunkAlpha = new Uint8ClampedArray(cw * ch * 4);
+            const rgb = isBackground ? 255 : 0;
+            const poly = selection.polygon;
+            for (let ly = 0; ly < ch; ly++) {
+              const gy = cy + ly + 0.5;
+              const dRow = ly * cw * 4;
+              for (let lx = 0; lx < cw; lx++) {
+                if (isPointInPolygon(cx + lx + 0.5, gy, poly)) {
+                  const off = dRow + lx * 4;
+                  chunkAlpha[off] = rgb;
+                  chunkAlpha[off + 1] = rgb;
+                  chunkAlpha[off + 2] = rgb;
+                  chunkAlpha[off + 3] = 255;
+                }
+              }
+            }
           }
-          mCtx.closePath();
-          mCtx.fill();
-          mCtx.restore();
-          chunkAlpha = mCtx.getImageData(0, 0, cw, ch).data;
         } else {
           continue;
         }
@@ -1485,5 +1510,572 @@ export function commitFloatingSelectionToTileGrid(params: {
 
   const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
   grid.notifyChange(true);
+  return { dirtyRect, tileDeltas };
+}
+
+export interface SelectionTileSnapshot {
+  format: TileFormat;
+  tiles: Array<{ tileX: number; tileY: number; format: TileFormat; data: Uint8Array }>;
+  bounds: DirtyRect;
+}
+
+function encodeRgbaToTileData(rgba: Uint8ClampedArray, format: TileFormat): Uint8Array {
+  if (format === 'monochrome-1bit') {
+    const out = new Uint8Array(BYTES_1BIT);
+    packRGBATo1Bit(rgba, out);
+    return out;
+  }
+  if (format === 'grayscale-8bit') {
+    const out = new Uint8Array(BYTES_8BIT);
+    packRGBATo8Bit(rgba, out);
+    return out;
+  }
+  const out = new Uint8Array(BYTES_32BIT);
+  out.set(rgba);
+  return out;
+}
+
+function buildTileLassoAlpha(
+  polygon: Array<{ x: number; y: number }>,
+  tileDocX: number,
+  tileDocY: number,
+  outAlpha: Uint8Array,
+  scratchCanvas: HTMLCanvasElement | null,
+  scratchCtx: CanvasRenderingContext2D | null
+): void {
+  outAlpha.fill(0);
+  if (scratchCanvas && scratchCtx) {
+    scratchCtx.clearRect(0, 0, TILE_SIZE, TILE_SIZE);
+    scratchCtx.save();
+    scratchCtx.translate(-tileDocX, -tileDocY);
+    scratchCtx.fillStyle = '#ffffff';
+    scratchCtx.beginPath();
+    scratchCtx.moveTo(polygon[0].x, polygon[0].y);
+    for (let i = 1; i < polygon.length; i++) {
+      scratchCtx.lineTo(polygon[i].x, polygon[i].y);
+    }
+    scratchCtx.closePath();
+    scratchCtx.fill();
+    scratchCtx.restore();
+    const img = scratchCtx.getImageData(0, 0, TILE_SIZE, TILE_SIZE).data;
+    for (let i = 0; i < TILE_SIZE * TILE_SIZE; i++) {
+      outAlpha[i] = img[i * 4 + 3];
+    }
+    return;
+  }
+
+  for (let ly = 0; ly < TILE_SIZE; ly++) {
+    const gy = tileDocY + ly + 0.5;
+    const row = ly * TILE_SIZE;
+    for (let lx = 0; lx < TILE_SIZE; lx++) {
+      if (isPointInPolygon(tileDocX + lx + 0.5, gy, polygon)) {
+        outAlpha[row + lx] = 255;
+      }
+    }
+  }
+}
+
+/**
+ * Tile-native extraction of selected pixels into a sparse tile snapshot at original document coordinates.
+ * Zero full-document HTMLCanvasElement allocation. Returns null if the selected region is empty.
+ */
+export function extractSelectionTileSnapshot(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  selection: CanvasSelection;
+  targetFormat?: TileFormat;
+}): SelectionTileSnapshot | null {
+  const { grid, layerId, dimensions, selection } = params;
+  const format = params.targetFormat ?? grid.getLayerFormat(layerId);
+
+  if (selection.floating) {
+    const { canvas, x, y } = selection.floating;
+    const fCtx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!fCtx) return null;
+
+    const dx = Math.round(x);
+    const dy = Math.round(y);
+    const clipX0 = Math.max(0, dx);
+    const clipY0 = Math.max(0, dy);
+    const clipX1 = Math.min(dimensions.width, dx + canvas.width);
+    const clipY1 = Math.min(dimensions.height, dy + canvas.height);
+    if (clipX1 <= clipX0 || clipY1 <= clipY0) return null;
+
+    const minTx = pixelToTileCoord(clipX0, 0);
+    const minTy = pixelToTileCoord(clipY0, 0);
+    const maxTx = pixelToTileCoord(clipX1 - 1, 0);
+    const maxTy = pixelToTileCoord(clipY1 - 1, 0);
+
+    const tiles: SelectionTileSnapshot['tiles'] = [];
+    const tileRgba = new Uint8ClampedArray(BYTES_32BIT);
+
+    for (let ty = minTy; ty <= maxTy; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      const y0 = Math.max(clipY0, tileDocY);
+      const y1 = Math.min(clipY1, tileDocY + TILE_SIZE);
+      for (let tx = minTx; tx <= maxTx; tx++) {
+        const tileDocX = tx * TILE_SIZE;
+        const x0 = Math.max(clipX0, tileDocX);
+        const x1 = Math.min(clipX1, tileDocX + TILE_SIZE);
+        const cw = x1 - x0;
+        const ch = y1 - y0;
+        if (cw <= 0 || ch <= 0) continue;
+
+        const img = fCtx.getImageData(x0 - dx, y0 - dy, cw, ch).data;
+        tileRgba.fill(0);
+        let hasOpaque = false;
+        const dstStartX = x0 - tileDocX;
+        const dstStartY = y0 - tileDocY;
+
+        for (let row = 0; row < ch; row++) {
+          const srcRow = row * cw * 4;
+          const dstRow = ((dstStartY + row) * TILE_SIZE + dstStartX) * 4;
+          for (let col = 0; col < cw; col++) {
+            const sOff = srcRow + col * 4;
+            const a = img[sOff + 3];
+            if (a > 0) {
+              hasOpaque = true;
+              const dOff = dstRow + col * 4;
+              tileRgba[dOff] = img[sOff];
+              tileRgba[dOff + 1] = img[sOff + 1];
+              tileRgba[dOff + 2] = img[sOff + 2];
+              tileRgba[dOff + 3] = a;
+            }
+          }
+        }
+
+        if (hasOpaque) {
+          tiles.push({
+            tileX: tx,
+            tileY: ty,
+            format,
+            data: encodeRgbaToTileData(tileRgba, format),
+          });
+        }
+      }
+    }
+
+    if (tiles.length === 0) return null;
+    return {
+      format,
+      tiles,
+      bounds: { x: clipX0, y: clipY0, width: clipX1 - clipX0, height: clipY1 - clipY0 },
+    };
+  }
+
+  const raw = selection.bounds;
+  if (!raw || raw.width <= 0 || raw.height <= 0) return null;
+
+  const bx = Math.max(0, Math.floor(raw.x));
+  const by = Math.max(0, Math.floor(raw.y));
+  const bx1 = Math.min(dimensions.width, Math.ceil(raw.x + raw.width));
+  const by1 = Math.min(dimensions.height, Math.ceil(raw.y + raw.height));
+  if (bx1 <= bx || by1 <= by) return null;
+
+  const intersecting = grid.getTilesInBounds(layerId, bx, by, bx1 - 1, by1 - 1, 0);
+  if (intersecting.length === 0) return null;
+
+  const hasMask = Boolean(selection.mask && selection.maskWidth && selection.maskHeight);
+  const hasLasso =
+    !hasMask && selection.type === 'lasso' && Boolean(selection.polygon && selection.polygon.length >= 3);
+
+  let scratchCanvas: HTMLCanvasElement | null = null;
+  let scratchCtx: CanvasRenderingContext2D | null = null;
+  const lassoAlpha = hasLasso ? new Uint8Array(TILE_SIZE * TILE_SIZE) : null;
+  if (hasLasso && typeof document !== 'undefined') {
+    scratchCanvas = document.createElement('canvas');
+    scratchCanvas.width = TILE_SIZE;
+    scratchCanvas.height = TILE_SIZE;
+    scratchCtx = scratchCanvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  const tiles: SelectionTileSnapshot['tiles'] = [];
+  const outRgba = new Uint8ClampedArray(BYTES_32BIT);
+
+  try {
+    for (const tile of intersecting) {
+      if (!tile.data) continue;
+      const tileDocX = tile.tileX * TILE_SIZE;
+      const tileDocY = tile.tileY * TILE_SIZE;
+      const x0 = Math.max(bx, tileDocX);
+      const y0 = Math.max(by, tileDocY);
+      const x1 = Math.min(bx1, tileDocX + TILE_SIZE);
+      const y1 = Math.min(by1, tileDocY + TILE_SIZE);
+      if (x1 <= x0 || y1 <= y0) continue;
+
+      const srcRgba = grid.getTileAsRGBA(tile);
+      outRgba.fill(0);
+      let hasOpaque = false;
+
+      if (hasLasso && lassoAlpha && selection.polygon) {
+        buildTileLassoAlpha(selection.polygon, tileDocX, tileDocY, lassoAlpha, scratchCanvas, scratchCtx);
+      }
+
+      const lx0 = x0 - tileDocX;
+      const ly0 = y0 - tileDocY;
+      const lx1 = x1 - tileDocX;
+      const ly1 = y1 - tileDocY;
+
+      if (hasMask && selection.mask && selection.maskWidth && selection.maskHeight) {
+        const mw = selection.maskWidth;
+        const mh = selection.maskHeight;
+        for (let ly = ly0; ly < ly1; ly++) {
+          const gy = tileDocY + ly;
+          if (gy < 0 || gy >= mh) continue;
+          const mRow = gy * mw;
+          const tRow = ly * TILE_SIZE;
+          for (let lx = lx0; lx < lx1; lx++) {
+            const gx = tileDocX + lx;
+            const ma = gx >= 0 && gx < mw ? selection.mask[mRow + gx] : 0;
+            if (ma === 0) continue;
+            const off = (tRow + lx) * 4;
+            const sa = srcRgba[off + 3];
+            if (sa === 0) continue;
+            const ea = ma === 255 ? sa : Math.round((sa * ma) / 255);
+            if (ea === 0) continue;
+            hasOpaque = true;
+            outRgba[off] = srcRgba[off];
+            outRgba[off + 1] = srcRgba[off + 1];
+            outRgba[off + 2] = srcRgba[off + 2];
+            outRgba[off + 3] = ea;
+          }
+        }
+      } else if (hasLasso && lassoAlpha) {
+        for (let ly = ly0; ly < ly1; ly++) {
+          const tRow = ly * TILE_SIZE;
+          for (let lx = lx0; lx < lx1; lx++) {
+            const ma = lassoAlpha[tRow + lx];
+            if (ma === 0) continue;
+            const off = (tRow + lx) * 4;
+            const sa = srcRgba[off + 3];
+            if (sa === 0) continue;
+            const ea = ma === 255 ? sa : Math.round((sa * ma) / 255);
+            if (ea === 0) continue;
+            hasOpaque = true;
+            outRgba[off] = srcRgba[off];
+            outRgba[off + 1] = srcRgba[off + 1];
+            outRgba[off + 2] = srcRgba[off + 2];
+            outRgba[off + 3] = ea;
+          }
+        }
+      } else {
+        for (let ly = ly0; ly < ly1; ly++) {
+          const tRow = ly * TILE_SIZE;
+          for (let lx = lx0; lx < lx1; lx++) {
+            const off = (tRow + lx) * 4;
+            const sa = srcRgba[off + 3];
+            if (sa === 0) continue;
+            hasOpaque = true;
+            outRgba[off] = srcRgba[off];
+            outRgba[off + 1] = srcRgba[off + 1];
+            outRgba[off + 2] = srcRgba[off + 2];
+            outRgba[off + 3] = sa;
+          }
+        }
+      }
+
+      if (hasOpaque) {
+        tiles.push({
+          tileX: tile.tileX,
+          tileY: tile.tileY,
+          format,
+          data: encodeRgbaToTileData(outRgba, format),
+        });
+      }
+    }
+  } finally {
+    if (scratchCanvas) releaseTemporaryCanvas(scratchCanvas);
+  }
+
+  if (tiles.length === 0) return null;
+  return {
+    format,
+    tiles,
+    bounds: { x: bx, y: by, width: bx1 - bx, height: by1 - by },
+  };
+}
+
+/**
+ * Tile-native Delete Outside Selection: erases (or fills white on background) every pixel
+ * on `layerId` outside `selection`, leaving only the selected pixels intact.
+ */
+export function clearOutsideSelectionInTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  selection: CanvasSelection;
+  isBackground: boolean;
+  targetFormat: TileFormat;
+  snapshotOut?: Map<string, TileSnapshotEntry>;
+}): { dirtyRect: DirtyRect | null; tileDeltas: TileDelta[] } {
+  const { grid, layerId, dimensions, selection, isBackground, targetFormat } = params;
+  const fullRect: DirtyRect = { x: 0, y: 0, width: dimensions.width, height: dimensions.height };
+
+  if (selection.floating) {
+    const beforeSnapshot = params.snapshotOut ?? new Map<string, TileSnapshotEntry>();
+    if (selection.floating.beforeTileSnapshot) {
+      for (const [k, v] of selection.floating.beforeTileSnapshot.entries()) {
+        if (!beforeSnapshot.has(k)) {
+          beforeSnapshot.set(k, v);
+        }
+      }
+    }
+
+    const existingTiles = grid.getLayerTiles(layerId, 0);
+    for (const tile of existingTiles) {
+      const key = getTileKey(layerId, tile.tileX, tile.tileY, 0);
+      if (!beforeSnapshot.has(key)) {
+        beforeSnapshot.set(key, {
+          format: tile.format,
+          data: tile.data ? new Uint8Array(tile.data) : null,
+        });
+      }
+    }
+
+    grid.clearLayer(layerId);
+    if (isBackground) {
+      grid.fillLayerSolidWhite(layerId, dimensions.width, dimensions.height, targetFormat);
+    }
+
+    const { canvas, x, y } = selection.floating;
+    const fCtx = canvas.getContext('2d', { willReadFrequently: true });
+    const dx = Math.round(x);
+    const dy = Math.round(y);
+    const clipX0 = Math.max(0, dx);
+    const clipY0 = Math.max(0, dy);
+    const clipX1 = Math.min(dimensions.width, dx + canvas.width);
+    const clipY1 = Math.min(dimensions.height, dy + canvas.height);
+
+    if (fCtx && clipX1 > clipX0 && clipY1 > clipY0) {
+      const imgData = fCtx.getImageData(clipX0 - dx, clipY0 - dy, clipX1 - clipX0, clipY1 - clipY0);
+      grid.compositeStrokeToTiles({
+        layerId,
+        strokeData: imgData,
+        destX: clipX0,
+        destY: clipY0,
+        format: targetFormat,
+        compositeOp: 'source-over',
+        opacity: 1.0,
+        snapshotOut: beforeSnapshot,
+        suppressNotify: true,
+      });
+    }
+
+    if (!isBackground) {
+      grid.pruneEmptyTiles(layerId);
+    }
+    const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId);
+    grid.notifyChange(true);
+    return { dirtyRect: fullRect, tileDeltas };
+  }
+
+  const raw = selection.bounds;
+  if (!raw || raw.width <= 0 || raw.height <= 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const bx = Math.max(0, Math.floor(raw.x));
+  const by = Math.max(0, Math.floor(raw.y));
+  const bx1 = Math.min(dimensions.width, Math.ceil(raw.x + raw.width));
+  const by1 = Math.min(dimensions.height, Math.ceil(raw.y + raw.height));
+  if (bx1 <= bx || by1 <= by) return { dirtyRect: null, tileDeltas: [] };
+
+  const existingTiles = grid.getLayerTiles(layerId, 0);
+  if (existingTiles.length === 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const beforeSnapshot = params.snapshotOut ?? new Map<string, TileSnapshotEntry>();
+  const hasMask = Boolean(selection.mask && selection.maskWidth && selection.maskHeight);
+  const hasLasso =
+    !hasMask && selection.type === 'lasso' && Boolean(selection.polygon && selection.polygon.length >= 3);
+
+  let scratchCanvas: HTMLCanvasElement | null = null;
+  let scratchCtx: CanvasRenderingContext2D | null = null;
+  const lassoAlpha = hasLasso ? new Uint8Array(TILE_SIZE * TILE_SIZE) : null;
+  if (hasLasso && typeof document !== 'undefined') {
+    scratchCanvas = document.createElement('canvas');
+    scratchCanvas.width = TILE_SIZE;
+    scratchCanvas.height = TILE_SIZE;
+    scratchCtx = scratchCanvas.getContext('2d', { willReadFrequently: true });
+  }
+
+  const outRgba = new Uint8ClampedArray(BYTES_32BIT);
+  let dirtyMinX = dimensions.width;
+  let dirtyMinY = dimensions.height;
+  let dirtyMaxX = -1;
+  let dirtyMaxY = -1;
+
+  const markDirtyTile = (tx: number, ty: number) => {
+    const tx0 = Math.max(0, tx * TILE_SIZE);
+    const ty0 = Math.max(0, ty * TILE_SIZE);
+    const tx1 = Math.min(dimensions.width, (tx + 1) * TILE_SIZE);
+    const ty1 = Math.min(dimensions.height, (ty + 1) * TILE_SIZE);
+    if (tx0 < dirtyMinX) dirtyMinX = tx0;
+    if (ty0 < dirtyMinY) dirtyMinY = ty0;
+    if (tx1 > dirtyMaxX) dirtyMaxX = tx1;
+    if (ty1 > dirtyMaxY) dirtyMaxY = ty1;
+  };
+
+  try {
+    const tileList = existingTiles.slice();
+    for (const tile of tileList) {
+      const tx = tile.tileX;
+      const ty = tile.tileY;
+      const tileDocX = tx * TILE_SIZE;
+      const tileDocY = ty * TILE_SIZE;
+      const key = getTileKey(layerId, tx, ty, 0);
+
+      const intersectsBounds =
+        tileDocX < bx1 && tileDocX + TILE_SIZE > bx && tileDocY < by1 && tileDocY + TILE_SIZE > by;
+
+      if (!intersectsBounds) {
+        if (!beforeSnapshot.has(key)) {
+          beforeSnapshot.set(key, {
+            format: tile.format,
+            data: tile.data ? new Uint8Array(tile.data) : null,
+          });
+        }
+        if (isBackground) {
+          outRgba.fill(0);
+          const maxLy = Math.min(TILE_SIZE, dimensions.height - tileDocY);
+          const maxLx = Math.min(TILE_SIZE, dimensions.width - tileDocX);
+          for (let ly = 0; ly < maxLy; ly++) {
+            const row = ly * TILE_SIZE * 4;
+            for (let lx = 0; lx < maxLx; lx++) {
+              const off = row + lx * 4;
+              outRgba[off] = 255;
+              outRgba[off + 1] = 255;
+              outRgba[off + 2] = 255;
+              outRgba[off + 3] = 255;
+            }
+          }
+          grid.writeImageData(
+            layerId,
+            { data: outRgba, width: TILE_SIZE, height: TILE_SIZE },
+            tileDocX,
+            tileDocY,
+            targetFormat,
+            true
+          );
+        } else {
+          grid.deleteTile(layerId, tx, ty, 0);
+        }
+        markDirtyTile(tx, ty);
+        continue;
+      }
+
+      if (
+        !hasMask &&
+        !hasLasso &&
+        tileDocX >= bx &&
+        tileDocX + TILE_SIZE <= bx1 &&
+        tileDocY >= by &&
+        tileDocY + TILE_SIZE <= by1
+      ) {
+        continue;
+      }
+
+      if (!beforeSnapshot.has(key)) {
+        beforeSnapshot.set(key, {
+          format: tile.format,
+          data: tile.data ? new Uint8Array(tile.data) : null,
+        });
+      }
+
+      const srcRgba = grid.getTileAsRGBA(tile);
+      outRgba.fill(0);
+
+      if (hasLasso && lassoAlpha && selection.polygon) {
+        buildTileLassoAlpha(selection.polygon, tileDocX, tileDocY, lassoAlpha, scratchCanvas, scratchCtx);
+      }
+
+      let hasAnyPixel = false;
+      const mw = selection.maskWidth ?? 0;
+      const mh = selection.maskHeight ?? 0;
+
+      for (let ly = 0; ly < TILE_SIZE; ly++) {
+        const gy = tileDocY + ly;
+        const inDocY = gy >= 0 && gy < dimensions.height;
+        const tRow = ly * TILE_SIZE;
+        for (let lx = 0; lx < TILE_SIZE; lx++) {
+          const gx = tileDocX + lx;
+          const off = (tRow + lx) * 4;
+          const inDoc = inDocY && gx >= 0 && gx < dimensions.width;
+          if (!inDoc) continue;
+
+          let keepAlpha = 0;
+          if (gx >= bx && gx < bx1 && gy >= by && gy < by1) {
+            if (hasMask && selection.mask) {
+              keepAlpha = gy < mh && gx < mw ? selection.mask[gy * mw + gx] : 0;
+            } else if (hasLasso && lassoAlpha) {
+              keepAlpha = lassoAlpha[tRow + lx];
+            } else {
+              keepAlpha = 255;
+            }
+          }
+
+          if (isBackground) {
+            hasAnyPixel = true;
+            if (keepAlpha === 255) {
+              outRgba[off] = srcRgba[off];
+              outRgba[off + 1] = srcRgba[off + 1];
+              outRgba[off + 2] = srcRgba[off + 2];
+              outRgba[off + 3] = srcRgba[off + 3];
+            } else if (keepAlpha === 0) {
+              outRgba[off] = 255;
+              outRgba[off + 1] = 255;
+              outRgba[off + 2] = 255;
+              outRgba[off + 3] = 255;
+            } else {
+              const k = keepAlpha / 255;
+              const inv = 1 - k;
+              outRgba[off] = Math.round(srcRgba[off] * k + 255 * inv);
+              outRgba[off + 1] = Math.round(srcRgba[off + 1] * k + 255 * inv);
+              outRgba[off + 2] = Math.round(srcRgba[off + 2] * k + 255 * inv);
+              outRgba[off + 3] = 255;
+            }
+          } else {
+            if (keepAlpha === 0) continue;
+            const sa = srcRgba[off + 3];
+            if (sa === 0) continue;
+            const ea = keepAlpha === 255 ? sa : Math.round((sa * keepAlpha) / 255);
+            if (ea === 0) continue;
+            hasAnyPixel = true;
+            outRgba[off] = srcRgba[off];
+            outRgba[off + 1] = srcRgba[off + 1];
+            outRgba[off + 2] = srcRgba[off + 2];
+            outRgba[off + 3] = ea;
+          }
+        }
+      }
+
+      if (hasAnyPixel) {
+        grid.writeImageData(
+          layerId,
+          { data: outRgba, width: TILE_SIZE, height: TILE_SIZE },
+          tileDocX,
+          tileDocY,
+          targetFormat,
+          true
+        );
+      } else {
+        grid.deleteTile(layerId, tx, ty, 0);
+      }
+      markDirtyTile(tx, ty);
+    }
+  } finally {
+    if (scratchCanvas) releaseTemporaryCanvas(scratchCanvas);
+  }
+
+  if (!isBackground) {
+    grid.pruneEmptyTiles(layerId);
+  }
+
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId);
+  grid.notifyChange(true);
+
+  const dirtyRect =
+    dirtyMaxX > dirtyMinX && dirtyMaxY > dirtyMinY
+      ? { x: dirtyMinX, y: dirtyMinY, width: dirtyMaxX - dirtyMinX, height: dirtyMaxY - dirtyMinY }
+      : null;
+
   return { dirtyRect, tileDeltas };
 }

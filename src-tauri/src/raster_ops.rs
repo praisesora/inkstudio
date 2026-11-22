@@ -924,8 +924,10 @@ pub fn liquify_step_rgba(
         -p.strength * 0.45
     };
     let row_bytes = p.roi_w * 4;
-    let max_sx = (p.roi_w as f32) - 1.0001;
-    let max_sy = (p.roi_h as f32) - 1.0001;
+    let max_x_idx = p.roi_w.saturating_sub(1);
+    let max_y_idx = p.roi_h.saturating_sub(1);
+    let max_sx = max_x_idx as f32;
+    let max_sy = max_y_idx as f32;
 
     dst.par_chunks_exact_mut(row_bytes)
         .enumerate()
@@ -966,17 +968,33 @@ pub fn liquify_step_rgba(
                         let alpha = (p.strength * weight * 0.35).min(1.0);
                         let inv_a = 1.0 - alpha;
                         let ii = ry * row_bytes + di;
-                        dst_row[di] =
-                            (dst_row[di] as f32 * inv_a + init[ii] as f32 * alpha).round() as u8;
-                        dst_row[di + 1] =
-                            (dst_row[di + 1] as f32 * inv_a + init[ii + 1] as f32 * alpha).round()
-                                as u8;
-                        dst_row[di + 2] =
-                            (dst_row[di + 2] as f32 * inv_a + init[ii + 2] as f32 * alpha).round()
-                                as u8;
-                        dst_row[di + 3] =
-                            (dst_row[di + 3] as f32 * inv_a + init[ii + 3] as f32 * alpha).round()
-                                as u8;
+                        let da = dst_row[di + 3] as f32;
+                        let ta = init[ii + 3] as f32;
+                        let out_a = da * inv_a + ta * alpha;
+                        if out_a <= 0.5 {
+                            dst_row[di] = 0;
+                            dst_row[di + 1] = 0;
+                            dst_row[di + 2] = 0;
+                            dst_row[di + 3] = 0;
+                        } else {
+                            let inv_out = 1.0 / out_a;
+                            dst_row[di] = ((dst_row[di] as f32 * da * inv_a
+                                + init[ii] as f32 * ta * alpha)
+                                * inv_out)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            dst_row[di + 1] = ((dst_row[di + 1] as f32 * da * inv_a
+                                + init[ii + 1] as f32 * ta * alpha)
+                                * inv_out)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            dst_row[di + 2] = ((dst_row[di + 2] as f32 * da * inv_a
+                                + init[ii + 2] as f32 * ta * alpha)
+                                * inv_out)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            dst_row[di + 3] = out_a.round().clamp(0.0, 255.0) as u8;
+                        }
                     }
                     continue;
                 }
@@ -1011,43 +1029,87 @@ pub fn liquify_step_rgba(
 
                 let lsx = (src_x - p.min_x).clamp(0.0, max_sx);
                 let lsy = (src_y - p.min_y).clamp(0.0, max_sy);
-                let x0 = lsx as usize;
-                let y0 = lsy as usize;
-                let x1 = (x0 + 1).min(p.roi_w - 1);
-                let y1 = (y0 + 1).min(p.roi_h - 1);
+                let x0 = lsx.floor() as usize;
+                let y0 = lsy.floor() as usize;
                 let fx = lsx - x0 as f32;
                 let fy = lsy - y0 as f32;
 
-                let w00 = (1.0 - fx) * (1.0 - fy);
-                let w10 = fx * (1.0 - fy);
-                let w01 = (1.0 - fx) * fy;
-                let w11 = fx * fy;
+                if fx < 1e-5 && fy < 1e-5 {
+                    let off = (y0 * p.roi_w + x0) * 4;
+                    dst_row[di] = src_roi[off];
+                    dst_row[di + 1] = src_roi[off + 1];
+                    dst_row[di + 2] = src_roi[off + 2];
+                    dst_row[di + 3] = src_roi[off + 3];
+                    continue;
+                }
 
-                let i00 = (y0 * p.roi_w + x0) * 4;
-                let i10 = (y0 * p.roi_w + x1) * 4;
-                let i01 = (y1 * p.roi_w + x0) * 4;
-                let i11 = (y1 * p.roi_w + x1) * 4;
+                let fx2 = fx * fx;
+                let fx3 = fx2 * fx;
+                let wx = [
+                    -0.5 * fx + fx2 - 0.5 * fx3,
+                    1.0 - 2.5 * fx2 + 1.5 * fx3,
+                    0.5 * fx + 2.0 * fx2 - 1.5 * fx3,
+                    -0.5 * fx2 + 0.5 * fx3,
+                ];
 
-                dst_row[di] = (w00 * src_roi[i00] as f32
-                    + w10 * src_roi[i10] as f32
-                    + w01 * src_roi[i01] as f32
-                    + w11 * src_roi[i11] as f32)
-                    .round() as u8;
-                dst_row[di + 1] = (w00 * src_roi[i00 + 1] as f32
-                    + w10 * src_roi[i10 + 1] as f32
-                    + w01 * src_roi[i01 + 1] as f32
-                    + w11 * src_roi[i11 + 1] as f32)
-                    .round() as u8;
-                dst_row[di + 2] = (w00 * src_roi[i00 + 2] as f32
-                    + w10 * src_roi[i10 + 2] as f32
-                    + w01 * src_roi[i01 + 2] as f32
-                    + w11 * src_roi[i11 + 2] as f32)
-                    .round() as u8;
-                dst_row[di + 3] = (w00 * src_roi[i00 + 3] as f32
-                    + w10 * src_roi[i10 + 3] as f32
-                    + w01 * src_roi[i01 + 3] as f32
-                    + w11 * src_roi[i11 + 3] as f32)
-                    .round() as u8;
+                let fy2 = fy * fy;
+                let fy3 = fy2 * fy;
+                let wy = [
+                    -0.5 * fy + fy2 - 0.5 * fy3,
+                    1.0 - 2.5 * fy2 + 1.5 * fy3,
+                    0.5 * fy + 2.0 * fy2 - 1.5 * fy3,
+                    -0.5 * fy2 + 0.5 * fy3,
+                ];
+
+                let ix = [
+                    x0.saturating_sub(1),
+                    x0,
+                    (x0 + 1).min(max_x_idx),
+                    (x0 + 2).min(max_x_idx),
+                ];
+
+                let mut sum_pr = 0.0f32;
+                let mut sum_pg = 0.0f32;
+                let mut sum_pb = 0.0f32;
+                let mut sum_a = 0.0f32;
+
+                for r in 0..4usize {
+                    let iy = (y0 + r).saturating_sub(1).min(max_y_idx);
+                    let row_base = iy * p.roi_w;
+                    let mut r_pr = 0.0f32;
+                    let mut r_pg = 0.0f32;
+                    let mut r_pb = 0.0f32;
+                    let mut r_a = 0.0f32;
+                    for c in 0..4usize {
+                        let off = (row_base + ix[c]) * 4;
+                        let a = src_roi[off + 3];
+                        if a == 0 {
+                            continue;
+                        }
+                        let wa = wx[c] * a as f32;
+                        r_pr += wa * src_roi[off] as f32;
+                        r_pg += wa * src_roi[off + 1] as f32;
+                        r_pb += wa * src_roi[off + 2] as f32;
+                        r_a += wa;
+                    }
+                    sum_pr += wy[r] * r_pr;
+                    sum_pg += wy[r] * r_pg;
+                    sum_pb += wy[r] * r_pb;
+                    sum_a += wy[r] * r_a;
+                }
+
+                if sum_a <= 0.5 {
+                    dst_row[di] = 0;
+                    dst_row[di + 1] = 0;
+                    dst_row[di + 2] = 0;
+                    dst_row[di + 3] = 0;
+                } else {
+                    let inv_a = 1.0 / sum_a;
+                    dst_row[di] = (sum_pr * inv_a).round().clamp(0.0, 255.0) as u8;
+                    dst_row[di + 1] = (sum_pg * inv_a).round().clamp(0.0, 255.0) as u8;
+                    dst_row[di + 2] = (sum_pb * inv_a).round().clamp(0.0, 255.0) as u8;
+                    dst_row[di + 3] = sum_a.round().clamp(0.0, 255.0) as u8;
+                }
             }
         });
 
@@ -1308,9 +1370,17 @@ mod tests {
             },
         )
         .unwrap();
-        // Pixel should have moved right (+x)
+        // Pixel should have moved right (+x) and retained pure red without dark alpha fringing
         let shifted = (16 * w + 19) * 4;
         assert!(out[shifted] > 0 || out[(16 * w + 18) * 4] > 0);
+        for x in 14..24 {
+            let off = (16 * w + x) * 4;
+            if out[off + 3] > 10 {
+                assert!(out[off] >= 250, "Expected pure red without dark halo, got {}", out[off]);
+                assert_eq!(out[off + 1], 0);
+                assert_eq!(out[off + 2], 0);
+            }
+        }
     }
 
     #[test]

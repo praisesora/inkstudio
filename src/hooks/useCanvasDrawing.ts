@@ -31,6 +31,7 @@ export function useCanvasDrawing({
   activeLayerVisible = true,
   layers,
   onUpdateLayerThumbnail,
+  onApplyLayerTreeDelta,
   isMaskMode = false,
   onUpdateMaskThumbnail,
   draftCanvasRef,
@@ -74,6 +75,7 @@ export function useCanvasDrawing({
   const selectionRef = useRef(selection);
   const isMaskModeRef = useRef(isMaskMode);
   const layersRef = useRef(layers);
+  const onApplyLayerTreeDeltaRef = useRef(onApplyLayerTreeDelta);
   const onUpdateMaskThumbnailRef = useRef(onUpdateMaskThumbnail);
   const onCollabStrokeStartRef = useRef(onCollabStrokeStart);
   const onCollabStrokeChunkRef = useRef(onCollabStrokeChunk);
@@ -101,6 +103,7 @@ export function useCanvasDrawing({
     selectionRef.current = selection;
     isMaskModeRef.current = isMaskMode;
     layersRef.current = layers;
+    onApplyLayerTreeDeltaRef.current = onApplyLayerTreeDelta;
     onUpdateMaskThumbnailRef.current = onUpdateMaskThumbnail;
     onCollabStrokeStartRef.current = onCollabStrokeStart;
     onCollabStrokeChunkRef.current = onCollabStrokeChunk;
@@ -126,6 +129,7 @@ export function useCanvasDrawing({
     selection,
     isMaskMode,
     layers,
+    onApplyLayerTreeDelta,
     onUpdateMaskThumbnail,
     onCollabStrokeStart,
     onCollabStrokeChunk,
@@ -157,6 +161,7 @@ export function useCanvasDrawing({
     colorModeRef,
     layersRef,
     onUpdateLayerThumbnail,
+    onApplyLayerTreeDeltaRef,
     onUpdateMaskThumbnailRef,
     isDrawingRef,
     lastStrokeEndRef,

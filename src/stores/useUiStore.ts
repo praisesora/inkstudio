@@ -27,6 +27,24 @@ export interface LayerStylesModalState {
   layerId?: string;
 }
 
+export type AppClosePromptStep = 'confirm-quit' | 'summary' | 'per-canvas';
+
+export interface AppClosePromptState {
+  isOpen: boolean;
+  step: AppClosePromptStep;
+  pendingDocIds: string[];
+  currentIndex: number;
+  isBusy: boolean;
+}
+
+export const INITIAL_APP_CLOSE_PROMPT_STATE: AppClosePromptState = {
+  isOpen: false,
+  step: 'confirm-quit',
+  pendingDocIds: [],
+  currentIndex: 0,
+  isBusy: false,
+};
+
 export interface UiStoreState {
   appView: 'home' | 'workspace';
   leftPanelWidth: number;
@@ -47,11 +65,13 @@ export interface UiStoreState {
   isMangaEffectsModalOpen: boolean;
   isWebtoonExportModalOpen: boolean;
   isTimelapseExportModalOpen: boolean;
+  isBrushStudioModalOpen: boolean;
   isRecoveryModalOpen: boolean;
   crashedSessions: CrashedSessionInfo[];
   tonalModalState: TonalModalState;
   adjustmentModalState: AdjustmentModalState;
   layerStylesModalState: LayerStylesModalState;
+  appClosePrompt: AppClosePromptState;
 
   // Transient feedback
   isLoadingFile: boolean;
@@ -103,11 +123,13 @@ const createInitialUiState = (): UiStoreState => ({
   isMangaEffectsModalOpen: false,
   isWebtoonExportModalOpen: false,
   isTimelapseExportModalOpen: false,
+  isBrushStudioModalOpen: false,
   isRecoveryModalOpen: false,
   crashedSessions: [],
   tonalModalState: { ...DEFAULT_TONAL_MODAL_STATE },
   adjustmentModalState: { isOpen: false },
   layerStylesModalState: { isOpen: false },
+  appClosePrompt: { ...INITIAL_APP_CLOSE_PROMPT_STATE },
 
   isLoadingFile: false,
   loadingStatus: '',
@@ -211,6 +233,10 @@ export const uiStoreActions = {
     useUiStore.setState({ isTimelapseExportModalOpen: open });
   },
 
+  setBrushStudioModalOpen(open: boolean): void {
+    useUiStore.setState({ isBrushStudioModalOpen: open });
+  },
+
   setRecoveryModal(open: boolean, sessions?: CrashedSessionInfo[]): void {
     useUiStore.setState((prev) => ({
       isRecoveryModalOpen: open,
@@ -240,6 +266,18 @@ export const uiStoreActions = {
 
   setLayerStylesModalState(layerStylesModalState: LayerStylesModalState): void {
     useUiStore.setState({ layerStylesModalState });
+  },
+
+  setAppClosePrompt(
+    updater: AppClosePromptState | ((prev: AppClosePromptState) => AppClosePromptState)
+  ): void {
+    useUiStore.setState((prev) => ({
+      appClosePrompt: typeof updater === 'function' ? updater(prev.appClosePrompt) : updater,
+    }));
+  },
+
+  resetAppClosePrompt(): void {
+    useUiStore.setState({ appClosePrompt: { ...INITIAL_APP_CLOSE_PROMPT_STATE } });
   },
 
   setLoading(isLoadingFile: boolean, loadingStatus = ''): void {
@@ -284,6 +322,7 @@ export function selectIsAnyModalOpen(
     state.tonalModalState.isOpen ||
     state.adjustmentModalState.isOpen ||
     state.layerStylesModalState.isOpen ||
+    state.appClosePrompt.isOpen ||
     isHostModalOpen ||
     isUpdateModalOpen
   );

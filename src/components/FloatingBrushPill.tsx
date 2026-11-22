@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback } from 'react';
-import { ToolType, BrushSettings, LiquifySettings } from '../types/editor';
+import { ToolType, BrushSettings, LiquifySettings, RetouchSettings } from '../types/editor';
 
 interface FloatingBrushPillProps {
   tool: ToolType;
@@ -7,6 +7,8 @@ interface FloatingBrushPillProps {
   onUpdateBrushSettings: (patch: Partial<BrushSettings>) => void;
   liquifySettings?: LiquifySettings;
   onUpdateLiquifySettings?: (patch: Partial<LiquifySettings>) => void;
+  retouchSettings?: RetouchSettings;
+  onUpdateRetouchSettings?: (patch: Partial<RetouchSettings>) => void;
   primaryColor?: string;
   onSwapColors?: () => void;
   zoom?: number;
@@ -33,6 +35,8 @@ export const FloatingBrushPill: React.FC<FloatingBrushPillProps> = React.memo(({
   onUpdateBrushSettings,
   liquifySettings,
   onUpdateLiquifySettings,
+  retouchSettings,
+  onUpdateRetouchSettings,
   primaryColor = '#000000',
   onSwapColors,
   zoom = 1,
@@ -43,13 +47,21 @@ export const FloatingBrushPill: React.FC<FloatingBrushPillProps> = React.memo(({
   const opacityTrackRef = useRef<HTMLDivElement>(null);
 
   const isLiquify = tool === 'liquify';
-  const minSize = isLiquify ? 5 : MIN_BRUSH_SIZE;
-  const maxSize = isLiquify ? 500 : MAX_BRUSH_SIZE;
+  const isRetouch = tool === 'retouch';
+  const usesStrength = isLiquify || isRetouch;
+  const minSize = isLiquify ? 5 : isRetouch ? 2 : MIN_BRUSH_SIZE;
+  const maxSize = isLiquify ? 500 : isRetouch ? 300 : MAX_BRUSH_SIZE;
 
-  const currentSize = isLiquify ? (liquifySettings?.size ?? 80) : brushSettings.size;
+  const currentSize = isLiquify
+    ? (liquifySettings?.size ?? 80)
+    : isRetouch
+      ? (retouchSettings?.size ?? 40)
+      : brushSettings.size;
   const currentOpacity = isLiquify
     ? (liquifySettings?.strength ?? 50) / 100
-    : (brushSettings.opacity ?? 1);
+    : isRetouch
+      ? (retouchSettings?.strength ?? 50) / 100
+      : (brushSettings.opacity ?? 1);
 
   const sizeRatio = sizeToRatio(currentSize, minSize, maxSize);
   const opacityRatio = Math.max(0.01, Math.min(1, currentOpacity));
@@ -63,11 +75,13 @@ export const FloatingBrushPill: React.FC<FloatingBrushPillProps> = React.memo(({
       const nextSize = ratioToSize(ratio, minSize, maxSize);
       if (isLiquify) {
         onUpdateLiquifySettings?.({ size: nextSize });
+      } else if (isRetouch) {
+        onUpdateRetouchSettings?.({ size: Math.round(nextSize) });
       } else {
         onUpdateBrushSettings({ size: nextSize });
       }
     },
-    [isLiquify, maxSize, minSize, onUpdateBrushSettings, onUpdateLiquifySettings]
+    [isLiquify, isRetouch, maxSize, minSize, onUpdateBrushSettings, onUpdateLiquifySettings, onUpdateRetouchSettings]
   );
 
   const updateOpacityFromPointer = useCallback(
@@ -78,11 +92,13 @@ export const FloatingBrushPill: React.FC<FloatingBrushPillProps> = React.memo(({
       const ratio = Math.max(0.01, Math.min(1, 1 - (clientY - rect.top) / rect.height));
       if (isLiquify) {
         onUpdateLiquifySettings?.({ strength: Math.round(ratio * 100) });
+      } else if (isRetouch) {
+        onUpdateRetouchSettings?.({ strength: Math.round(ratio * 100) });
       } else {
         onUpdateBrushSettings({ opacity: Math.round(ratio * 100) / 100 });
       }
     },
-    [isLiquify, onUpdateBrushSettings, onUpdateLiquifySettings]
+    [isLiquify, isRetouch, onUpdateBrushSettings, onUpdateLiquifySettings, onUpdateRetouchSettings]
   );
 
   const showSizeHud = activeDrag === 'size' || hoveredTrack === 'size';
@@ -197,7 +213,7 @@ export const FloatingBrushPill: React.FC<FloatingBrushPillProps> = React.memo(({
           }
         }}
         onPointerCancel={() => setActiveDrag(null)}
-        title={`${isLiquify ? 'Strength' : 'Opacity'}: ${Math.round(opacityRatio * 100)}%`}
+        title={`${usesStrength ? 'Strength' : 'Opacity'}: ${Math.round(opacityRatio * 100)}%`}
         className="relative w-4 h-28 flex items-center justify-center cursor-ns-resize touch-none group"
       >
         <div className="w-1.5 h-full rounded-full bg-[#161616] group-hover:bg-[#2c2c2c] relative overflow-hidden transition-colors">
@@ -221,7 +237,7 @@ export const FloatingBrushPill: React.FC<FloatingBrushPillProps> = React.memo(({
         {showOpacityHud && (
           <div className="pointer-events-none absolute left-8 top-1/2 -translate-y-1/2 px-2 py-1 rounded bg-[#202020] shadow-[0_4px_16px_rgba(0,0,0,0.6)] whitespace-nowrap flex items-center gap-1.5">
             <span className="text-[10px] text-[#8a8a8a]">
-              {isLiquify ? 'Strength' : 'Opacity'}
+              {usesStrength ? 'Strength' : 'Opacity'}
             </span>
             <span className="text-[11px] font-mono text-[#e5e5e5] font-medium">
               {Math.round(opacityRatio * 100)}%

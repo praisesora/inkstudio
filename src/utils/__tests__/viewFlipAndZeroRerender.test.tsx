@@ -598,6 +598,118 @@ describe('Zero-Rerender Camera Navigation & Non-Destructive View Flip', () => {
       expect(exposedNav!.pan.y).toBeCloseTo(510, 5);
       expect(exposedNav!.rotation).toBeCloseTo(28, 5);
     });
+
+    it('never leaves Space/pan hand cursor stuck on XP-Pen synthetic Space, fast tap, dropped pointerup, or visibilitychange', () => {
+      let exposedNav: ReturnType<typeof useCanvasNavigation> | null = null;
+      const dims = { width: 1000, height: 800, dpi: 300 };
+
+      function Host() {
+        const nav = useCanvasNavigation({ dimensions: dims, activeDocumentId: 'doc-xppen' });
+        exposedNav = nav;
+        return <div ref={nav.viewportRef as any} />;
+      }
+
+      root = createRoot(env.container as unknown as HTMLElement);
+      act(() => {
+        root!.render(<Host />);
+      });
+
+      // 1. XP-Pen synthetic Space (empty code, key === ' ') keydown + repeat + keyup
+      act(() => {
+        const down1 = new Event('keydown', { bubbles: true, cancelable: true }) as any;
+        down1.key = ' ';
+        down1.code = '';
+        window.dispatchEvent(down1);
+      });
+      expect(exposedNav!.isSpaceDown).toBe(true);
+      expect(exposedNav!.heldModifierAction).toBe('pan');
+
+      act(() => {
+        const repeat = new Event('keydown', { bubbles: true, cancelable: true }) as any;
+        repeat.key = ' ';
+        repeat.code = '';
+        repeat.repeat = true;
+        window.dispatchEvent(repeat);
+      });
+      expect(exposedNav!.isSpaceDown).toBe(true);
+      expect(exposedNav!.heldModifierAction).toBe('pan');
+
+      act(() => {
+        const up = new Event('keyup', { bubbles: true, cancelable: true }) as any;
+        up.key = ' ';
+        up.code = '';
+        window.dispatchEvent(up);
+      });
+      expect(exposedNav!.isSpaceDown).toBe(false);
+      expect(exposedNav!.heldModifierAction).toBe('none');
+
+      // 2. Fast stylus tap: pointerup fires synchronously BEFORE React commits effect
+      act(() => {
+        exposedNav!.startPan({
+          pointerId: 7,
+          clientX: 200,
+          clientY: 200,
+          buttons: 1,
+          preventDefault: () => {},
+        } as unknown as PointerEvent);
+        const upEv = new Event('pointerup', { bubbles: true }) as any;
+        upEv.pointerId = 7;
+        upEv.buttons = 0;
+        window.dispatchEvent(upEv);
+      });
+      expect(exposedNav!.isPanning).toBe(false);
+      expect(document.body.style.cursor).toBe('');
+
+      // 3. Dropped pointerup (pen lifted out of proximity): next hover pointermove with buttons === 0 ends pan
+      act(() => {
+        exposedNav!.startPan({
+          pointerId: 9,
+          clientX: 300,
+          clientY: 300,
+          buttons: 1,
+          preventDefault: () => {},
+        } as unknown as PointerEvent);
+      });
+      expect(exposedNav!.isPanning).toBe(true);
+      expect(document.body.style.cursor).toBe('grabbing');
+
+      act(() => {
+        const hoverMove = new Event('pointermove', { bubbles: true }) as any;
+        hoverMove.pointerId = 9;
+        hoverMove.clientX = 320;
+        hoverMove.clientY = 310;
+        hoverMove.buttons = 0;
+        window.dispatchEvent(hoverMove);
+      });
+      expect(exposedNav!.isPanning).toBe(false);
+      expect(document.body.style.cursor).toBe('');
+
+      // 4. Tab/window hidden (visibilitychange) clears stuck Space & active pan
+      act(() => {
+        const down = new Event('keydown', { bubbles: true, cancelable: true }) as any;
+        down.code = 'Space';
+        down.key = ' ';
+        window.dispatchEvent(down);
+        exposedNav!.startPan({
+          pointerId: 11,
+          clientX: 300,
+          clientY: 300,
+          buttons: 1,
+          preventDefault: () => {},
+        } as unknown as PointerEvent);
+      });
+      expect(exposedNav!.isSpaceDown).toBe(true);
+      expect(exposedNav!.isPanning).toBe(true);
+
+      act(() => {
+        (document as any).hidden = true;
+        document.dispatchEvent(new Event('visibilitychange'));
+      });
+      expect(exposedNav!.isSpaceDown).toBe(false);
+      expect(exposedNav!.isPanning).toBe(false);
+      expect(exposedNav!.heldModifierAction).toBe('none');
+      expect(document.body.style.cursor).toBe('');
+    });
   });
 
   describe('Flipped View Brush Stroke Precision & Non-Destructive Layer Guarantee', () => {

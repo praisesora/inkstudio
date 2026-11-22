@@ -147,6 +147,70 @@ export function commitRasterStrokeToTiles(
     helpers.markTouchedTiles(sx, sy, sx + dw, sy + dh);
   }
 
+  // Zero-pop Natural Paint commit: flush remaining tail segments into the exact live
+  // NaturalPaintStrokeSession and composite its shaded RGBA directly into the sparse tiles.
+  if (state.naturalPaintSession) {
+    const natSession = state.naturalPaintSession;
+    state.naturalPaintSession = null;
+
+    for (let i = 0; i < tailSegments.length; i++) {
+      const seg = tailSegments[i];
+      const batch = natSession.engine.emitCubicSegment(
+        seg.p0,
+        seg.c1,
+        seg.c2,
+        seg.p3,
+        state.layerPixelSampler || undefined
+      );
+      natSession.rasterizeBatch(batch);
+    }
+    if (tailSegments.length === 0) {
+      natSession.flushPendingTapIfNeeded(state.layerPixelSampler || undefined);
+    }
+
+    const beforeSnapshot = new Map<
+      string,
+      { format: TileFormat; data: Uint8Array | null }
+    >();
+    const spans = helpers.buildTouchedTileSpans(sx, sy, dw, dh);
+    for (let i = 0; i < spans.length; i++) {
+      const sp = spans[i];
+      const rgba = new Uint8ClampedArray(sp.width * sp.height * 4);
+      natSession.shadeRectToBuffer(sp.x, sp.y, sp.width, sp.height, rgba);
+      const spanData =
+        typeof ImageData !== 'undefined'
+          ? new ImageData(rgba, sp.width, sp.height)
+          : ({ data: rgba, width: sp.width, height: sp.height } as ImageData);
+      grid.compositeStrokeToTiles({
+        layerId: currentLayerId,
+        strokeData: spanData,
+        destX: sp.x,
+        destY: sp.y,
+        format: targetFormat,
+        compositeOp,
+        opacity: bs.opacity ?? 1.0,
+        monochrome: monoOpts,
+        selectionMask: selMaskOpts,
+        snapshotOut: beforeSnapshot,
+        suppressNotify: true,
+      });
+    }
+
+    natSession.finishAndDispose();
+
+    return createRasterPostPresentWork(
+      grid,
+      beforeSnapshot,
+      currentLayerId,
+      dirtyRect,
+      toolForHistory,
+      label,
+      strokeIdForHistory,
+      enqueueHistoryTask,
+      pushHistoryStep
+    );
+  }
+
   if (canDirectDraftCommit && draftCanvas && draftCtx && draftDocRect) {
     return commitDirectDraftToTiles({
       state,

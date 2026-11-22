@@ -461,7 +461,11 @@ export function useBrushStrokeSession(
 
         if (s.phase === 1) {
           // Pen down
-          if (isBrushOrEraser && isPointOverCanvasViewport(s.clientX, s.clientY)) {
+          if (
+            !paramsRef.current.disabled &&
+            isBrushOrEraser &&
+            isPointOverCanvasViewport(s.clientX, s.clientY)
+          ) {
             const isTailEraser = (s.buttons & 8) !== 0;
             if (isTailEraser && curTool !== 'eraser') {
               prevToolBeforeEraserFlip = curTool;

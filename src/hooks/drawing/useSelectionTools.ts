@@ -1,10 +1,12 @@
 import React, { useState, useRef, useCallback } from 'react';
 import {
+  BlendMode,
   CanvasColorMode,
   CanvasDimensions,
   CanvasSelection,
   DirtyRect,
   LayerItem,
+  TileDelta,
   TransformSession,
 } from '../../types/editor';
 import { documentStore } from '../../utils/documentStore';
@@ -19,6 +21,8 @@ import {
   computePolygonBounds,
   floodSelectWandOnTileGrid,
   clearSelectionInTileGrid,
+  clearOutsideSelectionInTileGrid,
+  extractSelectionTileSnapshot,
   fillSelectionInTileGrid,
   liftSelectionFromTileGrid,
   commitFloatingSelectionToTileGrid,
@@ -29,12 +33,15 @@ import {
   selectionToMask,
   maskToBounds,
   maskToSvgPath,
+  SelectionTileSnapshot,
 } from '../../utils/selectionUtils';
 import {
   renderPerspectiveQuad,
   renderMeshWarp,
   createDefaultPerspectiveQuad,
   createDefaultMeshPoints,
+  computeMeshSubdivisions,
+  getMeshSurfaceBounds,
 } from '../../utils/transformEngine';
 import { get2DContext } from '../../utils/canvasUtils';
 import { useToolStore, toolStoreActions } from '../../stores';
@@ -60,9 +67,9 @@ function computeTransformDestRect(
   if (session.mode === 'perspective' && session.perspectiveQuad) {
     for (const p of session.perspectiveQuad) includePt(p.x, p.y);
   } else if (session.mode === 'mesh' && session.meshPoints) {
-    for (const row of session.meshPoints) {
-      for (const p of row) includePt(p.x, p.y);
-    }
+    const sb = getMeshSurfaceBounds(session.meshPoints, 6);
+    includePt(sb.minX, sb.minY);
+    includePt(sb.maxX, sb.maxY);
   } else {
     const cx = session.x + session.width / 2;
     const cy = session.y + session.height / 2;
@@ -126,12 +133,22 @@ function compositeTransformedIntoTileGrid(
         cCtx.setTransform(1, 0, 0, 1, 0, 0);
         cCtx.clearRect(0, 0, cw, ch);
         cCtx.save();
+        cCtx.imageSmoothingEnabled = true;
+        if ('imageSmoothingQuality' in cCtx) {
+          cCtx.imageSmoothingQuality = 'high';
+        }
         cCtx.translate(-cx, -cy);
 
         if (session.mode === 'perspective' && session.perspectiveQuad) {
-          renderPerspectiveQuad(cCtx, sourceCanvas, session.perspectiveQuad, 24);
+          renderPerspectiveQuad(cCtx, sourceCanvas, session.perspectiveQuad, 32);
         } else if (session.mode === 'mesh' && session.meshPoints) {
-          renderMeshWarp(cCtx, sourceCanvas, session.meshPoints, 6);
+          const subPerCell = computeMeshSubdivisions(
+            sourceCanvas.width,
+            sourceCanvas.height,
+            session.meshPoints,
+            true
+          );
+          renderMeshWarp(cCtx, sourceCanvas, session.meshPoints, subPerCell);
         } else {
           const midX = session.x + session.width / 2;
           const midY = session.y + session.height / 2;
@@ -181,6 +198,20 @@ export interface UseSelectionToolsParams {
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   pushHistoryStep: PushHistoryStepFn;
   showToast: (msg: string) => void;
+  copySelectionToClipboard?: (
+    selection: CanvasSelection,
+    targetId?: string
+  ) => { copied: boolean; empty?: boolean; layerName?: string; snapshot?: SelectionTileSnapshot };
+  createLayerFromTileSnapshot?: (
+    tileSnapshot: {
+      format: TileFormat;
+      tiles: Array<{ tileX: number; tileY: number; format: TileFormat; data: Uint8Array }>;
+    },
+    layerName: string,
+    blendMode?: BlendMode,
+    opacity?: number,
+    layerOverrides?: Partial<LayerItem>
+  ) => { id: string; name: string; tileDeltas: TileDelta[] };
 }
 
 export interface UseSelectionToolsResult {
@@ -192,6 +223,11 @@ export interface UseSelectionToolsResult {
   handleCommitFloatingSelection: () => void;
   handleDeselect: () => void;
   handleClearSelection: () => void;
+  handleDeleteOutsideSelection: () => void;
+  handleCopySelection: () => void;
+  handleCutSelection: () => void;
+  handleMoveSelectionToNewLayer: () => void;
+  handleCopySelectionToNewLayer: () => void;
   handleFillSelectionColor: () => void;
   handleExpandSelection: (pixels?: number) => void;
   handleContractSelection: (pixels?: number) => void;
@@ -221,6 +257,8 @@ export function useSelectionTools({
   updateLayerThumbnail,
   pushHistoryStep,
   showToast,
+  copySelectionToClipboard,
+  createLayerFromTileSnapshot,
 }: UseSelectionToolsParams): UseSelectionToolsResult {
   const [selection, setSelection] = useState<CanvasSelection | null>(null);
   const [transformSession, setTransformSession] = useState<TransformSession | null>(null);
@@ -314,6 +352,10 @@ export function useSelectionTools({
 
   const handleClearSelection = useCallback(() => {
     if (!selection) return;
+    if (!activeLayer || activeLayer.type !== 'raster' || activeLayer.locked) {
+      showToast('Select an unlocked raster layer');
+      return;
+    }
     flushPendingHistoryTasks?.();
     const grid = getGrid();
 
@@ -327,7 +369,7 @@ export function useSelectionTools({
         if (tileDeltas.length > 0) {
           pushHistoryStep(
             'clear',
-            'Clear Selection',
+            'Delete Selection',
             null,
             null,
             targetLayerId,
@@ -357,7 +399,7 @@ export function useSelectionTools({
     if (tileDeltas.length > 0) {
       pushHistoryStep(
         'clear',
-        'Clear Selection',
+        'Delete Selection',
         null,
         null,
         activeLayerId,
@@ -368,6 +410,8 @@ export function useSelectionTools({
     updateLayerThumbnail(activeLayerId, true);
   }, [
     selection,
+    activeLayer,
+    showToast,
     flushPendingHistoryTasks,
     getGrid,
     activeLayerId,
@@ -375,6 +419,316 @@ export function useSelectionTools({
     resolveLayerFormat,
     updateLayerThumbnail,
     pushHistoryStep,
+  ]);
+
+  const handleDeleteOutsideSelection = useCallback(() => {
+    if (!selection) return;
+    if (!activeLayer || activeLayer.type !== 'raster' || activeLayer.locked) {
+      showToast('Select an unlocked raster layer');
+      return;
+    }
+    flushPendingHistoryTasks?.();
+    const grid = getGrid();
+    const targetLayerId = selection.floating?.layerId || activeLayerId;
+    const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
+    const targetFormat = resolveLayerFormat(targetLayerId);
+
+    const { dirtyRect, tileDeltas } = clearOutsideSelectionInTileGrid({
+      grid,
+      layerId: targetLayerId,
+      dimensions,
+      selection,
+      isBackground: isBg,
+      targetFormat,
+    });
+
+    if (selection.floating) {
+      releaseTemporaryCanvas(selection.floating.canvas);
+      setSelection((prev) => (prev ? { ...prev, floating: null } : null));
+    }
+
+    if (tileDeltas.length > 0) {
+      pushHistoryStep(
+        'clear',
+        'Delete Outside Selection',
+        null,
+        null,
+        targetLayerId,
+        dirtyRect ?? undefined,
+        tileDeltas
+      );
+      showToast('Deleted outside selection');
+    } else {
+      showToast('Nothing outside selection to delete');
+    }
+    updateLayerThumbnail(targetLayerId, true);
+  }, [
+    selection,
+    activeLayer,
+    showToast,
+    flushPendingHistoryTasks,
+    getGrid,
+    activeLayerId,
+    resolveLayerFormat,
+    dimensions,
+    pushHistoryStep,
+    updateLayerThumbnail,
+  ]);
+
+  const handleCopySelection = useCallback(() => {
+    if (!selection) return;
+    if (!activeLayer || activeLayer.type !== 'raster') {
+      showToast('Select a raster layer to copy selection');
+      return;
+    }
+    if (!copySelectionToClipboard) return;
+    const targetLayerId = selection.floating?.layerId || activeLayerId;
+    const res = copySelectionToClipboard(selection, targetLayerId);
+    if (res.copied) {
+      showToast(`Copied selection from "${res.layerName || activeLayer.name}"`);
+    } else if (res.empty) {
+      showToast('Selected area is empty');
+    }
+  }, [selection, activeLayer, activeLayerId, copySelectionToClipboard, showToast]);
+
+  const handleCutSelection = useCallback(() => {
+    if (!selection) return;
+    if (!activeLayer || activeLayer.type !== 'raster' || activeLayer.locked) {
+      showToast('Select an unlocked raster layer to cut');
+      return;
+    }
+    if (!copySelectionToClipboard) return;
+
+    flushPendingHistoryTasks?.();
+    const targetLayerId = selection.floating?.layerId || activeLayerId;
+    const copyRes = copySelectionToClipboard(selection, targetLayerId);
+    if (!copyRes.copied) {
+      showToast(copyRes.empty ? 'Selected area is empty' : 'Failed to cut selection');
+      return;
+    }
+
+    const grid = getGrid();
+    if (selection.floating) {
+      if (selection.floating.beforeTileSnapshot) {
+        const tileDeltas = grid.computeDeltasFromSnapshot(
+          selection.floating.beforeTileSnapshot,
+          targetLayerId
+        );
+        if (tileDeltas.length > 0) {
+          pushHistoryStep(
+            'clear',
+            'Cut Selection',
+            null,
+            null,
+            targetLayerId,
+            selection.bounds,
+            tileDeltas
+          );
+        }
+      }
+      releaseTemporaryCanvas(selection.floating.canvas);
+      grid.notifyChange(true);
+      updateLayerThumbnail(targetLayerId, true);
+      setSelection(null);
+      showToast(`Cut selection from "${activeLayer.name}"`);
+      return;
+    }
+
+    const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
+    const targetFormat = resolveLayerFormat(targetLayerId);
+    const { dirtyRect, tileDeltas } = clearSelectionInTileGrid({
+      grid,
+      layerId: targetLayerId,
+      dimensions,
+      selection,
+      isBackground: isBg,
+      targetFormat,
+    });
+
+    if (tileDeltas.length > 0) {
+      pushHistoryStep(
+        'clear',
+        'Cut Selection',
+        null,
+        null,
+        targetLayerId,
+        dirtyRect ?? undefined,
+        tileDeltas
+      );
+    }
+    updateLayerThumbnail(targetLayerId, true);
+    setSelection(null);
+    showToast(`Cut selection from "${activeLayer.name}"`);
+  }, [
+    selection,
+    activeLayer,
+    activeLayerId,
+    copySelectionToClipboard,
+    flushPendingHistoryTasks,
+    getGrid,
+    resolveLayerFormat,
+    dimensions,
+    pushHistoryStep,
+    updateLayerThumbnail,
+    showToast,
+  ]);
+
+  const handleMoveSelectionToNewLayer = useCallback(() => {
+    if (!selection) return;
+    if (!activeLayer || activeLayer.type !== 'raster' || activeLayer.locked) {
+      showToast('Select an unlocked raster layer');
+      return;
+    }
+    if (!createLayerFromTileSnapshot) return;
+
+    flushPendingHistoryTasks?.();
+    const grid = getGrid();
+    const targetLayerId = selection.floating?.layerId || activeLayerId;
+    const targetFormat = resolveLayerFormat(targetLayerId);
+    const snapshot = extractSelectionTileSnapshot({
+      grid,
+      layerId: targetLayerId,
+      dimensions,
+      selection,
+      targetFormat,
+    });
+
+    if (!snapshot || snapshot.tiles.length === 0) {
+      showToast('Selected area is empty');
+      return;
+    }
+
+    let srcDeltas: TileDelta[] = [];
+    let dirtyRect: DirtyRect | undefined = snapshot.bounds;
+
+    if (selection.floating) {
+      if (selection.floating.beforeTileSnapshot) {
+        srcDeltas = grid.computeDeltasFromSnapshot(
+          selection.floating.beforeTileSnapshot,
+          targetLayerId
+        );
+      }
+      releaseTemporaryCanvas(selection.floating.canvas);
+    } else {
+      const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
+      const cleared = clearSelectionInTileGrid({
+        grid,
+        layerId: targetLayerId,
+        dimensions,
+        selection,
+        isBackground: isBg,
+        targetFormat,
+      });
+      srcDeltas = cleared.tileDeltas;
+      if (cleared.dirtyRect) dirtyRect = cleared.dirtyRect;
+    }
+
+    const overrides = activeLayer.expressionColor
+      ? { expressionColor: activeLayer.expressionColor }
+      : undefined;
+    const created = createLayerFromTileSnapshot(
+      snapshot,
+      `${activeLayer.name} (Cut)`,
+      activeLayer.blendMode,
+      activeLayer.opacity,
+      overrides
+    );
+
+    const combinedDeltas = [...srcDeltas, ...created.tileDeltas];
+    if (combinedDeltas.length > 0) {
+      pushHistoryStep(
+        'selection-move',
+        'Move Selection to New Layer',
+        null,
+        null,
+        created.id,
+        dirtyRect,
+        combinedDeltas
+      );
+    }
+
+    updateLayerThumbnail(targetLayerId, true);
+    setSelection(null);
+    showToast(`Moved selection to "${created.name}"`);
+  }, [
+    selection,
+    activeLayer,
+    activeLayerId,
+    createLayerFromTileSnapshot,
+    flushPendingHistoryTasks,
+    getGrid,
+    resolveLayerFormat,
+    dimensions,
+    pushHistoryStep,
+    updateLayerThumbnail,
+    showToast,
+  ]);
+
+  const handleCopySelectionToNewLayer = useCallback(() => {
+    if (!selection) return;
+    if (!activeLayer || activeLayer.type !== 'raster') {
+      showToast('Select a raster layer');
+      return;
+    }
+    if (!createLayerFromTileSnapshot) return;
+
+    flushPendingHistoryTasks?.();
+    const grid = getGrid();
+    const targetLayerId = selection.floating?.layerId || activeLayerId;
+    const targetFormat = resolveLayerFormat(targetLayerId);
+    const snapshot = extractSelectionTileSnapshot({
+      grid,
+      layerId: targetLayerId,
+      dimensions,
+      selection,
+      targetFormat,
+    });
+
+    if (!snapshot || snapshot.tiles.length === 0) {
+      showToast('Selected area is empty');
+      return;
+    }
+
+    const overrides = activeLayer.expressionColor
+      ? { expressionColor: activeLayer.expressionColor }
+      : undefined;
+    const created = createLayerFromTileSnapshot(
+      snapshot,
+      `${activeLayer.name} (Copy)`,
+      activeLayer.blendMode,
+      activeLayer.opacity,
+      overrides
+    );
+
+    if (created.tileDeltas.length > 0) {
+      pushHistoryStep(
+        'selection-move',
+        'Copy Selection to New Layer',
+        null,
+        null,
+        created.id,
+        snapshot.bounds,
+        created.tileDeltas
+      );
+    }
+
+    if (selection.floating) {
+      handleCommitFloatingSelection();
+    }
+    setSelection(null);
+    showToast(`Copied selection to "${created.name}"`);
+  }, [
+    selection,
+    activeLayer,
+    activeLayerId,
+    createLayerFromTileSnapshot,
+    flushPendingHistoryTasks,
+    getGrid,
+    resolveLayerFormat,
+    dimensions,
+    pushHistoryStep,
+    handleCommitFloatingSelection,
+    showToast,
   ]);
 
   const handleFillSelectionColor = useCallback(() => {
@@ -1272,6 +1626,11 @@ export function useSelectionTools({
     handleCommitFloatingSelection,
     handleDeselect,
     handleClearSelection,
+    handleDeleteOutsideSelection,
+    handleCopySelection,
+    handleCutSelection,
+    handleMoveSelectionToNewLayer,
+    handleCopySelectionToNewLayer,
     handleFillSelectionColor,
     handleExpandSelection,
     handleContractSelection,

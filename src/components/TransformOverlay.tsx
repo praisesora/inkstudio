@@ -10,7 +10,9 @@ import {
   renderMeshWarp,
   createDefaultPerspectiveQuad,
   createDefaultMeshPoints,
+  computeMeshSubdivisions,
   getPointsBounds,
+  getMeshSurfaceBounds,
   evaluateMeshSurface,
 } from '../utils/transformEngine';
 
@@ -75,11 +77,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
       return getPointsBounds(quad);
     }
     if (mode === 'mesh') {
-      const flat: Point2D[] = [];
-      for (const row of meshPoints) {
-        for (const pt of row) flat.push(pt);
-      }
-      return getPointsBounds(flat);
+      return getMeshSurfaceBounds(meshPoints, 6);
     }
     if (session.rotation) {
       const cx = session.x + session.width / 2;
@@ -136,8 +134,8 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    const bw = Math.max(10, nonAffineBounds.width);
-    const bh = Math.max(10, nonAffineBounds.height);
+    const bw = Math.max(1, nonAffineBounds.width);
+    const bh = Math.max(1, nonAffineBounds.height);
     if (canvas.width !== bw) canvas.width = bw;
     if (canvas.height !== bh) canvas.height = bh;
     ctx.clearRect(0, 0, bw, bh);
@@ -150,7 +148,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         { x: quad[3].x - nonAffineBounds.minX, y: quad[3].y - nonAffineBounds.minY },
       ];
 
-      renderPerspectiveQuad(ctx, session.sourceCanvas, localQuad, 16);
+      renderPerspectiveQuad(ctx, session.sourceCanvas, localQuad, 24);
     } else {
       const localMesh: Point2D[][] = meshPoints.map((row) =>
         row.map((pt) => ({
@@ -159,7 +157,13 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         }))
       );
 
-      renderMeshWarp(ctx, session.sourceCanvas, localMesh, 4);
+      const subPerCell = computeMeshSubdivisions(
+        session.sourceCanvas.width,
+        session.sourceCanvas.height,
+        localMesh,
+        false
+      );
+      renderMeshWarp(ctx, session.sourceCanvas, localMesh, subPerCell);
     }
   }, [mode, session.sourceCanvas, nonAffineBounds, quad, meshPoints]);
 
@@ -195,9 +199,9 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
         const row: Point2D[] = [];
         for (let c = 0; c < size; c++) {
           const u = size > 1 ? c / (size - 1) : 0;
-          // Resample position from existing surface
+          // Resample position from existing surface without integer rounding distortion
           const evaluated = evaluateMeshSurface(existingMesh, u, v);
-          row.push({ x: Math.round(evaluated.x), y: Math.round(evaluated.y) });
+          row.push({ x: evaluated.x, y: evaluated.y });
         }
         newMesh.push(row);
       }
@@ -551,7 +555,11 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
               height: `${nonAffineBounds.height}px`,
             }}
           >
-            <canvas ref={previewCanvasRef} className="w-full h-full block" />
+            <canvas
+              ref={previewCanvasRef}
+              className="w-full h-full block"
+              style={{ imageRendering: zoom > 1 ? 'pixelated' : 'auto' }}
+            />
           </div>
 
           {/* SVG Overlay for Quad or Mesh Lattice Lines */}

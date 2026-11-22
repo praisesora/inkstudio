@@ -142,6 +142,16 @@ export function renderInitialStrokeDot(
     return;
   }
 
+  if (state.naturalPaintSession) {
+    state.naturalPaintSession.stampInitialPoint(
+      draftCtx,
+      firstDotPoint,
+      state.layerPixelSampler || undefined,
+      true
+    );
+    return;
+  }
+
   const liveColor =
     (isEraser && !isBgEraser) || bs.isTransparentInk ? '#000000' : strokeColor;
   const liveAA = helpers.resolveLiveAntiAlias(bs, isMonochrome, draftScale);

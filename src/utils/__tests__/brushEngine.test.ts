@@ -459,6 +459,37 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       // Dabs were deposited during bake
       expect(bakeCanvas.drawnDabs.length).toBeGreaterThan(10);
     });
+
+    it('layers cleanly at amountOfPaint=1.0 and maintains step-size-invariant equilibrium in both blend and running_color modes', () => {
+      const blueSample = { r: 10, g: 30, b: 220, a: 1.0 };
+
+      // 1. At amountOfPaint=1.0, painting red over blue must stay pure red across 50 fine steps
+      for (const mode of ['blend', 'running_color'] as const) {
+        const res = new PaintReservoir('#ff0000');
+        let last = res.mixWithCanvas(blueSample, 1.0, 0.95, 0.75, mode, 0.85, 1.0, 0, true);
+        for (let i = 0; i < 50; i++) {
+          last = res.mixWithCanvas(blueSample, 1.0, 0.95, 0.75, mode, 0.85, 1.0, 2.0, true);
+        }
+        expect(last.r).toBe(255);
+        expect(last.g).toBe(0);
+        expect(last.b).toBe(0);
+      }
+
+      // 2. Step-size invariance: 25 steps of 2px (50px) vs 5 steps of 10px (50px) converge tightly
+      const fineRes = new PaintReservoir('#facc15');
+      const coarseRes = new PaintReservoir('#facc15');
+      for (let i = 0; i < 25; i++) {
+        fineRes.mixWithCanvas(blueSample, 0.65, 0.9, 0.65, 'blend', 0.8, 1.0, 2.0, true);
+      }
+      for (let i = 0; i < 5; i++) {
+        coarseRes.mixWithCanvas(blueSample, 0.65, 0.9, 0.65, 'blend', 0.8, 1.0, 10.0, true);
+      }
+      expect(Math.abs(fineRes.r - coarseRes.r)).toBeLessThan(12);
+      expect(Math.abs(fineRes.g - coarseRes.g)).toBeLessThan(12);
+      expect(Math.abs(fineRes.b - coarseRes.b)).toBeLessThan(12);
+      // Must NOT collapse into underlying dark blue at amountOfPaint=0.65
+      expect(fineRes.g).toBeGreaterThan(150);
+    });
   });
 
   describe('Alpha Lock (Lock Transparent Pixels) & Transparent Ink Mode', () => {

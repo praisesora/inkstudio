@@ -1,15 +1,18 @@
 import React, { useState, useRef } from 'react';
 import {
   Paintbrush,
+  Palette,
   PenTool,
   Pencil,
   Plus,
+  Copy,
   Download,
   Trash2,
   Loader2,
   FolderDown,
   ChevronDown,
   ChevronRight,
+  Sliders,
 } from 'lucide-react';
 import { BrushCategory, BrushPresetId, CspBrush } from '../types/editor';
 import {
@@ -21,6 +24,7 @@ import {
 import {
   deleteCustomBrush,
   prepareBrushSettingsForCsp,
+  saveCustomBrush,
 } from '../utils/brushStorage';
 import {
   BUILTIN_BRUSHES,
@@ -34,7 +38,7 @@ import {
   getSavedBrushSettings,
   saveActivePresetId,
 } from '../utils/brushPresetManager';
-import { useToolStore, toolStoreActions } from '../stores';
+import { useToolStore, toolStoreActions, uiStoreActions } from '../stores';
 
 export interface SubToolListProps {
   customBrushes: CspBrush[];
@@ -44,6 +48,7 @@ export interface SubToolListProps {
 function renderBuiltinIcon(icon: BuiltinBrushDefinition['icon']) {
   if (icon === 'pen') return <PenTool className="w-3 h-3 shrink-0 opacity-80" />;
   if (icon === 'pencil') return <Pencil className="w-3 h-3 shrink-0 opacity-80" />;
+  if (icon === 'palette') return <Palette className="w-3 h-3 shrink-0 text-rose-300/85" />;
   return <Paintbrush className="w-3 h-3 shrink-0 opacity-80" />;
 }
 
@@ -129,30 +134,92 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
       }
     };
 
+    const handleCreateNewBrush = async () => {
+      const id = `inkb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      const base = buildExportableBrush('impasto-bristle-oil', customBrushes);
+      const newBrush: CspBrush = {
+        ...base,
+        id,
+        name: 'New Natural Brush',
+        category: 'natural-paint',
+        badge: 'Studio',
+        importedAt: Date.now(),
+      };
+      await saveCustomBrush(newBrush);
+      setCustomBrushes((prev) => [newBrush, ...prev]);
+      await handleSelectCustomBrush(newBrush);
+      uiStoreActions.setBrushStudioModalOpen(true);
+    };
+
+    const handleDuplicateActiveBrush = async () => {
+      const sourceId = activePreset || DEFAULT_BRUSH_PRESET_ID;
+      const liveSettings = useToolStore.getState().brushSettings;
+      const exported = buildExportableBrush(sourceId, customBrushes, liveSettings);
+      const id = `inkb-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      const dupBrush: CspBrush = {
+        ...exported,
+        id,
+        name: `${exported.name} Copy`,
+        badge: 'Studio',
+        importedAt: Date.now(),
+      };
+      await saveCustomBrush(dupBrush);
+      setCustomBrushes((prev) => [dupBrush, ...prev]);
+      await handleSelectCustomBrush(dupBrush);
+      uiStoreActions.setBrushStudioModalOpen(true);
+    };
+
     const brushesByCategory = (cat: BrushCategory) =>
       BUILTIN_BRUSHES.filter((b) => b.category === cat);
 
     return (
       <>
-        <div className="px-1.5 py-1 flex items-center justify-end gap-1 shrink-0">
-          <button
-            type="button"
-            onClick={() => sutInputRef.current?.click()}
-            title="Import Brush (.inkb, .sut)"
-            className="h-5 px-1.5 rounded flex items-center gap-1 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
-          >
-            <Plus className="w-3 h-3" />
-            <span>Import</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => handleExportBrush(activePreset || DEFAULT_BRUSH_PRESET_ID)}
-            title="Export Active Brush (.inkb)"
-            className="h-5 px-1.5 rounded flex items-center gap-1 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
-          >
-            <Download className="w-3 h-3" />
-            <span>Export</span>
-          </button>
+        <div className="px-1.5 py-1 flex items-center justify-between gap-0.5 shrink-0">
+          <div className="flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={handleCreateNewBrush}
+              title="Create New Brush in Brush Studio"
+              className="h-5 px-1 rounded flex items-center gap-0.5 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+            >
+              <Plus className="w-3 h-3" />
+              <span>New</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleDuplicateActiveBrush}
+              title="Duplicate Active Brush"
+              className="h-5 px-1 rounded flex items-center text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+            >
+              <Copy className="w-2.5 h-2.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => uiStoreActions.setBrushStudioModalOpen(true)}
+              title="Edit Active Brush in Brush Studio"
+              className="h-5 px-1 rounded flex items-center text-[10px] text-[#8a8a8a] hover:text-[var(--accent)] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+            >
+              <Sliders className="w-2.5 h-2.5" />
+            </button>
+          </div>
+          <div className="flex items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => sutInputRef.current?.click()}
+              title="Import Brush (.inkb, .sut)"
+              className="h-5 px-1 rounded flex items-center gap-0.5 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+            >
+              <FolderDown className="w-2.5 h-2.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => handleExportBrush(activePreset || DEFAULT_BRUSH_PRESET_ID)}
+              title="Export Active Brush (.inkb)"
+              className="h-5 px-1 rounded flex items-center gap-0.5 text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] shrink-0 cursor-pointer"
+            >
+              <Download className="w-2.5 h-2.5" />
+            </button>
+          </div>
         </div>
 
         <input

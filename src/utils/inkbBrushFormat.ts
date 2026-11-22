@@ -2,7 +2,11 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 import {
   ALL_BLEND_MODES,
   BlendMode,
+  BristleProfilePreset,
+  BristleSettings,
+  BrushCategory,
   BrushDynamics,
+  BrushRenderMode,
   BrushSettings,
   CspAngleDynamicsMode,
   CspBlendTipsMode,
@@ -13,6 +17,11 @@ import {
   CspSubTip,
   CspTaperSettings,
   CspTipFlipMode,
+  GrainMappingMode,
+  ImpastoSettings,
+  NaturalMixingMode,
+  NaturalPaintSettings,
+  SurfaceTextureId,
 } from '../types/editor';
 import { getEffectiveBrushSettings } from './brushPresetManager';
 import {
@@ -26,7 +35,7 @@ import { parseSutFile } from './sutParser';
 import { toolStoreActions } from '../stores';
 
 export const INKB_FORMAT = 'inkb';
-export const INKB_VERSION = 1;
+export const INKB_VERSION = 2;
 export const INKB_EXTENSION = '.inkb';
 
 const MAX_INKB_FILE_BYTES = 25 * 1024 * 1024;
@@ -46,13 +55,50 @@ const VALID_ANGLE_DYNAMICS = new Set<CspAngleDynamicsMode>([
 ]);
 const VALID_FLIP_MODES = new Set<CspTipFlipMode>(['none', 'random', 'alternate']);
 const VALID_BLEND_TIPS = new Set<CspBlendTipsMode>(['normal', 'darken', 'compare']);
-const VALID_MIXING_MODES = new Set(['blend', 'running_color', 'smear']);
+const VALID_MIXING_MODES = new Set<NaturalMixingMode>([
+  'blend',
+  'running_color',
+  'smear',
+  'impasto_mix',
+]);
 const VALID_TEXTURE_MODES = new Set<CspPaperTextureMode>([
   'multiply',
   'subtract',
   'compare',
   'overlay',
   'outline',
+]);
+const VALID_RENDER_MODES = new Set<BrushRenderMode>(['stamp', 'bristle-ribbon', 'bristle-hybrid']);
+const VALID_GRAIN_MAPPING_MODES = new Set<GrainMappingMode>([
+  'canvas-locked',
+  'brush-aligned',
+  'stroke-flow',
+  'random-per-stroke',
+]);
+const VALID_SURFACE_TEXTURES = new Set<SurfaceTextureId>([
+  'linen-canvas',
+  'coarse-burlap',
+  'fine-cotton',
+  'cold-press-watercolor',
+  'rough-pastel',
+  'gesso-board',
+  'stipple-grain',
+]);
+const VALID_BRISTLE_PROFILES = new Set<BristleProfilePreset>([
+  'round',
+  'flat',
+  'filbert',
+  'fan',
+  'rake',
+  'knife',
+  'custom',
+]);
+const VALID_CATEGORIES = new Set<BrushCategory | 'custom'>([
+  'pen',
+  'sketch',
+  'brush',
+  'natural-paint',
+  'custom',
 ]);
 const VALID_BLEND_MODES = new Set<BlendMode>(ALL_BLEND_MODES);
 
@@ -112,14 +158,75 @@ function sanitizeSensor(val: unknown): CspSensorConfig | undefined {
   if (typeof s.useTilt === 'boolean') out.useTilt = s.useTilt;
   const tMin = optNum(s.tiltMin, 0, 1);
   if (tMin !== undefined) out.tiltMin = tMin;
+  if (typeof s.useTiltAzimuth === 'boolean') out.useTiltAzimuth = s.useTiltAzimuth;
+  if (typeof s.useBarrelTwist === 'boolean') out.useBarrelTwist = s.useBarrelTwist;
+  const twMin = optNum(s.twistMin, 0, 1);
+  if (twMin !== undefined) out.twistMin = twMin;
   if (typeof s.useVelocity === 'boolean') out.useVelocity = s.useVelocity;
   const vMin = optNum(s.velocityMin, 0, 1);
   if (vMin !== undefined) out.velocityMin = vMin;
   if (typeof s.invertVelocity === 'boolean') out.invertVelocity = s.invertVelocity;
+  if (typeof s.useDistance === 'boolean') out.useDistance = s.useDistance;
+  const dMin = optNum(s.distanceMin, 0, 1);
+  if (dMin !== undefined) out.distanceMin = dMin;
+  const dMax = optNum(s.distanceMaxPx, 10, 10000);
+  if (dMax !== undefined) out.distanceMaxPx = dMax;
   if (typeof s.useRandom === 'boolean') out.useRandom = s.useRandom;
   const rMin = optNum(s.randomMin, 0, 1);
   if (rMin !== undefined) out.randomMin = rMin;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function sanitizeBristle(val: unknown): BristleSettings | undefined {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return undefined;
+  const b = val as Record<string, unknown>;
+  const profile =
+    typeof b.profile === 'string' && VALID_BRISTLE_PROFILES.has(b.profile as BristleProfilePreset)
+      ? (b.profile as BristleProfilePreset)
+      : 'filbert';
+  return {
+    profile,
+    count: Math.round(clampNum(b.count, 4, 64, 28)),
+    clumping: clampNum(b.clumping, 0, 1, 0.35),
+    stiffness: clampNum(b.stiffness, 0, 1, 0.6),
+    length: clampNum(b.length, 0.2, 2.0, 1.0),
+    splay: clampNum(b.splay, 0, 1, 0.3),
+    irregularity: clampNum(b.irregularity, 0, 1, 0.35),
+    edgeRidge: optNum(b.edgeRidge, 0, 1),
+  };
+}
+
+function sanitizeNaturalPaint(val: unknown): NaturalPaintSettings | undefined {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return undefined;
+  const n = val as Record<string, unknown>;
+  return {
+    enabled: Boolean(n.enabled),
+    spatialMixing: Boolean(n.spatialMixing),
+    pigmentMixingStrength: clampNum(n.pigmentMixingStrength, 0, 1, 0.85),
+    paintLoad: clampNum(n.paintLoad, 0, 1, 0.85),
+    depletionRate: clampNum(n.depletionRate, 0, 1, 0.25),
+    wetness: clampNum(n.wetness, 0, 1, 0.5),
+    viscosity: clampNum(n.viscosity, 0, 1, 0.5),
+    autoClean: typeof n.autoClean === 'boolean' ? n.autoClean : true,
+    chargePerPressure: clampNum(n.chargePerPressure, 0, 1, 0.45),
+    dryBrush: clampNum(n.dryBrush, 0, 1, 0.3),
+    granulation: optNum(n.granulation, 0, 1),
+    penetrationCurve: sanitizeCurve(n.penetrationCurve),
+  };
+}
+
+function sanitizeImpasto(val: unknown): ImpastoSettings | undefined {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return undefined;
+  const imp = val as Record<string, unknown>;
+  return {
+    enabled: Boolean(imp.enabled),
+    depth: clampNum(imp.depth, 0, 1, 0.55),
+    bristleRelief: clampNum(imp.bristleRelief, 0, 1, 0.6),
+    gloss: clampNum(imp.gloss, 0, 1, 0.45),
+    reliefContrast: clampNum(imp.reliefContrast, 0, 1, 0.55),
+    lightAzimuth: clampNum(imp.lightAzimuth, 0, 360, 315),
+    lightElevation: clampNum(imp.lightElevation, 5, 85, 42),
+  };
 }
 
 function sanitizeSpray(val: unknown): CspSpraySettings | undefined {
@@ -151,6 +258,7 @@ function sanitizeTaper(val: unknown): CspTaperSettings | undefined {
     affectSize: optBool(t.affectSize),
     affectDensity: optBool(t.affectDensity),
     affectOpacity: optBool(t.affectOpacity),
+    affectLoad: optBool(t.affectLoad),
   };
 }
 
@@ -169,6 +277,7 @@ function sanitizeDynamics(val: unknown): BrushDynamics | undefined {
     hueJitter: clampNum(d.hueJitter, 0, 1, 0),
     saturationJitter: clampNum(d.saturationJitter, 0, 1, 0),
     brightnessJitter: clampNum(d.brightnessJitter, 0, 1, 0),
+    temperatureJitter: optNum(d.temperatureJitter, 0, 1),
     foregroundBackgroundJitter: clampNum(d.foregroundBackgroundJitter, 0, 1, 0),
   };
 }
@@ -233,6 +342,7 @@ export function buildExportableBrush(
   return {
     id: existingCustom?.id || `inkb-${presetId}`,
     name,
+    category: existingCustom?.category,
     badge: 'INKB',
     desc: existingCustom?.desc,
     tipDataUrl: merged.customTipDataUrl ?? existingCustom?.tipDataUrl,
@@ -274,6 +384,11 @@ export function buildExportableBrush(
     sizeSensor: merged.sizeSensor,
     opacitySensor: merged.opacitySensor,
     densitySensor: merged.densitySensor,
+    bristleSplaySensor: merged.bristleSplaySensor,
+    paintLoadSensor: merged.paintLoadSensor,
+    grainPenetrationSensor: merged.grainPenetrationSensor,
+    angleSensor: merged.angleSensor,
+    scatterSensor: merged.scatterSensor,
     colorMixing: merged.colorMixing,
     perceptualMixing: merged.perceptualMixing,
     amountOfPaint: merged.amountOfPaint,
@@ -285,6 +400,8 @@ export function buildExportableBrush(
     wetEdgeAlphaPower: merged.wetEdgeAlphaPower,
     wetEdgeValuePower: merged.wetEdgeValuePower,
     paperTexture: merged.paperTexture ?? existingCustom?.paperTexture,
+    surfaceTextureId: merged.surfaceTextureId ?? existingCustom?.surfaceTextureId,
+    grainMappingMode: merged.grainMappingMode ?? existingCustom?.grainMappingMode,
     textureDensity: merged.textureDensity ?? merged.grain,
     paperTextureMode: merged.paperTextureMode,
     paperTextureBrightness: merged.paperTextureBrightness,
@@ -297,6 +414,11 @@ export function buildExportableBrush(
     dualBrushCompositeMode: merged.dualBrushCompositeMode,
     dualSize: merged.dualSize,
     dualSpacing: merged.dualSpacing,
+    dualScatter: merged.dualScatter,
+    dualAngle: merged.dualAngle,
+    dualScale: merged.dualScale,
+    dualSurfaceTextureId: merged.dualSurfaceTextureId,
+    dualGrainDepth: merged.dualGrainDepth,
     spray: merged.spray,
     taper: merged.taper,
     isRibbon: merged.isRibbon,
@@ -304,6 +426,10 @@ export function buildExportableBrush(
     pressureCurveGamma: merged.pressureCurveGamma,
     velocityDynamics: merged.velocityDynamics,
     dynamics: merged.dynamics,
+    renderMode: merged.renderMode,
+    bristle: merged.bristle,
+    naturalPaint: merged.naturalPaint,
+    impasto: merged.impasto,
     importedAt: Date.now(),
   };
 }
@@ -392,6 +518,10 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
   return {
     id: `inkb-${idSuffix}`,
     name,
+    category:
+      typeof b.category === 'string' && VALID_CATEGORIES.has(b.category as BrushCategory | 'custom')
+        ? (b.category as BrushCategory | 'custom')
+        : undefined,
     badge: 'INKB',
     desc: typeof b.desc === 'string' ? b.desc.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 200) : undefined,
     tipDataUrl: sanitizeDataUrl(b.tipDataUrl),
@@ -454,13 +584,18 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     sizeSensor: sanitizeSensor(b.sizeSensor),
     opacitySensor: sanitizeSensor(b.opacitySensor),
     densitySensor: sanitizeSensor(b.densitySensor),
+    bristleSplaySensor: sanitizeSensor(b.bristleSplaySensor),
+    paintLoadSensor: sanitizeSensor(b.paintLoadSensor),
+    grainPenetrationSensor: sanitizeSensor(b.grainPenetrationSensor),
+    angleSensor: sanitizeSensor(b.angleSensor),
+    scatterSensor: sanitizeSensor(b.scatterSensor),
     colorMixing: optBool(b.colorMixing),
     perceptualMixing: optBool(b.perceptualMixing),
     amountOfPaint: optNum(b.amountOfPaint, 0, 1),
     densityOfPaint: optNum(b.densityOfPaint, 0, 1),
     colorStretch: optNum(b.colorStretch, 0, 1),
     mixingMode:
-      typeof b.mixingMode === 'string' && VALID_MIXING_MODES.has(b.mixingMode)
+      typeof b.mixingMode === 'string' && VALID_MIXING_MODES.has(b.mixingMode as NaturalMixingMode)
         ? (b.mixingMode as CspBrush['mixingMode'])
         : undefined,
     wetEdge: optNum(b.wetEdge, 0, 1),
@@ -468,6 +603,16 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     wetEdgeAlphaPower: optNum(b.wetEdgeAlphaPower, 0, 10),
     wetEdgeValuePower: optNum(b.wetEdgeValuePower, 0, 10),
     paperTexture: sanitizeDataUrl(b.paperTexture),
+    surfaceTextureId:
+      typeof b.surfaceTextureId === 'string' &&
+      VALID_SURFACE_TEXTURES.has(b.surfaceTextureId as SurfaceTextureId)
+        ? (b.surfaceTextureId as SurfaceTextureId)
+        : undefined,
+    grainMappingMode:
+      typeof b.grainMappingMode === 'string' &&
+      VALID_GRAIN_MAPPING_MODES.has(b.grainMappingMode as GrainMappingMode)
+        ? (b.grainMappingMode as GrainMappingMode)
+        : undefined,
     textureDensity: optNum(b.textureDensity, 0, 1),
     paperTextureMode:
       typeof b.paperTextureMode === 'string' &&
@@ -485,6 +630,15 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
       typeof b.dualBrushCompositeMode === 'string' ? b.dualBrushCompositeMode.slice(0, 32) : undefined,
     dualSize: optNum(b.dualSize, 0.5, 2000),
     dualSpacing: optNum(b.dualSpacing, 0.01, 5),
+    dualScatter: optNum(b.dualScatter, 0, 5),
+    dualAngle: optNum(b.dualAngle, -360, 360),
+    dualScale: optNum(b.dualScale, 0.05, 10),
+    dualSurfaceTextureId:
+      typeof b.dualSurfaceTextureId === 'string' &&
+      VALID_SURFACE_TEXTURES.has(b.dualSurfaceTextureId as SurfaceTextureId)
+        ? (b.dualSurfaceTextureId as SurfaceTextureId)
+        : undefined,
+    dualGrainDepth: optNum(b.dualGrainDepth, 0, 1),
     spray: sanitizeSpray(b.spray),
     taper: sanitizeTaper(b.taper),
     isRibbon: optBool(b.isRibbon),
@@ -492,6 +646,13 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     pressureCurveGamma: optNum(b.pressureCurveGamma, 0.1, 5),
     velocityDynamics: optBool(b.velocityDynamics),
     dynamics: sanitizeDynamics(b.dynamics),
+    renderMode:
+      typeof b.renderMode === 'string' && VALID_RENDER_MODES.has(b.renderMode as BrushRenderMode)
+        ? (b.renderMode as BrushRenderMode)
+        : undefined,
+    bristle: sanitizeBristle(b.bristle),
+    naturalPaint: sanitizeNaturalPaint(b.naturalPaint),
+    impasto: sanitizeImpasto(b.impasto),
     importedAt: Date.now(),
   };
 }

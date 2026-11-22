@@ -12,8 +12,15 @@ import {
   SoftProofSettings,
   CanvasColorMode,
   ShapeDragPreview,
+  GradientDragPreview,
+  GradientMeshState,
+  GradientSettings,
+  RetouchSettings,
+  PenPathSession,
+  PenToolSettings,
   AnimationTimeline as AnimationTimelineType,
 } from '../../types/editor';
+import type { CloneSourceIndicator } from '../../hooks/drawing/useRetouchTool';
 import { ROTATE_CURSOR_CSS, CanvasNavigationHandle } from '../../hooks/useCanvasNavigation';
 import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../../types/perspective';
 import { SparseTileGrid } from '../../utils/tileEngine';
@@ -34,6 +41,7 @@ export interface CanvasAreaProps {
   navigation?: CanvasNavigationHandle;
   isSpaceDown: boolean;
   isShiftDown: boolean;
+  heldModifierAction?: ModifierAction;
   isRotateModifier: boolean;
   isPanning: boolean;
   isRotating: boolean;
@@ -71,6 +79,11 @@ export interface CanvasAreaProps {
   onFillScreentone?: () => void;
   onFillColor?: () => void;
   onClearSelection?: () => void;
+  onDeleteOutsideSelection?: () => void;
+  onCutSelection?: () => void;
+  onCopySelection?: () => void;
+  onPasteSelection?: () => void;
+  onMoveSelectionToNewLayer?: () => void;
   onInvertSelection?: () => void;
   onExpandSelection?: (pixels: number) => void;
   onContractSelection?: (pixels: number) => void;
@@ -110,6 +123,19 @@ export interface CanvasAreaProps {
   onDeleteBalloon?: () => void;
   frameDragPreview?: { mode: 'create' | 'divide'; start: { x: number; y: number }; end: { x: number; y: number } } | null;
   shapeDragPreview?: ShapeDragPreview | null;
+  gradientDragPreview?: GradientDragPreview | null;
+  gradientMesh?: GradientMeshState | null;
+  gradientSettings?: GradientSettings;
+  onApplyGradientMesh?: () => void;
+  onCancelGradientMesh?: () => void;
+  retouchSettings?: RetouchSettings;
+  onUpdateRetouchSettings?: (newSettings: Partial<RetouchSettings>) => void;
+  cloneSourceIndicator?: CloneSourceIndicator | null;
+  penSession?: PenPathSession | null;
+  penSettings?: PenToolSettings;
+  onCommitPenPath?: () => void;
+  onCancelPenPath?: () => void;
+  onToggleClosePenPath?: () => void;
   secondaryColor?: string;
   animationTimeline?: AnimationTimelineType | null;
   onUpdateAnimationTimeline?: (timeline: AnimationTimelineType) => void;
@@ -247,10 +273,19 @@ export function getCursorStyle({
   if (tool === 'text') {
     return { cursor: 'text' };
   }
-  if (tool === 'select-rect' || tool === 'select-lasso' || tool === 'select-wand' || tool === 'fill' || tool === 'frame' || tool === 'shape') {
+  if (
+    tool === 'select-rect' ||
+    tool === 'select-lasso' ||
+    tool === 'select-wand' ||
+    tool === 'fill' ||
+    tool === 'gradient' ||
+    tool === 'frame' ||
+    tool === 'shape' ||
+    tool === 'pen'
+  ) {
     return { cursor: 'crosshair' };
   }
-  if (tool === 'liquify') {
+  if (tool === 'liquify' || tool === 'retouch') {
     return { cursor: isOverCanvas ? 'none' : 'default' };
   }
   if (tool === 'transform') {

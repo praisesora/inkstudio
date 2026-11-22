@@ -3,6 +3,7 @@ import {
   BrushSettings,
   CanvasDimensions,
   LiquifySettings,
+  RetouchSettings,
   ToolType,
 } from '../../types/editor';
 import { ModifierAction } from '../../types/settings';
@@ -18,6 +19,7 @@ export interface UseCanvasPointerHandlersParams {
   dimensions: CanvasDimensions;
   brushSettings: BrushSettings;
   liquifySettings?: LiquifySettings;
+  retouchSettings?: RetouchSettings;
   tool: ToolType;
   navigation?: CanvasNavigationHandle;
   pan: { x: number; y: number };
@@ -47,6 +49,7 @@ export function useCanvasPointerHandlers({
   dimensions,
   brushSettings,
   liquifySettings,
+  retouchSettings,
   tool,
   navigation,
   pan,
@@ -89,8 +92,16 @@ export function useCanvasPointerHandlers({
     setIsResizingBrush(true);
     resizeOriginRef.current = { clientX: e.clientX, clientY: e.clientY };
     resizeStartSettingsRef.current = {
-      size: tool === 'liquify' && liquifySettings ? liquifySettings.size : brushSettings.size,
-      hardness: brushSettings.hardness ?? 1.0,
+      size:
+        tool === 'liquify' && liquifySettings
+          ? liquifySettings.size
+          : tool === 'retouch' && retouchSettings
+            ? retouchSettings.size
+            : brushSettings.size,
+      hardness:
+        tool === 'retouch' && retouchSettings
+          ? retouchSettings.hardness / 100
+          : (brushSettings.hardness ?? 1.0),
     };
   };
 
@@ -156,13 +167,16 @@ export function useCanvasPointerHandlers({
   ): boolean => {
     switch (action) {
       case 'pan':
+        e.stopPropagation();
         onStartPan(e);
         return true;
       case 'rotate':
+        e.stopPropagation();
         onStartRotate(e);
         return true;
       case 'zoom-drag':
         if (onStartZoomDrag) {
+          e.stopPropagation();
           onStartZoomDrag(e);
           return true;
         }
@@ -171,6 +185,14 @@ export function useCanvasPointerHandlers({
         startBrushResize(e);
         return true;
       case 'eyedropper':
+        if (
+          allowDrawingPassThrough &&
+          e.button === 0 &&
+          e.altKey &&
+          ((tool === 'retouch' && retouchSettings?.mode === 'clone-stamp') || tool === 'pen')
+        ) {
+          return false;
+        }
         if (e.button !== 0 || !allowDrawingPassThrough) {
           startModifierEyedropper(e);
           return true;

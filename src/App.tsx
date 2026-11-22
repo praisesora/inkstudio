@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AnimationTimeline, BlendMode, ExpressionColor, FilterType, LayerItem } from './types/editor';
+import { AnimationTimeline, BlendMode, ExpressionColor, FilterType, LayerItem, LayerTreeDelta } from './types/editor';
 import {
   createDefaultAnimationTimeline,
   removeFrameCel,
@@ -16,6 +16,9 @@ import { updaterService } from './services/updaterService';
 import { useCanvasDrawing } from './hooks/useCanvasDrawing';
 import {
   PushHistoryStepFn,
+  useGradientTool,
+  usePenTool,
+  useRetouchTool,
   useSelectionTools,
   useShapeAndFillTools,
   useVectorDrawing,
@@ -94,7 +97,9 @@ export function App() {
       documentStoreActions.setAnimationTimeline(timeline);
       if (activeDocumentId) {
         documentStoreActions.setDocuments((docs) =>
-          docs.map((d) => (d.id === activeDocumentId ? { ...d, animation: timeline } : d))
+          docs.map((d) =>
+            d.id === activeDocumentId ? { ...d, animation: timeline, isDirty: true } : d
+          )
         );
       }
     },
@@ -209,6 +214,8 @@ export function App() {
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
     pushHistoryStep: stablePushHistoryStep,
     showToast,
+    copySelectionToClipboard: layerMgr.copySelectionToClipboard,
+    createLayerFromTileSnapshot: layerMgr.createLayerFromTileSnapshot,
   });
 
   const handleCollabStrokeStart = useCallback(
@@ -288,6 +295,7 @@ export function App() {
       : true,
     layers: hasOpenDocument ? layerMgr.layers : [],
     onUpdateLayerThumbnail: layerMgr.updateLayerThumbnail,
+    onApplyLayerTreeDelta: layerMgr.applyLayerTreeDelta,
     isMaskMode: activeEditTarget === 'mask',
     onUpdateMaskThumbnail: layerMgr.updateMaskThumbnail,
     draftCanvasRef,
@@ -383,6 +391,55 @@ export function App() {
     showToast,
   });
 
+  // Modular Gradient Tool (Linear / Radial / Mesh)
+  const gradientTools = useGradientTool({
+    dimensions,
+    colorMode,
+    activeLayer: layerMgr.activeLayer,
+    activeLayerId: layerMgr.activeLayerId,
+    selection: selectionTools.selection,
+    zoomRef: nav.navigation.zoomRef,
+    flushPendingHistoryTasks: drawing.flushPendingHistoryTasks,
+    isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
+    getCanvasCoords,
+    updateLayerThumbnail: layerMgr.updateLayerThumbnail,
+    pushHistoryStep: drawing.pushHistoryStep,
+    showToast,
+  });
+
+  // Modular Retouch Tools (Smudge / Blur / Dodge / Burn / Clone Stamp)
+  const retouchTools = useRetouchTool({
+    dimensions,
+    colorMode,
+    layers: layerMgr.layers,
+    activeLayer: layerMgr.activeLayer,
+    activeLayerId: layerMgr.activeLayerId,
+    selection: selectionTools.selection,
+    flushPendingHistoryTasks: drawing.flushPendingHistoryTasks,
+    isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
+    getEffectiveOpacity: layerMgr.getEffectiveOpacity,
+    getCanvasCoords,
+    updateLayerThumbnail: layerMgr.updateLayerThumbnail,
+    pushHistoryStep: drawing.pushHistoryStep,
+    showToast,
+  });
+
+  // Modular True Cubic Bézier Pen Tool
+  const penTools = usePenTool({
+    dimensions,
+    colorMode,
+    activeLayer: layerMgr.activeLayer,
+    activeLayerId: layerMgr.activeLayerId,
+    selection: selectionTools.selection,
+    zoomRef: nav.navigation.zoomRef,
+    flushPendingHistoryTasks: drawing.flushPendingHistoryTasks,
+    isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
+    getCanvasCoords,
+    updateLayerThumbnail: layerMgr.updateLayerThumbnail,
+    pushHistoryStep: drawing.pushHistoryStep,
+    showToast,
+  });
+
   // Tonal, Filter, Adjustment, Styles, Screentone & Expression Color Actions
   const tonalActions = useTonalAndFilterActions({
     hasOpenDocument,
@@ -424,6 +481,7 @@ export function App() {
     resizeCanvas: layerMgr.resizeCanvas,
     copyLayer: layerMgr.copyLayer,
     pasteLayer: layerMgr.pasteLayer,
+    onDeselectAfterPaste: selectionTools.handleDeselect,
     deleteLayer: collab.handleDeleteLayer,
     pasteLayerFromFile: layerMgr.pasteLayerFromFile,
     resetZoomAndCenter: nav.resetZoomAndCenter,
@@ -437,8 +495,9 @@ export function App() {
       layerMgr.setLayers((prev) =>
         prev.map((l) => (l.id === layerId ? { ...l, isReference: !l.isReference } : l))
       );
+      documentStoreActions.markDocumentDirty(activeDocumentId, true);
     },
-    [layerMgr.setLayers]
+    [activeDocumentId, layerMgr.setLayers]
   );
 
   const handleMergeDown = useCallback(() => {
@@ -453,13 +512,27 @@ export function App() {
   }, [layerMgr.mergeDown, activeDocumentId, showToast]);
 
   const handleAddDefaultFrameFolder = useCallback(() => {
+    drawing.flushPendingHistoryTasks();
     const dpi = dimensions.dpi ?? 600;
     const defaultFrame = createDefaultPageFrame('', dimensions.width, dimensions.height, dpi, 15);
-    const { folder } = layerMgr.createFrameFolder([defaultFrame], undefined, true);
-    drawing.pushHistoryStep('frame', 'New Frame Border Folder', null, null, folder.id);
+    const { folder, layerTreeDelta } = layerMgr.createFrameFolder([defaultFrame], undefined, true);
+    drawing.pushHistoryStep(
+      'frame',
+      'New Frame Border Folder',
+      null,
+      null,
+      folder.id,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      layerTreeDelta
+    );
     autoActionStoreActions.recordStep('create-frame-folder', 'New Frame Border Folder');
     showToast('Created Frame Border Folder');
-  }, [dimensions, layerMgr.createFrameFolder, drawing.pushHistoryStep, showToast]);
+  }, [dimensions, layerMgr.createFrameFolder, drawing.flushPendingHistoryTasks, drawing.pushHistoryStep, showToast]);
 
   const handleRasterizeLayer = useCallback(
     (layerId: string) => {
@@ -547,6 +620,7 @@ export function App() {
       let currentLayerId = layerMgr.activeLayerId;
       let groupStartSnapshot: Map<string, TileSnapshotEntry> | null = null;
       let groupTargetLayerId = currentLayerId;
+      let groupLayerTreeDelta: LayerTreeDelta | undefined;
 
       const ctx: AutoActionExecutionContext = {
         getActiveLayerId: () => currentLayerId,
@@ -563,7 +637,22 @@ export function App() {
         createFrameFolder: (name) => {
           const dpi = dimensions.dpi ?? 600;
           const df = createDefaultPageFrame('', dimensions.width, dimensions.height, dpi, 15);
-          const { folder } = layerMgr.createFrameFolder([df], name, true);
+          const { folder, layerTreeDelta } = layerMgr.createFrameFolder([df], name, true);
+          if (!groupLayerTreeDelta) {
+            groupLayerTreeDelta = {
+              addedLayers: [...(layerTreeDelta.addedLayers || [])],
+              insertBeforeLayerId: layerTreeDelta.insertBeforeLayerId,
+              insertIndex: layerTreeDelta.insertIndex,
+              beforeActiveLayerId: layerTreeDelta.beforeActiveLayerId,
+              afterActiveLayerId: layerTreeDelta.afterActiveLayerId,
+            };
+          } else {
+            groupLayerTreeDelta.addedLayers = [
+              ...(layerTreeDelta.addedLayers || []),
+              ...(groupLayerTreeDelta.addedLayers || []),
+            ];
+            groupLayerTreeDelta.afterActiveLayerId = layerTreeDelta.afterActiveLayerId;
+          }
           currentLayerId = folder.id;
           return folder.id;
         },
@@ -642,7 +731,12 @@ export function App() {
             null,
             targetId,
             undefined,
-            tileDeltas && tileDeltas.length > 0 ? tileDeltas : undefined
+            tileDeltas && tileDeltas.length > 0 ? tileDeltas : undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            groupLayerTreeDelta
           );
         },
       };
@@ -770,6 +864,21 @@ export function App() {
         return;
       }
 
+      if (tool === 'gradient') {
+        gradientTools.handleGradientPointerDown(e, pt);
+        return;
+      }
+
+      if (tool === 'retouch') {
+        retouchTools.handleRetouchPointerDown(e, pt);
+        return;
+      }
+
+      if (tool === 'pen') {
+        penTools.handlePenPointerDown(e, pt);
+        return;
+      }
+
       if (selectionTools.handleSelectionPointerDown(e, pt)) return;
       shapeFillTools.handleShapeFillPointerDown(e, pt);
     },
@@ -779,6 +888,9 @@ export function App() {
       selectionTools,
       drawing,
       vectorTools,
+      gradientTools,
+      retouchTools,
+      penTools,
       shapeFillTools,
       collab.isConnected,
       collab.isReconnecting,
@@ -805,10 +917,22 @@ export function App() {
         vectorTools.handleVectorEditPointerMove(e);
         return;
       }
+      if (tool === 'gradient') {
+        gradientTools.handleGradientPointerMove(e);
+        return;
+      }
+      if (tool === 'retouch') {
+        retouchTools.handleRetouchPointerMove(e);
+        return;
+      }
+      if (tool === 'pen') {
+        penTools.handlePenPointerMove(e);
+        return;
+      }
       if (shapeFillTools.handleShapeFillPointerMove(e)) return;
       selectionTools.handleSelectionPointerMove(getCanvasCoords(e));
     },
-    [drawing, vectorTools, shapeFillTools, selectionTools, getCanvasCoords]
+    [drawing, vectorTools, gradientTools, retouchTools, penTools, shapeFillTools, selectionTools, getCanvasCoords]
   );
 
   const handlePointerUp = useCallback(
@@ -823,10 +947,22 @@ export function App() {
         return;
       }
       const pt = getCanvasCoords(e);
+      if (tool === 'gradient') {
+        gradientTools.handleGradientPointerUp(e, pt);
+        return;
+      }
+      if (tool === 'retouch') {
+        retouchTools.handleRetouchPointerUp(e);
+        return;
+      }
+      if (tool === 'pen') {
+        penTools.handlePenPointerUp(e);
+        return;
+      }
       if (selectionTools.handleSelectionPointerUp(pt)) return;
       shapeFillTools.handleShapeFillPointerUp(e, pt);
     },
-    [drawing, vectorTools, getCanvasCoords, selectionTools, shapeFillTools]
+    [drawing, vectorTools, gradientTools, retouchTools, penTools, getCanvasCoords, selectionTools, shapeFillTools]
   );
 
   // Memoized Top Menu Bar Sections (independent of brush size & color)
@@ -854,6 +990,11 @@ export function App() {
     handleSave: docLifecycle.handleSave,
     handleSaveAs: docLifecycle.handleSaveAs,
     handleExportImage: docLifecycle.handleExportImage,
+    handleCutSelection: selectionTools.handleCutSelection,
+    handleCopySelection: selectionTools.handleCopySelection,
+    handleMoveSelectionToNewLayer: selectionTools.handleMoveSelectionToNewLayer,
+    handleClearSelection: selectionTools.handleClearSelection,
+    handleDeleteOutsideSelection: selectionTools.handleDeleteOutsideSelection,
     handleCopySelectedLayer: docLifecycle.handleCopySelectedLayer,
     handlePasteSelectedLayer: docLifecycle.handlePasteSelectedLayer,
     handleTriggerPasteFromFile: docLifecycle.handleTriggerPasteFromFile,
@@ -914,6 +1055,7 @@ export function App() {
       navigation: nav.navigation,
       isSpaceDown: nav.isSpaceDown,
       isShiftDown: nav.isShiftDown,
+      heldModifierAction: nav.heldModifierAction,
       isRotateModifier: nav.isRotateModifier,
       isPanning: nav.isPanning,
       isRotating: nav.isRotating,
@@ -949,6 +1091,11 @@ export function App() {
       onFillScreentone: tonalActions.handleFillScreentone,
       onFillColor: selectionTools.handleFillSelectionColor,
       onClearSelection: selectionTools.handleClearSelection,
+      onDeleteOutsideSelection: selectionTools.handleDeleteOutsideSelection,
+      onCutSelection: selectionTools.handleCutSelection,
+      onCopySelection: selectionTools.handleCopySelection,
+      onPasteSelection: docLifecycle.handlePasteSelectedLayer,
+      onMoveSelectionToNewLayer: selectionTools.handleMoveSelectionToNewLayer,
       onInvertSelection: selectionTools.handleInvertSelection,
       onExpandSelection: selectionTools.handleExpandSelection,
       onContractSelection: selectionTools.handleContractSelection,
@@ -968,6 +1115,15 @@ export function App() {
       onDeleteBalloon: shapeFillTools.handleDeleteBalloon,
       frameDragPreview: shapeFillTools.frameDragPreview,
       shapeDragPreview: shapeFillTools.shapeDragPreview,
+      gradientDragPreview: gradientTools.gradientDragPreview,
+      gradientMesh: gradientTools.gradientMesh,
+      onApplyGradientMesh: gradientTools.handleApplyGradientMesh,
+      onCancelGradientMesh: gradientTools.handleCancelGradientMesh,
+      cloneSourceIndicator: retouchTools.cloneSourceIndicator,
+      penSession: penTools.penSession,
+      onCommitPenPath: penTools.handleCommitPenPath,
+      onCancelPenPath: penTools.handleCancelPenPath,
+      onToggleClosePenPath: penTools.handleClosePenPath,
       animationTimeline: activeAnimationTimeline,
       onUpdateAnimationTimeline: handleUpdateAnimationTimeline,
       onAddAnimationCel: handleAddAnimationCel,
@@ -977,6 +1133,7 @@ export function App() {
     [
       nav,
       docLifecycle.handleViewportReady,
+      docLifecycle.handlePasteSelectedLayer,
       drawing.isHovering,
       drawing.cursorPos,
       drawing.handlePointerEnter,
@@ -1008,6 +1165,15 @@ export function App() {
       shapeFillTools.frameDragPreview,
       shapeFillTools.shapeDragPreview,
       shapeFillTools.handleSampleColor,
+      gradientTools.gradientDragPreview,
+      gradientTools.gradientMesh,
+      gradientTools.handleApplyGradientMesh,
+      gradientTools.handleCancelGradientMesh,
+      retouchTools.cloneSourceIndicator,
+      penTools.penSession,
+      penTools.handleCommitPenPath,
+      penTools.handleCancelPenPath,
+      penTools.handleClosePenPath,
       handleUndo,
       drawing.redo,
       activeAnimationTimeline,
@@ -1126,6 +1292,7 @@ export function App() {
         resetToNewCanvas={layerMgr.resetToNewCanvas}
         resetZoomAndCenter={nav.resetZoomAndCenter}
         resetHistory={drawing.resetHistory}
+        onSelectDocument={docLifecycle.handleSelectDocument}
       />
 
       <GlobalShortcutListener
@@ -1150,8 +1317,12 @@ export function App() {
         handleSave={docLifecycle.handleSave}
         handleSaveAs={docLifecycle.handleSaveAs}
         duplicateLayer={layerMgr.duplicateLayer}
+        handleCutSelection={selectionTools.handleCutSelection}
+        handleCopySelection={selectionTools.handleCopySelection}
         handleCopySelectedLayer={docLifecycle.handleCopySelectedLayer}
         handlePasteSelectedLayer={docLifecycle.handlePasteSelectedLayer}
+        handleMoveSelectionToNewLayer={selectionTools.handleMoveSelectionToNewLayer}
+        handleCopySelectionToNewLayer={selectionTools.handleCopySelectionToNewLayer}
         handleGroupSelectedLayers={collab.handleGroupSelectedLayers}
         handleStartTransform={selectionTools.handleStartTransform}
         handleSelectAll={selectionTools.handleSelectAll}
@@ -1220,6 +1391,7 @@ export function App() {
         joinRoom={collab.joinRoom}
         onCaptureTimelapseNow={handleCaptureTimelapseNow}
         handleSave={docLifecycle.handleSave}
+        handleSaveDocumentById={docLifecycle.handleSaveDocumentById}
         showToast={showToast}
       />
     </AppShell>

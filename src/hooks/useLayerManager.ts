@@ -3,6 +3,7 @@ import { CanvasDimensions, LayerItem } from '../types/editor';
 import { SparseTileGrid, globalTileGrid } from '../utils/tileEngine';
 import { documentStore } from '../utils/documentStore';
 import { recoveryService } from '../services/recoveryService';
+import { documentStoreActions } from '../stores';
 import { computeLayerSelection } from './layerManager/layerTreeOps';
 import { LayerManagerContext, UseLayerManagerProps } from './layerManager/types';
 import { useLayerCanvasRegistry } from './layerManager/useLayerCanvasRegistry';
@@ -24,6 +25,7 @@ export {
   computeBatchReorderLayers,
   computeBatchVisibility,
   computeBatchLock,
+  applyLayerTreeDelta,
 } from './layerManager/layerTreeOps';
 
 export function useLayerManager({ dimensions: _dimensions, activeSessionId, tileGrid }: UseLayerManagerProps) {
@@ -72,6 +74,10 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
   // Track structural layer mutations and log to recovery service WAL (ignore pure thumbnailUrl refreshes)
   const isInitialLayerMount = useRef(true);
   const lastLoggedLayersSigRef = useRef<string>('');
+  const lastDirtyStructRef = useRef<{ sessionId: string | null; sig: string }>({
+    sessionId: null,
+    sig: '',
+  });
   useEffect(() => {
     if (isInitialLayerMount.current) {
       isInitialLayerMount.current = false;
@@ -79,12 +85,28 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     }
     const sId = activeSessionId || recoveryService.getCurrentSessionId();
     if (sId && layers.length > 0) {
-      const sig = `${activeLayerId}|` + layers
-        .map((l) => `${l.id}:${l.name}:${l.visible ? 1 : 0}:${l.opacity}:${l.blendMode}:${l.locked ? 1 : 0}:${l.clipped ? 1 : 0}:${l.alphaLocked ? 1 : 0}:${l.parentId || ''}:${l.expressionColor || ''}:${l.toneEnabled ? 1 : 0}`)
+      const structSig = layers
+        .map(
+          (l) =>
+            `${l.id}:${l.name}:${l.visible ? 1 : 0}:${l.opacity}:${l.blendMode}:${l.locked ? 1 : 0}:${l.clipped ? 1 : 0}:${l.alphaLocked ? 1 : 0}:${l.parentId || ''}:${l.expressionColor || ''}:${l.toneEnabled ? 1 : 0}:${l.maskCanvas ? 1 : 0}:${l.maskEnabled === false ? 0 : 1}:${l.maskLinked === false ? 0 : 1}`
+        )
         .join(';');
+
+      if (activeSessionId) {
+        if (lastDirtyStructRef.current.sessionId !== activeSessionId) {
+          lastDirtyStructRef.current = { sessionId: activeSessionId, sig: structSig };
+        } else if (lastDirtyStructRef.current.sig && lastDirtyStructRef.current.sig !== structSig) {
+          lastDirtyStructRef.current = { sessionId: activeSessionId, sig: structSig };
+          documentStoreActions.markDocumentDirty(activeSessionId, true);
+        }
+      }
+
+      const sig = `${activeLayerId}|${structSig}`;
       if (sig === lastLoggedLayersSigRef.current) return;
       lastLoggedLayersSigRef.current = sig;
       recoveryService.logLayerMutation(sId, 'update', layers, activeLayerId);
+    } else if (!activeSessionId) {
+      lastDirtyStructRef.current = { sessionId: null, sig: '' };
     }
   }, [layers, activeSessionId, activeLayerId]);
 
@@ -193,6 +215,8 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     duplicateLayer: crud.duplicateLayer,
     deleteLayer: crud.deleteLayer,
     copyLayer: clipboard.copyLayer,
+    copySelectionToClipboard: clipboard.copySelectionToClipboard,
+    createLayerFromTileSnapshot: clipboard.createLayerFromTileSnapshot,
     pasteLayer: clipboard.pasteLayer,
     pasteLayerFromCanvas: clipboard.pasteLayerFromCanvas,
     fillScreentoneSelection: clipboard.fillScreentoneSelection,
@@ -233,6 +257,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     upsertBalloonLayer: specialLayers.upsertBalloonLayer,
     createFrameFolder: specialLayers.createFrameFolder,
     divideFrameFolder: specialLayers.divideFrameFolder,
+    applyLayerTreeDelta: specialLayers.applyLayerTreeDelta,
     rasterizeLayer: specialLayers.rasterizeLayer,
   };
 }

@@ -8,6 +8,22 @@ export type {
   ShapeSettings,
   ShapeDragPreview,
 } from '../utils/shapeEngine';
+export type {
+  GradientType,
+  GradientRepeatMode,
+  GradientBlendMode,
+  GradientToolStop,
+  GradientMeshNode,
+  GradientMeshState,
+  GradientSettings,
+  GradientDragPreview,
+} from '../utils/gradientEngine';
+export type {
+  RetouchMode,
+  RetouchTonalRange,
+  CloneSampleMode,
+  RetouchSettings,
+} from '../utils/retouchEngine';
 
 export type ToolType =
   | 'brush'
@@ -20,7 +36,10 @@ export type ToolType =
   | 'select-pen'
   | 'select-eraser'
   | 'fill'
+  | 'gradient'
+  | 'retouch'
   | 'shape'
+  | 'pen'
   | 'text'
   | 'frame'
   | 'balloon'
@@ -40,7 +59,106 @@ export interface Point {
   isCorner?: boolean;
 }
 
-export type BrushCategory = 'pen' | 'sketch' | 'brush';
+export type BrushCategory = 'pen' | 'sketch' | 'brush' | 'natural-paint';
+
+export type BrushRenderMode = 'stamp' | 'bristle-ribbon' | 'bristle-hybrid';
+
+export type GrainMappingMode =
+  | 'canvas-locked'
+  | 'brush-aligned'
+  | 'stroke-flow'
+  | 'random-per-stroke';
+
+export type SurfaceTextureId =
+  | 'linen-canvas'
+  | 'coarse-burlap'
+  | 'fine-cotton'
+  | 'cold-press-watercolor'
+  | 'rough-pastel'
+  | 'gesso-board'
+  | 'stipple-grain';
+
+export type BristleProfilePreset =
+  | 'round'
+  | 'flat'
+  | 'filbert'
+  | 'fan'
+  | 'rake'
+  | 'knife'
+  | 'custom';
+
+export type NaturalMixingMode = 'blend' | 'running_color' | 'smear' | 'impasto_mix';
+
+export interface BristleSettings {
+  profile: BristleProfilePreset;
+  count: number; // 4 to 64 independent strands/tufts across brush width
+  clumping: number; // 0.0 to 1.0 (groups bristles into natural paint tufts)
+  stiffness: number; // 0.0 to 1.0 (flexibility / bend resistance)
+  length: number; // 0.2 to 2.0 (relative strand length)
+  splay: number; // 0.0 to 1.0 (width spread under pressure / tilt)
+  irregularity: number; // 0.0 to 1.0 (strand length, density & spacing variation)
+  edgeRidge?: number; // 0.0 to 1.0 (paint ridge buildup along brush edges / palette knife)
+}
+
+export const DEFAULT_BRISTLE_SETTINGS: BristleSettings = {
+  profile: 'filbert',
+  count: 28,
+  clumping: 0.35,
+  stiffness: 0.6,
+  length: 1.0,
+  splay: 0.3,
+  irregularity: 0.35,
+  edgeRidge: 0.2,
+};
+
+export interface NaturalPaintSettings {
+  enabled: boolean;
+  spatialMixing: boolean; // Per-bristle across-width pigment pickup
+  pigmentMixingStrength: number; // 0.0 to 1.0 (Kubelka-Munk subtractive strength)
+  paintLoad: number; // 0.0 (pure blender) to 1.0 (fully loaded brush)
+  depletionRate: number; // 0.0 (infinite) to 1.0 (rapid dry-brush exhaustion)
+  wetness: number; // 0.0 to 1.0 (underlying canvas pickup strength)
+  viscosity: number; // 0.0 to 1.0 (mixing resistance / thick oil body)
+  autoClean: boolean; // true = clean reload on pointer-up; false = dirty brush persists across strokes
+  chargePerPressure: number; // 0.0 to 1.0 (heavy pressure squeezes more paint from ferrule)
+  dryBrush: number; // 0.0 to 1.0 (canvas valley-skipping sensitivity)
+  granulation?: number; // 0.0 to 1.0 (watercolor pigment settling into paper valleys)
+  penetrationCurve?: [number, number][]; // Pressure-to-canvas-valley penetration curve
+}
+
+export const DEFAULT_NATURAL_PAINT_SETTINGS: NaturalPaintSettings = {
+  enabled: false,
+  spatialMixing: false,
+  pigmentMixingStrength: 0.85,
+  paintLoad: 0.85,
+  depletionRate: 0.25,
+  wetness: 0.5,
+  viscosity: 0.5,
+  autoClean: true,
+  chargePerPressure: 0.45,
+  dryBrush: 0.3,
+  granulation: 0,
+};
+
+export interface ImpastoSettings {
+  enabled: boolean;
+  depth: number; // 0.0 to 1.0 (overall paint relief thickness)
+  bristleRelief: number; // 0.0 to 1.0 (individual bristle groove depth)
+  gloss: number; // 0.0 (matte gouache) to 1.0 (glossy wet oil)
+  reliefContrast: number; // 0.0 to 1.0 (diffuse lighting & AO contrast)
+  lightAzimuth: number; // 0 to 360 degrees
+  lightElevation: number; // 5 to 85 degrees
+}
+
+export const DEFAULT_IMPASTO_SETTINGS: ImpastoSettings = {
+  enabled: false,
+  depth: 0.55,
+  bristleRelief: 0.6,
+  gloss: 0.45,
+  reliefContrast: 0.55,
+  lightAzimuth: 225,
+  lightElevation: 34,
+};
 
 export type BrushPresetId =
   // Pen section
@@ -63,6 +181,16 @@ export type BrushPresetId =
   | 'blend-chalk-brush'
   | 'soft-round'
   | 'noise-shader'
+  // Natural Paint section
+  | 'impasto-bristle-oil'
+  | 'wet-mixing-filbert'
+  | 'dry-bristle-rake'
+  | 'heavy-body-acrylic'
+  | 'palette-knife-impasto'
+  | 'velvet-gouache'
+  | 'granulating-watercolor'
+  | 'oil-bristle-blender'
+  | 'pastel-stick-canvas'
   | string;
 
 export interface CspEffectorCurvePoint {
@@ -98,6 +226,7 @@ export interface CspTaperSettings {
   affectSize?: boolean;       // Taper modulates brush size (default true)
   affectDensity?: boolean;    // Taper modulates brush density
   affectOpacity?: boolean;    // Taper modulates dab opacity
+  affectLoad?: boolean;       // Taper modulates Natural Paint load / dry-brush fade
 }
 
 export type CspAntiAliasLevel = 0 | 1 | 2 | 3; // 0: None (Binary), 1: Weak, 2: Medium, 3: Strong
@@ -127,9 +256,15 @@ export interface CspSensorConfig {
   pressureCurve?: [number, number][];
   useTilt?: boolean;
   tiltMin?: number; // 0.0 to 1.0
+  useTiltAzimuth?: boolean;
+  useBarrelTwist?: boolean;
+  twistMin?: number; // 0.0 to 1.0
   useVelocity?: boolean;
   velocityMin?: number; // 0.0 to 1.0
   invertVelocity?: boolean;
+  useDistance?: boolean;
+  distanceMin?: number; // 0.0 to 1.0
+  distanceMaxPx?: number; // Arc-length distance over which sensor ramps (default 600)
   useRandom?: boolean;
   randomMin?: number; // 0.0 to 1.0
 }
@@ -147,6 +282,7 @@ export interface BrushDynamics {
   hueJitter: number; // 0.0 to 1.0
   saturationJitter: number; // 0.0 to 1.0
   brightnessJitter: number; // 0.0 to 1.0
+  temperatureJitter?: number; // 0.0 to 1.0 (warm-cool pigment shift)
   foregroundBackgroundJitter: number; // 0.0 to 1.0 (mix with secondary color)
 }
 
@@ -162,12 +298,14 @@ export const DEFAULT_BRUSH_DYNAMICS: BrushDynamics = {
   hueJitter: 0,
   saturationJitter: 0,
   brightnessJitter: 0,
+  temperatureJitter: 0,
   foregroundBackgroundJitter: 0,
 };
 
 export interface CspBrush {
   id: string; // Unique ID, e.g. "csp-1727256000000-xyz"
   name: string; // Brush display name, e.g. "G-Pen"
+  category?: BrushCategory | 'custom';
   badge?: string; // Badge text, e.g. "CSP"
   desc?: string; // Short description
   tipDataUrl?: string; // Base64 PNG data URL of the primary brush tip
@@ -210,18 +348,25 @@ export interface CspBrush {
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  bristleSplaySensor?: CspSensorConfig;
+  paintLoadSensor?: CspSensorConfig;
+  grainPenetrationSensor?: CspSensorConfig;
+  angleSensor?: CspSensorConfig;
+  scatterSensor?: CspSensorConfig;
   // Advanced CSP Mathematics Parameters
   colorMixing?: boolean; // Enable CSP pigment mixing
   perceptualMixing?: boolean; // OKLab / Kubelka-Munk perceptual pigment mixing (default true)
   amountOfPaint?: number; // 0.0 to 1.0 (CSP: Amount of Paint)
   densityOfPaint?: number; // 0.0 to 1.0 (CSP: Density of Paint)
   colorStretch?: number; // 0.0 to 1.0 (CSP: Color Stretch along stroke length)
-  mixingMode?: 'blend' | 'running_color' | 'smear'; // CSP Mixing mode
+  mixingMode?: NaturalMixingMode; // CSP / Natural Paint mixing mode
   wetEdge?: number; // 0.0 to 1.0 (CSP: Watercolor Wet / Water Edge)
   wetEdgeRadius?: number;
   wetEdgeAlphaPower?: number;
   wetEdgeValuePower?: number;
   paperTexture?: string; // Paper grain texture data URL
+  surfaceTextureId?: SurfaceTextureId; // Built-in 512x512 seamless surface texture ID
+  grainMappingMode?: GrainMappingMode; // Spatial grain mapping mode
   textureDensity?: number; // 0.0 to 1.0 (CSP: Texture / Paper Grain intensity)
   paperTextureMode?: CspPaperTextureMode;
   paperTextureBrightness?: number; // -100 to 100
@@ -234,6 +379,11 @@ export interface CspBrush {
   dualBrushCompositeMode?: string;
   dualSize?: number;
   dualSpacing?: number;
+  dualScatter?: number;
+  dualAngle?: number;
+  dualScale?: number;
+  dualSurfaceTextureId?: SurfaceTextureId;
+  dualGrainDepth?: number;
   spray?: CspSpraySettings;
   taper?: CspTaperSettings;
   isRibbon?: boolean;
@@ -241,6 +391,11 @@ export interface CspBrush {
   pressureCurveGamma?: number; // CSP Pressure response curve gamma
   velocityDynamics?: boolean; // Velocity-based taper
   dynamics?: BrushDynamics; // Multi-axis jitter matrix
+  // Natural Paint Engine (v2)
+  renderMode?: BrushRenderMode;
+  bristle?: BristleSettings;
+  naturalPaint?: NaturalPaintSettings;
+  impasto?: ImpastoSettings;
   importedAt: number;
 }
 
@@ -276,6 +431,11 @@ export interface BrushSettings {
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  bristleSplaySensor?: CspSensorConfig;
+  paintLoadSensor?: CspSensorConfig;
+  grainPenetrationSensor?: CspSensorConfig;
+  angleSensor?: CspSensorConfig;
+  scatterSensor?: CspSensorConfig;
   // Custom / CSP brush tip properties
   customTipDataUrl?: string;
   customTipImage?: HTMLImageElement;
@@ -298,13 +458,15 @@ export interface BrushSettings {
   amountOfPaint?: number; // 0.0 to 1.0 (default 0.7)
   densityOfPaint?: number; // 0.0 to 1.0 (default 0.8)
   colorStretch?: number; // 0.0 to 1.0 (default 0.6)
-  mixingMode?: 'blend' | 'running_color' | 'smear'; // 'blend', 'running_color', or 'smear'
+  mixingMode?: NaturalMixingMode; // 'blend', 'running_color', 'smear', or 'impasto_mix'
   wetEdge?: number; // 0.0 to 1.0 (CSP Water Edge rim density)
   wetEdgeRadius?: number;
   wetEdgeAlphaPower?: number;
   wetEdgeValuePower?: number;
   paperTexture?: string; // Optional paper texture data URL
   paperTextureImage?: HTMLImageElement; // Preloaded paper grain image
+  surfaceTextureId?: SurfaceTextureId; // Built-in 512x512 seamless surface texture ID
+  grainMappingMode?: GrainMappingMode; // Spatial grain mapping mode
   textureDensity?: number; // 0.0 to 1.0 (paper grain tooth)
   paperTextureMode?: CspPaperTextureMode;
   paperTextureBrightness?: number;
@@ -317,6 +479,11 @@ export interface BrushSettings {
   dualBrushCompositeMode?: 'multiply' | 'subtract' | 'darken' | 'overlay' | 'screen' | string;
   dualSize?: number;
   dualSpacing?: number;
+  dualScatter?: number;
+  dualAngle?: number;
+  dualScale?: number;
+  dualSurfaceTextureId?: SurfaceTextureId;
+  dualGrainDepth?: number;
   dualTipDataUrl?: string;
   dualTipImage?: HTMLImageElement;
   pressureCurveGamma?: number; // 0.4 (soft) to 2.5 (hard) response curve
@@ -324,6 +491,11 @@ export interface BrushSettings {
   useGpu?: boolean; // Run brush mathematics on GPU video card by default
   isTransparentInk?: boolean; // Transparent Ink mode (CSP 'C' key toggle)
   dynamics?: BrushDynamics; // Multi-axis jitter matrix
+  // Natural Paint Engine (v2)
+  renderMode?: BrushRenderMode;
+  bristle?: BristleSettings;
+  naturalPaint?: NaturalPaintSettings;
+  impasto?: ImpastoSettings;
 }
 
 export interface OnionSkinSettings {
@@ -387,6 +559,9 @@ export type HistoryActionType =
   | 'expression-color'
   | 'layer-convert'
   | 'liquify'
+  | 'gradient'
+  | 'retouch'
+  | 'pen'
   | 'filter'
   | 'auto-action';
 
@@ -615,6 +790,8 @@ export interface DirtyRect {
   height: number;
 }
 
+export type BezierHandleType = 'corner' | 'smooth' | 'symmetric';
+
 export interface VectorKnot {
   x: number;
   y: number;
@@ -622,18 +799,45 @@ export interface VectorKnot {
   width: number;
   angle?: number;
   timestamp: number;
+  handleIn?: Point2D | null;
+  handleOut?: Point2D | null;
+  handleType?: BezierHandleType;
 }
 
 export interface VectorStroke {
   id: string;
   layerId: string;
-  tool: 'brush' | 'pencil' | 'eraser';
+  tool: 'brush' | 'pencil' | 'eraser' | 'pen';
+  curveType?: 'catmull-rom' | 'bezier';
+  closed?: boolean;
+  fillColor?: string | null;
   knots: VectorKnot[];
   color: string;
   baseWidth: number;
   opacity: number;
   bounds: { minX: number; minY: number; maxX: number; maxY: number };
   deleted?: boolean;
+}
+
+export type PenToolMode = 'draw' | 'edit';
+
+export interface PenToolSettings {
+  mode: PenToolMode;
+  strokeWidth: number;
+  opacity: number;
+  strokeEnabled: boolean;
+  fillEnabled: boolean;
+  fillColorMode: 'primary' | 'secondary' | 'custom';
+  customFillColor: string;
+  rubberBandPreview: boolean;
+}
+
+export interface PenPathSession {
+  editingStrokeId: string | null;
+  knots: VectorKnot[];
+  closed: boolean;
+  selectedAnchorIndex: number | null;
+  hoverPoint: Point2D | null;
 }
 
 export interface ComicFrame {
@@ -656,6 +860,21 @@ export interface TileDelta {
   afterData?: Uint8Array | null;
 }
 
+export interface LayerTreeDeltaUpdate {
+  layerId: string;
+  beforeComicFrames?: ComicFrame[];
+  afterComicFrames?: ComicFrame[];
+}
+
+export interface LayerTreeDelta {
+  addedLayers?: LayerItem[];
+  insertBeforeLayerId?: string | null;
+  insertIndex?: number;
+  updatedLayers?: LayerTreeDeltaUpdate[];
+  beforeActiveLayerId?: string;
+  afterActiveLayerId?: string;
+}
+
 export interface HistoryItem extends HistoryItemMeta {
   imageData?: ImageData;
   beforeImageData?: ImageData | null;
@@ -668,6 +887,7 @@ export interface HistoryItem extends HistoryItemMeta {
     before: VectorStroke[];
     after: VectorStroke[];
   };
+  layerTreeDelta?: LayerTreeDelta;
   peerId?: string | number;
   strokeId?: string;
   isMaskEdit?: boolean;

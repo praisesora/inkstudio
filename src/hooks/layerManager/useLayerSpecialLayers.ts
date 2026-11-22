@@ -3,14 +3,35 @@ import {
   ComicFrame,
   FrameDivideMode,
   LayerItem,
+  LayerTreeDelta,
   LayerType,
   SpeechBalloon,
   TextLayerData,
+  TileDelta,
   hasTileBackedLayer,
 } from '../../types/editor';
 import { divideFramesInFolder, Point2D } from '../../utils/frameEngine';
+import { getTileKey } from '../../utils/tileEngine';
 import { syncVectorObjectLayerToGrid } from '../../utils/vectorLayerRenderer';
+import {
+  ApplyLayerTreeDeltaResult,
+  applyLayerTreeDelta as applyLayerTreeDeltaPure,
+  cloneComicFrames,
+  cloneLayerItemForHistory,
+} from './layerTreeOps';
 import { LayerManagerContext } from './types';
+
+export interface CreateFrameFolderResult {
+  folder: LayerItem;
+  childLayer: LayerItem | null;
+  layerTreeDelta: LayerTreeDelta;
+}
+
+export interface DivideFrameFolderActionResult {
+  divided: boolean;
+  layerTreeDelta?: LayerTreeDelta;
+  tileDeltas?: TileDelta[];
+}
 
 export function useLayerSpecialLayers(
   ctx: LayerManagerContext,
@@ -26,8 +47,11 @@ export function useLayerSpecialLayers(
   const {
     activeTileGridRef,
     dimensionsRef,
+    thumbDebounceTimersRef,
     setLayers,
     layersRef,
+    setActiveLayerId,
+    activeLayerIdRef,
   } = ctx;
 
   // Create or update a non-destructive Vector Text Layer (re-renders crisply into tileGrid)
@@ -124,34 +148,115 @@ export function useLayerSpecialLayers(
       frames: ComicFrame[],
       customName?: string,
       addInitialChildLayer = true
-    ): { folder: LayerItem; childLayer: LayerItem | null } => {
-      const folder = addLayer('frame-folder', null, customName, undefined, !addInitialChildLayer);
+    ): CreateFrameFolderResult => {
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
+      const activeIdx = beforeLayers.findIndex((l) => l.id === beforeActiveLayerId);
+      const currentActiveLayer = activeIdx >= 0 ? beforeLayers[activeIdx] : undefined;
+      const insertIndex = activeIdx >= 0 ? activeIdx : 0;
+      const insertBeforeLayerId = beforeLayers[insertIndex]?.id ?? null;
+
+      const folderId = `frame-folder-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      let frameCount = 1;
+      for (const l of beforeLayers) {
+        if (l.type === 'frame-folder' && l.name.startsWith('Frame ')) {
+          const num = parseInt(l.name.replace('Frame ', ''), 10);
+          if (!isNaN(num) && num >= frameCount) frameCount = num + 1;
+        }
+      }
+
+      const expressionColor =
+        currentActiveLayer?.expressionColor === 'monochrome'
+          ? 'monochrome'
+          : currentActiveLayer?.expressionColor === 'gray'
+          ? 'gray'
+          : 'color';
+      const monoThreshold = currentActiveLayer?.monoThreshold ?? 128;
+      const monoExpressBlack = currentActiveLayer?.monoExpressBlack ?? true;
+      const monoExpressWhite = currentActiveLayer?.monoExpressWhite ?? true;
+
       const normalizedFrames = frames.map((f) => ({
         ...f,
-        layerId: folder.id,
+        layerId: folderId,
         clipChildren: f.clipChildren !== false,
+        polygon: f.polygon.map((p) => ({ x: p.x, y: p.y })),
       }));
+
       const updatedFolder: LayerItem = {
-        ...folder,
+        id: folderId,
+        name: customName || `Frame ${frameCount}`,
+        type: 'frame-folder',
+        visible: true,
+        opacity: 1,
+        blendMode: 'normal',
+        locked: false,
+        collapsed: false,
+        parentId: null,
+        thumbnailUrl: '',
+        expressionColor,
+        monoThreshold,
+        monoExpressBlack,
+        monoExpressWhite,
         comicFrames: normalizedFrames,
       };
+
+      const grid = activeTileGridRef.current;
+      let childLayer: LayerItem | null = null;
+      if (addInitialChildLayer) {
+        const childId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+        childLayer = {
+          id: childId,
+          name: 'Panel Layer',
+          type: 'raster',
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal',
+          locked: false,
+          collapsed: false,
+          parentId: folderId,
+          thumbnailUrl: '',
+          expressionColor,
+          monoThreshold,
+          monoExpressBlack,
+          monoExpressWhite,
+        };
+        const isMono = expressionColor === 'monochrome';
+        grid.setLayerFormat(childId, isMono ? 'monochrome-1bit' : 'color-32bit');
+        grid.markLayerIngested(childId);
+      }
+
+      const addedLayers = childLayer ? [updatedFolder, childLayer] : [updatedFolder];
+      const syncNext = [...beforeLayers];
+      syncNext.splice(insertIndex, 0, ...addedLayers);
+      layersRef.current = syncNext;
+
       setLayers((prev) => {
-        const next = prev.map((l) =>
-          l.id === folder.id ? { ...l, comicFrames: normalizedFrames } : l
-        );
+        if (prev.some((l) => l.id === folderId)) return prev;
+        const anchorIdx = insertBeforeLayerId
+          ? prev.findIndex((l) => l.id === insertBeforeLayerId)
+          : -1;
+        const targetIdx = anchorIdx >= 0 ? anchorIdx : Math.min(insertIndex, prev.length);
+        const next = [...prev];
+        next.splice(targetIdx, 0, ...addedLayers);
         layersRef.current = next;
         return next;
       });
 
-      let childLayer: LayerItem | null = null;
-      if (addInitialChildLayer) {
-        childLayer = addLayer('raster', folder.id, 'Panel Layer', undefined, true);
-      }
+      const afterActiveLayerId = childLayer ? childLayer.id : updatedFolder.id;
+      setActiveLayerId(afterActiveLayerId);
+      grid.notifyChange(true);
 
-      activeTileGridRef.current.notifyChange(true);
-      return { folder: updatedFolder, childLayer };
+      const layerTreeDelta: LayerTreeDelta = {
+        addedLayers: addedLayers.map(cloneLayerItemForHistory),
+        insertBeforeLayerId,
+        insertIndex,
+        beforeActiveLayerId,
+        afterActiveLayerId,
+      };
+
+      return { folder: updatedFolder, childLayer, layerTreeDelta };
     },
-    [activeTileGridRef, addLayer, layersRef, setLayers]
+    [activeLayerIdRef, activeTileGridRef, layersRef, setActiveLayerId, setLayers]
   );
 
   // Divide a Frame Border Folder along a cut line (single folder split polygons or 2 independent folders)
@@ -162,21 +267,27 @@ export function useLayerSpecialLayers(
       cutEnd: Point2D,
       dpi = 600,
       mode: FrameDivideMode = 'same-folder'
-    ): boolean => {
+    ): DivideFrameFolderActionResult => {
       const current = layersRef.current;
       const folderIdx = current.findIndex((l) => l.id === folderId && l.type === 'frame-folder');
-      if (folderIdx < 0) return false;
+      if (folderIdx < 0) return { divided: false };
       const folder = current[folderIdx];
       const frames = folder.comicFrames || [];
-      if (frames.length === 0) return false;
+      if (frames.length === 0) return { divided: false };
 
       const result = divideFramesInFolder(frames, cutStart, cutEnd, dpi, mode);
-      if (!result.divided) return false;
+      if (!result.divided) return { divided: false };
 
       const grid = activeTileGridRef.current;
+      const beforeFrames = cloneComicFrames(frames);
+      const currentActiveId = activeLayerIdRef.current;
 
       if (mode === 'same-folder' || result.folderGroups.length < 2) {
         const nextFrames = result.frames.map((f) => ({ ...f, layerId: folder.id }));
+        const syncNext = current.map((l) =>
+          l.id === folder.id ? { ...l, comicFrames: nextFrames } : l
+        );
+        layersRef.current = syncNext;
         setLayers((prev) => {
           const next = prev.map((l) =>
             l.id === folder.id ? { ...l, comicFrames: nextFrames } : l
@@ -185,28 +296,55 @@ export function useLayerSpecialLayers(
           return next;
         });
         grid.notifyChange(true);
-        return true;
+        return {
+          divided: true,
+          layerTreeDelta: {
+            updatedLayers: [
+              {
+                layerId: folder.id,
+                beforeComicFrames: beforeFrames,
+                afterComicFrames: cloneComicFrames(nextFrames),
+              },
+            ],
+            beforeActiveLayerId: currentActiveId,
+            afterActiveLayerId: currentActiveId,
+          },
+        };
       }
 
       // Split into 2 independent frame folders, cloning child layers into the 2nd folder so artwork stays intact
       const [group1, group2] = result.folderGroups;
       const newFolderId = `frame-folder-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const group1Frames = group1.map((f) => ({ ...f, layerId: folder.id }));
+      const group2Frames = group2.map((f) => ({ ...f, layerId: newFolderId }));
       const updatedFolder1: LayerItem = {
         ...folder,
-        comicFrames: group1.map((f) => ({ ...f, layerId: folder.id })),
+        comicFrames: group1Frames,
       };
       const newFolder2: LayerItem = {
         ...folder,
         id: newFolderId,
         name: `${folder.name} B`,
-        comicFrames: group2.map((f) => ({ ...f, layerId: newFolderId })),
+        comicFrames: group2Frames,
       };
 
       const directChildren = current.filter((l) => l.parentId === folder.id);
+      const clonedTileDeltas: TileDelta[] = [];
       const clonedChildren: LayerItem[] = directChildren.map((child) => {
         const cloneId = `${child.type}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
         if (hasTileBackedLayer(child)) {
           grid.cloneLayer(child.id, cloneId);
+          for (const tile of grid.getLayerTiles(cloneId, 0)) {
+            if (!tile.data) continue;
+            const copy = new Uint8Array(tile.data.length);
+            copy.set(tile.data);
+            clonedTileDeltas.push({
+              key: getTileKey(cloneId, tile.tileX, tile.tileY, 0),
+              format: tile.format,
+              beforeData: null,
+              afterData: copy,
+            });
+          }
         }
         return {
           ...child,
@@ -218,19 +356,88 @@ export function useLayerSpecialLayers(
         };
       });
 
+      const addedLayers = [newFolder2, ...clonedChildren];
+      const syncNext = current.map((l) => (l.id === folder.id ? updatedFolder1 : l));
+      syncNext.splice(folderIdx, 0, ...addedLayers);
+      layersRef.current = syncNext;
+
       setLayers((prev) => {
+        if (prev.some((l) => l.id === newFolderId)) return prev;
         const idx = prev.findIndex((l) => l.id === folder.id);
         if (idx < 0) return prev;
         const next = prev.map((l) => (l.id === folder.id ? updatedFolder1 : l));
-        next.splice(idx, 0, newFolder2, ...clonedChildren);
+        next.splice(idx, 0, ...addedLayers);
         layersRef.current = next;
         return next;
       });
 
       grid.notifyChange(true);
-      return true;
+      return {
+        divided: true,
+        layerTreeDelta: {
+          addedLayers: addedLayers.map(cloneLayerItemForHistory),
+          insertBeforeLayerId: folder.id,
+          insertIndex: folderIdx,
+          updatedLayers: [
+            {
+              layerId: folder.id,
+              beforeComicFrames: beforeFrames,
+              afterComicFrames: cloneComicFrames(group1Frames),
+            },
+          ],
+          beforeActiveLayerId: currentActiveId,
+          afterActiveLayerId: currentActiveId,
+        },
+        tileDeltas: clonedTileDeltas.length > 0 ? clonedTileDeltas : undefined,
+      };
     },
-    [activeTileGridRef, layersRef, setLayers]
+    [activeLayerIdRef, activeTileGridRef, layersRef, setLayers]
+  );
+
+  // Apply a targeted LayerTreeDelta during Undo/Redo (keeps React state, refs, and SparseTileGrid synchronized)
+  const applyLayerTreeDelta = useCallback(
+    (delta: LayerTreeDelta, direction: 'undo' | 'redo'): ApplyLayerTreeDeltaResult => {
+      const grid = activeTileGridRef.current;
+      const syncResult = applyLayerTreeDeltaPure(
+        layersRef.current,
+        activeLayerIdRef.current,
+        delta,
+        direction
+      );
+      layersRef.current = syncResult.nextLayers;
+
+      setLayers((prev) => {
+        const nextRes = applyLayerTreeDeltaPure(prev, activeLayerIdRef.current, delta, direction);
+        layersRef.current = nextRes.nextLayers;
+        return nextRes.nextLayers;
+      });
+
+      if (direction === 'undo') {
+        for (const delId of syncResult.removedLayerIds) {
+          const timer = thumbDebounceTimersRef.current.get(delId);
+          if (timer) {
+            clearTimeout(timer);
+            thumbDebounceTimersRef.current.delete(delId);
+          }
+          grid.clearLayer(delId);
+        }
+      } else {
+        for (const added of syncResult.addedLayers) {
+          if (hasTileBackedLayer(added)) {
+            const isMono = added.expressionColor === 'monochrome';
+            grid.setLayerFormat(added.id, isMono ? 'monochrome-1bit' : 'color-32bit');
+            grid.markLayerIngested(added.id);
+          }
+        }
+      }
+
+      if (syncResult.nextActiveLayerId !== null) {
+        setActiveLayerId(syncResult.nextActiveLayerId);
+      }
+
+      return syncResult;
+    },
+    [activeLayerIdRef, activeTileGridRef, layersRef, setActiveLayerId, setLayers, thumbDebounceTimersRef]
   );
 
   // Rasterize a non-destructive text, balloon, or vector layer into a standard raster layer
@@ -274,6 +481,7 @@ export function useLayerSpecialLayers(
     upsertBalloonLayer,
     createFrameFolder,
     divideFrameFolder,
+    applyLayerTreeDelta,
     rasterizeLayer,
   };
 }

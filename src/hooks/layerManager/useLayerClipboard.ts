@@ -8,8 +8,20 @@ import {
 import { createCanvasThumbnail } from '../../utils/canvasUtils';
 import { LayerInsertTarget, sanitizeImportedLayerName } from '../../utils/fileDropImport';
 import { HalftoneDotShape } from '../../utils/screentoneEngine';
-import { fillSelectionInTileGrid } from '../../utils/selectionUtils';
-import { TileDelta, TileFormat, releaseTemporaryCanvas } from '../../utils/tileEngine';
+import {
+  SelectionTileSnapshot,
+  extractSelectionTileSnapshot,
+  fillSelectionInTileGrid,
+} from '../../utils/selectionUtils';
+import {
+  TILE_SIZE,
+  TileDelta,
+  TileFormat,
+  getTileKey,
+  releaseTemporaryCanvas,
+  unpack1BitToRGBA,
+  unpack8BitToRGBA,
+} from '../../utils/tileEngine';
 import { LayerManagerContext } from './types';
 
 export function useLayerClipboard(ctx: LayerManagerContext) {
@@ -32,6 +44,8 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     type: LayerItem['type'];
     blendMode: BlendMode;
     opacity: number;
+    isSelection?: boolean;
+    expressionColor?: LayerItem['expressionColor'];
     tileSnapshot: {
       format: TileFormat;
       tiles: Array<{ tileX: number; tileY: number; format: TileFormat; data: Uint8Array }>;
@@ -265,6 +279,140 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     [activeLayerId, activeTileGridRef, defaultToneFrequencyRef, dimensions, setActiveLayerId, setLayers]
   );
 
+  // Create a new raster layer directly from a sparse tile snapshot (zero full-doc canvas)
+  const createLayerFromTileSnapshot = useCallback(
+    (
+      tileSnapshot: {
+        format: TileFormat;
+        tiles: Array<{ tileX: number; tileY: number; format: TileFormat; data: Uint8Array }>;
+      },
+      layerName: string,
+      blendMode: BlendMode = 'normal',
+      opacity: number = 1,
+      layerOverrides?: Partial<LayerItem>,
+      insertTarget?: LayerInsertTarget
+    ): { id: string; name: string; tileDeltas: TileDelta[] } => {
+      const newId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+      const grid = activeTileGridRef.current;
+      grid.pasteLayerTilesSnapshot(newId, tileSnapshot);
+      const tileDeltas: TileDelta[] = tileSnapshot.tiles.map((entry) => ({
+        key: getTileKey(newId, entry.tileX, entry.tileY, 0),
+        format: entry.format,
+        beforeData: null,
+        afterData: new Uint8Array(entry.data),
+      }));
+      const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions: dimensionsRef.current }, true);
+      const resolvedOverrides: Partial<LayerItem> = {
+        ...(tileSnapshot.format === 'monochrome-1bit' ? { expressionColor: 'monochrome' as const } : {}),
+        ...layerOverrides,
+      };
+      insertNewLayerItem(newId, layerName, blendMode, opacity, thumb, resolvedOverrides, insertTarget);
+      setActiveLayerId(newId);
+      return { id: newId, name: layerName, tileDeltas };
+    },
+    [activeTileGridRef, dimensionsRef, insertNewLayerItem, setActiveLayerId]
+  );
+
+  // Copy ONLY the selected pixels from a single layer into the sparse tile clipboard
+  const copySelectionToClipboard = useCallback(
+    (
+      selection: CanvasSelection,
+      targetId?: string
+    ): { copied: boolean; empty?: boolean; layerName?: string; snapshot?: SelectionTileSnapshot } => {
+      const id = targetId || activeLayerId;
+      const targetLayer = layers.find((l) => l.id === id);
+      if (!targetLayer || targetLayer.type !== 'raster') {
+        return { copied: false };
+      }
+
+      const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
+      const snapshot = extractSelectionTileSnapshot({
+        grid,
+        layerId: id,
+        dimensions: dims,
+        selection,
+      });
+
+      if (!snapshot || snapshot.tiles.length === 0) {
+        return { copied: false, empty: true, layerName: targetLayer.name };
+      }
+
+      layerClipboardRef.current = {
+        name: targetLayer.name,
+        type: 'raster',
+        blendMode: targetLayer.blendMode,
+        opacity: targetLayer.opacity,
+        isSelection: true,
+        expressionColor: targetLayer.expressionColor,
+        tileSnapshot: {
+          format: snapshot.format,
+          tiles: snapshot.tiles.map((t) => ({
+            tileX: t.tileX,
+            tileY: t.tileY,
+            format: t.format,
+            data: new Uint8Array(t.data),
+          })),
+        },
+      };
+
+      // Best-effort export tight cutout to system clipboard
+      try {
+        const b = snapshot.bounds;
+        if (navigator.clipboard && window.isSecureContext && b.width > 0 && b.height > 0 && b.width * b.height <= 4096 * 4096) {
+          const temp = document.createElement('canvas');
+          temp.width = b.width;
+          temp.height = b.height;
+          const tCtx = temp.getContext('2d');
+          if (tCtx) {
+            const outImg = tCtx.createImageData(b.width, b.height);
+            const out = outImg.data;
+            const scratch = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
+            for (const entry of snapshot.tiles) {
+              let rgba: Uint8ClampedArray;
+              if (entry.format === 'color-32bit') {
+                rgba = new Uint8ClampedArray(entry.data.buffer, entry.data.byteOffset, entry.data.byteLength);
+              } else if (entry.format === 'monochrome-1bit') {
+                unpack1BitToRGBA(entry.data, scratch);
+                rgba = scratch;
+              } else {
+                unpack8BitToRGBA(entry.data, scratch);
+                rgba = scratch;
+              }
+              const tx0 = entry.tileX * TILE_SIZE;
+              const ty0 = entry.tileY * TILE_SIZE;
+              const x0 = Math.max(b.x, tx0);
+              const y0 = Math.max(b.y, ty0);
+              const x1 = Math.min(b.x + b.width, tx0 + TILE_SIZE);
+              const y1 = Math.min(b.y + b.height, ty0 + TILE_SIZE);
+              for (let gy = y0; gy < y1; gy++) {
+                const srcRow = (gy - ty0) * TILE_SIZE * 4;
+                const dstRow = (gy - b.y) * b.width * 4;
+                const srcStart = srcRow + (x0 - tx0) * 4;
+                const dstStart = dstRow + (x0 - b.x) * 4;
+                out.set(rgba.subarray(srcStart, srcStart + (x1 - x0) * 4), dstStart);
+              }
+            }
+            tCtx.putImageData(outImg, 0, 0);
+            temp.toBlob((blob) => {
+              releaseTemporaryCanvas(temp);
+              if (blob && navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]).catch(() => {});
+              }
+            });
+          } else {
+            releaseTemporaryCanvas(temp);
+          }
+        }
+      } catch {
+        // Ignore clipboard write restrictions
+      }
+
+      return { copied: true, layerName: targetLayer.name, snapshot };
+    },
+    [activeLayerId, activeTileGridRef, dimensionsRef, layers]
+  );
+
   // Copy selected layer into sparse tile snapshot (zero retained full-doc HTMLCanvasElement)
   const copyLayer = useCallback(
     (targetId?: string): LayerItem | null => {
@@ -280,6 +428,8 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
         type: targetLayer.type,
         blendMode: targetLayer.blendMode,
         opacity: targetLayer.opacity,
+        isSelection: false,
+        expressionColor: targetLayer.expressionColor,
         tileSnapshot,
       };
 
@@ -310,18 +460,25 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
   );
 
   // Paste layer from internal sparse tile clipboard or system clipboard
-  const pasteLayer = useCallback(async (): Promise<{ success: boolean; layerName?: string }> => {
+  const pasteLayer = useCallback(async (): Promise<{
+    success: boolean;
+    layerId?: string;
+    layerName?: string;
+    tileDeltas?: TileDelta[];
+  }> => {
     // 1. Check internal tile-backed clipboard (zero full-doc canvas)
     if (layerClipboardRef.current) {
       const data = layerClipboardRef.current;
-      const newName = `${data.name} Copy`;
-      const newId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
-      const grid = activeTileGridRef.current;
-      grid.pasteLayerTilesSnapshot(newId, data.tileSnapshot);
-      const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions: dimensionsRef.current }, true);
-      insertNewLayerItem(newId, newName, data.blendMode, data.opacity, thumb);
-      setActiveLayerId(newId);
-      return { success: true, layerName: newName };
+      const newName = data.isSelection ? `${data.name} (Selection)` : `${data.name} Copy`;
+      const overrides = data.expressionColor ? { expressionColor: data.expressionColor } : undefined;
+      const created = createLayerFromTileSnapshot(
+        data.tileSnapshot,
+        newName,
+        data.blendMode,
+        data.opacity,
+        overrides
+      );
+      return { success: true, layerId: created.id, layerName: created.name, tileDeltas: created.tileDeltas };
     }
 
     // 2. Check system clipboard
@@ -360,12 +517,18 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
             URL.revokeObjectURL(url);
             releaseTemporaryCanvas(tight);
 
+            const tileDeltas = grid.computeDeltasFromSnapshot(new Map(), newId, {
+              x: dx,
+              y: dy,
+              width: dw,
+              height: dh,
+            });
             const newName = 'Pasted Image';
             const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions }, true);
             insertNewLayerItem(newId, newName, 'normal', 1, thumb);
             setActiveLayerId(newId);
             grid.notifyChange(true);
-            return { success: true, layerName: newName };
+            return { success: true, layerId: newId, layerName: newName, tileDeltas };
           }
         }
       }
@@ -374,7 +537,7 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     }
 
     return { success: false };
-  }, [activeTileGridRef, dimensions, dimensionsRef, insertNewLayerItem, setActiveLayerId]);
+  }, [activeTileGridRef, createLayerFromTileSnapshot, dimensions, insertNewLayerItem, setActiveLayerId]);
 
   // Import an image file directly as a centered/fitted raster layer (tight-sized canvas -> tiles)
   const importImageFileAsLayer = useCallback(
@@ -460,6 +623,8 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     pasteLayerFromCanvas,
     fillScreentoneSelection,
     copyLayer,
+    copySelectionToClipboard,
+    createLayerFromTileSnapshot,
     pasteLayer,
     importImageFileAsLayer,
     pasteLayerFromFile,

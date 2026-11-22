@@ -14,6 +14,12 @@ import { ToolPropertyInspector } from './ToolPropertyInspector';
 export interface LeftPanelProps {
   onDeselect?: () => void;
   onTransformSelection?: () => void;
+  onClearSelection?: () => void;
+  onDeleteOutsideSelection?: () => void;
+  onCutSelection?: () => void;
+  onCopySelection?: () => void;
+  onPasteSelection?: () => void;
+  onMoveSelectionToNewLayer?: () => void;
   onExpandSelection?: (pixels: number) => void;
   onContractSelection?: (pixels: number) => void;
   onFeatherSelection?: (radius: number) => void;
@@ -25,6 +31,12 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(
   ({
     onDeselect,
     onTransformSelection,
+    onClearSelection,
+    onDeleteOutsideSelection,
+    onCutSelection,
+    onCopySelection,
+    onPasteSelection,
+    onMoveSelectionToNewLayer,
     onExpandSelection,
     onContractSelection,
     onFeatherSelection,
@@ -113,6 +125,12 @@ export const LeftPanel: React.FC<LeftPanelProps> = React.memo(
               setCustomBrushes={setCustomBrushes}
               onDeselect={onDeselect}
               onTransformSelection={onTransformSelection}
+              onClearSelection={onClearSelection}
+              onDeleteOutsideSelection={onDeleteOutsideSelection}
+              onCutSelection={onCutSelection}
+              onCopySelection={onCopySelection}
+              onPasteSelection={onPasteSelection}
+              onMoveSelectionToNewLayer={onMoveSelectionToNewLayer}
               onExpandSelection={onExpandSelection}
               onContractSelection={onContractSelection}
               onFeatherSelection={onFeatherSelection}

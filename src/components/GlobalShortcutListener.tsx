@@ -54,8 +54,12 @@ export interface GlobalShortcutListenerProps {
   handleSave: () => void;
   handleSaveAs: () => void;
   duplicateLayer: (layerId: string) => void;
+  handleCutSelection: () => void;
+  handleCopySelection: () => void;
   handleCopySelectedLayer: () => void;
   handlePasteSelectedLayer: () => void;
+  handleMoveSelectionToNewLayer: () => void;
+  handleCopySelectionToNewLayer: () => void;
   handleGroupSelectedLayers: () => void;
   handleStartTransform: () => void;
   handleSelectAll: () => void;
@@ -177,12 +181,24 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
             Math.min(500, Math.round(stepBrushSizePreset(toolState.liquifySettings.size, dir)))
           );
           toolStoreActions.updateLiquifySettings({ size: nextSize });
+        } else if (toolState.tool === 'retouch') {
+          const nextSize = Math.max(
+            2,
+            Math.min(300, Math.round(stepBrushSizePreset(toolState.retouchSettings.size, dir)))
+          );
+          toolStoreActions.updateRetouchSettings({ size: nextSize });
         } else if (toolState.tool === 'shape') {
           const nextWidth = Math.max(
             1,
             Math.min(120, Math.round(stepBrushSizePreset(toolState.shapeSettings.strokeWidth, dir)))
           );
           toolStoreActions.updateShapeSettings({ strokeWidth: nextWidth });
+        } else if (toolState.tool === 'pen') {
+          const nextWidth = Math.max(
+            1,
+            Math.min(100, Math.round(stepBrushSizePreset(toolState.penSettings.strokeWidth, dir)))
+          );
+          toolStoreActions.updatePenSettings({ strokeWidth: nextWidth });
         } else {
           const nextSize = stepBrushSizePreset(toolState.brushSettings.size, dir);
           toolStoreActions.updateBrushSettings({ size: nextSize });
@@ -237,12 +253,30 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
           if (!p.hasOpenDocument || p.transformSession?.active) return;
           p.redo();
         },
+        'edit.cut': () => {
+          const p = propsRef.current;
+          if (!p.hasOpenDocument) return;
+          if (p.selection) {
+            p.handleCutSelection();
+          } else {
+            p.handleCopySelectedLayer();
+          }
+        },
         'edit.copy': () => {
-          if (!propsRef.current.hasOpenDocument) return;
-          propsRef.current.handleCopySelectedLayer();
+          const p = propsRef.current;
+          if (!p.hasOpenDocument) return;
+          if (p.selection) {
+            p.handleCopySelection();
+          } else {
+            p.handleCopySelectedLayer();
+          }
         },
         'edit.paste': () => {
           if (propsRef.current.hasOpenDocument) propsRef.current.handlePasteSelectedLayer();
+        },
+        'edit.moveSelectionToNewLayer': () => {
+          const p = propsRef.current;
+          if (p.hasOpenDocument && p.selection) p.handleMoveSelectionToNewLayer();
         },
         'edit.delete': () => {
           const p = propsRef.current;
@@ -293,7 +327,12 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         },
         'layer.duplicate': () => {
           const p = propsRef.current;
-          if (p.hasOpenDocument && p.activeLayer) p.duplicateLayer(p.activeLayerId);
+          if (!p.hasOpenDocument || !p.activeLayer) return;
+          if (p.selection) {
+            p.handleCopySelectionToNewLayer();
+          } else {
+            p.duplicateLayer(p.activeLayerId);
+          }
         },
         'layer.group': () => {
           if (propsRef.current.hasOpenDocument) propsRef.current.handleGroupSelectedLayers();
@@ -409,9 +448,18 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
 
           const tempTool = modifierActionToTempTool(action);
           if (tempTool && modKey) {
+            const curState = useToolStore.getState();
+            const reserveAltForActiveTool =
+              modKey === 'Alt' &&
+              tempTool === 'pipette' &&
+              ((curState.tool === 'retouch' && curState.retouchSettings.mode === 'clone-stamp') ||
+                curState.tool === 'pen');
+            if (reserveAltForActiveTool) {
+              return;
+            }
             if (modKey === 'Alt') e.preventDefault();
             if (!activeModHoldRef.current && !e.repeat) {
-              const currentTool = useToolStore.getState().tool;
+              const currentTool = curState.tool;
               if (currentTool !== tempTool) {
                 activeModHoldRef.current = { modKey, prevTool: currentTool, tempTool };
                 if (modKey === 'Alt') {
@@ -428,6 +476,7 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         if (
           activeModHoldRef.current &&
           (e.code === 'Space' ||
+            e.key === ' ' ||
             (activeModHoldRef.current.modKey === 'Alt' && (e.ctrlKey || e.metaKey || e.shiftKey)) ||
             (activeModHoldRef.current.modKey === 'Control' && (e.altKey || e.shiftKey)) ||
             (activeModHoldRef.current.modKey === 'Shift' && (e.ctrlKey || e.metaKey || e.altKey)))
@@ -442,7 +491,7 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
 
         if (matched) {
           // Guard special contextual exceptions before preventDefault
-          if (matched.id === 'edit.copy') {
+          if (matched.id === 'edit.copy' || matched.id === 'edit.cut') {
             const textSel = window.getSelection()?.toString();
             if (textSel && textSel.length > 0) return;
           }

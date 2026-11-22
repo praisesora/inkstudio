@@ -5,6 +5,8 @@ import { TransformOverlay } from '../TransformOverlay';
 import { TextEditorOverlay } from '../TextEditorOverlay';
 import { SpeechBalloonOverlay } from '../SpeechBalloonOverlay';
 import { Local3DContainer } from '../Local3DContainer';
+import { GradientOverlay } from '../GradientOverlay';
+import { PenPathOverlay } from '../PenPathOverlay';
 import { CanvasAreaProps, formatArtboardTransform } from './types';
 
 export interface CanvasArtboardOverlaysProps {
@@ -53,6 +55,11 @@ export const CanvasArtboardOverlays: React.FC<CanvasArtboardOverlaysProps> = ({
     onFillScreentone,
     onFillColor,
     onClearSelection,
+    onDeleteOutsideSelection,
+    onCutSelection,
+    onCopySelection,
+    onPasteSelection,
+    onMoveSelectionToNewLayer,
     onInvertSelection,
     onExpandSelection,
     onContractSelection,
@@ -72,6 +79,19 @@ export const CanvasArtboardOverlays: React.FC<CanvasArtboardOverlaysProps> = ({
     onDeleteBalloon,
     frameDragPreview = null,
     shapeDragPreview = null,
+    gradientDragPreview = null,
+    gradientMesh = null,
+    gradientSettings,
+    onApplyGradientMesh,
+    onCancelGradientMesh,
+    retouchSettings,
+    cloneSourceIndicator = null,
+    penSession = null,
+    penSettings,
+    onCommitPenPath,
+    onCancelPenPath,
+    onToggleClosePenPath,
+    tool = 'brush',
     primaryColor = '#000000',
     secondaryColor = '#ffffff',
     is3DLayerOpen = false,
@@ -195,6 +215,11 @@ export const CanvasArtboardOverlays: React.FC<CanvasArtboardOverlaysProps> = ({
           onFillScreentone={onFillScreentone || (() => {})}
           onFillColor={onFillColor || (() => {})}
           onClearSelection={onClearSelection || (() => {})}
+          onDeleteOutsideSelection={onDeleteOutsideSelection}
+          onCutSelection={onCutSelection}
+          onCopySelection={onCopySelection}
+          onPasteSelection={onPasteSelection}
+          onMoveSelectionToNewLayer={onMoveSelectionToNewLayer}
           onInvertSelection={onInvertSelection || (() => {})}
           onExpandSelection={onExpandSelection}
           onContractSelection={onContractSelection}
@@ -360,6 +385,81 @@ export const CanvasArtboardOverlays: React.FC<CanvasArtboardOverlaysProps> = ({
           </>
         );
       })()}
+
+      {/* Live Gradient Guide & Interactive Mesh Gradient Overlay */}
+      {(gradientDragPreview || gradientMesh) && (
+        <GradientOverlay
+          dimensions={dimensions}
+          zoom={liveZoom}
+          flipX={liveFlipX}
+          flipY={liveFlipY}
+          dragPreview={gradientDragPreview}
+          mesh={gradientMesh}
+          opacity={gradientSettings?.opacity ?? 1}
+          onApplyMesh={onApplyGradientMesh}
+          onCancelMesh={onCancelGradientMesh}
+        />
+      )}
+
+      {/* Clone Stamp Source Anchor & Live Sample Crosshair */}
+      {tool === 'retouch' &&
+        retouchSettings?.mode === 'clone-stamp' &&
+        cloneSourceIndicator &&
+        cloneSourceIndicator.anchor.x > -9000 && (() => {
+          const invZoom = 1 / Math.max(0.05, liveZoom);
+          const pt = cloneSourceIndicator.liveSamplePos || cloneSourceIndicator.anchor;
+          const r = Math.max(6 * invZoom, (retouchSettings.size * 0.5));
+          return (
+            <svg
+              className="absolute inset-0 w-full h-full pointer-events-none z-35 overflow-visible"
+              viewBox={`0 0 ${dimensions.width} ${dimensions.height}`}
+            >
+              <circle
+                cx={pt.x}
+                cy={pt.y}
+                r={r}
+                fill="none"
+                stroke="#ffffff"
+                strokeOpacity={0.75}
+                strokeWidth={1.2 * invZoom}
+                strokeDasharray={`${4 * invZoom} ${3 * invZoom}`}
+              />
+              <line
+                x1={pt.x - 8 * invZoom}
+                y1={pt.y}
+                x2={pt.x + 8 * invZoom}
+                y2={pt.y}
+                stroke="#38bdf8"
+                strokeWidth={1.6 * invZoom}
+              />
+              <line
+                x1={pt.x}
+                y1={pt.y - 8 * invZoom}
+                x2={pt.x}
+                y2={pt.y + 8 * invZoom}
+                stroke="#38bdf8"
+                strokeWidth={1.6 * invZoom}
+              />
+            </svg>
+          );
+        })()}
+
+      {/* True Cubic Bézier Pen Tool Interactive Overlay */}
+      {penSession && penSettings && (
+        <PenPathOverlay
+          dimensions={dimensions}
+          zoom={liveZoom}
+          flipX={liveFlipX}
+          flipY={liveFlipY}
+          session={penSession}
+          settings={penSettings}
+          primaryColor={primaryColor}
+          secondaryColor={secondaryColor}
+          onCommit={onCommitPenPath}
+          onCancel={onCancelPenPath}
+          onToggleClose={onToggleClosePenPath}
+        />
+      )}
 
       {/* Local-Only 3D Viewport Ghost Layer (Strictly Client-Side Isolated State) */}
       {is3DLayerOpen && onClose3DLayer && onInsertRasterLayer && (

@@ -6,6 +6,7 @@ import {
   ComicFrame,
   FrameDivideMode,
   LayerItem,
+  LayerTreeDelta,
   ShapeDragPreview,
   SpeechBalloon,
   TextLayerData,
@@ -13,19 +14,19 @@ import {
   TileDelta,
 } from '../../types/editor';
 import { documentStore } from '../../utils/documentStore';
-import { TileFormat, TileSnapshotEntry } from '../../utils/tileEngine';
+import { SparseTileGrid, TileFormat, TileSnapshotEntry } from '../../utils/tileEngine';
 import {
   executeFloodFillOnTileGridAsync,
   executeLassoFillOnTileGrid,
 } from '../../utils/floodFill';
 import {
-  applyLiquifyStepOnTileGrid,
-  applyLiquifyStepOnTileGridAsync,
+  LiquifySubStep,
+  LiquifyWarpField,
   createLiquifySelectionMask,
+  resampleLayerFromWarpField,
   resolveLiquifyTargetLayers,
   DirtyRect,
 } from '../../utils/liquifyEngine';
-import { isNativeRustAvailable } from '../../utils/nativeBackend';
 import { rasterizeShapeToTileGrid, resolveShapeFillColor } from '../../utils/shapeEngine';
 import { createSelectionMask } from '../../utils/tonalEngine';
 import { sampleCompositedColor } from '../../utils/canvasUtils';
@@ -74,14 +75,14 @@ export interface UseShapeAndFillToolsParams {
     frames: ComicFrame[],
     customName?: string,
     addInitialChildLayer?: boolean
-  ) => { folder: LayerItem; childLayer: LayerItem | null };
+  ) => { folder: LayerItem; childLayer: LayerItem | null; layerTreeDelta: LayerTreeDelta };
   divideFrameFolder: (
     folderId: string,
     cutStart: Point2D,
     cutEnd: Point2D,
     dpi?: number,
     mode?: FrameDivideMode
-  ) => boolean;
+  ) => { divided: boolean; layerTreeDelta?: LayerTreeDelta; tileDeltas?: TileDelta[] };
   deleteLayer?: (id: string) => void;
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   pushHistoryStep: PushHistoryStepFn;
@@ -118,7 +119,16 @@ interface LiquifyLayerSession {
   layerId: string;
   targetFormat: TileFormat;
   beforeTileSnapshot: Map<string, TileSnapshotEntry>;
+  origRgbaCache: Map<number, Uint8ClampedArray | null>;
   dirtyRect: DirtyRect | null;
+}
+
+interface PersistentLiquifyWarpSession {
+  grid: SparseTileGrid;
+  width: number;
+  height: number;
+  warpField: LiquifyWarpField;
+  layers: Map<string, { origRgbaCache: Map<number, Uint8ClampedArray | null>; lastVersion: number }>;
 }
 
 function mergeDirtyRects(a: DirtyRect | null, b: DirtyRect | null): DirtyRect | null {
@@ -160,7 +170,7 @@ export function useShapeAndFillTools({
   const [shapeDragPreview, setShapeDragPreview] = useState<ShapeDragPreview | null>(null);
 
   const isPipetteSamplingRef = useRef<boolean>(false);
-  const liquifyInFlightRef = useRef<boolean>(false);
+  const liquifyPersistentRef = useRef<PersistentLiquifyWarpSession | null>(null);
   const lassoFillPointsRef = useRef<Array<{ x: number; y: number }>>([]);
   const frameStartRef = useRef<{ x: number; y: number } | null>(null);
   const shapeDragRef = useRef<{
@@ -275,6 +285,28 @@ export function useShapeAndFillTools({
   } | null>(null);
   const liquifySelectionMaskRef = useRef<Uint8Array | null>(null);
 
+  useEffect(() => {
+    const clearPersistent = () => {
+      if (liquifyPersistentRef.current) {
+        liquifyPersistentRef.current.warpField.clear();
+        liquifyPersistentRef.current.layers.clear();
+        liquifyPersistentRef.current = null;
+      }
+    };
+    let prevTool = useToolStore.getState().tool;
+    const unsub = useToolStore.subscribe(() => {
+      const curTool = useToolStore.getState().tool;
+      if (prevTool === 'liquify' && curTool !== 'liquify') {
+        clearPersistent();
+      }
+      prevTool = curTool;
+    });
+    return () => {
+      unsub();
+      clearPersistent();
+    };
+  }, []);
+
   const handleSampleColor = useCallback(
     (pt: { x: number; y: number }) => {
       const sampled = sampleCompositedColor(
@@ -355,9 +387,11 @@ export function useShapeAndFillTools({
     if (liquifyRafIdRef.current) cancelAnimationFrame(liquifyRafIdRef.current);
 
     const tick = () => {
+      const persistent = liquifyPersistentRef.current;
       if (
         !isLiquifyingRef.current ||
         !liquifyLastPointerPosRef.current ||
+        !persistent ||
         liquifySessionsRef.current.length === 0
       ) {
         liquifyRafIdRef.current = null;
@@ -367,68 +401,34 @@ export function useShapeAndFillTools({
       const liquifySettings = useToolStore.getState().liquifySettings;
       const grid = documentStore.getActiveTileGrid();
 
-      if (isNativeRustAvailable()) {
-        if (!liquifyInFlightRef.current) {
-          liquifyInFlightRef.current = true;
-          const sessions = liquifySessionsRef.current.slice();
-          void (async () => {
-            try {
-              let anyDirty = false;
-              for (const session of sessions) {
-                const dirty = await applyLiquifyStepOnTileGridAsync({
-                  grid,
-                  layerId: session.layerId,
-                  dimensions,
-                  targetFormat: session.targetFormat,
-                  cx: pt.x,
-                  cy: pt.y,
-                  prevX: pt.x,
-                  prevY: pt.y,
-                  settings: liquifySettings,
-                  pressure,
-                  beforeTileSnapshot: session.beforeTileSnapshot,
-                  selectionMask: liquifySelectionMaskRef.current,
-                });
-                if (dirty) {
-                  session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
-                  anyDirty = true;
-                }
-              }
-              if (anyDirty) grid.notifyChange(true);
-            } finally {
-              liquifyInFlightRef.current = false;
-            }
-          })();
+      const stepDirty = persistent.warpField.applySubSteps(
+        [{ cx: pt.x, cy: pt.y, prevX: pt.x, prevY: pt.y, pressure }],
+        dimensions,
+        liquifySettings,
+        liquifySelectionMaskRef.current
+      );
+
+      if (stepDirty) {
+        let anyDirty = false;
+        for (const session of liquifySessionsRef.current) {
+          const dirty = resampleLayerFromWarpField({
+            grid,
+            layerId: session.layerId,
+            dimensions,
+            targetFormat: session.targetFormat,
+            warpField: persistent.warpField,
+            dirtyRect: stepDirty,
+            beforeTileSnapshot: session.beforeTileSnapshot,
+            origRgbaCache: session.origRgbaCache,
+          });
+          if (dirty) {
+            session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
+            anyDirty = true;
+          }
         }
-        liquifyRafIdRef.current = requestAnimationFrame(tick);
-        return;
-      }
-
-      let anyDirty = false;
-
-      for (const session of liquifySessionsRef.current) {
-        const dirty = applyLiquifyStepOnTileGrid({
-          grid,
-          layerId: session.layerId,
-          dimensions,
-          targetFormat: session.targetFormat,
-          cx: pt.x,
-          cy: pt.y,
-          prevX: pt.x,
-          prevY: pt.y,
-          settings: liquifySettings,
-          pressure,
-          beforeTileSnapshot: session.beforeTileSnapshot,
-          selectionMask: liquifySelectionMaskRef.current,
-        });
-        if (dirty) {
-          session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
-          anyDirty = true;
+        if (anyDirty) {
+          grid.notifyChange(true);
         }
-      }
-
-      if (anyDirty) {
-        grid.notifyChange(true);
       }
 
       liquifyRafIdRef.current = requestAnimationFrame(tick);
@@ -510,20 +510,63 @@ export function useShapeAndFillTools({
         }
 
         const grid = documentStore.getActiveTileGrid();
-        const sessions: LiquifyLayerSession[] = [];
+        const eligibleLayers = targetLayers.filter((l) => grid.hasLayerTiles(l.id));
+        if (eligibleLayers.length === 0) return true;
 
-        for (const layer of targetLayers) {
+        // Reuse persistent warp field across consecutive Liquify strokes while layers remain
+        // untouched by external edits/undo/redo, guaranteeing single-pass bicubic quality
+        // and ghost-free cross-stroke Reconstruct.
+        let persistent = liquifyPersistentRef.current;
+        const canReuse =
+          persistent !== null &&
+          persistent.grid === grid &&
+          persistent.width === dimensions.width &&
+          persistent.height === dimensions.height &&
+          persistent.layers.size === eligibleLayers.length &&
+          eligibleLayers.every((l) => {
+            const entry = persistent!.layers.get(l.id);
+            return entry !== undefined && grid.getLayerVersion(l.id) === entry.lastVersion;
+          });
+
+        if (!canReuse) {
+          if (persistent) {
+            persistent.warpField.clear();
+            persistent.layers.clear();
+          }
+          const layerEntries = new Map<
+            string,
+            { origRgbaCache: Map<number, Uint8ClampedArray | null>; lastVersion: number }
+          >();
+          for (const layer of eligibleLayers) {
+            layerEntries.set(layer.id, {
+              origRgbaCache: new Map<number, Uint8ClampedArray | null>(),
+              lastVersion: grid.getLayerVersion(layer.id),
+            });
+          }
+          persistent = {
+            grid,
+            width: dimensions.width,
+            height: dimensions.height,
+            warpField: new LiquifyWarpField(),
+            layers: layerEntries,
+          };
+          liquifyPersistentRef.current = persistent;
+        }
+
+        const sessions: LiquifyLayerSession[] = [];
+        for (const layer of eligibleLayers) {
           const targetId = layer.id;
-          if (!grid.hasLayerTiles(targetId)) continue;
           const isBg = targetId === 'layer-bg' || targetId.startsWith('layer-bg');
           const isMono = !isBg && (colorMode === 'monochrome' || layer.expressionColor === 'monochrome');
           const targetFormat: TileFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+          const persistentEntry = persistent!.layers.get(targetId)!;
 
           sessions.push({
             layer,
             layerId: targetId,
             targetFormat,
             beforeTileSnapshot: new Map<string, TileSnapshotEntry>(),
+            origRgbaCache: persistentEntry.origRgbaCache,
             dirtyRect: null,
           });
         }
@@ -554,29 +597,33 @@ export function useShapeAndFillTools({
           mode === 'twirl-ccw' ||
           mode === 'reconstruct'
         ) {
-          let anyDirty = false;
-          for (const session of sessions) {
-            const dirty = applyLiquifyStepOnTileGrid({
-              grid,
-              layerId: session.layerId,
-              dimensions,
-              targetFormat: session.targetFormat,
-              cx: pt.x,
-              cy: pt.y,
-              prevX: pt.x,
-              prevY: pt.y,
-              settings: liquifySettings,
-              pressure: e.pressure || 1.0,
-              beforeTileSnapshot: session.beforeTileSnapshot,
-              selectionMask: liquifySelectionMaskRef.current,
-            });
-            if (dirty) {
-              session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
-              anyDirty = true;
+          const stepDirty = persistent!.warpField.applySubSteps(
+            [{ cx: pt.x, cy: pt.y, prevX: pt.x, prevY: pt.y, pressure: e.pressure || 1.0 }],
+            dimensions,
+            liquifySettings,
+            liquifySelectionMaskRef.current
+          );
+          if (stepDirty) {
+            let anyDirty = false;
+            for (const session of sessions) {
+              const dirty = resampleLayerFromWarpField({
+                grid,
+                layerId: session.layerId,
+                dimensions,
+                targetFormat: session.targetFormat,
+                warpField: persistent!.warpField,
+                dirtyRect: stepDirty,
+                beforeTileSnapshot: session.beforeTileSnapshot,
+                origRgbaCache: session.origRgbaCache,
+              });
+              if (dirty) {
+                session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
+                anyDirty = true;
+              }
             }
-          }
-          if (anyDirty) {
-            grid.notifyChange(true);
+            if (anyDirty) {
+              grid.notifyChange(true);
+            }
           }
           startLiquifyLoop();
         }
@@ -776,7 +823,10 @@ export function useShapeAndFillTools({
       }
 
       if (tool === 'liquify') {
-        if (!isLiquifyingRef.current || liquifySessionsRef.current.length === 0) return true;
+        const persistent = liquifyPersistentRef.current;
+        if (!isLiquifyingRef.current || !persistent || liquifySessionsRef.current.length === 0) {
+          return true;
+        }
         const pt = getCanvasCoords(e);
         const pressure = e.pressure || 1.0;
         liquifyLastPointerPosRef.current = { pt, pressure };
@@ -787,93 +837,50 @@ export function useShapeAndFillTools({
         const numSteps = Math.max(1, Math.ceil(dist / stepDist));
         const grid = documentStore.getActiveTileGrid();
 
-        if (isNativeRustAvailable()) {
-          if (!liquifyInFlightRef.current) {
-            liquifyInFlightRef.current = true;
-            const sessions = liquifySessionsRef.current.slice();
-            prevLiquifyPointRef.current = pt;
-            void (async () => {
-              try {
-                let anyDirty = false;
-                for (const session of sessions) {
-                  let layerDirty: DirtyRect | null = null;
-                  for (let i = 1; i <= numSteps; i++) {
-                    const t = i / numSteps;
-                    const cx = prev.x + (pt.x - prev.x) * t;
-                    const cy = prev.y + (pt.y - prev.y) * t;
-                    const px = prev.x + (pt.x - prev.x) * ((i - 1) / numSteps);
-                    const py = prev.y + (pt.y - prev.y) * ((i - 1) / numSteps);
-                    const dirty = await applyLiquifyStepOnTileGridAsync({
-                      grid,
-                      layerId: session.layerId,
-                      dimensions,
-                      targetFormat: session.targetFormat,
-                      cx,
-                      cy,
-                      prevX: px,
-                      prevY: py,
-                      settings: liquifySettings,
-                      pressure,
-                      beforeTileSnapshot: session.beforeTileSnapshot,
-                      selectionMask: liquifySelectionMaskRef.current,
-                    });
-                    if (dirty) layerDirty = mergeDirtyRects(layerDirty, dirty);
-                  }
-                  if (layerDirty) {
-                    session.dirtyRect = mergeDirtyRects(session.dirtyRect, layerDirty);
-                    anyDirty = true;
-                  }
-                }
-                if (anyDirty) grid.notifyChange(true);
-              } finally {
-                liquifyInFlightRef.current = false;
-              }
-            })();
-          }
-          return true;
+        // Accumulate all sub-steps in float32 warp space, then resample pixels ONCE
+        const subSteps: LiquifySubStep[] = new Array(numSteps);
+        for (let i = 1; i <= numSteps; i++) {
+          const t = i / numSteps;
+          const tPrev = (i - 1) / numSteps;
+          subSteps[i - 1] = {
+            cx: prev.x + (pt.x - prev.x) * t,
+            cy: prev.y + (pt.y - prev.y) * t,
+            prevX: prev.x + (pt.x - prev.x) * tPrev,
+            prevY: prev.y + (pt.y - prev.y) * tPrev,
+            pressure,
+          };
         }
 
-        let anyDirty = false;
+        const batchDirty = persistent.warpField.applySubSteps(
+          subSteps,
+          dimensions,
+          liquifySettings,
+          liquifySelectionMaskRef.current
+        );
 
-        for (const session of liquifySessionsRef.current) {
-          let layerDirty: DirtyRect | null = null;
-          for (let i = 1; i <= numSteps; i++) {
-            const t = i / numSteps;
-            const cx = prev.x + (pt.x - prev.x) * t;
-            const cy = prev.y + (pt.y - prev.y) * t;
-            const px = prev.x + (pt.x - prev.x) * ((i - 1) / numSteps);
-            const py = prev.y + (pt.y - prev.y) * ((i - 1) / numSteps);
+        prevLiquifyPointRef.current = pt;
 
-            const dirty = applyLiquifyStepOnTileGrid({
+        if (batchDirty) {
+          let anyDirty = false;
+          for (const session of liquifySessionsRef.current) {
+            const dirty = resampleLayerFromWarpField({
               grid,
               layerId: session.layerId,
               dimensions,
               targetFormat: session.targetFormat,
-              cx,
-              cy,
-              prevX: px,
-              prevY: py,
-              settings: liquifySettings,
-              pressure,
+              warpField: persistent.warpField,
+              dirtyRect: batchDirty,
               beforeTileSnapshot: session.beforeTileSnapshot,
-              selectionMask: liquifySelectionMaskRef.current,
+              origRgbaCache: session.origRgbaCache,
             });
-
             if (dirty) {
-              layerDirty = mergeDirtyRects(layerDirty, dirty);
+              session.dirtyRect = mergeDirtyRects(session.dirtyRect, dirty);
+              anyDirty = true;
             }
           }
-
-          if (layerDirty) {
-            session.dirtyRect = mergeDirtyRects(session.dirtyRect, layerDirty);
-            anyDirty = true;
+          if (anyDirty) {
+            grid.notifyChange(true);
           }
-        }
-
-        prevLiquifyPointRef.current = pt;
-
-        if (anyDirty) {
-          grid.notifyChange(true);
         }
         return true;
       }
@@ -1008,7 +1015,12 @@ export function useShapeAndFillTools({
           let modifiedCount = 0;
           let primaryTargetId = activeLayerId;
 
+          const persistent = liquifyPersistentRef.current;
           for (const session of sessions) {
+            if (persistent) {
+              const entry = persistent.layers.get(session.layerId);
+              if (entry) entry.lastVersion = grid.getLayerVersion(session.layerId);
+            }
             if (!session.dirtyRect) continue;
             modifiedCount++;
             primaryTargetId = session.layerId;
@@ -1126,14 +1138,22 @@ export function useShapeAndFillTools({
           }
 
           const divideMode = frameSettings.divideMode ?? 'same-folder';
-          const ok = divideFrameFolder(targetFolder.id, s, pt, dpi, divideMode);
-          if (ok) {
+          flushPendingHistoryTasks?.();
+          const res = divideFrameFolder(targetFolder.id, s, pt, dpi, divideMode);
+          if (res.divided) {
             pushHistoryStep(
               'frame',
               divideMode === 'split-folders' ? 'Divide Frame Folder' : 'Divide Frame Border',
               null,
               null,
-              targetFolder.id
+              targetFolder.id,
+              undefined,
+              res.tileDeltas,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              res.layerTreeDelta
             );
             showToast?.(
               divideMode === 'split-folders'
@@ -1153,6 +1173,7 @@ export function useShapeAndFillTools({
         const h = Math.ceil(Math.abs(pt.y - s.y));
 
         if (w >= 8 && h >= 8) {
+          flushPendingHistoryTasks?.();
           const rectFrame = createRectFrame('', minX, minY, w, h, {
             dpi,
             borderWidth: frameSettings.thickness || 4,
@@ -1168,8 +1189,21 @@ export function useShapeAndFillTools({
             fillColor: frameSettings.fillColor || '#ffffff',
             strokeColor: frameSettings.strokeColor || primaryColor || '#000000',
           });
-          const { folder } = createFrameFolder([rectFrame], undefined, true);
-          pushHistoryStep('frame', 'Create Frame Folder', null, null, folder.id);
+          const { folder, layerTreeDelta } = createFrameFolder([rectFrame], undefined, true);
+          pushHistoryStep(
+            'frame',
+            'Create Frame Folder',
+            null,
+            null,
+            folder.id,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            layerTreeDelta
+          );
           showToast?.('Created Frame Border Folder (child layers auto-clip)');
         }
         return true;

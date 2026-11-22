@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { isTauriEnvironment } from '../hooks/useMultiplayer';
 import { ThemePreset } from '../types/settings';
+import { requestAppClose } from '../utils/appCloseFlow';
 
 interface WindowControlsProps {
   themePreset?: ThemePreset;
@@ -125,22 +126,10 @@ export const WindowControls: React.FC<WindowControlsProps> = () => {
     [isTauri]
   );
 
-  const handleClose = useCallback(
-    async (e: React.MouseEvent) => {
-      e.stopPropagation();
-      try {
-        if (isTauri) {
-          const { getCurrentWindow } = await import('@tauri-apps/api/window');
-          await getCurrentWindow().close();
-        } else {
-          window.close();
-        }
-      } catch (err) {
-        console.error('Failed to close window:', err);
-      }
-    },
-    [isTauri]
-  );
+  const handleClose = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    requestAppClose();
+  }, []);
 
   return (
     <div

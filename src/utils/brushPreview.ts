@@ -1,12 +1,20 @@
 import {
+  BristleSettings,
   BrushDynamics,
   BrushPresetId,
+  BrushRenderMode,
+  BrushSettings,
   CspAngleDynamicsMode,
   CspAntiAliasLevel,
   CspBlendTipsMode,
   CspPaperTextureMode,
   CspSpraySettings,
   CspTipFlipMode,
+  GrainMappingMode,
+  ImpastoSettings,
+  NaturalPaintSettings,
+  Point,
+  SurfaceTextureId,
 } from '../types/editor';
 import { getBuiltinBrushConfig } from './presetBrushes';
 import {
@@ -21,6 +29,10 @@ import {
   resolveTipFlipSigns,
   applyCspPaperTextureAlpha,
 } from '../engine/BrushEngine';
+import {
+  isNaturalPaintBrush,
+  renderCompleteNaturalPaintStroke,
+} from '../engine/NaturalPaintRenderer';
 
 export interface BrushPreviewOptions {
   preset?: BrushPresetId;
@@ -59,6 +71,12 @@ export interface BrushPreviewOptions {
   densityOfPaint?: number;
   colorStretch?: number;
   wetEdge?: number;
+  renderMode?: BrushRenderMode;
+  bristle?: BristleSettings;
+  naturalPaint?: NaturalPaintSettings;
+  impasto?: ImpastoSettings;
+  surfaceTextureId?: SurfaceTextureId;
+  grainMappingMode?: GrainMappingMode;
 }
 
 const previewCache = new Map<string, HTMLCanvasElement>();
@@ -150,6 +168,12 @@ export function renderBrushStrokePreview(
   const isEraser = options.tool === 'eraser';
   const strokeColor = options.color || '#ffffff';
   const bgColor = options.backgroundColor || 'transparent';
+  const renderMode = options.renderMode ?? builtinCfg?.renderMode;
+  const bristleCfg = options.bristle ?? builtinCfg?.bristle;
+  const naturalCfg = options.naturalPaint ?? builtinCfg?.naturalPaint;
+  const impastoCfg = options.impasto ?? builtinCfg?.impasto;
+  const surfaceTextureId = options.surfaceTextureId ?? builtinCfg?.surfaceTextureId;
+  const grainMappingMode = options.grainMappingMode ?? builtinCfg?.grainMappingMode;
 
   const curveSig = options.pressureCurve
     ? options.pressureCurve.map((p) => `${p[0].toFixed(2)},${p[1].toFixed(2)}`).join(';')
@@ -178,6 +202,11 @@ export function renderBrushStrokePreview(
     isEraser ? '1' : '0',
     options.wetEdge?.toFixed(2) || '0',
     options.colorMixing ? '1' : '0',
+    renderMode || 'stamp',
+    bristleCfg ? `${bristleCfg.profile}:${bristleCfg.count}:${bristleCfg.clumping.toFixed(2)}` : 'nb',
+    impastoCfg?.enabled ? `imp:${impastoCfg.depth.toFixed(2)}:${impastoCfg.gloss.toFixed(2)}` : 'ni',
+    naturalCfg?.enabled ? `np:${naturalCfg.paintLoad.toFixed(2)}:${naturalCfg.dryBrush.toFixed(2)}:${naturalCfg.depletionRate.toFixed(2)}` : 'nn',
+    surfaceTextureId || 'std',
     strokeColor,
     bgColor,
     cssWidth,
@@ -238,7 +267,74 @@ export function renderBrushStrokePreview(
     pts.push({ x, y, width: w, pressure, tipAlpha });
   }
 
-  if (isEraser) {
+  const isNaturalPreview =
+    !isEraser &&
+    isNaturalPaintBrush({
+      renderMode,
+      naturalPaint: naturalCfg,
+      impasto: impastoCfg,
+    });
+
+  if (isNaturalPreview) {
+    // Render authentic Natural Paint bristle-ribbon + impasto S-curve preview
+    const previewPts: Point[] = pts.map((p) => ({
+      x: p.x,
+      y: p.y,
+      width: Math.max(3, p.width),
+      pressure: p.pressure,
+    }));
+    const previewNatural: NaturalPaintSettings = {
+      enabled: true,
+      spatialMixing: false, // Preview on clean swatch uses visible pigment even for zero-load blender
+      pigmentMixingStrength: naturalCfg?.pigmentMixingStrength ?? 0.85,
+      paintLoad: (naturalCfg?.paintLoad ?? 0.85) <= 0.05 ? 0.55 : (naturalCfg?.paintLoad ?? 0.85),
+      depletionRate: naturalCfg?.depletionRate ?? 0.25,
+      wetness: naturalCfg?.wetness ?? 0.5,
+      viscosity: naturalCfg?.viscosity ?? 0.5,
+      autoClean: true,
+      chargePerPressure: naturalCfg?.chargePerPressure ?? 0.45,
+      dryBrush: naturalCfg?.dryBrush ?? 0.3,
+      granulation: naturalCfg?.granulation ?? 0,
+    };
+    const previewSettings: BrushSettings = {
+      size: displayWidth,
+      minSizeFactor,
+      color: strokeColor,
+      opacity,
+      flow,
+      spacing: Math.max(0.05, spacing),
+      usePressure: true,
+      smoothing: true,
+      stabilization: 0,
+      hardness,
+      grain,
+      textureDensity: grain,
+      paperTextureScale: Math.max(0.35, paperScale * 0.65),
+      paperTextureContrast: paperContrast,
+      paperTextureBrightness: paperBrightness,
+      paperTextureInverted: paperInverted,
+      wetEdge: options.wetEdge ?? builtinCfg?.wetEdge ?? 0,
+      renderMode: renderMode ?? 'bristle-ribbon',
+      bristle: bristleCfg
+        ? { ...bristleCfg, count: Math.min(24, Math.max(8, bristleCfg.count)) }
+        : undefined,
+      naturalPaint: previewNatural,
+      impasto: impastoCfg,
+      surfaceTextureId: surfaceTextureId ?? 'linen-canvas',
+      grainMappingMode: grainMappingMode ?? 'canvas-locked',
+      useGpu: false, // Deterministic fast CPU shading for tiny preview cards
+    };
+    renderCompleteNaturalPaintStroke(
+      offCtx,
+      previewPts,
+      previewSettings,
+      strokeColor,
+      undefined,
+      opacity,
+      'source-over',
+      1337
+    );
+  } else if (isEraser) {
     offCtx.save();
     offCtx.fillStyle = 'rgba(255, 255, 255, 0.18)';
     offCtx.fillRect(padX - 4, centerY - amp - 4, strokeLength + 8, (amp + 4) * 2);

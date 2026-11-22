@@ -8,9 +8,27 @@ import {
 } from '../changelog';
 
 describe('changelog parser', () => {
-  it('parses bundled CHANGELOG.md including v1.0.1 sections', () => {
+  it('parses bundled CHANGELOG.md including v1.0.2 and v1.0.1 sections', () => {
     const entries = getChangelogEntries();
-    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.length).toBeGreaterThanOrEqual(2);
+
+    const latest = getChangelogForVersion();
+    expect(latest?.version).toBe('1.0.2');
+
+    const v102 = getChangelogForVersion('1.0.2');
+    expect(v102).toBeDefined();
+    expect(v102?.version).toBe('1.0.2');
+    expect(v102?.sections.map((s) => s.title)).toEqual([
+      'New',
+      'Improvements',
+      'Bug Fixes',
+    ]);
+    expect(v102?.sections[0].items).toContain(
+      'Added Auto-Reconnect, Roles, and Access Rights in the Collaborative Room'
+    );
+    expect(v102?.sections[2].items).toContain(
+      'Fixed bug with hand cursor stays on while drawing'
+    );
 
     const v101 = getChangelogForVersion('1.0.1');
     expect(v101).toBeDefined();

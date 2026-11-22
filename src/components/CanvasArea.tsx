@@ -1,7 +1,6 @@
 import React, { useState, useRef } from 'react';
 import { globalTileGrid } from '../utils/tileEngine';
 import { FloatingBrushPill } from './FloatingBrushPill';
-import { ModifierAction } from '../types/settings';
 import {
   CanvasAreaProps,
   extractCoalescedEvents,
@@ -29,6 +28,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     flipY = false,
     navigation,
     isSpaceDown,
+    heldModifierAction = 'none',
     isRotateModifier,
     isPanning,
     isRotating,
@@ -50,6 +50,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     tool = 'brush',
     liquifySettings,
     onUpdateLiquifySettings,
+    retouchSettings,
+    onUpdateRetouchSettings,
     primaryColor = '#000000',
     onSwapColors,
     showCursorCoordinates = false,
@@ -79,7 +81,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
   const liveFlipY = liveCamera.flipY;
 
   // Dynamic on-canvas brush resizing via configured modifier (default Ctrl + Alt + Drag or Shift + Alt + Drag)
-  const [heldModifierAction, setHeldModifierAction] = useState<ModifierAction>('none');
   const [isResizingBrush, setIsResizingBrush] = useState(false);
   const [quickPalettePos, setQuickPalettePos] = useState<{ x: number; y: number } | null>(null);
   const resizeOriginRef = useRef<{ clientX: number; clientY: number }>({ clientX: 0, clientY: 0 });
@@ -107,6 +108,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     onUpdateBrushSettings,
     liquifySettings,
     onUpdateLiquifySettings,
+    retouchSettings,
+    onUpdateRetouchSettings,
     tool,
     liveZoom,
     liveRotation,
@@ -121,7 +124,6 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     showCursorCoordinates,
     showPressureInStatusBar,
     heldModifierAction,
-    setHeldModifierAction,
     isResizingBrush,
     setIsResizingBrush,
     quickPalettePos,
@@ -174,6 +176,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     dimensions,
     brushSettings,
     liquifySettings,
+    retouchSettings,
     tool,
     navigation,
     pan,
@@ -232,6 +235,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     tool === 'brush' ||
     tool === 'eraser' ||
     tool === 'liquify' ||
+    tool === 'retouch' ||
     tool === 'select-pen' ||
     tool === 'select-eraser';
 
@@ -255,6 +259,8 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
           onUpdateBrushSettings={onUpdateBrushSettings}
           liquifySettings={liquifySettings}
           onUpdateLiquifySettings={onUpdateLiquifySettings}
+          retouchSettings={retouchSettings}
+          onUpdateRetouchSettings={onUpdateRetouchSettings}
           primaryColor={primaryColor}
           onSwapColors={onSwapColors}
           zoom={zoom}

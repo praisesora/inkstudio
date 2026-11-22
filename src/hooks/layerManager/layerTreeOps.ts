@@ -1,4 +1,4 @@
-import { LayerItem, isFolderLikeLayer } from '../../types/editor';
+import { ComicFrame, LayerItem, LayerTreeDelta, isFolderLikeLayer } from '../../types/editor';
 
 export function isBackgroundLayerId(id: string): boolean {
   return id === 'layer-bg' || id.startsWith('layer-bg');
@@ -329,4 +329,127 @@ export function computeBatchLock(
   const newLocked = target ? !target.locked : true;
   const selectedSet = new Set(selectedIds);
   return layers.map((l) => (selectedSet.has(l.id) ? { ...l, locked: newLocked } : l));
+}
+
+export function cloneComicFrames(frames: ComicFrame[]): ComicFrame[] {
+  return frames.map((f) => ({
+    ...f,
+    polygon: f.polygon.map((p) => ({ x: p.x, y: p.y })),
+  }));
+}
+
+export function cloneLayerItemForHistory(layer: LayerItem): LayerItem {
+  return {
+    ...layer,
+    comicFrames: layer.comicFrames ? cloneComicFrames(layer.comicFrames) : undefined,
+    vectorStrokes: layer.vectorStrokes ? JSON.parse(JSON.stringify(layer.vectorStrokes)) : undefined,
+    textData: layer.textData ? JSON.parse(JSON.stringify(layer.textData)) : undefined,
+    balloonData: layer.balloonData ? JSON.parse(JSON.stringify(layer.balloonData)) : undefined,
+    balloons: layer.balloons ? JSON.parse(JSON.stringify(layer.balloons)) : undefined,
+    adjustmentData: layer.adjustmentData ? JSON.parse(JSON.stringify(layer.adjustmentData)) : undefined,
+    styles: layer.styles ? JSON.parse(JSON.stringify(layer.styles)) : undefined,
+  };
+}
+
+export interface ApplyLayerTreeDeltaResult {
+  nextLayers: LayerItem[];
+  nextActiveLayerId: string | null;
+  removedLayerIds: string[];
+  addedLayers: LayerItem[];
+}
+
+// Pure undo/redo application of a targeted LayerTreeDelta (e.g. create/divide frame border folder)
+export function applyLayerTreeDelta(
+  layers: LayerItem[],
+  currentActiveLayerId: string,
+  delta: LayerTreeDelta,
+  direction: 'undo' | 'redo'
+): ApplyLayerTreeDeltaResult {
+  let nextLayers = [...layers];
+  const removedLayerIds: string[] = [];
+  const addedLayers: LayerItem[] = [];
+
+  if (direction === 'undo') {
+    if (delta.updatedLayers && delta.updatedLayers.length > 0) {
+      const updateMap = new Map(delta.updatedLayers.map((u) => [u.layerId, u]));
+      nextLayers = nextLayers.map((l) => {
+        const upd = updateMap.get(l.id);
+        if (!upd) return l;
+        return {
+          ...l,
+          comicFrames: upd.beforeComicFrames ? cloneComicFrames(upd.beforeComicFrames) : undefined,
+        };
+      });
+    }
+
+    if (delta.addedLayers && delta.addedLayers.length > 0) {
+      const addedIdSet = new Set(delta.addedLayers.map((l) => l.id));
+      for (const l of nextLayers) {
+        if (addedIdSet.has(l.id)) {
+          removedLayerIds.push(l.id);
+        }
+      }
+      if (removedLayerIds.length > 0) {
+        const removedSet = new Set(removedLayerIds);
+        nextLayers = nextLayers
+          .filter((l) => !removedSet.has(l.id))
+          .map((l) => (l.parentId && removedSet.has(l.parentId) ? { ...l, parentId: null } : l));
+      }
+    }
+
+    let nextActiveLayerId: string | null = null;
+    if (delta.beforeActiveLayerId && nextLayers.some((l) => l.id === delta.beforeActiveLayerId)) {
+      nextActiveLayerId = delta.beforeActiveLayerId;
+    } else if (
+      removedLayerIds.includes(currentActiveLayerId) ||
+      (currentActiveLayerId && !nextLayers.some((l) => l.id === currentActiveLayerId))
+    ) {
+      const fallback = nextLayers.find((l) => l.type === 'raster') || nextLayers[0];
+      nextActiveLayerId = fallback ? fallback.id : '';
+    }
+
+    return { nextLayers, nextActiveLayerId, removedLayerIds, addedLayers };
+  }
+
+  // direction === 'redo'
+  if (delta.updatedLayers && delta.updatedLayers.length > 0) {
+    const updateMap = new Map(delta.updatedLayers.map((u) => [u.layerId, u]));
+    nextLayers = nextLayers.map((l) => {
+      const upd = updateMap.get(l.id);
+      if (!upd) return l;
+      return {
+        ...l,
+        comicFrames: upd.afterComicFrames ? cloneComicFrames(upd.afterComicFrames) : undefined,
+      };
+    });
+  }
+
+  if (delta.addedLayers && delta.addedLayers.length > 0) {
+    const existingIds = new Set(nextLayers.map((l) => l.id));
+    const toAdd = delta.addedLayers
+      .filter((al) => !existingIds.has(al.id))
+      .map(cloneLayerItemForHistory);
+
+    if (toAdd.length > 0) {
+      let insertIdx: number;
+      if (delta.insertBeforeLayerId) {
+        const anchorIdx = nextLayers.findIndex((l) => l.id === delta.insertBeforeLayerId);
+        insertIdx =
+          anchorIdx >= 0
+            ? anchorIdx
+            : Math.max(0, Math.min(delta.insertIndex ?? 0, nextLayers.length));
+      } else {
+        insertIdx = Math.max(0, Math.min(delta.insertIndex ?? 0, nextLayers.length));
+      }
+      nextLayers.splice(insertIdx, 0, ...toAdd);
+      addedLayers.push(...toAdd);
+    }
+  }
+
+  let nextActiveLayerId: string | null = null;
+  if (delta.afterActiveLayerId && nextLayers.some((l) => l.id === delta.afterActiveLayerId)) {
+    nextActiveLayerId = delta.afterActiveLayerId;
+  }
+
+  return { nextLayers, nextActiveLayerId, removedLayerIds, addedLayers };
 }

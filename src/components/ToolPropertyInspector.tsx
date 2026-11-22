@@ -7,6 +7,13 @@ import {
   Minimize2,
   RotateCcw,
   Feather,
+  Sliders,
+  Scissors,
+  Copy,
+  ClipboardPaste,
+  Layers,
+  Trash2,
+  Crop,
 } from 'lucide-react';
 import {
   BrushSettings,
@@ -24,8 +31,16 @@ import {
   ShapeKind,
   ShapeDrawMode,
   ShapeFillColorMode,
+  GradientType,
+  GradientRepeatMode,
+  GradientBlendMode,
+  RetouchMode,
+  RetouchTonalRange,
+  CloneSampleMode,
+  PenToolMode,
 } from '../types/editor';
 import { isOpenShape } from '../utils/shapeEngine';
+import { GRADIENT_PRESETS, resolveGradientStops } from '../utils/gradientEngine';
 import { saveCustomBrushDebounced } from '../utils/brushStorage';
 import { resolveBrushTipImage } from '../utils/brushOutline';
 import { BUILTIN_BRUSHES } from '../utils/presetBrushes';
@@ -36,7 +51,13 @@ import {
 } from '../utils/brushPresetManager';
 import { renderBrushStrokePreview } from '../utils/brushPreview';
 import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/BrushEngine';
-import { useToolStore, toolStoreActions, useUiStore, uiStoreActions } from '../stores';
+import {
+  useToolStore,
+  toolStoreActions,
+  interactiveToolBridge,
+  useUiStore,
+  uiStoreActions,
+} from '../stores';
 
 interface CompactSliderProps {
   label: string;
@@ -112,6 +133,12 @@ export interface ToolPropertyInspectorProps {
   setCustomBrushes: React.Dispatch<React.SetStateAction<CspBrush[]>>;
   onDeselect?: () => void;
   onTransformSelection?: () => void;
+  onClearSelection?: () => void;
+  onDeleteOutsideSelection?: () => void;
+  onCutSelection?: () => void;
+  onCopySelection?: () => void;
+  onPasteSelection?: () => void;
+  onMoveSelectionToNewLayer?: () => void;
   onExpandSelection?: (pixels: number) => void;
   onContractSelection?: (pixels: number) => void;
   onFeatherSelection?: (radius: number) => void;
@@ -125,6 +152,12 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
     setCustomBrushes,
     onDeselect,
     onTransformSelection,
+    onClearSelection,
+    onDeleteOutsideSelection,
+    onCutSelection,
+    onCopySelection,
+    onPasteSelection,
+    onMoveSelectionToNewLayer,
     onExpandSelection,
     onContractSelection,
     onFeatherSelection,
@@ -137,6 +170,17 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
     const frameSettings = useToolStore((s) => s.frameSettings);
     const liquifySettings = useToolStore((s) => s.liquifySettings);
     const shapeSettings = useToolStore((s) => s.shapeSettings);
+    const gradientSettings = useToolStore((s) => s.gradientSettings);
+    const activeGradientMesh = useToolStore((s) => s.activeGradientMesh);
+    const retouchSettings = useToolStore((s) => s.retouchSettings);
+    const isPickingCloneSource = useToolStore((s) => s.isPickingCloneSource);
+    const cloneSourceAnchor = useToolStore((s) => s.cloneSourceAnchor);
+    const penSettings = useToolStore((s) => s.penSettings);
+    const activePenPointCount = useToolStore((s) => s.activePenPointCount);
+    const activePenClosed = useToolStore((s) => s.activePenClosed);
+    const activePenSelectedAnchor = useToolStore((s) => s.activePenSelectedAnchor);
+    const primaryColor = useToolStore((s) => s.primaryColor);
+    const secondaryColor = useToolStore((s) => s.secondaryColor);
     const balloonSettings = useToolStore((s) => s.balloonSettings);
     const vectorEditSettings = useToolStore((s) => s.vectorEditSettings);
     const wandSettings = useToolStore((s) => s.wandSettings);
@@ -201,6 +245,12 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             densityOfPaint: brushSettings.densityOfPaint,
             colorStretch: brushSettings.colorStretch,
             wetEdge: brushSettings.wetEdge,
+            renderMode: brushSettings.renderMode,
+            bristle: brushSettings.bristle,
+            naturalPaint: brushSettings.naturalPaint,
+            impasto: brushSettings.impasto,
+            surfaceTextureId: brushSettings.surfaceTextureId,
+            grainMappingMode: brushSettings.grainMappingMode,
           },
           true
         );
@@ -362,6 +412,692 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                 </label>
               </>
             )}
+          </div>
+        );
+      }
+
+      if (currentTool === 'gradient') {
+        const resolvedStops = resolveGradientStops(gradientSettings, primaryColor, secondaryColor);
+        const cssStops = (gradientSettings.reverse ? [...resolvedStops].reverse() : resolvedStops)
+          .map((s) => {
+            const pct = Math.round((gradientSettings.reverse ? 1 - s.offset : s.offset) * 100);
+            return `rgba(${Math.round(s.r)},${Math.round(s.g)},${Math.round(s.b)},${(s.a / 255).toFixed(2)}) ${pct}%`;
+          })
+          .join(', ');
+
+        const selectedMeshNode =
+          activeGradientMesh && activeGradientMesh.selectedNodeIndex !== null
+            ? activeGradientMesh.nodes[activeGradientMesh.selectedNodeIndex]
+            : null;
+
+        return (
+          <div className="p-2 space-y-3 overflow-y-auto flex-1">
+            <div className="px-0.5 text-[11px] font-medium text-[#e5e5e5]">Gradient</div>
+
+            <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+              {(
+                [
+                  ['linear', 'Linear'],
+                  ['radial', 'Radial'],
+                  ['mesh', 'Mesh'],
+                ] as Array<[GradientType, string]>
+              ).map(([t, lbl]) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => toolStoreActions.updateGradientSettings({ type: t })}
+                  className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                    gradientSettings.type === t
+                      ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                  }`}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+
+            {gradientSettings.type !== 'mesh' ? (
+              <>
+                <div
+                  className="h-5 rounded border border-white/10"
+                  style={{
+                    backgroundImage: `linear-gradient(90deg, ${cssStops}), repeating-conic-gradient(#555 0% 25%, #888 0% 50%)`,
+                    backgroundSize: '100% 100%, 8px 8px',
+                  }}
+                />
+
+                <div className="grid grid-cols-2 gap-1">
+                  {GRADIENT_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() =>
+                        toolStoreActions.updateGradientSettings({
+                          useForegroundBackground: Boolean(preset.useForegroundBackground),
+                          stops: preset.stops.map((s, idx) => ({
+                            id: `stop-${preset.id}-${idx}`,
+                            offset: s.offset,
+                            color: s.color,
+                            opacity: s.opacity,
+                          })),
+                        })
+                      }
+                      className="px-1.5 py-1 rounded text-[10px] text-left bg-[#161616] text-[#bdbdbd] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer truncate"
+                    >
+                      {preset.name}
+                    </button>
+                  ))}
+                </div>
+
+                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                  <span>Use FG / BG</span>
+                  <input
+                    type="checkbox"
+                    checked={gradientSettings.useForegroundBackground}
+                    onChange={(e) =>
+                      toolStoreActions.updateGradientSettings({
+                        useForegroundBackground: e.target.checked,
+                      })
+                    }
+                  />
+                </label>
+
+                {/* Color Stops Editor */}
+                <div className="space-y-1.5 pt-1 border-t border-[#2c2c2c]">
+                  <div className="flex items-center justify-between text-[10px] text-[#8a8a8a]">
+                    <span>Stops ({gradientSettings.stops.length})</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextStops = [
+                          ...gradientSettings.stops,
+                          {
+                            id: `stop-${Date.now()}`,
+                            offset: 0.5,
+                            color: primaryColor || '#38bdf8',
+                            opacity: 1,
+                          },
+                        ];
+                        toolStoreActions.updateGradientSettings({
+                          useForegroundBackground: false,
+                          stops: nextStops,
+                        });
+                      }}
+                      className="px-1.5 py-0.5 rounded bg-[#2c2c2c] text-[#e5e5e5] hover:bg-[#3a3a3a] cursor-pointer"
+                    >
+                      + Add
+                    </button>
+                  </div>
+                  <div className="space-y-1 max-h-32 overflow-y-auto pr-0.5">
+                    {gradientSettings.stops.map((stop, idx) => (
+                      <div key={stop.id} className="flex items-center gap-1 text-[10px]">
+                        <input
+                          type="color"
+                          value={stop.color}
+                          onChange={(e) => {
+                            const next = gradientSettings.stops.map((s, i) =>
+                              i === idx ? { ...s, color: e.target.value } : s
+                            );
+                            toolStoreActions.updateGradientSettings({
+                              useForegroundBackground: false,
+                              stops: next,
+                            });
+                          }}
+                          className="w-5 h-4 bg-transparent border-0 cursor-pointer shrink-0"
+                        />
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          value={Math.round(stop.offset * 100)}
+                          onChange={(e) => {
+                            const next = gradientSettings.stops.map((s, i) =>
+                              i === idx ? { ...s, offset: Number(e.target.value) / 100 } : s
+                            );
+                            toolStoreActions.updateGradientSettings({ stops: next });
+                          }}
+                          className="flex-1 min-w-0"
+                          title={`Position: ${Math.round(stop.offset * 100)}%`}
+                        />
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          value={Math.round(stop.opacity * 100)}
+                          onChange={(e) => {
+                            const val = Math.max(0, Math.min(100, Number(e.target.value))) / 100;
+                            const next = gradientSettings.stops.map((s, i) =>
+                              i === idx ? { ...s, opacity: val } : s
+                            );
+                            toolStoreActions.updateGradientSettings({ stops: next });
+                          }}
+                          className="w-9 px-1 py-0.5 bg-[#161616] text-[#e5e5e5] rounded font-mono text-right"
+                          title="Stop Opacity %"
+                        />
+                        {gradientSettings.stops.length > 2 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              toolStoreActions.updateGradientSettings({
+                                stops: gradientSettings.stops.filter((_, i) => i !== idx),
+                              })
+                            }
+                            className="text-[#8a8a8a] hover:text-red-400 px-0.5 cursor-pointer"
+                            title="Remove Stop"
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-[#8a8a8a]">Repeat</span>
+                  <select
+                    value={gradientSettings.repeat}
+                    onChange={(e) =>
+                      toolStoreActions.updateGradientSettings({
+                        repeat: e.target.value as GradientRepeatMode,
+                      })
+                    }
+                    className="px-1.5 py-0.5 text-[11px] bg-[#161616] text-[#e5e5e5] rounded cursor-pointer"
+                  >
+                    <option value="clamp">None</option>
+                    <option value="repeat">Repeat</option>
+                    <option value="reflect">Reflect</option>
+                  </select>
+                </div>
+
+                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                  <span>Reverse</span>
+                  <input
+                    type="checkbox"
+                    checked={gradientSettings.reverse}
+                    onChange={(e) =>
+                      toolStoreActions.updateGradientSettings({ reverse: e.target.checked })
+                    }
+                  />
+                </label>
+              </>
+            ) : (
+              <div className="space-y-2 pt-1 border-t border-[#2c2c2c]">
+                <CompactSlider
+                  label="Columns"
+                  valueLabel={`${gradientSettings.meshCols}`}
+                  min={2}
+                  max={6}
+                  value={gradientSettings.meshCols}
+                  onChange={(v) => toolStoreActions.updateGradientSettings({ meshCols: v })}
+                />
+                <CompactSlider
+                  label="Rows"
+                  valueLabel={`${gradientSettings.meshRows}`}
+                  min={2}
+                  max={6}
+                  value={gradientSettings.meshRows}
+                  onChange={(v) => toolStoreActions.updateGradientSettings({ meshRows: v })}
+                />
+
+                {selectedMeshNode && activeGradientMesh?.selectedNodeIndex !== null && (
+                  <div className="space-y-1.5 p-1.5 rounded bg-[#161616]">
+                    <div className="flex items-center justify-between text-[10px]">
+                      <span className="text-[#8a8a8a]">
+                        Node #{activeGradientMesh!.selectedNodeIndex! + 1}
+                      </span>
+                      <input
+                        type="color"
+                        value={selectedMeshNode.color}
+                        onChange={(e) =>
+                          toolStoreActions.updateActiveGradientMeshNode(
+                            activeGradientMesh!.selectedNodeIndex!,
+                            { color: e.target.value }
+                          )
+                        }
+                        className="w-6 h-5 bg-transparent border-0 cursor-pointer"
+                      />
+                    </div>
+                    <CompactSlider
+                      label="Node Opacity"
+                      valueLabel={`${Math.round(selectedMeshNode.opacity * 100)}%`}
+                      min={0}
+                      max={100}
+                      value={Math.round(selectedMeshNode.opacity * 100)}
+                      onChange={(v) =>
+                        toolStoreActions.updateActiveGradientMeshNode(
+                          activeGradientMesh!.selectedNodeIndex!,
+                          { opacity: v / 100 }
+                        )
+                      }
+                    />
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-1">
+                  <button
+                    type="button"
+                    onClick={() => interactiveToolBridge.initGradientMesh?.()}
+                    className="py-1 rounded bg-[#2c2c2c] text-[#e5e5e5] text-[10px] hover:bg-[#3a3a3a] cursor-pointer"
+                  >
+                    {activeGradientMesh ? 'Reset Mesh' : 'Create Mesh'}
+                  </button>
+                  {activeGradientMesh && (
+                    <button
+                      type="button"
+                      onClick={() => interactiveToolBridge.applyGradientMesh?.()}
+                      className="py-1 rounded bg-[var(--accent)] text-[var(--accent-contrast)] text-[10px] font-medium cursor-pointer"
+                    >
+                      Apply (Enter)
+                    </button>
+                  )}
+                </div>
+                {activeGradientMesh && (
+                  <button
+                    type="button"
+                    onClick={() => interactiveToolBridge.cancelGradientMesh?.()}
+                    className="w-full py-1 rounded bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] text-[10px] cursor-pointer"
+                  >
+                    Cancel (Esc)
+                  </button>
+                )}
+              </div>
+            )}
+
+            <div className="space-y-2 pt-1 border-t border-[#2c2c2c]">
+              <CompactSlider
+                label="Opacity"
+                valueLabel={`${Math.round(gradientSettings.opacity * 100)}%`}
+                min={5}
+                max={100}
+                value={Math.round(gradientSettings.opacity * 100)}
+                onChange={(v) => toolStoreActions.updateGradientSettings({ opacity: v / 100 })}
+              />
+              <div className="flex items-center justify-between text-[11px]">
+                <span className="text-[#8a8a8a]">Blend</span>
+                <select
+                  value={gradientSettings.blendMode}
+                  onChange={(e) =>
+                    toolStoreActions.updateGradientSettings({
+                      blendMode: e.target.value as GradientBlendMode,
+                    })
+                  }
+                  className="px-1.5 py-0.5 text-[11px] bg-[#161616] text-[#e5e5e5] rounded cursor-pointer"
+                >
+                  <option value="normal">Normal</option>
+                  <option value="multiply">Multiply</option>
+                  <option value="screen">Screen</option>
+                  <option value="overlay">Overlay</option>
+                </select>
+              </div>
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Dither</span>
+                <input
+                  type="checkbox"
+                  checked={gradientSettings.dither}
+                  onChange={(e) =>
+                    toolStoreActions.updateGradientSettings({ dither: e.target.checked })
+                  }
+                />
+              </label>
+            </div>
+          </div>
+        );
+      }
+
+      if (currentTool === 'retouch') {
+        const retouchModes: Array<{ id: RetouchMode; label: string }> = [
+          { id: 'smudge', label: 'Smudge' },
+          { id: 'blur', label: 'Blur' },
+          { id: 'dodge', label: 'Dodge' },
+          { id: 'burn', label: 'Burn' },
+          { id: 'clone-stamp', label: 'Clone Stamp' },
+        ];
+        const strengthLabel =
+          retouchSettings.mode === 'dodge' || retouchSettings.mode === 'burn'
+            ? 'Exposure'
+            : retouchSettings.mode === 'clone-stamp'
+              ? 'Opacity'
+              : 'Strength';
+        return (
+          <div className="p-2 space-y-3 overflow-y-auto flex-1">
+            <div className="px-0.5 text-[11px] font-medium text-[#e5e5e5]">Retouch</div>
+            <div className="space-y-0.5">
+              {retouchModes.map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => toolStoreActions.updateRetouchSettings({ mode: m.id })}
+                  className={`w-full px-2 py-1 rounded text-left text-[11px] transition-colors cursor-pointer ${
+                    retouchSettings.mode === m.id
+                      ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60'
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            <CompactSlider
+              label="Size"
+              valueLabel={`${retouchSettings.size}px`}
+              min={2}
+              max={300}
+              value={retouchSettings.size}
+              onChange={(v) => toolStoreActions.updateRetouchSettings({ size: v })}
+            />
+            <CompactSlider
+              label={strengthLabel}
+              valueLabel={`${retouchSettings.strength}%`}
+              min={1}
+              max={100}
+              value={retouchSettings.strength}
+              onChange={(v) => toolStoreActions.updateRetouchSettings({ strength: v })}
+            />
+            <CompactSlider
+              label="Hardness"
+              valueLabel={`${retouchSettings.hardness}%`}
+              min={0}
+              max={100}
+              value={retouchSettings.hardness}
+              onChange={(v) => toolStoreActions.updateRetouchSettings({ hardness: v })}
+            />
+            <CompactSlider
+              label="Spacing"
+              valueLabel={`${Math.round(retouchSettings.spacing * 100)}%`}
+              min={5}
+              max={50}
+              value={Math.round(retouchSettings.spacing * 100)}
+              onChange={(v) => toolStoreActions.updateRetouchSettings({ spacing: v / 100 })}
+            />
+
+            <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+              <span>Pressure</span>
+              <input
+                type="checkbox"
+                checked={retouchSettings.usePressure}
+                onChange={(e) =>
+                  toolStoreActions.updateRetouchSettings({ usePressure: e.target.checked })
+                }
+              />
+            </label>
+
+            {retouchSettings.mode === 'smudge' && (
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer pt-1 border-t border-[#2c2c2c]">
+                <span>Finger Painting</span>
+                <input
+                  type="checkbox"
+                  checked={retouchSettings.smudgeFingerPainting}
+                  onChange={(e) =>
+                    toolStoreActions.updateRetouchSettings({
+                      smudgeFingerPainting: e.target.checked,
+                    })
+                  }
+                />
+              </label>
+            )}
+
+            {(retouchSettings.mode === 'dodge' || retouchSettings.mode === 'burn') && (
+              <div className="space-y-2 pt-1 border-t border-[#2c2c2c]">
+                <div className="space-y-1">
+                  <div className="text-[11px] text-[#8a8a8a]">Range</div>
+                  <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                    {(
+                      [
+                        ['shadows', 'Shadows'],
+                        ['midtones', 'Mid'],
+                        ['highlights', 'High'],
+                      ] as Array<[RetouchTonalRange, string]>
+                    ).map(([r, lbl]) => (
+                      <button
+                        key={r}
+                        type="button"
+                        onClick={() => toolStoreActions.updateRetouchSettings({ tonalRange: r })}
+                        className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                          retouchSettings.tonalRange === r
+                            ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                            : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                        }`}
+                      >
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                  <span>Protect Tones</span>
+                  <input
+                    type="checkbox"
+                    checked={retouchSettings.protectTones}
+                    onChange={(e) =>
+                      toolStoreActions.updateRetouchSettings({ protectTones: e.target.checked })
+                    }
+                  />
+                </label>
+              </div>
+            )}
+
+            {retouchSettings.mode === 'clone-stamp' && (
+              <div className="space-y-2 pt-1 border-t border-[#2c2c2c]">
+                <button
+                  type="button"
+                  onClick={() => toolStoreActions.setIsPickingCloneSource(!isPickingCloneSource)}
+                  className={`w-full py-1 rounded text-[11px] transition-colors cursor-pointer ${
+                    isPickingCloneSource
+                      ? 'bg-[var(--accent)] text-[var(--accent-contrast)] font-medium'
+                      : 'bg-[#2c2c2c] text-[#e5e5e5] hover:bg-[#3a3a3a]'
+                  }`}
+                >
+                  {isPickingCloneSource ? 'Click Canvas to Set Origin...' : 'Pick Source (Alt+Click)'}
+                </button>
+                <div className="text-[10px] font-mono text-[#8a8a8a]">
+                  {cloneSourceAnchor
+                    ? `Origin: ${Math.round(cloneSourceAnchor.x)}, ${Math.round(cloneSourceAnchor.y)}`
+                    : 'No source set'}
+                </div>
+                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                  <span>Aligned</span>
+                  <input
+                    type="checkbox"
+                    checked={retouchSettings.cloneAligned}
+                    onChange={(e) =>
+                      toolStoreActions.updateRetouchSettings({ cloneAligned: e.target.checked })
+                    }
+                  />
+                </label>
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-[#8a8a8a]">Sample</span>
+                  <select
+                    value={retouchSettings.cloneSampleMode}
+                    onChange={(e) =>
+                      toolStoreActions.updateRetouchSettings({
+                        cloneSampleMode: e.target.value as CloneSampleMode,
+                      })
+                    }
+                    className="px-1.5 py-0.5 text-[11px] bg-[#161616] text-[#e5e5e5] rounded cursor-pointer"
+                  >
+                    <option value="active">Active Layer</option>
+                    <option value="all-visible">All Visible</option>
+                  </select>
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      if (currentTool === 'pen') {
+        return (
+          <div className="p-2 space-y-3 overflow-y-auto flex-1">
+            <div className="px-0.5 text-[11px] font-medium text-[#e5e5e5]">Bézier Pen</div>
+
+            <div className="grid grid-cols-2 gap-0.5 bg-[#161616] p-0.5 rounded">
+              {(
+                [
+                  ['draw', 'Draw'],
+                  ['edit', 'Edit Nodes'],
+                ] as Array<[PenToolMode, string]>
+              ).map(([m, lbl]) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => toolStoreActions.updatePenSettings({ mode: m })}
+                  className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                    penSettings.mode === m
+                      ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                      : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                  }`}
+                >
+                  {lbl}
+                </button>
+              ))}
+            </div>
+
+            <CompactSlider
+              label="Stroke Width"
+              valueLabel={`${penSettings.strokeWidth}px`}
+              min={1}
+              max={100}
+              value={penSettings.strokeWidth}
+              onChange={(v) => toolStoreActions.updatePenSettings({ strokeWidth: v })}
+            />
+            <CompactSlider
+              label="Opacity"
+              valueLabel={`${Math.round(penSettings.opacity * 100)}%`}
+              min={5}
+              max={100}
+              value={Math.round(penSettings.opacity * 100)}
+              onChange={(v) => toolStoreActions.updatePenSettings({ opacity: v / 100 })}
+            />
+
+            <div className="space-y-1.5 pt-1 border-t border-[#2c2c2c]">
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Stroke Path</span>
+                <input
+                  type="checkbox"
+                  checked={penSettings.strokeEnabled}
+                  onChange={(e) =>
+                    toolStoreActions.updatePenSettings({ strokeEnabled: e.target.checked })
+                  }
+                />
+              </label>
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Fill Closed Path</span>
+                <input
+                  type="checkbox"
+                  checked={penSettings.fillEnabled}
+                  onChange={(e) =>
+                    toolStoreActions.updatePenSettings({ fillEnabled: e.target.checked })
+                  }
+                />
+              </label>
+              {penSettings.fillEnabled && (
+                <div className="space-y-1.5">
+                  <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
+                    {(
+                      [
+                        ['primary', 'Primary'],
+                        ['secondary', 'Sub'],
+                        ['custom', 'Custom'],
+                      ] as const
+                    ).map(([m, lbl]) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => toolStoreActions.updatePenSettings({ fillColorMode: m })}
+                        className={`py-1 rounded text-[10px] transition-colors cursor-pointer ${
+                          penSettings.fillColorMode === m
+                            ? 'bg-[#2c2c2c] text-[#e5e5e5] font-medium'
+                            : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
+                        }`}
+                      >
+                        {lbl}
+                      </button>
+                    ))}
+                  </div>
+                  {penSettings.fillColorMode === 'custom' && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono text-[#8a8a8a]">
+                        {penSettings.customFillColor}
+                      </span>
+                      <input
+                        type="color"
+                        value={penSettings.customFillColor}
+                        onChange={(e) =>
+                          toolStoreActions.updatePenSettings({ customFillColor: e.target.value })
+                        }
+                        className="w-6 h-5 bg-transparent border-0 cursor-pointer"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <span>Rubber Band</span>
+                <input
+                  type="checkbox"
+                  checked={penSettings.rubberBandPreview}
+                  onChange={(e) =>
+                    toolStoreActions.updatePenSettings({ rubberBandPreview: e.target.checked })
+                  }
+                />
+              </label>
+            </div>
+
+            {activePenPointCount > 0 && (
+              <div className="space-y-1.5 pt-1 border-t border-[#2c2c2c]">
+                <div className="text-[10px] font-mono text-[#8a8a8a]">
+                  Path: {activePenPointCount} anchor{activePenPointCount === 1 ? '' : 's'}
+                  {activePenClosed ? ' (Closed)' : ''}
+                </div>
+                <div className="grid grid-cols-2 gap-1">
+                  <button
+                    type="button"
+                    onClick={() => interactiveToolBridge.toggleClosePenPath?.()}
+                    disabled={activePenPointCount < 2}
+                    className="py-1 rounded bg-[#2c2c2c] text-[#e5e5e5] text-[10px] disabled:opacity-40 cursor-pointer"
+                  >
+                    {activePenClosed ? 'Open Path' : 'Close Path'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => interactiveToolBridge.toggleSelectedPenAnchorSmooth?.()}
+                    disabled={activePenSelectedAnchor === null}
+                    className="py-1 rounded bg-[#2c2c2c] text-[#e5e5e5] text-[10px] disabled:opacity-40 cursor-pointer"
+                  >
+                    Smooth / Corner
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => interactiveToolBridge.deleteSelectedPenAnchor?.()}
+                    className="py-1 rounded bg-[#2c2c2c] text-[#e5e5e5] text-[10px] cursor-pointer"
+                  >
+                    Delete Node
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => interactiveToolBridge.commitPenPath?.()}
+                    disabled={activePenPointCount < 2}
+                    className="py-1 rounded bg-[var(--accent)] text-[var(--accent-contrast)] text-[10px] font-medium disabled:opacity-40 cursor-pointer"
+                  >
+                    Commit (Enter)
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => interactiveToolBridge.cancelPenPath?.()}
+                  className="w-full py-1 rounded bg-[#161616] text-[#8a8a8a] hover:text-[#e5e5e5] text-[10px] cursor-pointer"
+                >
+                  Cancel (Esc)
+                </button>
+              </div>
+            )}
+
+            <div className="text-[10px] text-[#707070] leading-relaxed pt-1 border-t border-[#2c2c2c]">
+              Click: corner · Drag: handles · Alt+Drag: break · Ctrl: edit nodes · Click curve in Edit: split
+            </div>
           </div>
         );
       }
@@ -824,6 +1560,62 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                   <Feather className="w-3 h-3" />
                 </button>
               </div>
+              <div className="grid grid-cols-3 gap-1 pt-1">
+                <button
+                  type="button"
+                  onClick={onCutSelection}
+                  title="Cut Selection (Ctrl+X)"
+                  className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <Scissors className="w-3 h-3" />
+                  <span>Cut</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onCopySelection}
+                  title="Copy Selection (Ctrl+C)"
+                  className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <Copy className="w-3 h-3" />
+                  <span>Copy</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={onPasteSelection}
+                  title="Paste to New Layer (Ctrl+V)"
+                  className="py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[10px] text-[#8a8a8a] hover:text-[#e5e5e5] flex items-center justify-center gap-1 cursor-pointer"
+                >
+                  <ClipboardPaste className="w-3 h-3" />
+                  <span>Paste</span>
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={onMoveSelectionToNewLayer}
+                title="Move Selected Section to New Layer (Ctrl+Shift+J)"
+                className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[var(--accent)] hover:text-[#e5e5e5] flex items-center gap-1.5 cursor-pointer"
+              >
+                <Layers className="w-3 h-3" />
+                <span>Move to New Layer</span>
+              </button>
+              <button
+                type="button"
+                onClick={onClearSelection}
+                title="Delete Selected Section (Del)"
+                className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-rose-400 flex items-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-3 h-3" />
+                <span>Delete Section</span>
+              </button>
+              <button
+                type="button"
+                onClick={onDeleteOutsideSelection}
+                title="Delete Outside Selected Section"
+                className="w-full py-1 px-2 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-rose-400 flex items-center gap-1.5 cursor-pointer"
+              >
+                <Crop className="w-3 h-3" />
+                <span>Delete Outside</span>
+              </button>
               <button
                 type="button"
                 onClick={onInvertSelection}
@@ -1178,7 +1970,20 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
       <>
         {/* Live S-Curve Stroke Preview + Quick Size/Opacity Bar */}
         <div className="shrink-0 bg-[#1b1b1b] border-t border-[#2a2a2a] px-2 py-1.5 space-y-1.5">
-          <canvas ref={previewCanvasRef} className="w-full h-8 rounded bg-[#161616] block" />
+          <div className="flex items-center gap-1">
+            <canvas ref={previewCanvasRef} className="flex-1 h-8 rounded bg-[#161616] block min-w-0" />
+            {currentTool === 'brush' && (
+              <button
+                type="button"
+                onClick={() => uiStoreActions.setBrushStudioModalOpen(true)}
+                title="Open Brush Studio"
+                className="h-8 px-1.5 rounded bg-[#262626] hover:bg-[#333333] border border-white/[0.08] text-[#d4d4d4] hover:text-white flex items-center gap-1 text-[10px] shrink-0 cursor-pointer"
+              >
+                <Sliders className="w-3 h-3 text-[var(--accent)]" />
+                <span className="hidden sm:inline">Studio</span>
+              </button>
+            )}
+          </div>
           <CompactSlider
             label="Brush Size ([ / ])"
             valueLabel={`${brushSettings.size < 10 ? brushSettings.size.toFixed(1) : Math.round(brushSettings.size)}px`}
@@ -1627,20 +2432,32 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                   <input
                     type="checkbox"
                     checked={Boolean(brushSettings.colorMixing)}
-                    onChange={(e) =>
-                      handleUpdateBrushSettings({ colorMixing: e.target.checked })
-                    }
+                    onChange={(e) => {
+                      const enabled = e.target.checked;
+                      handleUpdateBrushSettings({
+                        colorMixing: enabled,
+                        ...(brushSettings.naturalPaint
+                          ? { naturalPaint: { ...brushSettings.naturalPaint, spatialMixing: enabled } }
+                          : {}),
+                      });
+                    }}
                   />
                 </label>
                 {brushSettings.colorMixing && (
                   <>
-                    <div className="grid grid-cols-3 gap-0.5 bg-[#161616] p-0.5 rounded">
-                      {(
-                        [
-                          { id: 'blend', label: 'Blend' },
-                          { id: 'running_color', label: 'Running' },
-                          { id: 'smear', label: 'Smear' },
-                        ] as const
+                    <div className={`grid ${brushSettings.naturalPaint?.enabled ? 'grid-cols-4' : 'grid-cols-3'} gap-0.5 bg-[#161616] p-0.5 rounded`}>
+                      {(brushSettings.naturalPaint?.enabled
+                        ? ([
+                            { id: 'blend', label: 'Blend' },
+                            { id: 'running_color', label: 'Running' },
+                            { id: 'impasto_mix', label: 'Impasto' },
+                            { id: 'smear', label: 'Smear' },
+                          ] as const)
+                        : ([
+                            { id: 'blend', label: 'Blend' },
+                            { id: 'running_color', label: 'Running' },
+                            { id: 'smear', label: 'Smear' },
+                          ] as const)
                       ).map((m) => (
                         <button
                           key={m.id}
@@ -1668,11 +2485,19 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                     </label>
                     <CompactSlider
                       label="Amount of Paint"
-                      valueLabel={`${Math.round((brushSettings.amountOfPaint ?? 0.7) * 100)}%`}
+                      valueLabel={`${Math.round((brushSettings.amountOfPaint ?? brushSettings.naturalPaint?.paintLoad ?? 0.7) * 100)}%`}
                       min={0}
                       max={100}
-                      value={Math.round((brushSettings.amountOfPaint ?? 0.7) * 100)}
-                      onChange={(v) => handleUpdateBrushSettings({ amountOfPaint: v / 100 })}
+                      value={Math.round((brushSettings.amountOfPaint ?? brushSettings.naturalPaint?.paintLoad ?? 0.7) * 100)}
+                      onChange={(v) => {
+                        const next = v / 100;
+                        handleUpdateBrushSettings({
+                          amountOfPaint: next,
+                          ...(brushSettings.naturalPaint
+                            ? { naturalPaint: { ...brushSettings.naturalPaint, paintLoad: next } }
+                            : {}),
+                        });
+                      }}
                     />
                     <CompactSlider
                       label="Density of Paint"

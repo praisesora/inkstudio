@@ -169,6 +169,12 @@ export interface DockWorkspaceProps {
   // Tool / selection callbacks
   onDeselect?: () => void;
   onTransformSelection?: () => void;
+  onClearSelection?: () => void;
+  onDeleteOutsideSelection?: () => void;
+  onCutSelection?: () => void;
+  onCopySelection?: () => void;
+  onPasteSelection?: () => void;
+  onMoveSelectionToNewLayer?: () => void;
   onExpandSelection?: (pixels: number) => void;
   onContractSelection?: (pixels: number) => void;
   onFeatherSelection?: (radius: number) => void;
@@ -798,6 +804,12 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
   commandHandlers,
   onDeselect,
   onTransformSelection,
+  onClearSelection,
+  onDeleteOutsideSelection,
+  onCutSelection,
+  onCopySelection,
+  onPasteSelection,
+  onMoveSelectionToNewLayer,
   onExpandSelection,
   onContractSelection,
   onFeatherSelection,
@@ -880,6 +892,12 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
                 setCustomBrushes={setCustomBrushes}
                 onDeselect={onDeselect}
                 onTransformSelection={onTransformSelection}
+                onClearSelection={onClearSelection}
+                onDeleteOutsideSelection={onDeleteOutsideSelection}
+                onCutSelection={onCutSelection}
+                onCopySelection={onCopySelection}
+                onPasteSelection={onPasteSelection}
+                onMoveSelectionToNewLayer={onMoveSelectionToNewLayer}
                 onExpandSelection={onExpandSelection}
                 onContractSelection={onContractSelection}
                 onFeatherSelection={onFeatherSelection}
@@ -939,11 +957,17 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
       customBrushes,
       layerSidebarProps,
       navigatorProps,
+      onClearSelection,
       onContractSelection,
+      onCopySelection,
+      onCutSelection,
+      onDeleteOutsideSelection,
       onDeselect,
       onExpandSelection,
       onFeatherSelection,
       onInvertSelection,
+      onMoveSelectionToNewLayer,
+      onPasteSelection,
       onToggleTransparentColor,
       onTransformSelection,
       setCustomBrushes,

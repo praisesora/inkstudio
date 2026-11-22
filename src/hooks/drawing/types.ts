@@ -9,6 +9,7 @@ import {
   CanvasColorMode,
   DirtyRect,
   LayerItem,
+  LayerTreeDelta,
   TileDelta,
   VectorStroke,
 } from '../../types/editor';
@@ -41,6 +42,16 @@ export interface LastStrokeEndState {
   layerId: string;
 }
 
+export type ApplyLayerTreeDeltaFn = (
+  delta: LayerTreeDelta,
+  direction: 'undo' | 'redo'
+) => {
+  nextLayers: LayerItem[];
+  nextActiveLayerId: string | null;
+  removedLayerIds: string[];
+  addedLayers: LayerItem[];
+};
+
 export type PushHistoryStepFn = (
   actionType: HistoryActionType,
   label: string,
@@ -52,7 +63,8 @@ export type PushHistoryStepFn = (
   vectorDelta?: { before: VectorStroke[]; after: VectorStroke[] },
   peerId?: string | number,
   strokeId?: string,
-  isMaskEdit?: boolean
+  isMaskEdit?: boolean,
+  layerTreeDelta?: LayerTreeDelta
 ) => void;
 
 export interface UseCanvasDrawingProps {
@@ -74,6 +86,7 @@ export interface UseCanvasDrawingProps {
   activeLayerVisible?: boolean;
   layers?: LayerItem[];
   onUpdateLayerThumbnail: (layerId: string) => void;
+  onApplyLayerTreeDelta?: ApplyLayerTreeDeltaFn;
   isMaskMode?: boolean;
   onUpdateMaskThumbnail?: (layerId: string) => void;
   draftCanvasRef?: React.RefObject<HTMLCanvasElement | null>;

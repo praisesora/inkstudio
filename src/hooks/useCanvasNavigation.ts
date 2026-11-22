@@ -72,6 +72,14 @@ export const ROTATE_CURSOR_CSS = `url('${ROTATE_CURSOR_SVG}') 16 16, crosshair`;
 export const ROTATION_CENTER_DAMP_RADIUS = 64;
 
 /**
+ * Matches Space across physical keyboards, IME layouts, and tablet driver synthetic SendInput
+ * events (e.g. XP-Pen / Wacom express keys emitting VK_SPACE with empty `code`).
+ */
+export function isSpaceKeyEvent(e: KeyboardEvent): boolean {
+  return e.code === 'Space' || e.key === ' ' || e.key === 'Spacebar' || e.keyCode === 32;
+}
+
+/**
  * Computes a continuous, branch-cut-free signed angular delta (degrees) between two
  * pointer positions around a pivot, with smooth radial damping near the pivot center
  * to eliminate atan2 singularity jumps.
@@ -211,6 +219,13 @@ export function useCanvasNavigation({
   const cameraSubscribersRef = useRef<Set<CameraSubscriber>>(new Set());
   const cameraBroadcastRafRef = useRef<number | null>(null);
   const navCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeDragCleanupRef = useRef<(() => void) | null>(null);
+
+  const setNavBodyCursor = useCallback((cursor: string | null) => {
+    if (typeof document === 'undefined') return;
+    document.body.style.cursor = cursor ?? '';
+    document.body.style.userSelect = cursor ? 'none' : '';
+  }, []);
 
   const getCameraState = useCallback((): CameraTransformState => {
     return {
@@ -282,6 +297,8 @@ export function useCanvasNavigation({
 
   useEffect(() => {
     return () => {
+      activeDragCleanupRef.current?.();
+      activeDragCleanupRef.current = null;
       if (cameraBroadcastRafRef.current !== null) {
         cancelAnimationFrame(cameraBroadcastRafRef.current);
         cameraBroadcastRafRef.current = null;
@@ -650,63 +667,365 @@ export function useCanvasNavigation({
     zoomToViewportCenter(target);
   }, [zoomToViewportCenter]);
 
-  const startPan = useCallback((e: React.PointerEvent | PointerEvent) => {
-    e.preventDefault();
-    isPanningRef.current = true;
-    setIsPanning(true);
+  const startPan = useCallback(
+    (e: React.PointerEvent | PointerEvent) => {
+      e.preventDefault();
+      activeDragCleanupRef.current?.();
+      activeDragCleanupRef.current = null;
 
-    panStartRef.current = {
-      clientX: e.clientX,
-      clientY: e.clientY,
-      panX: panRef.current.x,
-      panY: panRef.current.y,
-    };
-  }, []);
+      const activePointerId = typeof e.pointerId === 'number' ? e.pointerId : null;
+      isPanningRef.current = true;
+      panStartRef.current = {
+        clientX: e.clientX,
+        clientY: e.clientY,
+        panX: panRef.current.x,
+        panY: panRef.current.y,
+      };
 
-  const startRotate = useCallback((e: React.PointerEvent | PointerEvent) => {
-    e.preventDefault();
-    const viewport = viewportRef.current;
-    if (!viewport) return;
+      const teardown = () => {
+        window.removeEventListener('pointermove', handleWindowPointerMove);
+        window.removeEventListener('pointerup', handleWindowPointerUp, true);
+        window.removeEventListener('pointercancel', handleWindowPointerUp, true);
+        window.removeEventListener('mouseup', handleWindowMouseUp, true);
+        setNavBodyCursor(null);
+        if (activeDragCleanupRef.current === teardown) {
+          activeDragCleanupRef.current = null;
+        }
+      };
 
-    const rect = viewport.getBoundingClientRect();
-    const vc = {
-      x: viewport.clientWidth / 2,
-      y: viewport.clientHeight / 2,
-    };
+      const finishPan = () => {
+        teardown();
+        if (!isPanningRef.current) return;
+        isPanningRef.current = false;
+        broadcastCameraImmediate();
+        setIsPanning(false);
+        commitNavStateImmediate();
+      };
 
-    const px = e.clientX - rect.left;
-    const py = e.clientY - rect.top;
+      const handleWindowPointerMove = (ev: PointerEvent) => {
+        if (!isPanningRef.current) return;
+        if (
+          activePointerId !== null &&
+          typeof ev.pointerId === 'number' &&
+          ev.pointerId !== activePointerId
+        ) {
+          return;
+        }
+        // Recover immediately if pen/button lifted without delivering pointerup (XP-Pen / WinTab proximity drop)
+        if (typeof ev.buttons === 'number' && ev.buttons === 0) {
+          finishPan();
+          return;
+        }
+        const dx = ev.clientX - panStartRef.current.clientX;
+        const dy = ev.clientY - panStartRef.current.clientY;
+        panRef.current = {
+          x: isWebtoonModeRef.current ? panStartRef.current.panX : panStartRef.current.panX + dx,
+          y: panStartRef.current.panY + dy,
+        };
+        scheduleCameraBroadcast();
+      };
 
-    rotateStartRef.current = {
-      lastX: px,
-      lastY: py,
-      startCanvasRotation: rotationRef.current,
-      totalAngleDelta: 0,
-      targetRotation: rotationRef.current,
-      startPan: { ...panRef.current },
-      center: vc,
-    };
+      const handleWindowPointerUp = (ev: PointerEvent) => {
+        if (
+          activePointerId !== null &&
+          typeof ev.pointerId === 'number' &&
+          ev.pointerId !== activePointerId &&
+          (typeof ev.buttons !== 'number' || ev.buttons !== 0)
+        ) {
+          return;
+        }
+        finishPan();
+      };
 
-    isRotatingRef.current = true;
-    setIsRotating(true);
-  }, []);
+      const handleWindowMouseUp = (ev: MouseEvent) => {
+        if (typeof ev.buttons !== 'number' || ev.buttons === 0) {
+          finishPan();
+        }
+      };
 
-  const startZoomDrag = useCallback((e: React.PointerEvent | PointerEvent) => {
-    e.preventDefault();
-    const viewport = viewportRef.current;
-    if (!viewport) return;
-    const rect = viewport.getBoundingClientRect();
-    zoomDragStartRef.current = {
-      clientX: e.clientX,
-      clientY: e.clientY,
-      anchorX: e.clientX - rect.left,
-      anchorY: e.clientY - rect.top,
-      startZoom: zoomRef.current,
-      startPan: { ...panRef.current },
-    };
-    isZoomDraggingRef.current = true;
-    setIsZoomDragging(true);
-  }, []);
+      activeDragCleanupRef.current = teardown;
+      window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
+      window.addEventListener('pointerup', handleWindowPointerUp, true);
+      window.addEventListener('pointercancel', handleWindowPointerUp, true);
+      window.addEventListener('mouseup', handleWindowMouseUp, true);
+      setNavBodyCursor('grabbing');
+      setIsPanning(true);
+    },
+    [broadcastCameraImmediate, commitNavStateImmediate, scheduleCameraBroadcast, setNavBodyCursor]
+  );
+
+  const startRotate = useCallback(
+    (e: React.PointerEvent | PointerEvent) => {
+      e.preventDefault();
+      const viewport = viewportRef.current;
+      if (!viewport) return;
+
+      activeDragCleanupRef.current?.();
+      activeDragCleanupRef.current = null;
+
+      let cachedRect: DOMRect | null = viewport.getBoundingClientRect();
+      const vc = {
+        x: viewport.clientWidth / 2,
+        y: viewport.clientHeight / 2,
+      };
+
+      const px = e.clientX - cachedRect.left;
+      const py = e.clientY - cachedRect.top;
+
+      rotateStartRef.current = {
+        lastX: px,
+        lastY: py,
+        startCanvasRotation: rotationRef.current,
+        totalAngleDelta: 0,
+        targetRotation: rotationRef.current,
+        startPan: { ...panRef.current },
+        center: vc,
+      };
+
+      const activePointerId = typeof e.pointerId === 'number' ? e.pointerId : null;
+      let smoothRafId: number | null = null;
+      let lastFrameTs = performance.now();
+
+      const applyRotationToCamera = (angleDeg: number) => {
+        const { center, startCanvasRotation, startPan } = rotateStartRef.current;
+        rotationRef.current = angleDeg;
+        const dRad = ((angleDeg - startCanvasRotation) * Math.PI) / 180;
+        const cos = Math.cos(dRad);
+        const sin = Math.sin(dRad);
+        const rx = startPan.x - center.x;
+        const ry = startPan.y - center.y;
+        panRef.current = {
+          x: center.x + rx * cos - ry * sin,
+          y: center.y + rx * sin + ry * cos,
+        };
+      };
+
+      const stepSmoothRotation = (now: number) => {
+        smoothRafId = null;
+        if (!isRotatingRef.current) return;
+
+        const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTs) / 1000));
+        lastFrameTs = now;
+
+        const target = rotateStartRef.current.targetRotation;
+        const current = rotationRef.current;
+        const diff = target - current;
+
+        if (Math.abs(diff) < 0.01) {
+          if (current !== target) {
+            applyRotationToCamera(target);
+            emitCameraToSubscribers();
+          }
+          return;
+        }
+
+        const alpha = 1 - Math.exp(-dt * 28);
+        applyRotationToCamera(current + diff * alpha);
+        emitCameraToSubscribers();
+        smoothRafId = requestAnimationFrame(stepSmoothRotation);
+      };
+
+      const ensureSmoothLoop = () => {
+        if (smoothRafId === null) {
+          lastFrameTs = performance.now();
+          smoothRafId = requestAnimationFrame(stepSmoothRotation);
+        }
+      };
+
+      const teardown = () => {
+        if (smoothRafId !== null) {
+          cancelAnimationFrame(smoothRafId);
+          smoothRafId = null;
+        }
+        window.removeEventListener('pointermove', handleWindowPointerMove);
+        window.removeEventListener('pointerup', handleWindowPointerUp, true);
+        window.removeEventListener('pointercancel', handleWindowPointerUp, true);
+        window.removeEventListener('mouseup', handleWindowMouseUp, true);
+        setNavBodyCursor(null);
+        if (activeDragCleanupRef.current === teardown) {
+          activeDragCleanupRef.current = null;
+        }
+      };
+
+      const finishRotate = () => {
+        teardown();
+        if (!isRotatingRef.current) return;
+        isRotatingRef.current = false;
+        applyRotationToCamera(rotateStartRef.current.targetRotation);
+        broadcastCameraImmediate();
+        setIsRotating(false);
+        commitNavStateImmediate();
+      };
+
+      const handleWindowPointerMove = (ev: PointerEvent) => {
+        if (!isRotatingRef.current) return;
+        if (
+          activePointerId !== null &&
+          typeof ev.pointerId === 'number' &&
+          ev.pointerId !== activePointerId
+        ) {
+          return;
+        }
+        if (typeof ev.buttons === 'number' && ev.buttons === 0) {
+          finishRotate();
+          return;
+        }
+        const vp = viewportRef.current;
+        if (!vp) return;
+        if (!cachedRect) cachedRect = vp.getBoundingClientRect();
+        const center = rotateStartRef.current.center;
+        const curX = ev.clientX - cachedRect.left;
+        const curY = ev.clientY - cachedRect.top;
+
+        const diff = computeSmoothRotationDelta(
+          rotateStartRef.current.lastX,
+          rotateStartRef.current.lastY,
+          curX,
+          curY,
+          center.x,
+          center.y
+        );
+
+        rotateStartRef.current.lastX = curX;
+        rotateStartRef.current.lastY = curY;
+        rotateStartRef.current.totalAngleDelta += diff;
+
+        let nextTarget =
+          rotateStartRef.current.startCanvasRotation + rotateStartRef.current.totalAngleDelta;
+
+        if (ev.altKey || ev.ctrlKey) {
+          nextTarget = Math.round(nextTarget / 15) * 15;
+        }
+
+        rotateStartRef.current.targetRotation = nextTarget;
+        ensureSmoothLoop();
+      };
+
+      const handleWindowPointerUp = (ev: PointerEvent) => {
+        if (
+          activePointerId !== null &&
+          typeof ev.pointerId === 'number' &&
+          ev.pointerId !== activePointerId &&
+          (typeof ev.buttons !== 'number' || ev.buttons !== 0)
+        ) {
+          return;
+        }
+        finishRotate();
+      };
+
+      const handleWindowMouseUp = (ev: MouseEvent) => {
+        if (typeof ev.buttons !== 'number' || ev.buttons === 0) {
+          finishRotate();
+        }
+      };
+
+      isRotatingRef.current = true;
+      activeDragCleanupRef.current = teardown;
+      window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
+      window.addEventListener('pointerup', handleWindowPointerUp, true);
+      window.addEventListener('pointercancel', handleWindowPointerUp, true);
+      window.addEventListener('mouseup', handleWindowMouseUp, true);
+      setNavBodyCursor(ROTATE_CURSOR_CSS);
+      setIsRotating(true);
+    },
+    [broadcastCameraImmediate, commitNavStateImmediate, emitCameraToSubscribers, setNavBodyCursor]
+  );
+
+  const startZoomDrag = useCallback(
+    (e: React.PointerEvent | PointerEvent) => {
+      e.preventDefault();
+      const viewport = viewportRef.current;
+      if (!viewport) return;
+
+      activeDragCleanupRef.current?.();
+      activeDragCleanupRef.current = null;
+
+      const rect = viewport.getBoundingClientRect();
+      zoomDragStartRef.current = {
+        clientX: e.clientX,
+        clientY: e.clientY,
+        anchorX: e.clientX - rect.left,
+        anchorY: e.clientY - rect.top,
+        startZoom: zoomRef.current,
+        startPan: { ...panRef.current },
+      };
+
+      const activePointerId = typeof e.pointerId === 'number' ? e.pointerId : null;
+
+      const teardown = () => {
+        window.removeEventListener('pointermove', handleWindowPointerMove);
+        window.removeEventListener('pointerup', handleWindowPointerUp, true);
+        window.removeEventListener('pointercancel', handleWindowPointerUp, true);
+        window.removeEventListener('mouseup', handleWindowMouseUp, true);
+        setNavBodyCursor(null);
+        if (activeDragCleanupRef.current === teardown) {
+          activeDragCleanupRef.current = null;
+        }
+      };
+
+      const finishZoomDrag = () => {
+        teardown();
+        if (!isZoomDraggingRef.current) return;
+        isZoomDraggingRef.current = false;
+        broadcastCameraImmediate();
+        setIsZoomDragging(false);
+        commitNavStateImmediate();
+      };
+
+      const handleWindowPointerMove = (ev: PointerEvent) => {
+        if (!isZoomDraggingRef.current) return;
+        if (
+          activePointerId !== null &&
+          typeof ev.pointerId === 'number' &&
+          ev.pointerId !== activePointerId
+        ) {
+          return;
+        }
+        if (typeof ev.buttons === 'number' && ev.buttons === 0) {
+          finishZoomDrag();
+          return;
+        }
+        const dx = ev.clientX - zoomDragStartRef.current.clientX;
+        const { anchorX, anchorY, startZoom, startPan } = zoomDragStartRef.current;
+        const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, startZoom * Math.exp(dx * 0.007)));
+        const ratio = nextZoom / startZoom;
+        zoomRef.current = nextZoom;
+        panRef.current = {
+          x: anchorX - (anchorX - startPan.x) * ratio,
+          y: anchorY - (anchorY - startPan.y) * ratio,
+        };
+        scheduleCameraBroadcast();
+      };
+
+      const handleWindowPointerUp = (ev: PointerEvent) => {
+        if (
+          activePointerId !== null &&
+          typeof ev.pointerId === 'number' &&
+          ev.pointerId !== activePointerId &&
+          (typeof ev.buttons !== 'number' || ev.buttons !== 0)
+        ) {
+          return;
+        }
+        finishZoomDrag();
+      };
+
+      const handleWindowMouseUp = (ev: MouseEvent) => {
+        if (typeof ev.buttons !== 'number' || ev.buttons === 0) {
+          finishZoomDrag();
+        }
+      };
+
+      isZoomDraggingRef.current = true;
+      activeDragCleanupRef.current = teardown;
+      window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
+      window.addEventListener('pointerup', handleWindowPointerUp, true);
+      window.addEventListener('pointercancel', handleWindowPointerUp, true);
+      window.addEventListener('mouseup', handleWindowMouseUp, true);
+      setNavBodyCursor('zoom-in');
+      setIsZoomDragging(true);
+    },
+    [broadcastCameraImmediate, commitNavStateImmediate, scheduleCameraBroadcast, setNavBodyCursor]
+  );
 
   useEffect(() => {
     hasInitializedCenterRef.current = false;
@@ -829,6 +1148,21 @@ export function useCanvasNavigation({
 
   // Modifier state tracking (Space, Shift, Ctrl, Alt) for navigation & modifier-key drag modes
   useEffect(() => {
+    const syncModifierState = (shift: boolean, ctrl: boolean, alt: boolean) => {
+      if (isShiftDownRef.current !== shift) {
+        isShiftDownRef.current = shift;
+        setIsShiftDown(shift);
+      }
+      if (isCtrlDownRef.current !== ctrl) {
+        isCtrlDownRef.current = ctrl;
+        setIsCtrlDown(ctrl);
+      }
+      if (isAltDownRef.current !== alt) {
+        isAltDownRef.current = alt;
+        setIsAltDown(alt);
+      }
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
       const targetEl = e.target as HTMLElement | null;
       if (
@@ -841,21 +1175,14 @@ export function useCanvasNavigation({
         return;
       }
 
-      if (e.key === 'Shift' && !isShiftDownRef.current) {
-        isShiftDownRef.current = true;
-        setIsShiftDown(true);
-      }
-      if ((e.key === 'Control' || e.key === 'Meta') && !isCtrlDownRef.current) {
-        isCtrlDownRef.current = true;
-        setIsCtrlDown(true);
-      }
-      if (e.key === 'Alt' && !isAltDownRef.current) {
-        isAltDownRef.current = true;
-        setIsAltDown(true);
-      }
+      const nextShift = e.key === 'Shift' ? true : Boolean(e.shiftKey);
+      const nextCtrl =
+        e.key === 'Control' || e.key === 'Meta' ? true : Boolean(e.ctrlKey || e.metaKey);
+      const nextAlt = e.key === 'Alt' ? true : Boolean(e.altKey);
+      syncModifierState(nextShift, nextCtrl, nextAlt);
 
       // Space key for Pan / Rotate / Scrubby Zoom (skip Alt+Space so Animation playback can use it)
-      if ((e.code === 'Space' || e.key === ' ') && !e.altKey) {
+      if (isSpaceKeyEvent(e) && !e.altKey) {
         e.preventDefault();
         if (!isSpaceDownRef.current) {
           isSpaceDownRef.current = true;
@@ -865,264 +1192,66 @@ export function useCanvasNavigation({
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (e.key === 'Shift') {
-        isShiftDownRef.current = false;
-        setIsShiftDown(false);
-      }
-      if (e.key === 'Control' || e.key === 'Meta') {
-        isCtrlDownRef.current = false;
-        setIsCtrlDown(false);
-      }
-      if (e.key === 'Alt') {
-        isAltDownRef.current = false;
-        setIsAltDown(false);
-      }
-      if (e.code === 'Space' || e.key === ' ') {
+      const nextShift = e.key === 'Shift' ? false : Boolean(e.shiftKey);
+      const nextCtrl =
+        e.key === 'Control' || e.key === 'Meta' ? false : Boolean(e.ctrlKey || e.metaKey);
+      const nextAlt = e.key === 'Alt' ? false : Boolean(e.altKey);
+      syncModifierState(nextShift, nextCtrl, nextAlt);
+
+      if (isSpaceKeyEvent(e) && isSpaceDownRef.current) {
         isSpaceDownRef.current = false;
         setIsSpaceDown(false);
       }
     };
 
-    const handleBlur = () => {
+    const resetAllNavState = () => {
       const wasInteracting =
         isPanningRef.current || isRotatingRef.current || isZoomDraggingRef.current;
-      isSpaceDownRef.current = false;
-      setIsSpaceDown(false);
-      isShiftDownRef.current = false;
-      setIsShiftDown(false);
-      isCtrlDownRef.current = false;
-      setIsCtrlDown(false);
-      isAltDownRef.current = false;
-      setIsAltDown(false);
-      isPanningRef.current = false;
-      setIsPanning(false);
-      isRotatingRef.current = false;
-      setIsRotating(false);
-      isZoomDraggingRef.current = false;
-      setIsZoomDragging(false);
+      activeDragCleanupRef.current?.();
+      activeDragCleanupRef.current = null;
+      setNavBodyCursor(null);
+      if (isSpaceDownRef.current) {
+        isSpaceDownRef.current = false;
+        setIsSpaceDown(false);
+      }
+      syncModifierState(false, false, false);
+      if (isPanningRef.current) {
+        isPanningRef.current = false;
+        setIsPanning(false);
+      }
+      if (isRotatingRef.current) {
+        isRotatingRef.current = false;
+        setIsRotating(false);
+      }
+      if (isZoomDraggingRef.current) {
+        isZoomDraggingRef.current = false;
+        setIsZoomDragging(false);
+      }
       if (wasInteracting) {
         broadcastCameraImmediate();
         commitNavStateImmediate();
       }
     };
 
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        resetAllNavState();
+      }
+    };
+
     window.addEventListener('keydown', handleKeyDown);
-    window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('blur', handleBlur);
+    // Capture phase ensures child stopPropagation() cannot swallow Space/modifier keyup
+    window.addEventListener('keyup', handleKeyUp, true);
+    window.addEventListener('blur', resetAllNavState);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
-      window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('keyup', handleKeyUp, true);
+      window.removeEventListener('blur', resetAllNavState);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [broadcastCameraImmediate, commitNavStateImmediate]);
-
-  // Panning pointermove: broadcasts directly to DOM/WebGL via rAF; commits React state only on pointerup
-  useEffect(() => {
-    if (!isPanning) return;
-
-    const handleWindowPointerMove = (e: PointerEvent) => {
-      if (!isPanningRef.current) return;
-      const dx = e.clientX - panStartRef.current.clientX;
-      const dy = e.clientY - panStartRef.current.clientY;
-
-      panRef.current = {
-        x: isWebtoonModeRef.current ? panStartRef.current.panX : panStartRef.current.panX + dx,
-        y: panStartRef.current.panY + dy,
-      };
-      scheduleCameraBroadcast();
-    };
-
-    const handleWindowPointerUp = () => {
-      isPanningRef.current = false;
-      broadcastCameraImmediate();
-      setIsPanning(false);
-      commitNavStateImmediate();
-    };
-
-    window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
-    window.addEventListener('pointerup', handleWindowPointerUp);
-    window.addEventListener('pointercancel', handleWindowPointerUp);
-
-    const prevCursor = document.body.style.cursor;
-    const prevUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = 'grabbing';
-    document.body.style.userSelect = 'none';
-
-    return () => {
-      window.removeEventListener('pointermove', handleWindowPointerMove);
-      window.removeEventListener('pointerup', handleWindowPointerUp);
-      window.removeEventListener('pointercancel', handleWindowPointerUp);
-      document.body.style.cursor = prevCursor;
-      document.body.style.userSelect = prevUserSelect;
-    };
-  }, [isPanning, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
-
-  // Rotating pointermove: damped radial delta + frame-rate-independent rAF smoothing across all angles
-  useEffect(() => {
-    if (!isRotating) return;
-
-    let cachedRect: DOMRect | null = viewportRef.current
-      ? viewportRef.current.getBoundingClientRect()
-      : null;
-    let smoothRafId: number | null = null;
-    let lastFrameTs = performance.now();
-
-    const applyRotationToCamera = (angleDeg: number) => {
-      const { center: vc, startCanvasRotation, startPan } = rotateStartRef.current;
-      rotationRef.current = angleDeg;
-      const dRad = ((angleDeg - startCanvasRotation) * Math.PI) / 180;
-      const cos = Math.cos(dRad);
-      const sin = Math.sin(dRad);
-      const rx = startPan.x - vc.x;
-      const ry = startPan.y - vc.y;
-      panRef.current = {
-        x: vc.x + rx * cos - ry * sin,
-        y: vc.y + rx * sin + ry * cos,
-      };
-    };
-
-    const stepSmoothRotation = (now: number) => {
-      smoothRafId = null;
-      if (!isRotatingRef.current) return;
-
-      const dt = Math.min(0.05, Math.max(0.001, (now - lastFrameTs) / 1000));
-      lastFrameTs = now;
-
-      const target = rotateStartRef.current.targetRotation;
-      const current = rotationRef.current;
-      const diff = target - current;
-
-      if (Math.abs(diff) < 0.01) {
-        if (current !== target) {
-          applyRotationToCamera(target);
-          emitCameraToSubscribers();
-        }
-        return;
-      }
-
-      const alpha = 1 - Math.exp(-dt * 28);
-      applyRotationToCamera(current + diff * alpha);
-      emitCameraToSubscribers();
-      smoothRafId = requestAnimationFrame(stepSmoothRotation);
-    };
-
-    const ensureSmoothLoop = () => {
-      if (smoothRafId === null) {
-        lastFrameTs = performance.now();
-        smoothRafId = requestAnimationFrame(stepSmoothRotation);
-      }
-    };
-
-    const handleWindowPointerMove = (e: PointerEvent) => {
-      if (!isRotatingRef.current) return;
-      const viewport = viewportRef.current;
-      if (!viewport) return;
-
-      if (!cachedRect) cachedRect = viewport.getBoundingClientRect();
-      const vc = rotateStartRef.current.center;
-      const px = e.clientX - cachedRect.left;
-      const py = e.clientY - cachedRect.top;
-
-      const diff = computeSmoothRotationDelta(
-        rotateStartRef.current.lastX,
-        rotateStartRef.current.lastY,
-        px,
-        py,
-        vc.x,
-        vc.y
-      );
-
-      rotateStartRef.current.lastX = px;
-      rotateStartRef.current.lastY = py;
-      rotateStartRef.current.totalAngleDelta += diff;
-
-      let nextTarget =
-        rotateStartRef.current.startCanvasRotation + rotateStartRef.current.totalAngleDelta;
-
-      if (e.altKey || e.ctrlKey) {
-        nextTarget = Math.round(nextTarget / 15) * 15;
-      }
-
-      rotateStartRef.current.targetRotation = nextTarget;
-      ensureSmoothLoop();
-    };
-
-    const handleWindowPointerUp = () => {
-      if (smoothRafId !== null) {
-        cancelAnimationFrame(smoothRafId);
-        smoothRafId = null;
-      }
-      isRotatingRef.current = false;
-      applyRotationToCamera(rotateStartRef.current.targetRotation);
-      broadcastCameraImmediate();
-      setIsRotating(false);
-      commitNavStateImmediate();
-    };
-
-    window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
-    window.addEventListener('pointerup', handleWindowPointerUp);
-    window.addEventListener('pointercancel', handleWindowPointerUp);
-
-    const prevCursor = document.body.style.cursor;
-    const prevUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = ROTATE_CURSOR_CSS;
-    document.body.style.userSelect = 'none';
-
-    return () => {
-      if (smoothRafId !== null) {
-        cancelAnimationFrame(smoothRafId);
-      }
-      window.removeEventListener('pointermove', handleWindowPointerMove);
-      window.removeEventListener('pointerup', handleWindowPointerUp);
-      window.removeEventListener('pointercancel', handleWindowPointerUp);
-      document.body.style.cursor = prevCursor;
-      document.body.style.userSelect = prevUserSelect;
-    };
-  }, [isRotating, emitCameraToSubscribers, broadcastCameraImmediate, commitNavStateImmediate]);
-
-  // Scrubby Zoom pointermove (default Ctrl+Space+Drag): zero-rerender via rAF camera broadcast
-  useEffect(() => {
-    if (!isZoomDragging) return;
-
-    const handleWindowPointerMove = (e: PointerEvent) => {
-      if (!isZoomDraggingRef.current) return;
-      const dx = e.clientX - zoomDragStartRef.current.clientX;
-      const { anchorX, anchorY, startZoom, startPan } = zoomDragStartRef.current;
-      const nextZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, startZoom * Math.exp(dx * 0.007)));
-      const ratio = nextZoom / startZoom;
-      zoomRef.current = nextZoom;
-      panRef.current = {
-        x: anchorX - (anchorX - startPan.x) * ratio,
-        y: anchorY - (anchorY - startPan.y) * ratio,
-      };
-      scheduleCameraBroadcast();
-    };
-
-    const handleWindowPointerUp = () => {
-      isZoomDraggingRef.current = false;
-      broadcastCameraImmediate();
-      setIsZoomDragging(false);
-      commitNavStateImmediate();
-    };
-
-    window.addEventListener('pointermove', handleWindowPointerMove, { passive: true });
-    window.addEventListener('pointerup', handleWindowPointerUp);
-    window.addEventListener('pointercancel', handleWindowPointerUp);
-
-    const prevCursor = document.body.style.cursor;
-    const prevUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = 'zoom-in';
-    document.body.style.userSelect = 'none';
-
-    return () => {
-      window.removeEventListener('pointermove', handleWindowPointerMove);
-      window.removeEventListener('pointerup', handleWindowPointerUp);
-      window.removeEventListener('pointercancel', handleWindowPointerUp);
-      document.body.style.cursor = prevCursor;
-      document.body.style.userSelect = prevUserSelect;
-    };
-  }, [isZoomDragging, scheduleCameraBroadcast, broadcastCameraImmediate, commitNavStateImmediate]);
+  }, [broadcastCameraImmediate, commitNavStateImmediate, setNavBodyCursor]);
 
   useEffect(() => {
     const handleAuxClick = (e: MouseEvent) => {
@@ -1176,6 +1305,7 @@ export function useCanvasNavigation({
     isShiftDown,
     isCtrlDown,
     isAltDown,
+    heldModifierAction: activeHeldModifierAction,
     isRotateModifier,
     isPanning,
     isRotating,

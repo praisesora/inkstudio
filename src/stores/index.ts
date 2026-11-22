@@ -1,8 +1,12 @@
 export { createStore, shallowEqual } from './createStore';
 export type { StoreApi, UseBoundStore, StoreListener, StateUpdater, EqualityFn } from './createStore';
 
-export { useToolStore, toolStoreActions } from './useToolStore';
-export type { ToolStoreState, QuickModifiersState } from './useToolStore';
+export { useToolStore, toolStoreActions, interactiveToolBridge } from './useToolStore';
+export type {
+  ToolStoreState,
+  QuickModifiersState,
+  InteractiveToolActionsBridge,
+} from './useToolStore';
 
 export {
   useDocumentStore,
@@ -12,12 +16,19 @@ export {
 } from './useDocumentStore';
 export type { DocumentStoreState } from './useDocumentStore';
 
-export { useUiStore, uiStoreActions, selectIsAnyModalOpen } from './useUiStore';
+export {
+  useUiStore,
+  uiStoreActions,
+  selectIsAnyModalOpen,
+  INITIAL_APP_CLOSE_PROMPT_STATE,
+} from './useUiStore';
 export type {
   UiStoreState,
   TonalModalState,
   AdjustmentModalState,
   LayerStylesModalState,
+  AppClosePromptStep,
+  AppClosePromptState,
 } from './useUiStore';
 
 export { useWorkspaceStore, workspaceStoreActions } from './useWorkspaceStore';

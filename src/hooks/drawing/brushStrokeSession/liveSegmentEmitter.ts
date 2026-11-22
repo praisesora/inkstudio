@@ -69,6 +69,19 @@ export function emitLiveSegmentToDraft(
     return;
   }
 
+  if (state.naturalPaintSession) {
+    state.naturalPaintSession.drawCubicSegment(
+      draftCtx,
+      sStart,
+      c1Pt,
+      c2Pt,
+      sEnd,
+      state.layerPixelSampler || undefined,
+      true
+    );
+    return;
+  }
+
   const liveColor =
     (isEraser && !isBgEraser) || bs.isTransparentInk ? '#000000' : strokeColor;
   const draftCanvas = params.effectiveDraftCanvasRef?.current as
@@ -115,7 +128,14 @@ export function renderPredictedStrokeOverlay(
 ): void {
   helpers.clearPredictedCanvas();
   const bs = helpers.getBrushSettings();
-  if (helpers.getTool() === 'eraser' || bs.isTransparentInk || bs.colorMixing) return;
+  if (
+    helpers.getTool() === 'eraser' ||
+    bs.isTransparentInk ||
+    bs.colorMixing ||
+    state.naturalPaintSession
+  ) {
+    return;
+  }
   const pipeline = state.strokePipeline;
   if (pipeline.getKnotCount() < 2) return;
   const pCanvas = helpers.getPredictedCanvas();

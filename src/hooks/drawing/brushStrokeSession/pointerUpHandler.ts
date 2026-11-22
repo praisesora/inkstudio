@@ -334,6 +334,10 @@ export function runPointerUp(
   state.isShiftLineStroke = false;
   state.layerPixelSampler = null;
   state.activeReservoir = null;
+  if (state.naturalPaintSession) {
+    state.naturalPaintSession.finishAndDispose();
+    state.naturalPaintSession = null;
+  }
   state.snapSession.endStroke();
   state.straightSnapSession.endStroke();
   helpers.emitConstraintAxisChange(null);

@@ -420,7 +420,9 @@ describe('WebGlBrushEngine Integration & Canvas 2D Fallback in stampEngine', () 
       expect(canUseWebGlForBrush({ size: 10, antiAlias: 0, useGpu: true, tipImage: mockTipImage })).toBe(false);
       expect(canUseWebGlForBrush({ size: 10, colorMixing: true, useGpu: true, tipImage: mockTipImage })).toBe(false);
       expect(canUseWebGlForBrush({ size: 10, useGpu: false, tipImage: mockTipImage })).toBe(false);
-      expect(canUseWebGlForBrush({ size: 10, tipImage: mockTipImage, subTipImages: [mockTipImage, mockTipImage], useGpu: true })).toBe(false);
+      // Multi-subTip now renders in a single WebGL draw call via texture atlas
+      expect(canUseWebGlForBrush({ size: 10, tipImage: mockTipImage, subTipImages: [mockTipImage, mockTipImage], useGpu: true })).toBe(true);
+      expect(canUseWebGlForBrush({ size: 10, renderMode: 'bristle-ribbon', useGpu: true })).toBe(false);
       expect(canUseWebGlForBrush({ antiAlias: 0, useGpu: true })).toBe(false);
       expect(canUseWebGlForBrush({ colorMixing: true, useGpu: true })).toBe(false);
 

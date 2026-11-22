@@ -4,3 +4,7 @@ export { useBrushStrokeSession } from './useBrushStrokeSession';
 export { useVectorDrawing, commitVectorStrokeOrErase } from './useVectorDrawing';
 export { useSelectionTools } from './useSelectionTools';
 export { useShapeAndFillTools } from './useShapeAndFillTools';
+export { useGradientTool } from './useGradientTool';
+export { useRetouchTool } from './useRetouchTool';
+export type { CloneSourceIndicator } from './useRetouchTool';
+export { usePenTool } from './usePenTool';

@@ -7,8 +7,13 @@
  * Paper textures encode surface elevation in luminance [0..255] with opaque alpha=255.
  */
 
+import type { BristleProfilePreset, SurfaceTextureId } from '../types/editor';
+
 const TIP_SIZE = 128;
 const PAPER_SIZE = 256;
+export const SURFACE_TEXTURE_SIZE = 1024;
+/** High-DPI texel density multiplier: 2x oversampled texels per document pixel at scale=1.0 */
+export const SURFACE_TEXELS_PER_PX = 2.0;
 
 const generatedCache = new Map<string, string>();
 
@@ -870,6 +875,499 @@ export function generateNoiseGrainTexture(): string {
         data[idx + 1] = v;
         data[idx + 2] = v;
         data[idx + 3] = 255;
+      }
+    }
+  });
+}
+
+// -------------------------------------------------------------
+// HIGH-DPI (1024x1024, 2x OVERSAMPLED) SEAMLESS SURFACE LIBRARY
+// Used by Natural Paint Engine (Canvas Tooth, Dry-Brush & Impasto)
+// -------------------------------------------------------------
+
+export interface SurfaceTextureMeta {
+  id: SurfaceTextureId;
+  label: string;
+  desc: string;
+}
+
+export const SURFACE_TEXTURE_CATALOG: SurfaceTextureMeta[] = [
+  { id: 'linen-canvas', label: 'Linen Canvas', desc: 'High-DPI woven primed Belgian linen with spun fibers & slubs' },
+  { id: 'coarse-burlap', label: 'Coarse Burlap', desc: 'Heavy twisted-yarn rustic canvas weave with deep valleys' },
+  { id: 'fine-cotton', label: 'Fine Cotton', desc: 'Smooth tight-weave primed cotton duck with gesso micro-tooth' },
+  { id: 'cold-press-watercolor', label: 'Cold-Press Paper', desc: 'Domed cotton fibers with granulating micro-valleys' },
+  { id: 'rough-pastel', label: 'Rough Pastel', desc: 'Toothy laid charcoal and pastel paper with crisp ridges' },
+  { id: 'gesso-board', label: 'Gesso Board', desc: 'Cross-brushed primed wood panel with fine bristle striations' },
+  { id: 'stipple-grain', label: 'Stipple Grain', desc: 'Organic high-DPI mineral & fine film grain' },
+];
+
+const surfaceHeightCache = new Map<SurfaceTextureId, Uint8Array>();
+
+function buildSurfaceHeightField(id: SurfaceTextureId): Uint8Array {
+  const size = SURFACE_TEXTURE_SIZE;
+  const out = new Uint8Array(size * size);
+  const invSize = 1 / size;
+
+  if (id === 'linen-canvas') {
+    const rand = createPrng(0x7a11f01);
+    // 80 Belgian linen threads across 1024 high-DPI texels (12.8 texels/thread -> ~5.5px at scale=0.85)
+    // Purely continuous, band-limited cylindrical yarn geometry (ZERO per-texel white noise -> silky 3D normals!)
+    const threads = 80;
+    const warpSlub = new Float32Array(threads);
+    const weftSlub = new Float32Array(threads);
+    const warpJitter = new Float32Array(threads);
+    const weftJitter = new Float32Array(threads);
+    const warpHeight = new Float32Array(threads);
+    const weftHeight = new Float32Array(threads);
+    for (let i = 0; i < threads; i++) {
+      warpSlub[i] = 0.82 + rand() * 0.30;
+      weftSlub[i] = 0.82 + rand() * 0.30;
+      warpJitter[i] = (rand() - 0.5) * 0.18;
+      weftJitter[i] = (rand() - 0.5) * 0.18;
+      warpHeight[i] = 0.90 + rand() * 0.15;
+      weftHeight[i] = 0.88 + rand() * 0.15;
+    }
+    const gFiber = makePeriodicGrid(128, rand);
+    const gUndul = makePeriodicGrid(32, rand);
+    const gDrift = makePeriodicGrid(16, rand);
+
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      const ny = y * invSize;
+      for (let x = 0; x < size; x++) {
+        const nx = x * invSize;
+        // Gentle hand-loomed warp/weft drift so the weave feels genuinely woven, never mechanical
+        const driftX = (samplePeriodic(gDrift, 16, nx * 16, ny * 16) - 0.5) * 0.24;
+        const driftY = (samplePeriodic(gDrift, 16, nx * 16 + 7.3, ny * 16 + 4.9) - 0.5) * 0.24;
+
+        const tx = ((nx * threads + driftX) % threads + threads) % threads;
+        const ty = ((ny * threads + driftY) % threads + threads) % threads;
+        const colCell = Math.floor(tx);
+        const rowCell = Math.floor(ty);
+        const fracX = tx - colCell;
+        const fracY = ty - rowCell;
+
+        const parity = ((rowCell + colCell) & 1) === 0;
+        const dx = (fracX - 0.5 + warpJitter[colCell] * 0.15) * 2.0;
+        const dy = (fracY - 0.5 + weftJitter[rowCell] * 0.15) * 2.0;
+
+        // Smooth cylindrical yarn cross-section with crisp dark woven interstices
+        const warpWidth = warpSlub[colCell];
+        const weftWidth = weftSlub[rowCell];
+        const warpCyl = Math.cos(Math.min(1, Math.abs(dx) / Math.max(0.60, warpWidth)) * Math.PI * 0.5);
+        const weftCyl = Math.cos(Math.min(1, Math.abs(dy) / Math.max(0.60, weftWidth)) * Math.PI * 0.5);
+
+        // Smooth band-limited spun-yarn twist along each thread (crisp at 1024x1024, zero static noise)
+        const warpTwist = 0.93 + 0.07 * Math.sin((fracX * 2.2 + ny * threads * 2.5) * Math.PI);
+        const weftTwist = 0.93 + 0.07 * Math.sin((fracY * 2.2 - nx * threads * 2.5) * Math.PI);
+
+        // Over/under yarn arch profile
+        const warpArch = warpCyl * (0.64 + 0.36 * Math.cos(dy * Math.PI * 0.5)) * warpTwist * warpHeight[colCell];
+        const weftArch = weftCyl * (0.64 + 0.36 * Math.cos(dx * Math.PI * 0.5)) * weftTwist * weftHeight[rowCell];
+
+        const over = parity ? warpArch : weftArch;
+        const under = parity ? weftArch * 0.44 : warpArch * 0.44;
+        const baseWeave = Math.max(over, under);
+
+        const fiber = samplePeriodic(gFiber, 128, nx * 128, ny * 128);
+        const undul = samplePeriodic(gUndul, 32, nx * 32, ny * 32);
+        const h = clamp01(baseWeave * 0.82 + fiber * 0.11 + undul * 0.07);
+        out[row + x] = Math.round(Math.pow(h, 0.95) * 255);
+      }
+    }
+    return out;
+  }
+
+  if (id === 'coarse-burlap') {
+    const rand = createPrng(0x7a22b02);
+    // 64 heavy twisted jute/burlap threads across 1024 high-DPI texels (16 texels/thread!)
+    const threads = 64;
+    const warpThick = new Float32Array(threads);
+    const weftThick = new Float32Array(threads);
+    for (let i = 0; i < threads; i++) {
+      warpThick[i] = 0.72 + rand() * 0.42;
+      weftThick[i] = 0.72 + rand() * 0.42;
+    }
+    const gRough = makePeriodicGrid(256, rand);
+    const gDrift = makePeriodicGrid(32, rand);
+
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      const ny = y * invSize;
+      for (let x = 0; x < size; x++) {
+        const nx = x * invSize;
+        const driftX = (samplePeriodic(gDrift, 32, nx * 32, ny * 32) - 0.5) * 0.25;
+        const driftY = (samplePeriodic(gDrift, 32, nx * 32 + 13, ny * 32 + 5) - 0.5) * 0.25;
+        const tx = ((nx * threads + driftX) % threads + threads) % threads;
+        const ty = ((ny * threads + driftY) % threads + threads) % threads;
+        const cCell = Math.floor(tx);
+        const rCell = Math.floor(ty);
+        const fx = (tx - cCell - 0.5) * 2.0;
+        const fy = (ty - rCell - 0.5) * 2.0;
+        const parity = ((rCell + cCell) & 1) === 0;
+        const twistW = 0.84 + 0.16 * Math.sin((ny * threads * 4.0 + fx * 2.2) * Math.PI);
+        const twistH = 0.84 + 0.16 * Math.sin((nx * threads * 4.0 - fy * 2.2) * Math.PI);
+        const warpC = Math.cos(Math.min(1, Math.abs(fx) / Math.max(0.55, warpThick[cCell])) * Math.PI * 0.5) * twistW;
+        const weftC = Math.cos(Math.min(1, Math.abs(fy) / Math.max(0.55, weftThick[rCell])) * Math.PI * 0.5) * twistH;
+        const weave = parity ? Math.max(warpC, weftC * 0.40) : Math.max(weftC, warpC * 0.40);
+        const rough = samplePeriodic(gRough, 256, nx * 256, ny * 256);
+        const h = clamp01(weave * 0.82 + rough * 0.18 - 0.04);
+        out[row + x] = Math.round(Math.pow(h, 1.04) * 255);
+      }
+    }
+    return out;
+  }
+
+  if (id === 'fine-cotton') {
+    const rand = createPrng(0x7a33c03);
+    const threads = 160; // Ultra-tight primed cotton duck across 1024 high-DPI texels
+    const gGesso = makePeriodicGrid(128, rand);
+    const gMicro = makePeriodicGrid(256, rand);
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      const ny = y * invSize;
+      const wy = Math.sin(ny * Math.PI * 2 * threads);
+      for (let x = 0; x < size; x++) {
+        const nx = x * invSize;
+        const wx = Math.sin(nx * Math.PI * 2 * threads);
+        const checker = Math.sin((nx + ny) * Math.PI * 2 * (threads * 0.5)) * 0.16;
+        const weave = (wx * 0.5 + 0.5) * 0.36 + (wy * 0.5 + 0.5) * 0.36 + 0.14 + checker;
+        const gesso = samplePeriodic(gGesso, 128, nx * 128, ny * 128);
+        const micro = samplePeriodic(gMicro, 256, nx * 256, ny * 256);
+        const h = clamp01(weave * 0.58 + gesso * 0.24 + micro * 0.14 + rand() * 0.04);
+        out[row + x] = Math.round(h * 255);
+      }
+    }
+    return out;
+  }
+
+  if (id === 'cold-press-watercolor') {
+    const rand = createPrng(0x7a44d04);
+    const coarseDomes = makeCellularDomeField(256, 48, rand);
+    const fineDomes = makeCellularDomeField(256, 96, rand);
+    const gFiber = makePeriodicGrid(256, rand);
+    const gUndul = makePeriodicGrid(64, rand);
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      const ny = y * invSize;
+      const sy = ny * 256;
+      const y0 = Math.floor(sy) & 255;
+      const y1 = (y0 + 1) & 255;
+      const ty = sy - Math.floor(sy);
+      for (let x = 0; x < size; x++) {
+        const nx = x * invSize;
+        const sx = nx * 256;
+        const x0 = Math.floor(sx) & 255;
+        const x1 = (x0 + 1) & 255;
+        const tx = sx - Math.floor(sx);
+        const cTop = coarseDomes[y0 * 256 + x0] * (1 - tx) + coarseDomes[y0 * 256 + x1] * tx;
+        const cBot = coarseDomes[y1 * 256 + x0] * (1 - tx) + coarseDomes[y1 * 256 + x1] * tx;
+        const d1 = cTop * (1 - ty) + cBot * ty;
+        const fTop = fineDomes[y0 * 256 + x0] * (1 - tx) + fineDomes[y0 * 256 + x1] * tx;
+        const fBot = fineDomes[y1 * 256 + x0] * (1 - tx) + fineDomes[y1 * 256 + x1] * tx;
+        const d2 = fTop * (1 - ty) + fBot * ty;
+        const fiber = samplePeriodic(gFiber, 256, nx * 256, ny * 256);
+        const undul = samplePeriodic(gUndul, 64, nx * 64, ny * 64);
+        const raw = d1 * 0.48 + d2 * 0.26 + fiber * 0.14 + undul * 0.08 + rand() * 0.04;
+        const h = clamp01((raw - 0.12) / 0.74);
+        out[row + x] = Math.round(Math.pow(h, 1.06) * 255);
+      }
+    }
+    return out;
+  }
+
+  if (id === 'rough-pastel') {
+    const rand = createPrng(0x7a55e05);
+    const domes = makeCellularDomeField(256, 60, rand);
+    const gGrit = makePeriodicGrid(256, rand);
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      const ny = y * invSize;
+      const rib = Math.sin(ny * Math.PI * 2 * 96) * 0.15;
+      const sy = ny * 256;
+      const y0 = Math.floor(sy) & 255;
+      const y1 = (y0 + 1) & 255;
+      const ty = sy - Math.floor(sy);
+      for (let x = 0; x < size; x++) {
+        const nx = x * invSize;
+        const chain = Math.sin(nx * Math.PI * 2 * 16) * 0.06;
+        const sx = nx * 256;
+        const x0 = Math.floor(sx) & 255;
+        const x1 = (x0 + 1) & 255;
+        const tx = sx - Math.floor(sx);
+        const top = domes[y0 * 256 + x0] * (1 - tx) + domes[y0 * 256 + x1] * tx;
+        const bot = domes[y1 * 256 + x0] * (1 - tx) + domes[y1 * 256 + x1] * tx;
+        const d = top * (1 - ty) + bot * ty;
+        const grit = samplePeriodic(gGrit, 256, nx * 256, ny * 256);
+        const raw = d * 0.48 + grit * 0.30 + rand() * 0.14 + rib + chain;
+        const h = clamp01((raw - 0.14) / 0.72);
+        out[row + x] = Math.round(Math.pow(h, 1.15) * 255);
+      }
+    }
+    return out;
+  }
+
+  if (id === 'gesso-board') {
+    const rand = createPrng(0x7a66f06);
+    const gBrushH = makePeriodicGrid(128, rand);
+    const gBrushV = makePeriodicGrid(128, rand);
+    const gMicro = makePeriodicGrid(256, rand);
+    for (let y = 0; y < size; y++) {
+      const row = y * size;
+      const ny = y * invSize;
+      for (let x = 0; x < size; x++) {
+        const nx = x * invSize;
+        const hStreak = samplePeriodic(gBrushH, 128, nx * 28, ny * 220);
+        const vStreak = samplePeriodic(gBrushV, 128, nx * 220, ny * 28);
+        const micro = samplePeriodic(gMicro, 256, nx * 256, ny * 256);
+        const raw = hStreak * 0.38 + vStreak * 0.30 + micro * 0.24 + rand() * 0.08;
+        const h = clamp01((raw - 0.12) / 0.76);
+        out[row + x] = Math.round(h * 255);
+      }
+    }
+    return out;
+  }
+
+  // 'stipple-grain'
+  const rand = createPrng(0x7a77007);
+  const gMed = makePeriodicGrid(128, rand);
+  const gFine = makePeriodicGrid(256, rand);
+  for (let y = 0; y < size; y++) {
+    const row = y * size;
+    const ny = y * invSize;
+    for (let x = 0; x < size; x++) {
+      const nx = x * invSize;
+      const m = samplePeriodic(gMed, 128, nx * 128, ny * 128);
+      const f = samplePeriodic(gFine, 256, nx * 256, ny * 256);
+      const raw = m * 0.28 + f * 0.36 + rand() * 0.36;
+      const h = clamp01((raw - 0.14) / 0.72);
+      out[row + x] = Math.round(h * 255);
+    }
+  }
+  return out;
+}
+
+/**
+ * Returns the cached 1024x1024 seamless high-DPI surface elevation table [0..255] for a built-in texture ID.
+ */
+export function getSurfaceTextureHeightField(id: SurfaceTextureId): Uint8Array {
+  const hit = surfaceHeightCache.get(id);
+  if (hit) return hit;
+  const field = buildSurfaceHeightField(id);
+  surfaceHeightCache.set(id, field);
+  return field;
+}
+
+/**
+ * Fast bilinear periodic lookup of the high-DPI 1024x1024 surface heightmap in [0..1]
+ * using 2x oversampled texel coordinates for razor-sharp grain at 100%-400% zoom.
+ */
+export function sampleSurfaceTextureHeight(
+  id: SurfaceTextureId,
+  x: number,
+  y: number,
+  scale: number = 1.0,
+  rotateRad: number = 0
+): number {
+  const table = getSurfaceTextureHeightField(id);
+  const size = SURFACE_TEXTURE_SIZE;
+  const mask = size - 1;
+  const invScale = SURFACE_TEXELS_PER_PX / Math.max(0.05, scale);
+  let px = x * invScale;
+  let py = y * invScale;
+  if (Math.abs(rotateRad) > 1e-4) {
+    const c = Math.cos(rotateRad);
+    const s = Math.sin(rotateRad);
+    const rx = px * c - py * s;
+    const ry = px * s + py * c;
+    px = rx;
+    py = ry;
+  }
+  const fx = Math.floor(px);
+  const fy = Math.floor(py);
+  const tx = px - fx;
+  const ty = py - fy;
+  const x0 = fx & mask;
+  const y0 = fy & mask;
+  const x1 = (fx + 1) & mask;
+  const y1 = (fy + 1) & mask;
+  const v00 = table[y0 * size + x0];
+  const v10 = table[y0 * size + x1];
+  const v01 = table[y1 * size + x0];
+  const v11 = table[y1 * size + x1];
+  const top = v00 + (v10 - v00) * tx;
+  const bot = v01 + (v11 - v01) * tx;
+  return (top + (bot - top) * ty) / 255.0;
+}
+
+/**
+ * Samples true 2x-DPI analytical surface gradients (dh/dx, dh/dy) directly from the 1024x1024
+ * continuous heightfield at sub-texel central differences — eliminates 1px aliasing on linen weave!
+ */
+export function sampleSurfaceTextureGrad(
+  id: SurfaceTextureId,
+  x: number,
+  y: number,
+  scale: number,
+  rotateRad: number,
+  out: { gx: number; gy: number }
+): void {
+  const table = getSurfaceTextureHeightField(id);
+  const size = SURFACE_TEXTURE_SIZE;
+  const mask = size - 1;
+  const invScale = SURFACE_TEXELS_PER_PX / Math.max(0.05, scale);
+  let px = x * invScale;
+  let py = y * invScale;
+  let cosR = 1;
+  let sinR = 0;
+  if (Math.abs(rotateRad) > 1e-4) {
+    cosR = Math.cos(rotateRad);
+    sinR = Math.sin(rotateRad);
+    const rx = px * cosR - py * sinR;
+    const ry = px * sinR + py * cosR;
+    px = rx;
+    py = ry;
+  }
+
+  const sampleBilin = (sx: number, sy: number): number => {
+    const fx = Math.floor(sx);
+    const fy = Math.floor(sy);
+    const tx = sx - fx;
+    const ty = sy - fy;
+    const x0 = fx & mask;
+    const y0 = fy & mask;
+    const x1 = (fx + 1) & mask;
+    const y1 = (fy + 1) & mask;
+    const r0 = y0 * size;
+    const r1 = y1 * size;
+    const v00 = table[r0 + x0];
+    const v10 = table[r0 + x1];
+    const v01 = table[r1 + x0];
+    const v11 = table[r1 + x1];
+    return v00 + (v10 - v00) * tx + ((v01 + (v11 - v01) * tx) - (v00 + (v10 - v00) * tx)) * ty;
+  };
+
+  // Central difference across +/-0.65 high-DPI texels (band-limited, zero stair-step!)
+  const eps = 0.65;
+  const dU = (sampleBilin(px + eps, py) - sampleBilin(px - eps, py)) / (255.0 * 2.0 * eps);
+  const dV = (sampleBilin(px, py + eps) - sampleBilin(px, py - eps)) / (255.0 * 2.0 * eps);
+  out.gx = dU * cosR + dV * sinR;
+  out.gy = -dU * sinR + dV * cosR;
+}
+
+/**
+ * Generates and caches a crisp 512x512 seamless PNG data URL (2x box-filtered from 1024x1024)
+ * for UI swatches and legacy paper-texture GPU binding.
+ */
+export function getSurfaceTextureDataUrl(id: SurfaceTextureId): string {
+  const outSize = 512;
+  return buildCachedPng(`surface512:${id}`, outSize, (data, size) => {
+    const field = getSurfaceTextureHeightField(id);
+    const srcSize = SURFACE_TEXTURE_SIZE;
+    const step = Math.max(1, srcSize / size);
+    for (let y = 0; y < size; y++) {
+      const sy = y * step;
+      const row = y * size * 4;
+      for (let x = 0; x < size; x++) {
+        const sx = x * step;
+        const v =
+          step === 2
+            ? Math.round(
+                (field[sy * srcSize + sx] +
+                  field[sy * srcSize + sx + 1] +
+                  field[(sy + 1) * srcSize + sx] +
+                  field[(sy + 1) * srcSize + sx + 1]) *
+                  0.25
+              )
+            : field[sy * srcSize + sx];
+        const idx = row + x * 4;
+        data[idx] = v;
+        data[idx + 1] = v;
+        data[idx + 2] = v;
+        data[idx + 3] = 255;
+      }
+    }
+  });
+}
+
+// -------------------------------------------------------------
+// NATURAL PAINT PHYSICAL BRUSH TIP GENERATORS (128x128)
+// -------------------------------------------------------------
+
+export function generateNaturalTipByProfile(profile: BristleProfilePreset): string {
+  const key = `natural-tip:${profile}`;
+  return buildCachedPng(key, TIP_SIZE, (data, size) => {
+    const rand = createPrng(
+      profile === 'flat'
+        ? 0x9011
+        : profile === 'filbert'
+        ? 0x9022
+        : profile === 'fan'
+        ? 0x9033
+        : profile === 'rake'
+        ? 0x9044
+        : profile === 'knife'
+        ? 0x9055
+        : 0x9066
+    );
+    const half = size * 0.5;
+    const rx = half - 6;
+    const ry = profile === 'knife' ? half * 0.24 : profile === 'flat' || profile === 'rake' ? half * 0.42 : profile === 'filbert' ? half * 0.55 : half - 8;
+
+    const strandCount =
+      profile === 'rake' ? 18 : profile === 'fan' ? 28 : profile === 'knife' ? 1 : 38;
+
+    if (profile === 'knife') {
+      // Sharp palette knife blade: crisp chisel edge with subtle paint buildup along outer ridge
+      for (let y = 0; y < size; y++) {
+        const ny = (y - half + 0.5) / ry;
+        const row = y * size * 4;
+        for (let x = 0; x < size; x++) {
+          const nx = (x - half + 0.5) / rx;
+          if (Math.abs(nx) > 1.02 || Math.abs(ny) > 1.05) continue;
+          const bladeMask =
+            (1.0 - smoothstep(0.86, 1.0, Math.abs(nx))) *
+            (1.0 - smoothstep(0.65, 1.0, Math.abs(ny)));
+          const micro = 0.88 + rand() * 0.12;
+          writeAlphaPixel(data, row + x * 4, bladeMask * micro);
+        }
+      }
+      return;
+    }
+
+    // Build bristle tuft clusters across the brush cross-section
+    const tufts: Array<{ cx: number; cy: number; r: number; strength: number }> = [];
+    for (let i = 0; i < strandCount; i++) {
+      const u = strandCount > 1 ? (i / (strandCount - 1)) * 2 - 1 : 0;
+      const arch = profile === 'filbert' ? Math.sqrt(Math.max(0.15, 1.0 - u * u * 0.85)) : profile === 'fan' ? 1.0 - Math.abs(u) * 0.35 : 1.0;
+      const cx = half + u * rx * (profile === 'rake' ? 0.94 : 0.86) + (rand() - 0.5) * (profile === 'rake' ? 1.2 : 3.5);
+      const cy = half + (rand() - 0.5) * ry * (profile === 'rake' ? 0.55 : 0.95) * arch;
+      const r =
+        profile === 'rake'
+          ? 2.2 + rand() * 1.4
+          : profile === 'fan'
+          ? 2.6 + rand() * 2.2
+          : (4.2 + rand() * 3.8) * (0.65 + 0.35 * arch);
+      tufts.push({ cx, cy, r, strength: 0.72 + rand() * 0.28 });
+    }
+
+    for (let y = 0; y < size; y++) {
+      const row = y * size * 4;
+      for (let x = 0; x < size; x++) {
+        let accum = 0;
+        for (let i = 0; i < tufts.length; i++) {
+          const t = tufts[i];
+          const dx = x - t.cx;
+          const dy = (y - t.cy) * (profile === 'flat' || profile === 'rake' ? 1.4 : 1.0);
+          const d = Math.hypot(dx, dy) / t.r;
+          if (d < 1.0) {
+            const v = (1.0 - smoothstep(0.35, 1.0, d)) * t.strength;
+            if (v > accum) accum = v;
+          }
+        }
+        if (accum > 0.02) {
+          writeAlphaPixel(data, row + x * 4, accum);
+        }
       }
     }
   });

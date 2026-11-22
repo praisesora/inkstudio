@@ -10,13 +10,18 @@ import {
   SpeechBalloon,
   TransformSession,
   ShapeDragPreview,
+  GradientDragPreview,
+  GradientMeshState,
+  PenPathSession,
 } from '../types/editor';
+import type { CloneSourceIndicator } from '../hooks/drawing/useRetouchTool';
 import { CollabPeer } from '../types/multiplayer';
 import { SparseTileGrid } from '../utils/tileEngine';
 import { RecentDocument } from '../utils/recentDocumentsManager';
 import {
   getAccentContrastColor,
   hexToRgb,
+  ModifierAction,
   resolveModernAccentColor,
 } from '../types/settings';
 import { CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
@@ -52,6 +57,7 @@ interface CanvasAreaContainerProps {
   navigation: CanvasNavigationHandle;
   isSpaceDown: boolean;
   isShiftDown: boolean;
+  heldModifierAction?: ModifierAction;
   isRotateModifier: boolean;
   isPanning: boolean;
   isRotating: boolean;
@@ -91,6 +97,11 @@ interface CanvasAreaContainerProps {
   onFillScreentone: () => void;
   onFillColor: () => void;
   onClearSelection: () => void;
+  onDeleteOutsideSelection: () => void;
+  onCutSelection: () => void;
+  onCopySelection: () => void;
+  onPasteSelection: () => void;
+  onMoveSelectionToNewLayer: () => void;
   onInvertSelection: () => void;
   onExpandSelection: (pixels?: number) => void;
   onContractSelection: (pixels?: number) => void;
@@ -110,6 +121,15 @@ interface CanvasAreaContainerProps {
   onDeleteBalloon: () => void;
   frameDragPreview?: FrameDragPreview | null;
   shapeDragPreview?: ShapeDragPreview | null;
+  gradientDragPreview?: GradientDragPreview | null;
+  gradientMesh?: GradientMeshState | null;
+  onApplyGradientMesh?: () => void;
+  onCancelGradientMesh?: () => void;
+  cloneSourceIndicator?: CloneSourceIndicator | null;
+  penSession?: PenPathSession | null;
+  onCommitPenPath?: () => void;
+  onCancelPenPath?: () => void;
+  onToggleClosePenPath?: () => void;
   animationTimeline: AnimationTimeline | null;
   onUpdateAnimationTimeline: (timeline: AnimationTimeline | null) => void;
   onAddAnimationCel: (frameIndex: number) => void;
@@ -126,6 +146,9 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
   const tool = useToolStore((s) => s.tool);
   const brushSettings = useToolStore((s) => s.brushSettings);
   const liquifySettings = useToolStore((s) => s.liquifySettings);
+  const gradientSettings = useToolStore((s) => s.gradientSettings);
+  const retouchSettings = useToolStore((s) => s.retouchSettings);
+  const penSettings = useToolStore((s) => s.penSettings);
   const primaryColor = useToolStore((s) => s.primaryColor);
   const secondaryColor = useToolStore((s) => s.secondaryColor);
 
@@ -199,6 +222,7 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       navigation={props.navigation}
       isSpaceDown={props.isSpaceDown}
       isShiftDown={props.isShiftDown}
+      heldModifierAction={props.heldModifierAction}
       isRotateModifier={props.isRotateModifier}
       isPanning={props.isPanning}
       isRotating={props.isRotating}
@@ -236,6 +260,10 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       tool={tool}
       liquifySettings={liquifySettings}
       onUpdateLiquifySettings={toolStoreActions.updateLiquifySettings}
+      gradientSettings={gradientSettings}
+      retouchSettings={retouchSettings}
+      onUpdateRetouchSettings={toolStoreActions.updateRetouchSettings}
+      penSettings={penSettings}
       primaryColor={primaryColor}
       onSwapColors={toolStoreActions.swapColors}
       selection={props.selection}
@@ -244,6 +272,11 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       onFillScreentone={props.onFillScreentone}
       onFillColor={props.onFillColor}
       onClearSelection={props.onClearSelection}
+      onDeleteOutsideSelection={props.onDeleteOutsideSelection}
+      onCutSelection={props.onCutSelection}
+      onCopySelection={props.onCopySelection}
+      onPasteSelection={props.onPasteSelection}
+      onMoveSelectionToNewLayer={props.onMoveSelectionToNewLayer}
       onInvertSelection={props.onInvertSelection}
       onExpandSelection={props.onExpandSelection}
       onContractSelection={props.onContractSelection}
@@ -275,6 +308,15 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       onDeleteBalloon={props.onDeleteBalloon}
       frameDragPreview={props.frameDragPreview}
       shapeDragPreview={props.shapeDragPreview}
+      gradientDragPreview={props.gradientDragPreview}
+      gradientMesh={props.gradientMesh}
+      onApplyGradientMesh={props.onApplyGradientMesh}
+      onCancelGradientMesh={props.onCancelGradientMesh}
+      cloneSourceIndicator={props.cloneSourceIndicator}
+      penSession={props.penSession}
+      onCommitPenPath={props.onCommitPenPath}
+      onCancelPenPath={props.onCancelPenPath}
+      onToggleClosePenPath={props.onToggleClosePenPath}
       secondaryColor={secondaryColor}
       animationTimeline={props.animationTimeline}
       onUpdateAnimationTimeline={props.onUpdateAnimationTimeline}
@@ -962,6 +1004,12 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
               commandHandlers={commandHandlers}
               onDeselect={canvasProps.onDeselect}
               onTransformSelection={canvasProps.onTransformSelection}
+              onClearSelection={canvasProps.onClearSelection}
+              onDeleteOutsideSelection={canvasProps.onDeleteOutsideSelection}
+              onCutSelection={canvasProps.onCutSelection}
+              onCopySelection={canvasProps.onCopySelection}
+              onPasteSelection={canvasProps.onPasteSelection}
+              onMoveSelectionToNewLayer={canvasProps.onMoveSelectionToNewLayer}
               onExpandSelection={canvasProps.onExpandSelection}
               onContractSelection={canvasProps.onContractSelection}
               onFeatherSelection={canvasProps.onFeatherSelection}

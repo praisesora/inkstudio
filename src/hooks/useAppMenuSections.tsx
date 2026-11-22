@@ -68,6 +68,11 @@ export interface UseAppMenuSectionsParams {
   handleSave: () => void;
   handleSaveAs: () => void;
   handleExportImage: () => void;
+  handleCutSelection: () => void;
+  handleCopySelection: () => void;
+  handleMoveSelectionToNewLayer: () => void;
+  handleClearSelection: () => void;
+  handleDeleteOutsideSelection: () => void;
   handleCopySelectedLayer: () => void;
   handlePasteSelectedLayer: () => void;
   handleTriggerPasteFromFile: () => void;
@@ -140,6 +145,11 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
     handleSave,
     handleSaveAs,
     handleExportImage,
+    handleCutSelection,
+    handleCopySelection,
+    handleMoveSelectionToNewLayer,
+    handleClearSelection,
+    handleDeleteOutsideSelection,
     handleCopySelectedLayer,
     handlePasteSelectedLayer,
     handleTriggerPasteFromFile,
@@ -340,11 +350,18 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
           },
           { id: 'edit-div-1', label: '', divider: true },
           {
+            id: 'edit-cut',
+            label: 'Cut',
+            shortcut: 'Ctrl+X',
+            disabled: !hasOpenDocument || !activeLayer || !selection,
+            onClick: handleCutSelection,
+          },
+          {
             id: 'edit-copy',
             label: 'Copy',
             shortcut: 'Ctrl+C',
             disabled: !hasOpenDocument || !activeLayer,
-            onClick: handleCopySelectedLayer,
+            onClick: selection ? handleCopySelection : handleCopySelectedLayer,
           },
           {
             id: 'edit-paste',
@@ -352,6 +369,13 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             shortcut: 'Ctrl+V',
             disabled: !hasOpenDocument,
             onClick: handlePasteSelectedLayer,
+          },
+          {
+            id: 'edit-move-selection-layer',
+            label: 'Move Selection to New Layer',
+            shortcut: 'Ctrl+Shift+J',
+            disabled: !hasOpenDocument || !activeLayer || !selection,
+            onClick: handleMoveSelectionToNewLayer,
           },
           {
             id: 'edit-paste-file',
@@ -530,6 +554,44 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             onClick: () => handleFeatherSelection(5),
           },
           { id: 'select-div-2', label: '', divider: true },
+          {
+            id: 'select-cut',
+            label: 'Cut Selection',
+            shortcut: 'Ctrl+X',
+            disabled: !hasOpenDocument || !selection,
+            onClick: handleCutSelection,
+          },
+          {
+            id: 'select-copy',
+            label: 'Copy Selection',
+            shortcut: 'Ctrl+C',
+            disabled: !hasOpenDocument || !selection,
+            onClick: handleCopySelection,
+          },
+          {
+            id: 'select-move-to-layer',
+            label: 'Move Selection to New Layer',
+            shortcut: 'Ctrl+Shift+J',
+            disabled: !hasOpenDocument || !selection,
+            onClick: handleMoveSelectionToNewLayer,
+          },
+          { id: 'select-div-3', label: '', divider: true },
+          {
+            id: 'select-delete',
+            label: 'Delete Selection',
+            shortcut: 'Del',
+            danger: true,
+            disabled: !hasOpenDocument || !selection,
+            onClick: handleClearSelection,
+          },
+          {
+            id: 'select-delete-outside',
+            label: 'Delete Outside Selection',
+            danger: true,
+            disabled: !hasOpenDocument || !selection,
+            onClick: handleDeleteOutsideSelection,
+          },
+          { id: 'select-div-4', label: '', divider: true },
           {
             id: 'select-transform',
             label: 'Transform Selection',
@@ -1372,9 +1434,13 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       handleApplyFilter,
       handleApplyReverseGradient,
       handleClearActiveLayer,
+      handleClearSelection,
       handleContractSelection,
       handleConvertLayer,
       handleCopySelectedLayer,
+      handleCopySelection,
+      handleCutSelection,
+      handleDeleteOutsideSelection,
       handleDeleteSelectedLayer,
       handleDeselect,
       handleExpandSelection,
@@ -1383,6 +1449,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       handleFillSelectionColor,
       handleInvertSelection,
       handleMergeDown,
+      handleMoveSelectionToNewLayer,
       handleOpenAdjustmentModal,
       handleOpenLayerStylesModal,
       handleOpenTonalModal,

@@ -1,5 +1,7 @@
 import {
+  BristleSettings,
   BrushPresetId,
+  BrushRenderMode,
   BrushSettings,
   CspBrush,
   BrushDynamics,
@@ -10,6 +12,11 @@ import {
   CspSpraySettings,
   CspTaperSettings,
   CspTipFlipMode,
+  GrainMappingMode,
+  ImpastoSettings,
+  NaturalMixingMode,
+  NaturalPaintSettings,
+  SurfaceTextureId,
 } from '../types/editor';
 import { getBuiltinBrushConfig } from './presetBrushes';
 import { getPreloadedTipImage, getCachedCustomBrushes } from './brushStorage';
@@ -95,12 +102,14 @@ export interface BrushPersistentSettings {
   amountOfPaint?: number;
   densityOfPaint?: number;
   colorStretch?: number;
-  mixingMode?: 'blend' | 'running_color' | 'smear';
+  mixingMode?: NaturalMixingMode;
   wetEdge?: number;
   wetEdgeRadius?: number;
   wetEdgeAlphaPower?: number;
   wetEdgeValuePower?: number;
   textureDensity?: number;
+  surfaceTextureId?: SurfaceTextureId;
+  grainMappingMode?: GrainMappingMode;
   paperTextureScale?: number;
   paperTextureRotate?: number;
   paperTextureMode?: CspPaperTextureMode;
@@ -112,9 +121,27 @@ export interface BrushPersistentSettings {
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  bristleSplaySensor?: CspSensorConfig;
+  paintLoadSensor?: CspSensorConfig;
+  grainPenetrationSensor?: CspSensorConfig;
+  angleSensor?: CspSensorConfig;
+  scatterSensor?: CspSensorConfig;
   spray?: CspSpraySettings;
   taper?: CspTaperSettings;
   dynamics?: BrushDynamics;
+  dualBrush?: boolean;
+  dualBrushCompositeMode?: string;
+  dualSize?: number;
+  dualSpacing?: number;
+  dualScatter?: number;
+  dualAngle?: number;
+  dualScale?: number;
+  dualSurfaceTextureId?: SurfaceTextureId;
+  dualGrainDepth?: number;
+  renderMode?: BrushRenderMode;
+  bristle?: BristleSettings;
+  naturalPaint?: NaturalPaintSettings;
+  impasto?: ImpastoSettings;
 }
 
 export const NEUTRAL_BRUSH_DEFAULTS: Partial<BrushSettings> = {
@@ -138,6 +165,11 @@ export const NEUTRAL_BRUSH_DEFAULTS: Partial<BrushSettings> = {
   sizeSensor: undefined,
   opacitySensor: undefined,
   densitySensor: undefined,
+  bristleSplaySensor: undefined,
+  paintLoadSensor: undefined,
+  grainPenetrationSensor: undefined,
+  angleSensor: undefined,
+  scatterSensor: undefined,
   customTipDataUrl: undefined,
   customTipImage: undefined,
   customTipAngle: 0,
@@ -165,6 +197,8 @@ export const NEUTRAL_BRUSH_DEFAULTS: Partial<BrushSettings> = {
   wetEdgeValuePower: undefined,
   paperTexture: undefined,
   paperTextureImage: undefined,
+  surfaceTextureId: undefined,
+  grainMappingMode: 'canvas-locked',
   paperTextureMode: 'subtract',
   paperTextureBrightness: 0,
   paperTextureContrast: 0,
@@ -176,9 +210,18 @@ export const NEUTRAL_BRUSH_DEFAULTS: Partial<BrushSettings> = {
   dualBrushCompositeMode: 'multiply',
   dualSize: undefined,
   dualSpacing: undefined,
+  dualScatter: 0,
+  dualAngle: 0,
+  dualScale: 1.0,
+  dualSurfaceTextureId: undefined,
+  dualGrainDepth: 0,
   dualTipDataUrl: undefined,
   dualTipImage: undefined,
   dynamics: undefined,
+  renderMode: 'stamp',
+  bristle: undefined,
+  naturalPaint: undefined,
+  impasto: undefined,
   useGpu: true,
 };
 
@@ -276,6 +319,8 @@ const PERSISTENT_KEYS: (keyof BrushPersistentSettings)[] = [
   'wetEdgeAlphaPower',
   'wetEdgeValuePower',
   'textureDensity',
+  'surfaceTextureId',
+  'grainMappingMode',
   'paperTextureScale',
   'paperTextureRotate',
   'paperTextureMode',
@@ -287,9 +332,27 @@ const PERSISTENT_KEYS: (keyof BrushPersistentSettings)[] = [
   'sizeSensor',
   'opacitySensor',
   'densitySensor',
+  'bristleSplaySensor',
+  'paintLoadSensor',
+  'grainPenetrationSensor',
+  'angleSensor',
+  'scatterSensor',
   'spray',
   'taper',
   'dynamics',
+  'dualBrush',
+  'dualBrushCompositeMode',
+  'dualSize',
+  'dualSpacing',
+  'dualScatter',
+  'dualAngle',
+  'dualScale',
+  'dualSurfaceTextureId',
+  'dualGrainDepth',
+  'renderMode',
+  'bristle',
+  'naturalPaint',
+  'impasto',
 ];
 
 function mergeIntoMemoryCache(presetId: string, settings: Partial<BrushSettings>): Record<string, BrushPersistentSettings> {
@@ -464,12 +527,17 @@ export function getEffectiveBrushSettings(
         sizeSensor: cspMatch.sizeSensor,
         opacitySensor: cspMatch.opacitySensor,
         densitySensor: cspMatch.densitySensor,
+        bristleSplaySensor: cspMatch.bristleSplaySensor,
+        paintLoadSensor: cspMatch.paintLoadSensor,
+        grainPenetrationSensor: cspMatch.grainPenetrationSensor,
+        angleSensor: cspMatch.angleSensor,
+        scatterSensor: cspMatch.scatterSensor,
         smoothing: cspMatch.smoothing ?? true,
         spray: cspMatch.spray,
         taper: cspMatch.taper,
         isRibbon: cspMatch.isRibbon,
         colorMixing: cspMatch.colorMixing,
-        perceptualMixing: true,
+        perceptualMixing: cspMatch.perceptualMixing ?? true,
         amountOfPaint: cspMatch.amountOfPaint ?? 0.7,
         densityOfPaint: cspMatch.densityOfPaint ?? 0.8,
         colorStretch: cspMatch.colorStretch ?? 0.6,
@@ -482,6 +550,8 @@ export function getEffectiveBrushSettings(
         textureDensity: cspMatch.textureDensity,
         paperTexture: cspMatch.paperTexture,
         paperTextureImage,
+        surfaceTextureId: cspMatch.surfaceTextureId,
+        grainMappingMode: cspMatch.grainMappingMode,
         paperTextureScale: cspMatch.paperTextureScale,
         paperTextureRotate: cspMatch.paperTextureRotate,
         paperTextureMode: cspMatch.paperTextureMode,
@@ -490,10 +560,21 @@ export function getEffectiveBrushSettings(
         paperTextureApplyEachPlot: cspMatch.paperTextureApplyEachPlot,
         paperTextureInverted: cspMatch.paperTextureInverted,
         dualBrush: cspMatch.dualBrush,
+        dualTipDataUrl: cspMatch.secondaryTipDataUrl,
         dualTipImage: dualTipImg,
         dualBrushCompositeMode: (cspMatch.dualBrushCompositeMode as BrushSettings['dualBrushCompositeMode']) || 'multiply',
         dualSize: cspMatch.dualSize,
         dualSpacing: cspMatch.dualSpacing,
+        dualScatter: cspMatch.dualScatter,
+        dualAngle: cspMatch.dualAngle,
+        dualScale: cspMatch.dualScale,
+        dualSurfaceTextureId: cspMatch.dualSurfaceTextureId,
+        dualGrainDepth: cspMatch.dualGrainDepth,
+        dynamics: cspMatch.dynamics,
+        renderMode: cspMatch.renderMode,
+        bristle: cspMatch.bristle,
+        naturalPaint: cspMatch.naturalPaint,
+        impasto: cspMatch.impasto,
         useGpu: true,
         ...saved,
       };

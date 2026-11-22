@@ -88,12 +88,18 @@ describe('Pre-Installed Standard Brushes & Realistic Physics', () => {
     };
   });
 
-  it('registers all 17 brushes cleanly across Pen (5), Sketch (5), and Brush (7) sections', () => {
-    expect(BUILTIN_BRUSH_SECTIONS.map((s) => s.id)).toEqual(['pen', 'sketch', 'brush']);
+  it('registers all 26 brushes cleanly across Pen (5), Sketch (5), Brush (7), and Natural Paint (9) sections', () => {
+    expect(BUILTIN_BRUSH_SECTIONS.map((s) => s.id)).toEqual([
+      'pen',
+      'sketch',
+      'brush',
+      'natural-paint',
+    ]);
 
     const penIds = BUILTIN_BRUSHES.filter((b) => b.category === 'pen').map((b) => b.id);
     const sketchIds = BUILTIN_BRUSHES.filter((b) => b.category === 'sketch').map((b) => b.id);
     const brushIds = BUILTIN_BRUSHES.filter((b) => b.category === 'brush').map((b) => b.id);
+    const naturalIds = BUILTIN_BRUSHES.filter((b) => b.category === 'natural-paint').map((b) => b.id);
 
     expect(penIds).toEqual(['g-pen', 'real-g-pen', 'textured-pen', 'dot-pen', 'calligraphy']);
     expect(sketchIds).toEqual([
@@ -111,6 +117,17 @@ describe('Pre-Installed Standard Brushes & Realistic Physics', () => {
       'blend-chalk-brush',
       'soft-round',
       'noise-shader',
+    ]);
+    expect(naturalIds).toEqual([
+      'impasto-bristle-oil',
+      'wet-mixing-filbert',
+      'dry-bristle-rake',
+      'heavy-body-acrylic',
+      'palette-knife-impasto',
+      'velvet-gouache',
+      'granulating-watercolor',
+      'oil-bristle-blender',
+      'pastel-stick-canvas',
     ]);
   });
 

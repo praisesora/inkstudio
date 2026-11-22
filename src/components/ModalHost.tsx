@@ -33,6 +33,9 @@ import { WebtoonExportModal } from './WebtoonExportModal';
 import { TimelapseExportModal } from './TimelapseExportModal';
 import { UpdateModal } from './UpdateModal';
 import { UpdateToast } from './UpdateToast';
+import { BrushStudioModal } from './BrushStudioModal';
+import { CloseConfirmModal } from './CloseConfirmModal';
+import { SaveDocumentResult } from '../utils/appCloseFlow';
 
 export type InviteLinkPayload = ParsedInviteLink;
 
@@ -105,6 +108,7 @@ export interface ModalHostProps {
   ) => Promise<boolean>;
   onCaptureTimelapseNow?: () => void;
   handleSave?: () => void;
+  handleSaveDocumentById: (docId: string) => Promise<SaveDocumentResult>;
   showToast: (msg: string) => void;
 }
 
@@ -153,6 +157,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     joinRoom,
     onCaptureTimelapseNow,
     handleSave,
+    handleSaveDocumentById,
     showToast,
   }) => {
     const dimensions = useDocumentStore((s) => s.dimensions);
@@ -173,6 +178,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     const isMangaEffectsModalOpen = useUiStore((s) => s.isMangaEffectsModalOpen);
     const isWebtoonExportModalOpen = useUiStore((s) => s.isWebtoonExportModalOpen);
     const isTimelapseExportModalOpen = useUiStore((s) => s.isTimelapseExportModalOpen);
+    const isBrushStudioModalOpen = useUiStore((s) => s.isBrushStudioModalOpen);
     const isLoadingFile = useUiStore((s) => s.isLoadingFile);
     const loadingStatus = useUiStore((s) => s.loadingStatus);
     const toastMessage = useUiStore((s) => s.toastMessage);
@@ -249,6 +255,12 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         <AboutModal
           isOpen={isAboutModalOpen}
           onClose={() => uiStoreActions.setAboutModalOpen(false)}
+          showToast={showToast}
+        />
+
+        <BrushStudioModal
+          isOpen={isBrushStudioModalOpen}
+          onClose={() => uiStoreActions.setBrushStudioModalOpen(false)}
           showToast={showToast}
         />
 
@@ -399,6 +411,8 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         />
 
         <UpdateToast />
+
+        <CloseConfirmModal onSaveDocumentById={handleSaveDocumentById} />
       </>
     );
   }

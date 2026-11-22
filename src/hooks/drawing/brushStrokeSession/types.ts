@@ -15,6 +15,7 @@ import { StrokePipeline } from '../../../engine/StrokePipeline';
 import { CubicBezierSegment } from '../../../engine/SplineGenerator';
 import { BrushRenderOptions } from '../../../engine/BrushEngine';
 import { GpuDab } from '../../../engine/WebGlBrushEngine';
+import { NaturalPaintStrokeSession } from '../../../engine/NaturalPaintRenderer';
 import { PaintReservoir, LayerPixelSampler } from '../../../utils/colorMixingEngine';
 import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../../../types/perspective';
 import { PerspectiveSnapSession } from '../../../utils/perspectiveSnapping';
@@ -147,6 +148,8 @@ export interface StrokeSessionState {
   liveDabCounter: { count: number };
   activeReservoir: PaintReservoir | null;
   layerPixelSampler: LayerPixelSampler | null;
+  naturalPaintSession: NaturalPaintStrokeSession | null;
+  naturalStrokeSeed: number;
   isWetColorStroke: boolean;
   liveNeedsNotify: boolean;
   isShiftLineStroke: boolean;
@@ -192,6 +195,8 @@ export function createInitialStrokeSessionState(): StrokeSessionState {
     liveDabCounter: { count: 0 },
     activeReservoir: null,
     layerPixelSampler: null,
+    naturalPaintSession: null,
+    naturalStrokeSeed: 1337,
     isWetColorStroke: false,
     liveNeedsNotify: false,
     isShiftLineStroke: false,

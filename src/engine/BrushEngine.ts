@@ -11,6 +11,13 @@ import {
   Point,
   BrushSettings,
   BrushDynamics,
+  BrushRenderMode,
+  BristleSettings,
+  GrainMappingMode,
+  ImpastoSettings,
+  NaturalMixingMode,
+  NaturalPaintSettings,
+  SurfaceTextureId,
   ToolType,
   CanvasColorMode,
   CspSensorConfig,
@@ -31,6 +38,7 @@ import {
   rgbToHex,
 } from '../utils/colorMixingEngine';
 import { GpuDab, WebGlBrushEngine } from './WebGlBrushEngine';
+import { isNaturalPaintBrush, renderCompleteNaturalPaintStroke } from './NaturalPaintRenderer';
 
 // ============================================================================
 // 1. Types & Unified Brush Render Options
@@ -65,6 +73,11 @@ export interface BrushRenderOptions {
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  bristleSplaySensor?: CspSensorConfig;
+  paintLoadSensor?: CspSensorConfig;
+  grainPenetrationSensor?: CspSensorConfig;
+  angleSensor?: CspSensorConfig;
+  scatterSensor?: CspSensorConfig;
   subTips?: CspSubTip[];
   subTipOrder?: 'random' | 'sequential' | 'direction' | 'reverse';
   subTipImages?: HTMLImageElement[];
@@ -75,13 +88,15 @@ export interface BrushRenderOptions {
   amountOfPaint?: number;
   densityOfPaint?: number;
   colorStretch?: number;
-  mixingMode?: 'blend' | 'running_color' | 'smear';
+  mixingMode?: NaturalMixingMode;
   wetEdge?: number;
   wetEdgeRadius?: number;
   wetEdgeAlphaPower?: number;
   wetEdgeValuePower?: number;
   grain?: number;
   textureDensity?: number;
+  surfaceTextureId?: SurfaceTextureId;
+  grainMappingMode?: GrainMappingMode;
   paperTextureMode?: CspPaperTextureMode;
   paperTextureBrightness?: number;
   paperTextureContrast?: number;
@@ -92,6 +107,15 @@ export interface BrushRenderOptions {
   dualBrush?: boolean;
   dualTipImage?: HTMLImageElement;
   dualBrushCompositeMode?: string;
+  dualScale?: number;
+  dualAngle?: number;
+  dualScatter?: number;
+  dualSurfaceTextureId?: SurfaceTextureId;
+  dualGrainDepth?: number;
+  renderMode?: BrushRenderMode;
+  bristle?: BristleSettings;
+  naturalPaint?: NaturalPaintSettings;
+  impasto?: ImpastoSettings;
   useGpu?: boolean;
   underlyingCanvas?: HTMLCanvasElement;
   sampler?: LayerPixelSampler;
@@ -456,7 +480,9 @@ export function evaluateCspSensor(
   pressure: number,
   tiltMagnitude: number,
   speedPxPerMs: number,
-  randomVal: number
+  randomVal: number,
+  twistDeg: number = 0,
+  strokeDistPx: number = 0
 ): number {
   if (!sensor) return 1.0;
 
@@ -472,11 +498,22 @@ export function evaluateCspSensor(
     const tMin = Math.max(0, Math.min(1, sensor.tiltMin ?? 0));
     factor *= tMin + (1.0 - tMin) * Math.max(0, Math.min(1, tiltMagnitude));
   }
+  if (sensor.useBarrelTwist) {
+    const twMin = Math.max(0, Math.min(1, sensor.twistMin ?? 0));
+    const twNorm = (((twistDeg % 360) + 360) % 360) / 360;
+    factor *= twMin + (1.0 - twMin) * twNorm;
+  }
   if (sensor.useVelocity) {
     const vMin = Math.max(0, Math.min(1, sensor.velocityMin ?? 0));
     const vNorm = Math.max(0, Math.min(1, speedPxPerMs / 3.5));
     const vVal = sensor.invertVelocity !== false ? 1.0 - vNorm : vNorm;
     factor *= vMin + (1.0 - vMin) * vVal;
+  }
+  if (sensor.useDistance) {
+    const dMin = Math.max(0, Math.min(1, sensor.distanceMin ?? 0));
+    const maxDist = Math.max(10, sensor.distanceMaxPx ?? 600);
+    const dNorm = Math.max(0, Math.min(1, 1.0 - strokeDistPx / maxDist));
+    factor *= dMin + (1.0 - dMin) * dNorm;
   }
   if (sensor.useRandom) {
     const rMin = Math.max(0, Math.min(1, sensor.randomMin ?? 0));
@@ -831,6 +868,12 @@ export function applyColorDynamics(
     if (dynamics.saturationJitter > 0) s = Math.max(0, Math.min(1, s * (1.0 + (rng() * 2 - 1) * dynamics.saturationJitter)));
     if (dynamics.brightnessJitter > 0) v = Math.max(0, Math.min(1, v * (1.0 + (rng() * 2 - 1) * dynamics.brightnessJitter)));
     [r, g, b] = hsvToRgb(h, s, v);
+  }
+
+  if (dynamics.temperatureJitter && dynamics.temperatureJitter > 0) {
+    const shift = (rng() * 2 - 1) * dynamics.temperatureJitter * 0.22;
+    r = Math.max(0, Math.min(1, r + shift));
+    b = Math.max(0, Math.min(1, b - shift));
   }
 
   r = Math.max(0, Math.min(1, r));
@@ -1318,6 +1361,25 @@ export function drawSingleStamp(
   if (antiAlias === 0 && prevSmooth !== false) ctx.imageSmoothingEnabled = prevSmooth;
 }
 
+function selectTipIndex(
+  tipImages: HTMLImageElement[] | undefined,
+  order: 'random' | 'sequential' | 'direction' | 'reverse' = 'sequential',
+  dabIndex: number = 0,
+  tangentAngle: number = 0,
+  x: number = 0,
+  y: number = 0
+): number {
+  if (!tipImages || tipImages.length <= 1) return 0;
+  const count = tipImages.length;
+  if (order === 'random') return Math.floor(dabHashFloat(x, y, dabIndex, 97) * count) % count;
+  if (order === 'reverse') return (count - 1 - (dabIndex % count)) % count;
+  if (order === 'direction') {
+    const normAngle = ((tangentAngle % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+    return Math.floor((normAngle / (2 * Math.PI)) * count) % count;
+  }
+  return dabIndex % count;
+}
+
 function selectTipImage(
   tipImages: HTMLImageElement[] | undefined,
   fallbackTip: HTMLImageElement,
@@ -1330,14 +1392,8 @@ function selectTipImage(
   if (!tipImages || tipImages.length <= 1) {
     return tipImages && tipImages.length === 1 ? tipImages[0] : fallbackTip;
   }
-  const count = tipImages.length;
-  if (order === 'random') return tipImages[Math.floor(dabHashFloat(x, y, dabIndex, 97) * count) % count];
-  if (order === 'reverse') return tipImages[(count - 1 - (dabIndex % count)) % count];
-  if (order === 'direction') {
-    const normAngle = ((tangentAngle % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
-    return tipImages[Math.floor((normAngle / (2 * Math.PI)) * count) % count];
-  }
-  return tipImages[dabIndex % count];
+  const idx = selectTipIndex(tipImages, order, dabIndex, tangentAngle, x, y);
+  return tipImages[idx] ?? fallbackTip;
 }
 
 let _invertedGrainCanvas: HTMLCanvasElement | null = null;
@@ -1471,7 +1527,14 @@ export function canUseWebGlForBrush(options?: BrushRenderOptions): boolean {
   if (options.useGpu === false) return false;
   if (options.colorMixing) return false;
   if ((options.antiAlias ?? 2) === 0) return false;
-  if (options.tipImage && options.subTipImages && options.subTipImages.length > 1) return false;
+  if (
+    options.renderMode === 'bristle-ribbon' ||
+    options.renderMode === 'bristle-hybrid' ||
+    options.naturalPaint?.enabled ||
+    options.impasto?.enabled
+  ) {
+    return false;
+  }
   return WebGlBrushEngine.getInstance().isAvailable();
 }
 
@@ -1503,6 +1566,8 @@ export function flushGpuDabs(
     wetEdge: options.wetEdge ?? 0,
     grain: options.grain ?? options.textureDensity ?? 0,
     textureDensity: options.textureDensity,
+    surfaceTextureId: options.surfaceTextureId,
+    grainMappingMode: options.grainMappingMode,
     paperTextureMode: options.paperTextureMode,
     paperTextureBrightness: options.paperTextureBrightness,
     paperTextureContrast: options.paperTextureContrast,
@@ -1513,9 +1578,14 @@ export function flushGpuDabs(
     customTipImage: options.tipImage,
     isColorTip: options.isColorTip,
     subTips: options.subTips,
+    subTipImages: options.subTipImages,
     dualBrush: options.dualBrush,
     dualTipImage: options.dualTipImage,
     dualBrushCompositeMode: options.dualBrushCompositeMode as BrushSettings['dualBrushCompositeMode'],
+    dualScale: options.dualScale,
+    dualAngle: options.dualAngle,
+    dualScatter: options.dualScatter,
+    naturalPaint: options.naturalPaint,
     colorMixing: false,
     isTransparentInk: Boolean(options.isTransparentInk),
     alphaLocked: Boolean(options.alphaLocked),
@@ -1573,7 +1643,10 @@ function sampleAndMixColor(
   pressure: number,
   flow: number,
   stepDist: number,
-  options: BrushRenderOptions
+  options: BrushRenderOptions,
+  spacingRatio: number = 0.08,
+  dirX: number = 0,
+  dirY: number = 0
 ): { colorHex: string; alpha: number; r: number; g: number; b: number } {
   const reservoir = options.reservoir!;
   let sampled = { r: 255, g: 255, b: 255, a: 0 };
@@ -1587,6 +1660,10 @@ function sampleAndMixColor(
     }
   }
 
+  const pressureAlreadyApplied = Boolean(
+    options.opacitySensor?.usePressure || options.densitySensor?.usePressure
+  );
+
   const mixed = reservoir.mixWithCanvas(
     sampled,
     options.amountOfPaint ?? 0.65,
@@ -1596,13 +1673,28 @@ function sampleAndMixColor(
     pressure,
     flow,
     stepDist,
-    options.perceptualMixing !== false
+    options.perceptualMixing !== false,
+    pressureAlreadyApplied
   );
 
-  if (options.sampler && mixed.alpha > 0.002) {
-    options.sampler.depositDab(x, y, radius, mixed.r, mixed.g, mixed.b, mixed.alpha);
+  // Spacing-aware alpha normalization for dense mixing strokes: prevents hard opaque walls
+  // at low/medium density or light pressure so transitions glaze & blend smoothly!
+  let effectiveAlpha = mixed.alpha;
+  if (stepDist > 0 && effectiveAlpha > 0.002 && effectiveAlpha < 0.99 && spacingRatio < 0.2) {
+    const overlapExp = Math.max(0.18, Math.min(1.0, spacingRatio * 4.5));
+    effectiveAlpha = Math.max(0.004, Math.min(1.0, 1.0 - Math.pow(1.0 - effectiveAlpha, overlapExp)));
   }
-  return mixed;
+
+  // Deposit strictly behind the sample radius so forward motion reads true underlying canvas
+  // (never bulldozing paint ahead or faking canvas alpha on blank canvas), while loops/reversals mix cleanly
+  if (options.sampler && effectiveAlpha > 0.002 && (dirX !== 0 || dirY !== 0)) {
+    const depRad = Math.max(1, radius * 0.32);
+    const trailOffset = radius + depRad + 0.5;
+    const depX = x - dirX * trailOffset;
+    const depY = y - dirY * trailOffset;
+    options.sampler.depositDab(depX, depY, depRad, mixed.r, mixed.g, mixed.b, effectiveAlpha * 0.45);
+  }
+  return { ...mixed, alpha: effectiveAlpha };
 }
 
 /**
@@ -2007,7 +2099,21 @@ export function drawBrushCubicBezierSegment(
 
     if (isColorMixing && options.reservoir) {
       const prelimStep = Math.max(0.15, curWidth * spacingRatio);
-      const mixed = sampleAndMixColor(ctx, pt.x, pt.y, curWidth * 0.45, effPressure, dabAlpha, prelimStep, options);
+      const dirX = pt.speed > 0.001 ? pt.dx / pt.speed : 0;
+      const dirY = pt.speed > 0.001 ? pt.dy / pt.speed : 0;
+      const mixed = sampleAndMixColor(
+        ctx,
+        pt.x,
+        pt.y,
+        curWidth * 0.45,
+        effPressure,
+        dabAlpha,
+        prelimStep,
+        options,
+        spacingRatio,
+        dirX,
+        dirY
+      );
       dabColor = mixed.colorHex;
       dabAlpha = mixed.alpha;
       if (gpuDabs) {
@@ -2030,6 +2136,9 @@ export function drawBrushCubicBezierSegment(
       );
     }
 
+    const activeTipIdx = tipImage
+      ? selectTipIndex(options.subTipImages, options.subTipOrder, dabSeq, stampAngle, pt.x, pt.y)
+      : 0;
     const activeTip = tipImage
       ? selectTipImage(options.subTipImages, tipImage, options.subTipOrder, dabSeq, stampAngle, pt.x, pt.y)
       : undefined;
@@ -2148,7 +2257,7 @@ export function drawBrushCubicBezierSegment(
             gpuDabs.push({
               x: spX, y: spY, width: spW, height: spH, angle: curDabAngle,
               r: dabR, g: dabG, b: dabB, alpha: curDabAlpha, pressure: grainPressure,
-              strokeDist, flipX: flips.signX, flipY: flips.signY,
+              strokeDist, flipX: flips.signX, flipY: flips.signY, tipIndex: activeTipIdx,
             });
           } else if (curMaster) {
             drawSingleStamp(
@@ -2162,7 +2271,7 @@ export function drawBrushCubicBezierSegment(
         gpuDabs.push({
           x: curDabX, y: curDabY, width: finalW, height: finalH, angle: curDabAngle,
           r: dabR, g: dabG, b: dabB, alpha: curDabAlpha, pressure: grainPressure,
-          strokeDist, flipX: flips.signX, flipY: flips.signY,
+          strokeDist, flipX: flips.signX, flipY: flips.signY, tipIndex: activeTipIdx,
         });
       } else if (curMaster) {
         drawSingleStamp(
@@ -2259,6 +2368,11 @@ export function buildBrushRenderOptions(
     sizeSensor: bs.sizeSensor,
     opacitySensor: bs.opacitySensor,
     densitySensor: bs.densitySensor,
+    bristleSplaySensor: bs.bristleSplaySensor,
+    paintLoadSensor: bs.paintLoadSensor,
+    grainPenetrationSensor: bs.grainPenetrationSensor,
+    angleSensor: bs.angleSensor,
+    scatterSensor: bs.scatterSensor,
     subTips: bs.subTips,
     subTipOrder: bs.subTipOrder,
     subTipImages: bs.subTipImages,
@@ -2276,6 +2390,8 @@ export function buildBrushRenderOptions(
     wetEdgeValuePower: bs.wetEdgeValuePower,
     grain: bs.grain ?? bs.textureDensity,
     textureDensity: bs.textureDensity,
+    surfaceTextureId: bs.surfaceTextureId,
+    grainMappingMode: bs.grainMappingMode,
     paperTextureMode: bs.paperTextureMode,
     paperTextureBrightness: bs.paperTextureBrightness,
     paperTextureContrast: bs.paperTextureContrast,
@@ -2286,6 +2402,15 @@ export function buildBrushRenderOptions(
     dualBrush: bs.dualBrush,
     dualTipImage: bs.dualTipImage,
     dualBrushCompositeMode: bs.dualBrushCompositeMode,
+    dualScale: bs.dualScale,
+    dualAngle: bs.dualAngle,
+    dualScatter: bs.dualScatter,
+    dualSurfaceTextureId: bs.dualSurfaceTextureId,
+    dualGrainDepth: bs.dualGrainDepth,
+    renderMode: bs.renderMode,
+    bristle: bs.bristle,
+    naturalPaint: bs.naturalPaint,
+    impasto: bs.impasto,
     useGpu: bs.useGpu !== false,
     isTransparentInk: Boolean(bs.isTransparentInk),
     dynamics: bs.dynamics,
@@ -2328,6 +2453,28 @@ export function renderCompleteStroke(
 
   const isEraser = tool === 'eraser';
   const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(resolvedSettings.color, colorMode);
+
+  // Route Natural Paint / Bristle Ribbon / Impasto brushes through the dedicated Natural Paint core
+  if (!isEraser && !isBgEraser && !isMono && !resolvedSettings.isTransparentInk && isNaturalPaintBrush(resolvedSettings)) {
+    const effectiveUnderlying = underlyingCanvas || ctx.canvas;
+    const natSampler =
+      resolvedSettings.colorMixing !== false &&
+      (resolvedSettings.colorMixing || resolvedSettings.naturalPaint?.spatialMixing)
+        ? explicitSampler || (effectiveUnderlying ? new LayerPixelSampler(effectiveUnderlying) : undefined)
+        : undefined;
+    const compOp: GlobalCompositeOperation = alphaLocked ? 'source-atop' : 'source-over';
+    renderCompleteNaturalPaintStroke(
+      ctx,
+      effectivePoints,
+      resolvedSettings,
+      strokeColor,
+      natSampler,
+      Math.max(0.01, Math.min(1.0, resolvedSettings.opacity ?? 1.0)),
+      compOp
+    );
+    return;
+  }
+
   const strokeHardness = isMono ? 1.0 : resolvedSettings.hardness ?? 1.0;
   const strokeFlow = isMono ? 1.0 : resolvedSettings.flow ?? 1.0;
   const strokeSpacing = resolvedSettings.spacing ?? 0.08;

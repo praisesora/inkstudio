@@ -8,14 +8,21 @@ import {
   maskToSvgPath,
   floodSelectWand,
   liftSelectionToFloating,
+  clearSelectionInTileGrid,
+  clearOutsideSelectionInTileGrid,
+  extractSelectionTileSnapshot,
 } from '../selectionUtils';
+import { SparseTileGrid } from '../tileEngine';
 import {
   solveUnitSquareToQuad,
   evaluateHomography,
   createDefaultPerspectiveQuad,
   createDefaultMeshPoints,
+  computeMeshSubdivisions,
   evaluateMeshSurface,
   expandTriangleOutward,
+  getPointsBounds,
+  getMeshSurfaceBounds,
   renderMeshWarp,
 } from '../transformEngine';
 
@@ -162,15 +169,47 @@ describe('Perspective and Mesh Transformation Engine', () => {
     expect(p01.y).toBeCloseTo(110, 3);
   });
 
-  it('generates bicubic mesh lattice and samples surface', () => {
+  it('generates exact identity bicubic mesh lattice without rounding distortion', () => {
     const quad = createDefaultPerspectiveQuad(0, 0, 100, 100, 0);
     const mesh = createDefaultMeshPoints(quad, 4, 4);
     expect(mesh.length).toBe(4);
     expect(mesh[0].length).toBe(4);
 
-    const mid = evaluateMeshSurface(mesh, 0.5, 0.5);
-    expect(mid.x).toBeCloseTo(50, 1);
-    expect(mid.y).toBeCloseTo(50, 1);
+    // Interior control points must not be rounded (100/3 = 33.333..., not 33)
+    expect(mesh[0][1].x).toBeCloseTo(100 / 3, 6);
+    expect(mesh[0][2].x).toBeCloseTo(200 / 3, 6);
+
+    for (const u of [0, 0.17, 0.33, 0.5, 0.73, 1]) {
+      for (const v of [0, 0.21, 0.5, 0.84, 1]) {
+        const pt = evaluateMeshSurface(mesh, u, v);
+        expect(pt.x).toBeCloseTo(u * 100, 5);
+        expect(pt.y).toBeCloseTo(v * 100, 5);
+      }
+    }
+  });
+
+  it('captures Catmull-Rom overshoot in getMeshSurfaceBounds and avoids 1px clipping in getPointsBounds', () => {
+    const b = getPointsBounds([
+      { x: 10.6, y: 20.7 },
+      { x: 109.2, y: 80.1 },
+    ]);
+    expect(b.minX).toBe(10);
+    expect(b.maxX).toBe(110);
+    expect(b.width).toBe(100);
+    expect(b.minY).toBe(20);
+    expect(b.maxY).toBe(81);
+    expect(b.height).toBe(61);
+
+    // Pull inner columns outward so Catmull-Rom bows past outer edge
+    const quad = createDefaultPerspectiveQuad(0, 0, 100, 100, 0);
+    const mesh = createDefaultMeshPoints(quad, 4, 4);
+    mesh[1][1].x -= 40;
+    mesh[1][2].x += 40;
+    const ctrlBounds = getPointsBounds(mesh.flat());
+    const surfBounds = getMeshSurfaceBounds(mesh, 6);
+    expect(surfBounds.minX).toBeLessThanOrEqual(ctrlBounds.minX);
+    expect(surfBounds.maxX).toBeGreaterThanOrEqual(ctrlBounds.maxX);
+    expect(computeMeshSubdivisions(1024, 1024, mesh, true)).toBeGreaterThanOrEqual(10);
   });
 
   it('expands adjacent quad triangles strictly outward across their shared diagonal', () => {
@@ -454,5 +493,197 @@ describe('liftSelectionToFloating integrity (no duplication or out-of-bounds art
     } finally {
       (globalThis as { document?: unknown }).document = prevDoc;
     }
+  });
+});
+
+describe('Tile-Native Lasso Cut/Copy/Paste and Delete Inside/Outside', () => {
+  const fillSolidRect = (
+    grid: SparseTileGrid,
+    layerId: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    rgba: [number, number, number, number],
+    format: 'color-32bit' | 'monochrome-1bit' = 'color-32bit'
+  ) => {
+    const data = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      data[i * 4] = rgba[0];
+      data[i * 4 + 1] = rgba[1];
+      data[i * 4 + 2] = rgba[2];
+      data[i * 4 + 3] = rgba[3];
+    }
+    grid.writeImageData(layerId, { data, width: w, height: h }, x, y, format, true);
+  };
+
+  it('cuts a lasso polygon section from a single layer, pastes into a new layer, and atomically undoes', () => {
+    const grid = new SparseTileGrid();
+    const dims = { width: 512, height: 512 };
+    // Paint a 100x100 red block at (10, 10)
+    fillSolidRect(grid, 'layer-1', 10, 10, 100, 100, [220, 40, 60, 255]);
+
+    // Lasso triangle inside the block: (20,20) -> (80,20) -> (20,80)
+    const lassoSelection = {
+      type: 'lasso' as const,
+      bounds: { x: 20, y: 20, width: 60, height: 60 },
+      polygon: [
+        { x: 20, y: 20 },
+        { x: 80, y: 20 },
+        { x: 20, y: 80 },
+      ],
+    };
+
+    // 1. Extract selected pixels
+    const snapshot = extractSelectionTileSnapshot({
+      grid,
+      layerId: 'layer-1',
+      dimensions: dims,
+      selection: lassoSelection,
+    });
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.tiles.length).toBe(1);
+
+    // 2. Clear selected pixels from source layer (Cut)
+    const cleared = clearSelectionInTileGrid({
+      grid,
+      layerId: 'layer-1',
+      dimensions: dims,
+      selection: lassoSelection,
+      isBackground: false,
+      targetFormat: 'color-32bit',
+    });
+    expect(cleared.tileDeltas.length).toBeGreaterThan(0);
+
+    // 3. Paste snapshot into new layer
+    grid.pasteLayerTilesSnapshot('layer-cut', snapshot!);
+    const destDeltas = grid.computeDeltasFromSnapshot(new Map(), 'layer-cut', snapshot!.bounds);
+    expect(destDeltas.length).toBeGreaterThan(0);
+
+    // Inside triangle (30, 30): erased from source, present in new layer
+    expect(grid.getPixelRGBA('layer-1', 30, 30)[3]).toBe(0);
+    expect(Array.from(grid.getPixelRGBA('layer-cut', 30, 30))).toEqual([220, 40, 60, 255]);
+
+    // Outside triangle but inside bounds (70, 70): still in source, empty in new layer
+    expect(Array.from(grid.getPixelRGBA('layer-1', 70, 70))).toEqual([220, 40, 60, 255]);
+    expect(grid.getPixelRGBA('layer-cut', 70, 70)[3]).toBe(0);
+
+    // Atomic undo restores source and clears new layer
+    const combined = [...cleared.tileDeltas, ...destDeltas];
+    grid.applyTileDeltas(combined, 'undo');
+    expect(Array.from(grid.getPixelRGBA('layer-1', 30, 30))).toEqual([220, 40, 60, 255]);
+    expect(grid.getPixelRGBA('layer-cut', 30, 30)[3]).toBe(0);
+
+    // Redo reapplies both
+    grid.applyTileDeltas(combined, 'redo');
+    expect(grid.getPixelRGBA('layer-1', 30, 30)[3]).toBe(0);
+    expect(Array.from(grid.getPixelRGBA('layer-cut', 30, 30))).toEqual([220, 40, 60, 255]);
+  });
+
+  it('returns null when extracting an empty selection region', () => {
+    const grid = new SparseTileGrid();
+    const dims = { width: 256, height: 256 };
+    fillSolidRect(grid, 'layer-1', 0, 0, 20, 20, [0, 0, 0, 255]);
+
+    const emptySnap = extractSelectionTileSnapshot({
+      grid,
+      layerId: 'layer-1',
+      dimensions: dims,
+      selection: { type: 'rect', bounds: { x: 100, y: 100, width: 40, height: 40 } },
+    });
+    expect(emptySnap).toBeNull();
+  });
+
+  it('deletes outside a lasso selection across multiple tiles and restores on undo', () => {
+    const grid = new SparseTileGrid();
+    const dims = { width: 600, height: 600 };
+    // Paint in tile (0,0) and tile (1,1)
+    fillSolidRect(grid, 'layer-1', 10, 10, 100, 100, [10, 200, 30, 255]);
+    fillSolidRect(grid, 'layer-1', 300, 300, 50, 50, [10, 200, 30, 255]);
+
+    const lassoSelection = {
+      type: 'lasso' as const,
+      bounds: { x: 20, y: 20, width: 60, height: 60 },
+      polygon: [
+        { x: 20, y: 20 },
+        { x: 80, y: 20 },
+        { x: 20, y: 80 },
+      ],
+    };
+
+    const { tileDeltas } = clearOutsideSelectionInTileGrid({
+      grid,
+      layerId: 'layer-1',
+      dimensions: dims,
+      selection: lassoSelection,
+      isBackground: false,
+      targetFormat: 'color-32bit',
+    });
+
+    expect(tileDeltas.length).toBeGreaterThanOrEqual(2);
+    // Inside triangle remains intact
+    expect(Array.from(grid.getPixelRGBA('layer-1', 30, 30))).toEqual([10, 200, 30, 255]);
+    // Outside triangle in same tile is erased
+    expect(grid.getPixelRGBA('layer-1', 70, 70)[3]).toBe(0);
+    // Separate tile (1,1) completely outside selection is pruned
+    expect(grid.getPixelRGBA('layer-1', 310, 310)[3]).toBe(0);
+    expect(grid.getTile('layer-1', 1, 1, 0)).toBeNull();
+
+    // Undo restores both tiles
+    grid.applyTileDeltas(tileDeltas, 'undo');
+    expect(Array.from(grid.getPixelRGBA('layer-1', 70, 70))).toEqual([10, 200, 30, 255]);
+    expect(Array.from(grid.getPixelRGBA('layer-1', 310, 310))).toEqual([10, 200, 30, 255]);
+  });
+
+  it('fills outside with white on background layer and preserves feathered mask alpha on normal layer', () => {
+    const grid = new SparseTileGrid();
+    const dims = { width: 64, height: 64 };
+    grid.fillLayerSolidWhite('layer-bg', 64, 64, 'color-32bit');
+    fillSolidRect(grid, 'layer-bg', 0, 0, 64, 64, [255, 0, 0, 255]);
+
+    const mask = new Uint8Array(64 * 64);
+    for (let y = 16; y < 32; y++) {
+      for (let x = 16; x < 32; x++) {
+        mask[y * 64 + x] = 255;
+      }
+    }
+
+    clearOutsideSelectionInTileGrid({
+      grid,
+      layerId: 'layer-bg',
+      dimensions: dims,
+      selection: {
+        type: 'mask',
+        bounds: { x: 16, y: 16, width: 16, height: 16 },
+        mask,
+        maskWidth: 64,
+        maskHeight: 64,
+      },
+      isBackground: true,
+      targetFormat: 'color-32bit',
+    });
+
+    // Inside mask stays red; outside becomes opaque white
+    expect(Array.from(grid.getPixelRGBA('layer-bg', 20, 20))).toEqual([255, 0, 0, 255]);
+    expect(Array.from(grid.getPixelRGBA('layer-bg', 5, 5))).toEqual([255, 255, 255, 255]);
+  });
+
+  it('preserves 1-bit monochrome format when extracting a selection', () => {
+    const grid = new SparseTileGrid();
+    const dims = { width: 128, height: 128 };
+    fillSolidRect(grid, 'mono-1', 10, 10, 40, 40, [0, 0, 0, 255], 'monochrome-1bit');
+
+    const snap = extractSelectionTileSnapshot({
+      grid,
+      layerId: 'mono-1',
+      dimensions: dims,
+      selection: { type: 'rect', bounds: { x: 15, y: 15, width: 20, height: 20 } },
+    });
+    expect(snap).not.toBeNull();
+    expect(snap!.format).toBe('monochrome-1bit');
+    grid.pasteLayerTilesSnapshot('mono-2', snap!);
+    expect(grid.getLayerFormat('mono-2')).toBe('monochrome-1bit');
+    expect(grid.getPixelRGBA('mono-2', 20, 20)[3]).toBe(255);
+    expect(grid.getPixelRGBA('mono-2', 12, 12)[3]).toBe(0);
   });
 });

@@ -33,6 +33,40 @@ import {
   useUiStore,
 } from '../stores';
 import { PushHistoryStepFn } from '../hooks/drawing';
+import { isTauriEnvironment } from '../hooks/useMultiplayer';
+import {
+  SaveDocumentResult,
+  isFinalizingAppClose,
+  requestAppClose,
+} from '../utils/appCloseFlow';
+
+function computeEffectiveOpacityForLayers(allLayers: LayerItem[], layer: LayerItem): number {
+  let opacity = layer.opacity;
+  let parentId = layer.parentId;
+  const visited = new Set<string>([layer.id]);
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    const parent = allLayers.find((l) => l.id === parentId);
+    if (!parent) break;
+    opacity *= parent.opacity;
+    parentId = parent.parentId;
+  }
+  return opacity;
+}
+
+function computeLayerVisibleForLayers(allLayers: LayerItem[], layer: LayerItem): boolean {
+  if (!layer.visible) return false;
+  let parentId = layer.parentId;
+  const visited = new Set<string>([layer.id]);
+  while (parentId && !visited.has(parentId)) {
+    visited.add(parentId);
+    const parent = allLayers.find((l) => l.id === parentId);
+    if (!parent) break;
+    if (!parent.visible) return false;
+    parentId = parent.parentId;
+  }
+  return true;
+}
 
 interface FileWithOptionalPath extends File {
   path?: string;
@@ -71,7 +105,13 @@ export interface UseDocumentLifecycleParams {
   ) => void;
   resizeCanvas: (newDims: CanvasDimensions, options: ResizeCanvasOptions) => void;
   copyLayer: (id: string) => LayerItem | null;
-  pasteLayer: () => Promise<{ success: boolean; layerName?: string }>;
+  pasteLayer: () => Promise<{
+    success: boolean;
+    layerId?: string;
+    layerName?: string;
+    tileDeltas?: import('../types/editor').TileDelta[];
+  }>;
+  onDeselectAfterPaste?: () => void;
   deleteLayer: (id: string) => void;
   pasteLayerFromFile: (file: File) => Promise<string>;
   resetZoomAndCenter: (dims?: CanvasDimensions) => void;
@@ -95,6 +135,7 @@ export function useDocumentLifecycle({
   resizeCanvas,
   copyLayer,
   pasteLayer,
+  onDeselectAfterPaste,
   deleteLayer,
   pasteLayerFromFile,
   resetZoomAndCenter,
@@ -102,7 +143,6 @@ export function useDocumentLifecycle({
   pushHistoryStep,
   showToast,
 }: UseDocumentLifecycleParams) {
-  const documents = useDocumentStore((s) => s.documents);
   const activeDocumentId = useDocumentStore((s) => s.activeDocumentId);
   const dimensions = useDocumentStore((s) => s.dimensions);
   const colorMode = useDocumentStore((s) => s.colorMode);
@@ -114,6 +154,8 @@ export function useDocumentLifecycle({
   const import3DFileInputRef = useRef<HTMLInputElement>(null);
   const needsAdaptiveFitRef = useRef<boolean>(true);
   const pendingFitDimsRef = useRef<CanvasDimensions | null>(null);
+  const layersRef = useRef<LayerItem[]>(layers);
+  layersRef.current = layers;
 
   const handleViewportReady = useCallback(
     (viewport: HTMLDivElement) => {
@@ -203,11 +245,23 @@ export function useDocumentLifecycle({
   const handlePasteSelectedLayer = useCallback(async () => {
     const res = await pasteLayer();
     if (res.success && res.layerName) {
-      showToast(`Pasted layer "${res.layerName}"`);
+      if (res.layerId && res.tileDeltas && res.tileDeltas.length > 0) {
+        pushHistoryStep(
+          'selection-move',
+          `Paste "${res.layerName}"`,
+          null,
+          null,
+          res.layerId,
+          undefined,
+          res.tileDeltas
+        );
+      }
+      onDeselectAfterPaste?.();
+      showToast(`Pasted into "${res.layerName}"`);
     } else {
       showToast('Clipboard is empty');
     }
-  }, [pasteLayer, showToast]);
+  }, [onDeselectAfterPaste, pasteLayer, pushHistoryStep, showToast]);
 
   const handleDeleteSelectedLayer = useCallback(() => {
     const rasterCount = layers.filter((l) => l.type === 'raster').length;
@@ -230,6 +284,7 @@ export function useDocumentLifecycle({
       if (file) {
         try {
           const layerName = await pasteLayerFromFile(file);
+          documentStoreActions.markDocumentDirty(useDocumentStore.getState().activeDocumentId, true);
           showToast(`Pasted "${layerName}" from file`);
         } catch (err: unknown) {
           console.error('Failed to paste from file:', err);
@@ -274,6 +329,7 @@ export function useDocumentLifecycle({
 
       resizeCanvas(newDims, options);
       documentStoreActions.setDimensions(newDims);
+      documentStoreActions.markDocumentDirty(useDocumentStore.getState().activeDocumentId, true);
       pendingFitDimsRef.current = newDims;
       needsAdaptiveFitRef.current = true;
       resetZoomAndCenter(newDims);
@@ -396,11 +452,12 @@ export function useDocumentLifecycle({
 
   const handleSelectDocument = useCallback(
     (id: string) => {
-      if (id === activeDocumentId) {
+      const storeState = useDocumentStore.getState();
+      if (id === storeState.activeDocumentId) {
         uiStoreActions.setAppView('workspace');
         return;
       }
-      const doc = documents.find((d) => d.id === id);
+      const doc = storeState.documents.find((d) => d.id === id);
       if (!doc) return;
       uiStoreActions.setAppView('workspace');
       documentStoreActions.setDimensions(doc.dimensions);
@@ -426,7 +483,7 @@ export function useDocumentLifecycle({
       pendingFitDimsRef.current = doc.dimensions;
       resetZoomAndCenter(doc.dimensions);
     },
-    [activeDocumentId, documents, resetZoomAndCenter, setDefaultToneFrequency, switchDocumentSession]
+    [resetZoomAndCenter, setDefaultToneFrequency, switchDocumentSession]
   );
 
   const handleCloseDocument = useCallback(
@@ -521,6 +578,7 @@ export function useDocumentLifecycle({
         const restoredDoc: DocumentTab = {
           id: session.session_id,
           name: manifest.documentName,
+          isDirty: true,
           dimensions: restoredDims,
           colorMode: manifest.colorMode,
           layers: manifest.layers,
@@ -644,99 +702,148 @@ export function useDocumentLifecycle({
     ]
   );
 
-  const handleSave = useCallback(async () => {
-    const onProgress = (p: SaveProgress) => {
-      uiStoreActions.setLoading(true, `${p.message} (${p.percent}%)`);
-    };
-    const docData = buildSaveData(onProgress);
+  const handleSaveDocumentById = useCallback(
+    async (docId: string): Promise<SaveDocumentResult> => {
+      const storeState = useDocumentStore.getState();
+      const targetDoc = storeState.documents.find((d) => d.id === docId);
+      if (!targetDoc) return 'error';
 
-    const preferredExt =
-      savedFileInfo?.extension && savedFileInfo.extension.toLowerCase() !== '.sora'
-        ? savedFileInfo.extension
-        : '.ink';
+      const isActive = storeState.activeDocumentId === docId;
+      const docLayers = isActive ? layersRef.current : targetDoc.layers;
+      const docSavedInfo = isActive
+        ? storeState.savedFileInfo ?? targetDoc.savedFileInfo ?? null
+        : targetDoc.savedFileInfo ?? null;
+      const docTileGrid =
+        documentStore.getSession(docId)?.tileGrid ?? documentStore.getActiveTileGrid();
+      const cleanNameForSave = targetDoc.name.replace(/\*+$/, '') || 'Untitled';
+      const tlStats = globalTimelapseManager.getStats(docId);
 
-    if (!savedFileInfo?.handle || savedFileInfo.extension?.toLowerCase() === '.sora') {
-      try {
-        const info = await promptSaveAs(docData, preferredExt);
-        documentStoreActions.setSavedFileInfo(info);
-        documentStoreActions.setDocumentName(info.name);
+      const onProgress = (p: SaveProgress) => {
+        uiStoreActions.setLoading(true, `${p.message} (${p.percent}%)`);
+      };
+
+      const docData: SaveDocumentData = {
+        name: cleanNameForSave,
+        dimensions: targetDoc.dimensions,
+        colorMode: targetDoc.colorMode,
+        layers: docLayers,
+        tileGrid: docTileGrid,
+        getEffectiveOpacity: (layer) => computeEffectiveOpacityForLayers(docLayers, layer),
+        isLayerEffectivelyVisible: (layer) => computeLayerVisibleForLayers(docLayers, layer),
+        tabId: docId,
+        perspectiveRuler: isActive
+          ? storeState.perspectiveRuler
+          : targetDoc.perspectiveRuler ?? null,
+        animationTimeline:
+          targetDoc.animation !== undefined
+            ? targetDoc.animation
+            : isActive
+              ? storeState.animationTimeline
+              : null,
+        timelapse:
+          tlStats.enabled || tlStats.frameCount > 0
+            ? { enabled: tlStats.enabled, frameCount: tlStats.frameCount }
+            : null,
+        onProgress,
+      };
+
+      const preferredExt =
+        docSavedInfo?.extension && docSavedInfo.extension.toLowerCase() !== '.sora'
+          ? docSavedInfo.extension
+          : '.ink';
+
+      const applySavedMetadata = (
+        info: { name: string; handle?: any; extension: string; size?: number; previewDataUrl?: string },
+        updateHandle: boolean
+      ) => {
+        const latestActiveId = useDocumentStore.getState().activeDocumentId;
+        if (latestActiveId === docId) {
+          if (updateHandle) {
+            documentStoreActions.setSavedFileInfo(info);
+          }
+          documentStoreActions.setDocumentName(info.name);
+        }
         documentStoreActions.setDocuments((prev) =>
           prev.map((d) =>
-            d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info, isDirty: false } : d
+            d.id === docId
+              ? {
+                  ...d,
+                  name: info.name,
+                  ...(updateHandle ? { savedFileInfo: info } : {}),
+                  isDirty: false,
+                }
+              : d
           )
         );
         saveRecentDocument({
-          id: activeDocumentId || `doc-${Date.now()}`,
+          id: docId,
           title: info.name,
           path: `InkStudio\\${info.name}`,
           size: info.size || 1572864,
-          coverUrl: info.previewDataUrl || layers[0]?.thumbnailUrl,
+          coverUrl: info.previewDataUrl || docLayers[0]?.thumbnailUrl,
           isStarred: false,
           fileType: info.extension,
           isSaved: true,
         }).catch(console.warn);
         showToast(`Saved to ${info.name}`);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg !== 'Save canceled') {
+      };
+
+      if (!docSavedInfo?.handle || docSavedInfo.extension?.toLowerCase() === '.sora') {
+        try {
+          const info = await promptSaveAs(docData, preferredExt);
+          applySavedMetadata(info, true);
+          return 'saved';
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg === 'Save canceled') {
+            return 'canceled';
+          }
           alert('Failed to save file: ' + msg);
+          return 'error';
+        } finally {
+          uiStoreActions.setLoading(false, '');
         }
-      } finally {
-        uiStoreActions.setLoading(false, '');
       }
-    } else {
+
       try {
-        const saveRes = await saveToExistingHandle(docData, savedFileInfo);
-        documentStoreActions.setDocumentName(savedFileInfo.name);
-        documentStoreActions.setDocuments((prev) =>
-          prev.map((d) =>
-            d.id === activeDocumentId ? { ...d, name: savedFileInfo.name, isDirty: false } : d
-          )
+        const saveRes = await saveToExistingHandle(docData, docSavedInfo);
+        applySavedMetadata(
+          {
+            name: docSavedInfo.name,
+            handle: docSavedInfo.handle,
+            extension: docSavedInfo.extension,
+            size: saveRes.size,
+            previewDataUrl: saveRes.previewDataUrl,
+          },
+          false
         );
-        saveRecentDocument({
-          id: activeDocumentId || `doc-${Date.now()}`,
-          title: savedFileInfo.name,
-          path: `InkStudio\\${savedFileInfo.name}`,
-          size: saveRes.size || 1572864,
-          coverUrl: saveRes.previewDataUrl || layers[0]?.thumbnailUrl,
-          isStarred: false,
-          fileType: savedFileInfo.extension,
-          isSaved: true,
-        }).catch(console.warn);
-        showToast(`Saved to ${savedFileInfo.name}`);
+        return 'saved';
       } catch (err: unknown) {
         console.warn('Direct handle save failed, prompting with Save As:', err);
         try {
           const info = await promptSaveAs(docData, preferredExt);
-          documentStoreActions.setSavedFileInfo(info);
-          documentStoreActions.setDocumentName(info.name);
-          documentStoreActions.setDocuments((prev) =>
-            prev.map((d) =>
-              d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info, isDirty: false } : d
-            )
-          );
-          saveRecentDocument({
-            id: activeDocumentId || `doc-${Date.now()}`,
-            title: info.name,
-            path: `InkStudio\\${info.name}`,
-            size: info.size || 1572864,
-            coverUrl: info.previewDataUrl || layers[0]?.thumbnailUrl,
-            isStarred: false,
-            fileType: info.extension,
-            isSaved: true,
-          }).catch(console.warn);
-          showToast(`Saved to ${info.name}`);
+          applySavedMetadata(info, true);
+          return 'saved';
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
-          if (msg !== 'Save canceled') {
-            alert('Failed to save file: ' + msg);
+          if (msg === 'Save canceled') {
+            return 'canceled';
           }
+          alert('Failed to save file: ' + msg);
+          return 'error';
         }
       } finally {
         uiStoreActions.setLoading(false, '');
       }
-    }
-  }, [activeDocumentId, buildSaveData, layers, savedFileInfo, showToast]);
+    },
+    [showToast]
+  );
+
+  const handleSave = useCallback(async () => {
+    const currentId = useDocumentStore.getState().activeDocumentId;
+    if (!currentId) return;
+    await handleSaveDocumentById(currentId);
+  }, [handleSaveDocumentById]);
 
   const handleSaveAs = useCallback(async () => {
     const onProgress = (p: SaveProgress) => {
@@ -859,6 +966,7 @@ export function useDocumentLifecycle({
     handleTriggerOpenFile,
     handleFileInputChange,
     handleSave,
+    handleSaveDocumentById,
     handleSaveAs,
     handleExportImage,
     handleSelectWelcomeDocument,
@@ -879,12 +987,13 @@ export interface DocumentLifecycleManagerProps {
   ) => { layers: LayerItem[]; activeLayerId: string };
   resetZoomAndCenter: (dims?: CanvasDimensions) => void;
   resetHistory: (targetDocumentId?: string) => void;
+  onSelectDocument: (id: string) => void;
 }
 
 /**
  * Headless lifecycle coordinator: handles startup crash recovery detection,
  * initial canvas creation, WAL checkpointing, tile memory budget sync,
- * and active document tab metadata synchronization.
+ * active document tab metadata synchronization, and app close confirmation guard.
  */
 export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> = React.memo(
   ({
@@ -895,6 +1004,7 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
     resetToNewCanvas,
     resetZoomAndCenter,
     resetHistory,
+    onSelectDocument,
   }) => {
     const documents = useDocumentStore((s) => s.documents);
     const activeDocumentId = useDocumentStore((s) => s.activeDocumentId);
@@ -902,6 +1012,7 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
     const colorMode = useDocumentStore((s) => s.colorMode);
     const documentName = useDocumentStore((s) => s.documentName);
     const appSettings = useUiStore((s) => s.appSettings);
+    const appClosePrompt = useUiStore((s) => s.appClosePrompt);
 
     // 1. Scan for unfinalized crashed WAL sessions on launch
     useEffect(() => {
@@ -1071,6 +1182,60 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
         );
       });
     }, [layers, activeLayerId, activeDocumentId]);
+
+    // 6. Intercept OS/window close requests (Alt+F4, taskbar close, WM close) and show quit confirmation
+    useEffect(() => {
+      if (isTauriEnvironment()) {
+        let disposed = false;
+        let unlisten: (() => void) | undefined;
+
+        void import('@tauri-apps/api/window')
+          .then(({ getCurrentWindow }) =>
+            getCurrentWindow().onCloseRequested((event) => {
+              if (isFinalizingAppClose()) return;
+              event.preventDefault();
+              requestAppClose();
+            })
+          )
+          .then((fn) => {
+            if (disposed) {
+              fn();
+            } else {
+              unlisten = fn;
+            }
+          })
+          .catch((err) => {
+            console.warn('Failed to register Tauri close-requested guard:', err);
+          });
+
+        return () => {
+          disposed = true;
+          if (unlisten) unlisten();
+        };
+      }
+
+      // Browser fallback: warn via native beforeunload dialog when closing tab with unsaved work
+      const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+        if (isFinalizingAppClose()) return;
+        const hasDirty = useDocumentStore.getState().documents.some((d) => Boolean(d.isDirty));
+        if (hasDirty) {
+          e.preventDefault();
+          e.returnValue = '';
+        }
+      };
+      window.addEventListener('beforeunload', handleBeforeUnload);
+      return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+    }, []);
+
+    // 7. Focus the canvas currently being confirmed during the per-canvas save prompt
+    const pendingCloseDocId =
+      appClosePrompt.isOpen && appClosePrompt.step === 'per-canvas'
+        ? appClosePrompt.pendingDocIds[appClosePrompt.currentIndex] ?? null
+        : null;
+    useEffect(() => {
+      if (!pendingCloseDocId) return;
+      onSelectDocument(pendingCloseDocId);
+    }, [pendingCloseDocId, onSelectDocument]);
 
     return null;
   }

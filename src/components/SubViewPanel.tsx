@@ -256,18 +256,24 @@ export const SubViewPanel: React.FC<SubViewPanelProps> = React.memo(
         return;
       }
       const onKeyDown = (e: KeyboardEvent) => {
-        if (e.code === 'Space') setIsSpaceHeld(true);
+        if (e.code === 'Space' || e.key === ' ') setIsSpaceHeld(true);
         if (e.key === 'Alt') setIsAltHeld(true);
       };
       const onKeyUp = (e: KeyboardEvent) => {
-        if (e.code === 'Space') setIsSpaceHeld(false);
+        if (e.code === 'Space' || e.key === ' ') setIsSpaceHeld(false);
         if (e.key === 'Alt') setIsAltHeld(false);
       };
+      const onBlur = () => {
+        setIsSpaceHeld(false);
+        setIsAltHeld(false);
+      };
       window.addEventListener('keydown', onKeyDown);
-      window.addEventListener('keyup', onKeyUp);
+      window.addEventListener('keyup', onKeyUp, true);
+      window.addEventListener('blur', onBlur);
       return () => {
         window.removeEventListener('keydown', onKeyDown);
-        window.removeEventListener('keyup', onKeyUp);
+        window.removeEventListener('keyup', onKeyUp, true);
+        window.removeEventListener('blur', onBlur);
       };
     }, [isHoveringStage]);
 

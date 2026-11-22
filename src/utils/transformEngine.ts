@@ -103,11 +103,35 @@ export function evaluateMeshSurface(
   const rowIdx = Math.min(Math.floor(scaledV), rows - 2);
   const s = scaledV - rowIdx;
 
-  // Helper to safely get point with border clamping
+  // Helper to get control point with linear phantom extrapolation beyond borders.
+  // Clamping borders to edge points halves the boundary Catmull-Rom tangent and warps
+  // even an unmodified mesh by ~1.5% across outer cells.
   const getP = (r: number, c: number): Point2D => {
-    const cr = Math.max(0, Math.min(rows - 1, r));
-    const cc = Math.max(0, Math.min(cols - 1, c));
-    return meshPoints[cr][cc];
+    const getRowP = (rr: number, cc: number): Point2D => {
+      if (cc < 0) {
+        const a = meshPoints[rr][0];
+        const b = meshPoints[rr][1];
+        return { x: 2 * a.x - b.x, y: 2 * a.y - b.y };
+      }
+      if (cc >= cols) {
+        const a = meshPoints[rr][cols - 1];
+        const b = meshPoints[rr][cols - 2];
+        return { x: 2 * a.x - b.x, y: 2 * a.y - b.y };
+      }
+      return meshPoints[rr][cc];
+    };
+
+    if (r < 0) {
+      const a = getRowP(0, c);
+      const b = getRowP(1, c);
+      return { x: 2 * a.x - b.x, y: 2 * a.y - b.y };
+    }
+    if (r >= rows) {
+      const a = getRowP(rows - 1, c);
+      const b = getRowP(rows - 2, c);
+      return { x: 2 * a.x - b.x, y: 2 * a.y - b.y };
+    }
+    return getRowP(r, c);
   };
 
   // Interpolate 4 row spans across u
@@ -221,6 +245,10 @@ export function drawAffineTriangle(
   const f = dy0 - b * sx0 - d * sy0;
 
   ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  if ('imageSmoothingQuality' in ctx) {
+    ctx.imageSmoothingQuality = 'high';
+  }
   ctx.beginPath();
   ctx.moveTo(expanded[0], expanded[1]);
   ctx.lineTo(expanded[2], expanded[3]);
@@ -233,7 +261,7 @@ export function drawAffineTriangle(
   ctx.restore();
 }
 
-const MESH_VERTEX_SHADER = `
+const MESH_VERTEX_SHADER_ES1 = `
   attribute vec2 a_pos;
   attribute vec2 a_uv;
   uniform vec2 u_origin;
@@ -246,12 +274,133 @@ const MESH_VERTEX_SHADER = `
   }
 `;
 
-const MESH_FRAGMENT_SHADER = `
+const MESH_FRAGMENT_SHADER_ES1 = `
   precision highp float;
   uniform sampler2D u_tex;
+  uniform vec2 u_texSize;
   varying vec2 v_uv;
+
+  vec4 cubicWeights(float f) {
+    float f2 = f * f;
+    float f3 = f2 * f;
+    return vec4(
+      -0.5 * f + f2 - 0.5 * f3,
+      1.0 - 2.5 * f2 + 1.5 * f3,
+      0.5 * f + 2.0 * f2 - 1.5 * f3,
+      -0.5 * f2 + 0.5 * f3
+    );
+  }
+
+  vec4 fetchRow(vec2 base, float dy, vec4 wx, vec2 invSize, vec2 maxIdx) {
+    float y = (clamp(base.y + dy, 0.0, maxIdx.y) + 0.5) * invSize.y;
+    float x0 = (clamp(base.x - 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
+    float x1 = (clamp(base.x,       0.0, maxIdx.x) + 0.5) * invSize.x;
+    float x2 = (clamp(base.x + 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
+    float x3 = (clamp(base.x + 2.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
+    return texture2D(u_tex, vec2(x0, y)) * wx.x
+         + texture2D(u_tex, vec2(x1, y)) * wx.y
+         + texture2D(u_tex, vec2(x2, y)) * wx.z
+         + texture2D(u_tex, vec2(x3, y)) * wx.w;
+  }
+
   void main() {
-    gl_FragColor = texture2D(u_tex, v_uv);
+    vec2 texPos = v_uv * u_texSize - 0.5;
+    vec2 base = floor(texPos);
+    vec2 f = texPos - base;
+    vec4 wx = cubicWeights(f.x);
+    vec4 wy = cubicWeights(f.y);
+    vec2 invSize = 1.0 / u_texSize;
+    vec2 maxIdx = u_texSize - 1.0;
+
+    vec4 c = fetchRow(base, -1.0, wx, invSize, maxIdx) * wy.x
+           + fetchRow(base,  0.0, wx, invSize, maxIdx) * wy.y
+           + fetchRow(base,  1.0, wx, invSize, maxIdx) * wy.z
+           + fetchRow(base,  2.0, wx, invSize, maxIdx) * wy.w;
+
+    float a = clamp(c.a, 0.0, 1.0);
+    vec3 rgb = clamp(c.rgb, vec3(0.0), vec3(a));
+    gl_FragColor = vec4(rgb, a);
+  }
+`;
+
+const MESH_VERTEX_SHADER_ES3 = `#version 300 es
+  in vec2 a_pos;
+  in vec2 a_uv;
+  uniform vec2 u_origin;
+  uniform vec2 u_size;
+  out vec2 v_uv;
+  void main() {
+    vec2 norm = (a_pos - u_origin) / u_size;
+    gl_Position = vec4(norm.x * 2.0 - 1.0, 1.0 - norm.y * 2.0, 0.0, 1.0);
+    v_uv = a_uv;
+  }
+`;
+
+const MESH_FRAGMENT_SHADER_ES3 = `#version 300 es
+  precision highp float;
+  uniform sampler2D u_tex;
+  uniform vec2 u_texSize;
+  in vec2 v_uv;
+  out vec4 outColor;
+
+  vec4 cubicWeights(float f) {
+    float f2 = f * f;
+    float f3 = f2 * f;
+    return vec4(
+      -0.5 * f + f2 - 0.5 * f3,
+      1.0 - 2.5 * f2 + 1.5 * f3,
+      0.5 * f + 2.0 * f2 - 1.5 * f3,
+      -0.5 * f2 + 0.5 * f3
+    );
+  }
+
+  vec4 fetchRow(vec2 base, float dy, vec4 wx, vec2 invSize, vec2 maxIdx) {
+    float y = (clamp(base.y + dy, 0.0, maxIdx.y) + 0.5) * invSize.y;
+    float x0 = (clamp(base.x - 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
+    float x1 = (clamp(base.x,       0.0, maxIdx.x) + 0.5) * invSize.x;
+    float x2 = (clamp(base.x + 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
+    float x3 = (clamp(base.x + 2.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
+    return texture(u_tex, vec2(x0, y)) * wx.x
+         + texture(u_tex, vec2(x1, y)) * wx.y
+         + texture(u_tex, vec2(x2, y)) * wx.z
+         + texture(u_tex, vec2(x3, y)) * wx.w;
+  }
+
+  vec4 sampleBicubic(vec2 uv, vec2 invSize, vec2 maxIdx) {
+    vec2 texPos = uv * u_texSize - 0.5;
+    vec2 base = floor(texPos);
+    vec2 f = texPos - base;
+    vec4 wx = cubicWeights(f.x);
+    vec4 wy = cubicWeights(f.y);
+
+    vec4 c = fetchRow(base, -1.0, wx, invSize, maxIdx) * wy.x
+           + fetchRow(base,  0.0, wx, invSize, maxIdx) * wy.y
+           + fetchRow(base,  1.0, wx, invSize, maxIdx) * wy.z
+           + fetchRow(base,  2.0, wx, invSize, maxIdx) * wy.w;
+
+    float a = clamp(c.a, 0.0, 1.0);
+    return vec4(clamp(c.rgb, vec3(0.0), vec3(a)), a);
+  }
+
+  void main() {
+    vec2 invSize = 1.0 / u_texSize;
+    vec2 maxIdx = u_texSize - 1.0;
+    vec2 du = dFdx(v_uv);
+    vec2 dv = dFdy(v_uv);
+    float footprint = max(length(du * u_texSize), length(dv * u_texSize));
+
+    if (footprint <= 1.35) {
+      outColor = sampleBicubic(v_uv, invSize, maxIdx);
+    } else {
+      vec4 acc =
+        sampleBicubic(v_uv + du * -0.375 + dv * -0.125, invSize, maxIdx) +
+        sampleBicubic(v_uv + du *  0.125 + dv * -0.375, invSize, maxIdx) +
+        sampleBicubic(v_uv + du *  0.375 + dv *  0.125, invSize, maxIdx) +
+        sampleBicubic(v_uv + du * -0.125 + dv *  0.375, invSize, maxIdx);
+      vec4 res = acc * 0.25;
+      float a = clamp(res.a, 0.0, 1.0);
+      outColor = vec4(clamp(res.rgb, vec3(0.0), vec3(a)), a);
+    }
   }
 `;
 
@@ -266,6 +415,7 @@ class WebGlMeshWarpRenderer {
   private uvLoc = -1;
   private originLoc: WebGLUniformLocation | null = null;
   private sizeLoc: WebGLUniformLocation | null = null;
+  private texSizeLoc: WebGLUniformLocation | null = null;
   private texLoc: WebGLUniformLocation | null = null;
   private maxDim = 0;
   private vertexData = new Float32Array(0);
@@ -282,6 +432,46 @@ class WebGlMeshWarpRenderer {
     this.init();
   }
 
+  private compileProgram(
+    gl: WebGLRenderingContext,
+    vsSrc: string,
+    fsSrc: string
+  ): WebGLProgram | null {
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    if (!vs || !fs) return null;
+
+    gl.shaderSource(vs, vsSrc);
+    gl.compileShader(vs);
+    gl.shaderSource(fs, fsSrc);
+    gl.compileShader(fs);
+    if (
+      !gl.getShaderParameter(vs, gl.COMPILE_STATUS) ||
+      !gl.getShaderParameter(fs, gl.COMPILE_STATUS)
+    ) {
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      return null;
+    }
+
+    const program = gl.createProgram();
+    if (!program) {
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      return null;
+    }
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      gl.deleteProgram(program);
+      return null;
+    }
+    return program;
+  }
+
   private init(): void {
     this.ready = false;
     if (typeof document === 'undefined') return;
@@ -295,42 +485,14 @@ class WebGlMeshWarpRenderer {
         stencil: false,
         preserveDrawingBuffer: false,
       };
-      const gl = (canvas.getContext('webgl2', attrs) ||
-        canvas.getContext('webgl', attrs)) as WebGLRenderingContext | null;
+      const gl2 = canvas.getContext('webgl2', attrs) as WebGL2RenderingContext | null;
+      const gl = (gl2 || canvas.getContext('webgl', attrs)) as WebGLRenderingContext | null;
       if (!gl) return;
 
-      const vs = gl.createShader(gl.VERTEX_SHADER);
-      const fs = gl.createShader(gl.FRAGMENT_SHADER);
-      if (!vs || !fs) return;
-
-      gl.shaderSource(vs, MESH_VERTEX_SHADER);
-      gl.compileShader(vs);
-      gl.shaderSource(fs, MESH_FRAGMENT_SHADER);
-      gl.compileShader(fs);
-      if (
-        !gl.getShaderParameter(vs, gl.COMPILE_STATUS) ||
-        !gl.getShaderParameter(fs, gl.COMPILE_STATUS)
-      ) {
-        gl.deleteShader(vs);
-        gl.deleteShader(fs);
-        return;
-      }
-
-      const program = gl.createProgram();
-      if (!program) {
-        gl.deleteShader(vs);
-        gl.deleteShader(fs);
-        return;
-      }
-      gl.attachShader(program, vs);
-      gl.attachShader(program, fs);
-      gl.linkProgram(program);
-      gl.deleteShader(vs);
-      gl.deleteShader(fs);
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        gl.deleteProgram(program);
-        return;
-      }
+      const program =
+        (gl2 ? this.compileProgram(gl, MESH_VERTEX_SHADER_ES3, MESH_FRAGMENT_SHADER_ES3) : null) ||
+        this.compileProgram(gl, MESH_VERTEX_SHADER_ES1, MESH_FRAGMENT_SHADER_ES1);
+      if (!program) return;
 
       const vertexBuffer = gl.createBuffer();
       const texture = gl.createTexture();
@@ -356,6 +518,7 @@ class WebGlMeshWarpRenderer {
       this.uvLoc = uvLoc;
       this.originLoc = gl.getUniformLocation(program, 'u_origin');
       this.sizeLoc = gl.getUniformLocation(program, 'u_size');
+      this.texSizeLoc = gl.getUniformLocation(program, 'u_texSize');
       this.texLoc = gl.getUniformLocation(program, 'u_tex');
       this.maxDim = Math.min(maxTex || 4096, maxVpDim || 4096);
       this.ready = true;
@@ -382,7 +545,7 @@ class WebGlMeshWarpRenderer {
 
     const sw = sourceCanvas.width;
     const sh = sourceCanvas.height;
-    if (sw > this.maxDim || sh > this.maxDim) return false;
+    if (sw <= 0 || sh <= 0 || sw > this.maxDim || sh > this.maxDim) return false;
 
     let minX = Infinity;
     let minY = Infinity;
@@ -412,11 +575,11 @@ class WebGlMeshWarpRenderer {
       typeof ctx.getTransform === 'function'
     ) {
       const m = ctx.getTransform();
-      if (m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1 && m.e === 0 && m.f === 0) {
-        originX = Math.max(0, originX);
-        originY = Math.max(0, originY);
-        endX = Math.min(ctx.canvas.width, endX);
-        endY = Math.min(ctx.canvas.height, endY);
+      if (m.a === 1 && m.b === 0 && m.c === 0 && m.d === 1) {
+        originX = Math.max(Math.floor(-m.e), originX);
+        originY = Math.max(Math.floor(-m.f), originY);
+        endX = Math.min(Math.ceil(ctx.canvas.width - m.e), endX);
+        endY = Math.min(Math.ceil(ctx.canvas.height - m.f), endY);
       }
     }
 
@@ -471,12 +634,13 @@ class WebGlMeshWarpRenderer {
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
     gl.uniform1i(this.texLoc, 0);
     gl.uniform2f(this.originLoc, originX, originY);
     gl.uniform2f(this.sizeLoc, outW, outH);
+    gl.uniform2f(this.texSizeLoc, sw, sh);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
     gl.bufferData(gl.ARRAY_BUFFER, buf.subarray(0, neededFloats), gl.STREAM_DRAW);
@@ -630,8 +794,8 @@ export function createDefaultPerspectiveQuad(
     const rx = px - cx;
     const ry = py - cy;
     return {
-      x: Math.round(cx + rx * cos - ry * sin),
-      y: Math.round(cy + rx * sin + ry * cos),
+      x: cx + rx * cos - ry * sin,
+      y: cy + rx * sin + ry * cos,
     };
   };
 
@@ -645,6 +809,7 @@ export function createDefaultPerspectiveQuad(
 
 /**
  * Creates a default grid of (rows x cols) control points interpolated from 4 corners.
+ * Preserves exact floating-point coordinates so an unmodified mesh is a lossless identity warp.
  */
 export function createDefaultMeshPoints(
   quad: [Point2D, Point2D, Point2D, Point2D],
@@ -662,12 +827,32 @@ export function createDefaultMeshPoints(
       // Bilinear interpolation across corners
       const x = (1 - u) * (1 - v) * q0.x + u * (1 - v) * q1.x + u * v * q2.x + (1 - u) * v * q3.x;
       const y = (1 - u) * (1 - v) * q0.y + u * (1 - v) * q1.y + u * v * q2.y + (1 - u) * v * q3.y;
-      row.push({ x: Math.round(x), y: Math.round(y) });
+      row.push({ x, y });
     }
     points.push(row);
   }
 
   return points;
+}
+
+/**
+ * Computes adaptive per-cell mesh subdivision count to prevent polygonal faceting
+ * and UV shearing on large or sharply curved warps.
+ */
+export function computeMeshSubdivisions(
+  sourceWidth: number,
+  sourceHeight: number,
+  meshPoints: Point2D[][],
+  highQuality: boolean
+): number {
+  const rows = Math.max(2, meshPoints.length);
+  const cols = Math.max(2, meshPoints[0]?.length || 2);
+  const maxSpan = Math.max(sourceWidth, sourceHeight);
+  const cells = Math.max(1, Math.min(rows - 1, cols - 1));
+  const targetPxPerSub = highQuality ? 20 : 32;
+  const minSub = highQuality ? 10 : 6;
+  const maxSub = highQuality ? 20 : 12;
+  return Math.max(minSub, Math.min(maxSub, Math.ceil(maxSpan / (cells * targetPxPerSub))));
 }
 
 /**
@@ -697,12 +882,72 @@ export function getPointsBounds(points: Point2D[]): {
     if (p.y > maxY) maxY = p.y;
   }
 
+  const minXF = Math.floor(minX);
+  const minYF = Math.floor(minY);
+  const maxXC = Math.ceil(maxX);
+  const maxYC = Math.ceil(maxY);
+
   return {
-    minX: Math.floor(minX),
-    minY: Math.floor(minY),
-    maxX: Math.ceil(maxX),
-    maxY: Math.ceil(maxY),
-    width: Math.max(1, Math.ceil(maxX - minX)),
-    height: Math.max(1, Math.ceil(maxY - minY)),
+    minX: minXF,
+    minY: minYF,
+    maxX: maxXC,
+    maxY: maxYC,
+    width: Math.max(1, maxXC - minXF),
+    height: Math.max(1, maxYC - minYF),
+  };
+}
+
+/**
+ * Calculates tight bounding box of an evaluated Catmull-Rom mesh surface,
+ * preventing spline overshoot clipping in preview and final commit.
+ */
+export function getMeshSurfaceBounds(
+  meshPoints: Point2D[][],
+  subPerCell = 6
+): {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  width: number;
+  height: number;
+} {
+  const rows = meshPoints.length;
+  const cols = meshPoints[0]?.length || 0;
+  if (rows < 2 || cols < 2) {
+    return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };
+  }
+
+  const totalRows = (rows - 1) * subPerCell;
+  const totalCols = (cols - 1) * subPerCell;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  for (let j = 0; j <= totalRows; j++) {
+    const v = j / totalRows;
+    for (let i = 0; i <= totalCols; i++) {
+      const u = i / totalCols;
+      const p = evaluateMeshSurface(meshPoints, u, v);
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+  }
+
+  const minXF = Math.floor(minX);
+  const minYF = Math.floor(minY);
+  const maxXC = Math.ceil(maxX);
+  const maxYC = Math.ceil(maxY);
+
+  return {
+    minX: minXF,
+    minY: minYF,
+    maxX: maxXC,
+    maxY: maxYC,
+    width: Math.max(1, maxXC - minXF),
+    height: Math.max(1, maxYC - minYF),
   };
 }

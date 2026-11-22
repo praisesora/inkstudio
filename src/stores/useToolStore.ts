@@ -11,8 +11,15 @@ import {
   VectorEditSettings,
   LiquifySettings,
   ShapeSettings,
+  GradientSettings,
+  GradientMeshState,
+  RetouchSettings,
+  PenToolSettings,
+  Point2D,
 } from '../types/editor';
 import { DEFAULT_SHAPE_SETTINGS } from '../utils/shapeEngine';
+import { DEFAULT_GRADIENT_SETTINGS } from '../utils/gradientEngine';
+import { DEFAULT_RETOUCH_SETTINGS } from '../utils/retouchEngine';
 import {
   saveBrushSettingsDebounced,
   getEffectiveBrushSettings,
@@ -51,6 +58,15 @@ export interface ToolStoreState {
   vectorEditSettings: VectorEditSettings;
   liquifySettings: LiquifySettings;
   shapeSettings: ShapeSettings;
+  gradientSettings: GradientSettings;
+  retouchSettings: RetouchSettings;
+  penSettings: PenToolSettings;
+  activeGradientMesh: GradientMeshState | null;
+  isPickingCloneSource: boolean;
+  cloneSourceAnchor: Point2D | null;
+  activePenPointCount: number;
+  activePenClosed: boolean;
+  activePenSelectedAnchor: number | null;
 }
 
 const DEFAULT_RECENT_COLORS = [
@@ -117,6 +133,66 @@ function loadInitialShapeSettings(): ShapeSettings {
     // Ignore storage errors
   }
   return { ...DEFAULT_SHAPE_SETTINGS };
+}
+
+const DEFAULT_PEN_SETTINGS: PenToolSettings = {
+  mode: 'draw',
+  strokeWidth: 4,
+  opacity: 1,
+  strokeEnabled: true,
+  fillEnabled: false,
+  fillColorMode: 'secondary',
+  customFillColor: '#ffffff',
+  rubberBandPreview: true,
+};
+
+function loadInitialGradientSettings(): GradientSettings {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('ink_studio_gradient_settings');
+      if (saved) {
+        const parsed = JSON.parse(saved) as Partial<GradientSettings>;
+        return {
+          ...DEFAULT_GRADIENT_SETTINGS,
+          ...parsed,
+          stops:
+            Array.isArray(parsed.stops) && parsed.stops.length >= 2
+              ? parsed.stops
+              : DEFAULT_GRADIENT_SETTINGS.stops.map((s) => ({ ...s })),
+        };
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return {
+    ...DEFAULT_GRADIENT_SETTINGS,
+    stops: DEFAULT_GRADIENT_SETTINGS.stops.map((s) => ({ ...s })),
+  };
+}
+
+function loadInitialRetouchSettings(): RetouchSettings {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('ink_studio_retouch_settings');
+      if (saved) return { ...DEFAULT_RETOUCH_SETTINGS, ...(JSON.parse(saved) as Partial<RetouchSettings>) };
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return { ...DEFAULT_RETOUCH_SETTINGS };
+}
+
+function loadInitialPenSettings(): PenToolSettings {
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('ink_studio_pen_settings');
+      if (saved) return { ...DEFAULT_PEN_SETTINGS, ...(JSON.parse(saved) as Partial<PenToolSettings>) };
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return { ...DEFAULT_PEN_SETTINGS };
 }
 
 const createInitialToolState = (): ToolStoreState => {
@@ -188,6 +264,15 @@ const createInitialToolState = (): ToolStoreState => {
     },
     liquifySettings: loadInitialLiquifySettings(),
     shapeSettings: loadInitialShapeSettings(),
+    gradientSettings: loadInitialGradientSettings(),
+    retouchSettings: loadInitialRetouchSettings(),
+    penSettings: loadInitialPenSettings(),
+    activeGradientMesh: null,
+    isPickingCloneSource: false,
+    cloneSourceAnchor: null,
+    activePenPointCount: 0,
+    activePenClosed: false,
+    activePenSelectedAnchor: null,
   };
 };
 
@@ -540,4 +625,86 @@ export const toolStoreActions = {
       return { shapeSettings: next };
     });
   },
+
+  updateGradientSettings(patch: Partial<GradientSettings>): void {
+    useToolStore.setState((prev) => {
+      const next = { ...prev.gradientSettings, ...patch };
+      safeLocalStorageSetItem('ink_studio_gradient_settings', JSON.stringify(next), 'gradient settings');
+      return { gradientSettings: next };
+    });
+  },
+
+  updateRetouchSettings(patch: Partial<RetouchSettings>): void {
+    useToolStore.setState((prev) => {
+      const next = { ...prev.retouchSettings, ...patch };
+      safeLocalStorageSetItem('ink_studio_retouch_settings', JSON.stringify(next), 'retouch settings');
+      return { retouchSettings: next };
+    });
+  },
+
+  updatePenSettings(patch: Partial<PenToolSettings>): void {
+    useToolStore.setState((prev) => {
+      const next = { ...prev.penSettings, ...patch };
+      safeLocalStorageSetItem('ink_studio_pen_settings', JSON.stringify(next), 'pen settings');
+      return { penSettings: next };
+    });
+  },
+
+  setActiveGradientMesh(
+    updater:
+      | GradientMeshState
+      | null
+      | ((prev: GradientMeshState | null) => GradientMeshState | null)
+  ): void {
+    useToolStore.setState((prev) => ({
+      activeGradientMesh:
+        typeof updater === 'function' ? updater(prev.activeGradientMesh) : updater,
+    }));
+  },
+
+  updateActiveGradientMeshNode(index: number, patch: { color?: string; opacity?: number }): void {
+    useToolStore.setState((prev) => {
+      const mesh = prev.activeGradientMesh;
+      if (!mesh || index < 0 || index >= mesh.nodes.length) return prev;
+      return {
+        activeGradientMesh: {
+          ...mesh,
+          nodes: mesh.nodes.map((n, i) => (i === index ? { ...n, ...patch } : n)),
+        },
+      };
+    });
+  },
+
+  setIsPickingCloneSource(picking: boolean): void {
+    useToolStore.setState({ isPickingCloneSource: picking });
+  },
+
+  setCloneSourceAnchor(anchor: Point2D | null): void {
+    useToolStore.setState({ cloneSourceAnchor: anchor });
+  },
+
+  setActivePenSessionMeta(
+    pointCount: number,
+    closed: boolean,
+    selectedAnchor: number | null
+  ): void {
+    useToolStore.setState({
+      activePenPointCount: pointCount,
+      activePenClosed: closed,
+      activePenSelectedAnchor: selectedAnchor,
+    });
+  },
 };
+
+export interface InteractiveToolActionsBridge {
+  initGradientMesh?: () => void;
+  applyGradientMesh?: () => void;
+  cancelGradientMesh?: () => void;
+  commitPenPath?: () => void;
+  cancelPenPath?: () => void;
+  toggleClosePenPath?: () => void;
+  deleteSelectedPenAnchor?: () => void;
+  toggleSelectedPenAnchorSmooth?: () => void;
+}
+
+export const interactiveToolBridge: InteractiveToolActionsBridge = {};
