@@ -1,6 +1,11 @@
-mod server;
+mod clip_parser;
+mod doc_wire;
+mod psd_parser;
+mod raster_ops;
 mod recovery;
 mod scratch_disk;
+mod server;
+mod tablet_input;
 mod timelapse;
 
 use server::{
@@ -91,12 +96,12 @@ fn sanitize_id(raw: &str) -> String {
 }
 
 const ALLOWED_DOCUMENT_EXTS: &[&str] = &[
-    "sora", "ink", "inkb", "psd", "psb", "clip", "csp", "sut", "png", "jpg", "jpeg", "webp", "bmp",
-    "gif", "svg", "avif", "ico", "glb", "gltf", "obj",
+    "ink", "inkb", "psd", "psb", "clip", "csp", "sut", "png", "jpg", "jpeg", "webp", "bmp", "gif",
+    "svg", "avif", "ico", "glb", "gltf", "obj", "sora", // .sora: read-only legacy migrator
 ];
 
 const DELETE_ALLOWED_EXTS: &[&str] = &[
-    "sora", "ink", "psd", "psb", "clip", "csp", "png", "jpg", "jpeg", "webp", "bmp", "gif", "svg",
+    "ink", "psd", "psb", "clip", "csp", "png", "jpg", "jpeg", "webp", "bmp", "gif", "svg",
 ];
 
 const MAX_READ_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512 MB ceiling
@@ -533,6 +538,305 @@ async fn timelapse_export_ffmpeg(
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+#[tauri::command]
+async fn parse_clip_file(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let body = raw_body(&request)?;
+    if body.len() as u64 > MAX_READ_FILE_BYTES {
+        return Err("CLIP file exceeds 512 MB safety limit".to_string());
+    }
+    let owned = body.to_vec();
+    let wire = tokio::task::spawn_blocking(move || clip_parser::parse_clip_to_binary(&owned))
+        .await
+        .map_err(|e| format!("CLIP parser worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(wire))
+}
+
+#[tauri::command]
+async fn parse_sut_sqlite(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let body = raw_body(&request)?;
+    if body.len() as u64 > MAX_READ_FILE_BYTES {
+        return Err("SUT file exceeds 512 MB safety limit".to_string());
+    }
+    let owned = body.to_vec();
+    let wire = tokio::task::spawn_blocking(move || clip_parser::extract_sut_sqlite_binary(&owned))
+        .await
+        .map_err(|e| format!("SUT parser worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(wire))
+}
+
+#[tauri::command]
+async fn parse_psd_file(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let body = raw_body(&request)?;
+    if body.len() as u64 > MAX_READ_FILE_BYTES {
+        return Err("PSD/PSB file exceeds 512 MB safety limit".to_string());
+    }
+    let owned = body.to_vec();
+    let wire = tokio::task::spawn_blocking(move || psd_parser::parse_psd_to_binary(&owned))
+        .await
+        .map_err(|e| format!("PSD parser worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(wire))
+}
+
+#[tauri::command]
+async fn native_apply_filter(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let filter_type = header_str(&request, "x-filter-type")?;
+    let width: usize = header_parse(&request, "x-width")?;
+    let height: usize = header_parse(&request, "x-height")?;
+    let p_a: f32 = header_parse(&request, "x-param-a").unwrap_or(0.0);
+    let p_b: f32 = header_parse(&request, "x-param-b").unwrap_or(0.0);
+    let p_c: f32 = header_parse(&request, "x-param-c").unwrap_or(0.0);
+    let p_d: u32 = header_parse(&request, "x-param-d").unwrap_or(0);
+    let body = raw_body(&request)?;
+    if body.len() > raster_ops::MAX_RASTER_BYTES {
+        return Err("Filter payload exceeds raster safety ceiling".to_string());
+    }
+    let owned = body.to_vec();
+    let out = tokio::task::spawn_blocking(move || match filter_type.as_str() {
+        "gaussian-blur" => raster_ops::gaussian_blur_rgba(&owned, width, height, p_a),
+        "motion-blur" => raster_ops::motion_blur_rgba(&owned, width, height, p_a, p_b),
+        "unsharp-mask" => raster_ops::unsharp_mask_rgba(&owned, width, height, p_a, p_b, p_c),
+        "film-grain" => raster_ops::film_grain_rgba(
+            &owned,
+            width,
+            height,
+            p_a,
+            p_b.round().max(1.0) as u32,
+            p_c > 0.5,
+            p_d,
+        ),
+        other => Err(format!("Unsupported filter type: {}", other)),
+    })
+    .await
+    .map_err(|e| format!("Filter worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+async fn native_flood_fill(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let width: usize = header_parse(&request, "x-width")?;
+    let height: usize = header_parse(&request, "x-height")?;
+    let start_x: i32 = header_parse(&request, "x-start-x")?;
+    let start_y: i32 = header_parse(&request, "x-start-y")?;
+    let fill_packed: u32 = header_parse(&request, "x-fill-rgba")?;
+    let tolerance: f32 = header_parse(&request, "x-tolerance").unwrap_or(32.0);
+    let close_gap: u32 = header_parse(&request, "x-close-gap").unwrap_or(0);
+    let area_scale: i32 = header_parse(&request, "x-area-scale").unwrap_or(0);
+    let anti_alias: bool = header_parse::<u8>(&request, "x-anti-alias").unwrap_or(0) != 0;
+    let same_surface: bool = header_parse::<u8>(&request, "x-same-surface").unwrap_or(1) != 0;
+    let has_mask: bool = header_parse::<u8>(&request, "x-has-mask").unwrap_or(0) != 0;
+
+    let total_pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| "FloodFill dimensions overflow".to_string())?;
+    let rgba_bytes = total_pixels
+        .checked_mul(4)
+        .ok_or_else(|| "FloodFill byte size overflow".to_string())?;
+    let expected = rgba_bytes
+        .checked_add(if same_surface { 0 } else { rgba_bytes })
+        .and_then(|n| n.checked_add(if has_mask { total_pixels } else { 0 }))
+        .ok_or_else(|| "FloodFill payload size overflow".to_string())?;
+
+    let body = raw_body(&request)?;
+    if body.len() != expected {
+        return Err("FloodFill binary payload size mismatch".to_string());
+    }
+    let owned = body.to_vec();
+    let params = raster_ops::FloodFillParams {
+        width,
+        height,
+        start_x,
+        start_y,
+        fill_rgba: [
+            ((fill_packed >> 24) & 0xff) as u8,
+            ((fill_packed >> 16) & 0xff) as u8,
+            ((fill_packed >> 8) & 0xff) as u8,
+            (fill_packed & 0xff) as u8,
+        ],
+        tolerance,
+        close_gap,
+        area_scale,
+        anti_alias,
+        same_surface,
+    };
+
+    let out = tokio::task::spawn_blocking(move || {
+        let ref_slice = &owned[..rgba_bytes];
+        let mut off = rgba_bytes;
+        let target_opt = if same_surface {
+            None
+        } else {
+            let s = &owned[off..off + rgba_bytes];
+            off += rgba_bytes;
+            Some(s)
+        };
+        let mask_opt = if has_mask {
+            Some(&owned[off..off + total_pixels])
+        } else {
+            None
+        };
+        raster_ops::flood_fill_rgba(ref_slice, target_opt, mask_opt, &params)
+    })
+    .await
+    .map_err(|e| format!("FloodFill worker failed: {}", e))??;
+
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+async fn native_liquify_step(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let roi_w: usize = header_parse(&request, "x-roi-w")?;
+    let roi_h: usize = header_parse(&request, "x-roi-h")?;
+    let min_x: f32 = header_parse(&request, "x-min-x")?;
+    let min_y: f32 = header_parse(&request, "x-min-y")?;
+    let cx: f32 = header_parse(&request, "x-cx")?;
+    let cy: f32 = header_parse(&request, "x-cy")?;
+    let ux: f32 = header_parse(&request, "x-ux").unwrap_or(0.0);
+    let uy: f32 = header_parse(&request, "x-uy").unwrap_or(0.0);
+    let v_len: f32 = header_parse(&request, "x-vlen").unwrap_or(0.0);
+    let radius: f32 = header_parse(&request, "x-radius")?;
+    let hardness: f32 = header_parse(&request, "x-hardness")?;
+    let strength: f32 = header_parse(&request, "x-strength")?;
+    let mode_u8: u8 = header_parse(&request, "x-mode")?;
+    let has_init: bool = header_parse::<u8>(&request, "x-has-init").unwrap_or(0) != 0;
+    let has_mask: bool = header_parse::<u8>(&request, "x-has-mask").unwrap_or(0) != 0;
+
+    let mode = raster_ops::LiquifyMode::from_u8(mode_u8)?;
+    let roi_pixels = roi_w
+        .checked_mul(roi_h)
+        .ok_or_else(|| "Liquify ROI dimensions overflow".to_string())?;
+    let roi_bytes = roi_pixels
+        .checked_mul(4)
+        .ok_or_else(|| "Liquify ROI byte size overflow".to_string())?;
+    let expected = roi_bytes
+        .checked_add(if has_init { roi_bytes } else { 0 })
+        .and_then(|n| n.checked_add(if has_mask { roi_pixels } else { 0 }))
+        .ok_or_else(|| "Liquify payload size overflow".to_string())?;
+
+    let body = raw_body(&request)?;
+    if body.len() != expected {
+        return Err("Liquify binary payload size mismatch".to_string());
+    }
+    let owned = body.to_vec();
+    let params = raster_ops::LiquifyStepParams {
+        roi_w,
+        roi_h,
+        min_x,
+        min_y,
+        cx,
+        cy,
+        ux,
+        uy,
+        v_len,
+        radius,
+        hardness,
+        strength,
+        mode,
+    };
+
+    let out = tokio::task::spawn_blocking(move || {
+        let src_roi = &owned[..roi_bytes];
+        let mut off = roi_bytes;
+        let init_opt = if has_init {
+            let s = &owned[off..off + roi_bytes];
+            off += roi_bytes;
+            Some(s)
+        } else {
+            None
+        };
+        let mask_opt = if has_mask {
+            Some(&owned[off..off + roi_pixels])
+        } else {
+            None
+        };
+        raster_ops::liquify_step_rgba(src_roi, init_opt, mask_opt, &params)
+    })
+    .await
+    .map_err(|e| format!("Liquify worker failed: {}", e))??;
+
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+async fn native_compress_tiles_lz4(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let owned = raw_body(&request)?.to_vec();
+    let out = tokio::task::spawn_blocking(move || raster_ops::compress_tiles_lz4_batch(&owned))
+        .await
+        .map_err(|e| format!("LZ4 compress worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+async fn native_decompress_tiles_lz4(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let owned = raw_body(&request)?.to_vec();
+    let out = tokio::task::spawn_blocking(move || raster_ops::decompress_tiles_lz4_batch(&owned))
+        .await
+        .map_err(|e| format!("LZ4 decompress worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+async fn native_flate_compress(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let op = header_str(&request, "x-op")?;
+    let level: u32 = header_parse(&request, "x-level").unwrap_or(1);
+    let owned = raw_body(&request)?.to_vec();
+    let out = tokio::task::spawn_blocking(move || raster_ops::flate_compress(&op, &owned, level))
+        .await
+        .map_err(|e| format!("Flate compress worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+async fn native_flate_decompress(
+    request: tauri::ipc::Request<'_>,
+) -> Result<tauri::ipc::Response, String> {
+    let op = header_str(&request, "x-op")?;
+    let max_out: usize = header_parse(&request, "x-max-output-bytes")
+        .unwrap_or(raster_ops::MAX_RASTER_BYTES);
+    let owned = raw_body(&request)?.to_vec();
+    let out =
+        tokio::task::spawn_blocking(move || raster_ops::flate_decompress(&op, &owned, max_out))
+            .await
+            .map_err(|e| format!("Flate decompress worker failed: {}", e))??;
+    Ok(tauri::ipc::Response::new(out))
+}
+
+#[tauri::command]
+fn tablet_start_input(
+    window: tauri::WebviewWindow,
+    mode: Option<String>,
+    on_samples: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Result<tablet_input::TabletStatus, String> {
+    tablet_input::start_tablet_input(&window, mode.as_deref().unwrap_or("auto"), on_samples)
+}
+
+#[tauri::command]
+fn tablet_stop_input() {
+    tablet_input::stop_tablet_input();
+}
+
+#[tauri::command]
+fn tablet_get_status() -> tablet_input::TabletStatus {
+    tablet_input::get_tablet_status()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Disable Windows 11 WebView2 Shell Handwriting / DirectInk overlay so stylus input on
@@ -608,13 +912,27 @@ pub fn run() {
             timelapse_read_frame,
             timelapse_clear,
             timelapse_check_ffmpeg,
-            timelapse_export_ffmpeg
+            timelapse_export_ffmpeg,
+            parse_clip_file,
+            parse_sut_sqlite,
+            parse_psd_file,
+            native_apply_filter,
+            native_flood_fill,
+            native_liquify_step,
+            native_compress_tiles_lz4,
+            native_decompress_tiles_lz4,
+            native_flate_compress,
+            native_flate_decompress,
+            tablet_start_input,
+            tablet_stop_input,
+            tablet_get_status
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
     app.run(|_app_handle, event| {
         if let tauri::RunEvent::Exit = event {
+            tablet_input::stop_tablet_input();
             server::shutdown_sync();
         }
     });
@@ -638,7 +956,7 @@ mod tests {
         std::fs::create_dir_all(&allowed_dir).unwrap();
         std::fs::create_dir_all(&outside_dir).unwrap();
 
-        let inside_file = allowed_dir.join("art.sora");
+        let inside_file = allowed_dir.join("art.ink");
         let outside_file = outside_dir.join("secret.png");
         std::fs::write(&inside_file, b"ok").unwrap();
         std::fs::write(&outside_file, b"secret").unwrap();
@@ -677,13 +995,13 @@ mod tests {
             .is_err());
 
         // Non-existent file outside allowed dir returns Access Denied (no existence oracle)
-        let missing_outside = outside_dir.join("missing.sora");
+        let missing_outside = outside_dir.join("missing.ink");
         assert!(validate_delete_path(missing_outside.to_str().unwrap(), &allowed_dirs)
             .await
             .is_err());
 
         // Non-existent file inside allowed dir returns Ok(None)
-        let missing_inside = allowed_dir.join("missing.sora");
+        let missing_inside = allowed_dir.join("missing.ink");
         assert_eq!(
             validate_delete_path(missing_inside.to_str().unwrap(), &allowed_dirs)
                 .await

@@ -7,6 +7,11 @@
  */
 
 import { deflateSync, inflateSync, zlibSync, unzlibSync } from 'fflate';
+import {
+  flateCompressNative,
+  flateDecompressNative,
+  isNativeRustAvailable,
+} from './nativeBackend';
 import type {
   CompressionOp,
   CompressionRequest,
@@ -205,6 +210,9 @@ export function deflateAsync(
   data: Uint8Array,
   options?: AsyncCompressionOptions
 ): Promise<Uint8Array> {
+  if (isNativeRustAvailable()) {
+    return flateCompressNative('deflate', data, options?.level ?? 1);
+  }
   return dispatchToWorker('deflate', data, options);
 }
 
@@ -212,6 +220,9 @@ export function inflateAsync(
   data: Uint8Array,
   options?: AsyncCompressionOptions
 ): Promise<Uint8Array> {
+  if (isNativeRustAvailable()) {
+    return flateDecompressNative('inflate', data, options?.maxOutputBytes);
+  }
   return dispatchToWorker('inflate', data, options);
 }
 
@@ -219,6 +230,9 @@ export function zlibAsync(
   data: Uint8Array,
   options?: AsyncCompressionOptions
 ): Promise<Uint8Array> {
+  if (isNativeRustAvailable()) {
+    return flateCompressNative('zlib', data, options?.level ?? 1);
+  }
   return dispatchToWorker('zlib', data, options);
 }
 
@@ -226,6 +240,9 @@ export function unzlibAsync(
   data: Uint8Array,
   options?: AsyncCompressionOptions
 ): Promise<Uint8Array> {
+  if (isNativeRustAvailable()) {
+    return flateDecompressNative('unzlib', data, options?.maxOutputBytes);
+  }
   return dispatchToWorker('unzlib', data, options);
 }
 

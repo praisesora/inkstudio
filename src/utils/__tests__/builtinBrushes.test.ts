@@ -5,9 +5,12 @@ import {
   getBuiltinBrushConfig,
 } from '../presetBrushes';
 import { getEffectiveBrushSettings } from '../brushPresetManager';
-import { applyCspPaperTextureAlpha } from '../../engine/CspBrushEngine';
+import {
+  applyCspPaperTextureAlpha,
+  drawBrushCubicBezierSegment,
+  BrushRenderOptions,
+} from '../../engine/BrushEngine';
 import { PaintReservoir } from '../colorMixingEngine';
-import { drawTexturedCubicBezierSegment, TexturedBrushOptions } from '../stampEngine';
 import { Point } from '../../types/editor';
 
 function createMockCanvas(width: number = 128, height: number = 128) {
@@ -200,17 +203,18 @@ describe('Pre-Installed Standard Brushes & Realistic Physics', () => {
     const b68 = getBuiltinBrushConfig('pencil-6b-8b')!;
     const cUp = createMockCanvas(200, 200);
     const cTilt = createMockCanvas(200, 200);
-    const b68Opts: TexturedBrushOptions = {
+    const b68Opts: BrushRenderOptions = {
       size: b68.size!,
       flow: b68.flow,
       spacing: 0.2,
       useTilt: b68.useTilt,
       tiltScale: b68.tiltScale,
       thickness: b68.thickness,
+      tipImage: mockTip,
       useGpu: false,
     };
-    drawTexturedCubicBezierSegment(cUp.getContext('2d'), ...uprightPts, '#111111', mockTip, b68Opts);
-    drawTexturedCubicBezierSegment(cTilt.getContext('2d'), ...tiltedPts, '#111111', mockTip, b68Opts);
+    drawBrushCubicBezierSegment(cUp.getContext('2d'), ...uprightPts, '#111111', b68Opts);
+    drawBrushCubicBezierSegment(cTilt.getContext('2d'), ...tiltedPts, '#111111', b68Opts);
 
     const avgUpW = cUp.drawnDabs.reduce((s, d) => s + d.width, 0) / cUp.drawnDabs.length;
     const avgTiltW = cTilt.drawnDabs.reduce((s, d) => s + d.width, 0) / cTilt.drawnDabs.length;
@@ -223,16 +227,17 @@ describe('Pre-Installed Standard Brushes & Realistic Physics', () => {
     const mech = getBuiltinBrushConfig('mechanical-pencil')!;
     const mUp = createMockCanvas(200, 200);
     const mTilt = createMockCanvas(200, 200);
-    const mechOpts: TexturedBrushOptions = {
+    const mechOpts: BrushRenderOptions = {
       size: mech.size!,
       flow: mech.flow,
       spacing: 0.2,
       useTilt: mech.useTilt,
       tiltScale: mech.tiltScale,
+      tipImage: mockTip,
       useGpu: false,
     };
-    drawTexturedCubicBezierSegment(mUp.getContext('2d'), ...uprightPts, '#111111', mockTip, mechOpts);
-    drawTexturedCubicBezierSegment(mTilt.getContext('2d'), ...tiltedPts, '#111111', mockTip, mechOpts);
+    drawBrushCubicBezierSegment(mUp.getContext('2d'), ...uprightPts, '#111111', mechOpts);
+    drawBrushCubicBezierSegment(mTilt.getContext('2d'), ...tiltedPts, '#111111', mechOpts);
 
     const mUpW = mUp.drawnDabs.reduce((s, d) => s + d.width, 0) / mUp.drawnDabs.length;
     const mTiltW = mTilt.drawnDabs.reduce((s, d) => s + d.width, 0) / mTilt.drawnDabs.length;

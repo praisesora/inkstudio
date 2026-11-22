@@ -1,4 +1,16 @@
-import { CanvasSelection, LayerItem, isFolderLikeLayer } from '../types/editor';
+import { CanvasDimensions, CanvasSelection, LayerItem, isFolderLikeLayer } from '../types/editor';
+import { isNativeRustAvailable, liquifyStepNative } from './nativeBackend';
+import {
+  BYTES_32BIT,
+  SparseTileGrid,
+  TILE_SIZE,
+  TileFormat,
+  TileSnapshotEntry,
+  getTileKey,
+  pixelToTileCoord,
+  unpack1BitToRGBA,
+  unpack8BitToRGBA,
+} from './tileEngine';
 
 export type LiquifyMode =
   | 'push'
@@ -652,4 +664,391 @@ export function resolveLiquifyTargetLayers(
   }
 
   return layers.filter(isEditableRaster);
+}
+
+export interface TileGridLiquifyStepParams {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  targetFormat: TileFormat;
+  cx: number;
+  cy: number;
+  prevX: number;
+  prevY: number;
+  settings: LiquifySettings;
+  pressure?: number;
+  beforeTileSnapshot: Map<string, TileSnapshotEntry>;
+  selectionMask?: Uint8Array | null;
+}
+
+/**
+ * Tile-native liquify step: reads ONLY the brush ROI from SparseTileGrid,
+ * lazily snapshots touched tiles before first mutation, performs bilinear displacement
+ * (or reconstructs from beforeTileSnapshot), and writes ONLY the ROI back to tiles.
+ * Zero full-document HTMLCanvasElement allocation.
+ */
+export function applyLiquifyStepOnTileGrid(params: TileGridLiquifyStepParams): DirtyRect | null {
+  const {
+    grid,
+    layerId,
+    dimensions,
+    targetFormat,
+    cx,
+    cy,
+    prevX,
+    prevY,
+    settings,
+    pressure = 1.0,
+    beforeTileSnapshot,
+    selectionMask,
+  } = params;
+
+  const width = dimensions.width;
+  const height = dimensions.height;
+  if (width <= 0 || height <= 0) return null;
+
+  const radius = Math.max(2, Math.round(settings.size / 2));
+  const radiusSq = radius * radius;
+  const pad = Math.min(32, Math.max(4, Math.ceil(radius * 0.2)));
+  const minX = Math.max(0, Math.floor(cx - radius - pad));
+  const minY = Math.max(0, Math.floor(cy - radius - pad));
+  const maxX = Math.min(width, Math.ceil(cx + radius + pad));
+  const maxY = Math.min(height, Math.ceil(cy + radius + pad));
+
+  const roiW = maxX - minX;
+  const roiH = maxY - minY;
+  if (roiW <= 0 || roiH <= 0) return null;
+
+  const vx = cx - prevX;
+  const vy = cy - prevY;
+  const vLen = Math.hypot(vx, vy);
+  let ux = 0;
+  let uy = 0;
+  if (vLen > 0.0001) {
+    ux = vx / vLen;
+    uy = vy / vLen;
+  }
+
+  const mode = settings.mode;
+  const isPushMode = mode === 'push' || mode === 'push-left' || mode === 'push-right';
+  if (isPushMode && vLen < 0.0001) return null;
+
+  const minTx = pixelToTileCoord(minX, 0);
+  const minTy = pixelToTileCoord(minY, 0);
+  const maxTx = pixelToTileCoord(maxX - 1, 0);
+  const maxTy = pixelToTileCoord(maxY - 1, 0);
+
+  // Skip completely empty ROI (unless reconstructing from a non-empty snapshot)
+  let hasAnyPixel = false;
+  for (let ty = minTy; ty <= maxTy && !hasAnyPixel; ty++) {
+    for (let tx = minTx; tx <= maxTx; tx++) {
+      if (grid.hasTile(layerId, tx, ty, 0)) {
+        hasAnyPixel = true;
+        break;
+      }
+      if (mode === 'reconstruct') {
+        const snap = beforeTileSnapshot.get(getTileKey(layerId, tx, ty, 0));
+        if (snap && snap.data) {
+          hasAnyPixel = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!hasAnyPixel) return null;
+
+  // Snapshot untouched tiles overlapping this ROI lazily before mutating
+  for (let ty = minTy; ty <= maxTy; ty++) {
+    for (let tx = minTx; tx <= maxTx; tx++) {
+      grid.snapshotSingleTileInto(layerId, tx, ty, beforeTileSnapshot);
+    }
+  }
+
+  const srcBuf = grid.readImageData(layerId, minX, minY, roiW, roiH);
+  const src = srcBuf.data;
+  const dst = new Uint8ClampedArray(src);
+
+  const hardnessFactor = Math.max(0, Math.min(1, settings.hardness / 100));
+  const effectivePressure = settings.usePressure ? Math.max(0.1, pressure) : 1.0;
+  const strengthFactor = (settings.strength / 100) * effectivePressure;
+  const twirlBaseAngle = (mode === 'twirl-cw' ? 1 : -1) * (strengthFactor * 0.45);
+
+  // Lazy unpacked cache of initial pre-stroke tiles when in reconstruct mode
+  let initRoiData: Uint8ClampedArray | null = null;
+  if (mode === 'reconstruct') {
+    initRoiData = new Uint8ClampedArray(roiW * roiH * 4);
+    const scratch = new Uint8ClampedArray(BYTES_32BIT);
+    for (let ty = minTy; ty <= maxTy; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      for (let tx = minTx; tx <= maxTx; tx++) {
+        const snap = beforeTileSnapshot.get(getTileKey(layerId, tx, ty, 0));
+        if (!snap || !snap.data) continue;
+        let tileRgba: Uint8ClampedArray;
+        if (snap.format === 'color-32bit') {
+          tileRgba = new Uint8ClampedArray(snap.data.buffer, snap.data.byteOffset, BYTES_32BIT);
+        } else if (snap.format === 'monochrome-1bit') {
+          unpack1BitToRGBA(snap.data, scratch);
+          tileRgba = scratch;
+        } else {
+          unpack8BitToRGBA(snap.data, scratch);
+          tileRgba = scratch;
+        }
+        const tileDocX = tx * TILE_SIZE;
+        const interX0 = Math.max(minX, tileDocX);
+        const interY0 = Math.max(minY, tileDocY);
+        const interX1 = Math.min(maxX, tileDocX + TILE_SIZE);
+        const interY1 = Math.min(maxY, tileDocY + TILE_SIZE);
+        const copyW = interX1 - interX0;
+        if (copyW <= 0 || interY1 <= interY0) continue;
+        for (let py = interY0; py < interY1; py++) {
+          const sOff = ((py - tileDocY) * TILE_SIZE + (interX0 - tileDocX)) << 2;
+          const dOff = ((py - minY) * roiW + (interX0 - minX)) << 2;
+          initRoiData.set(tileRgba.subarray(sOff, sOff + (copyW << 2)), dOff);
+        }
+      }
+    }
+  }
+
+  for (let ry = 0; ry < roiH; ry++) {
+    const py = minY + ry;
+    const dy = py - cy;
+    const rowOffset = ry * roiW * 4;
+
+    for (let rx = 0; rx < roiW; rx++) {
+      const px = minX + rx;
+      const dx = px - cx;
+      const distSq = dx * dx + dy * dy;
+      if (distSq >= radiusSq) continue;
+      if (selectionMask && selectionMask[py * width + px] === 0) continue;
+
+      const dist = Math.sqrt(distSq);
+      const weight = computeFalloffWeight(dist, radius, hardnessFactor);
+      if (weight <= 0) continue;
+
+      const dstIdx = rowOffset + rx * 4;
+
+      if (mode === 'reconstruct') {
+        if (!initRoiData) continue;
+        const alpha = Math.min(1, strengthFactor * weight * 0.35);
+        dst[dstIdx] = Math.round(dst[dstIdx] * (1 - alpha) + initRoiData[dstIdx] * alpha);
+        dst[dstIdx + 1] = Math.round(dst[dstIdx + 1] * (1 - alpha) + initRoiData[dstIdx + 1] * alpha);
+        dst[dstIdx + 2] = Math.round(dst[dstIdx + 2] * (1 - alpha) + initRoiData[dstIdx + 2] * alpha);
+        dst[dstIdx + 3] = Math.round(dst[dstIdx + 3] * (1 - alpha) + initRoiData[dstIdx + 3] * alpha);
+        continue;
+      }
+
+      let srcCanvasX = px;
+      let srcCanvasY = py;
+      if (mode === 'push') {
+        const pushAmount = vLen * strengthFactor * weight;
+        srcCanvasX = px - ux * pushAmount;
+        srcCanvasY = py - uy * pushAmount;
+      } else if (mode === 'push-left') {
+        const pushAmount = Math.max(1.5, vLen) * strengthFactor * weight;
+        srcCanvasX = px + uy * pushAmount;
+        srcCanvasY = py - ux * pushAmount;
+      } else if (mode === 'push-right') {
+        const pushAmount = Math.max(1.5, vLen) * strengthFactor * weight;
+        srcCanvasX = px - uy * pushAmount;
+        srcCanvasY = py + ux * pushAmount;
+      } else if (mode === 'expand') {
+        const factor = strengthFactor * weight * 0.3;
+        srcCanvasX = cx + dx * (1 - factor);
+        srcCanvasY = cy + dy * (1 - factor);
+      } else if (mode === 'pinch') {
+        const factor = strengthFactor * weight * 0.3;
+        srcCanvasX = cx + dx * (1 + factor);
+        srcCanvasY = cy + dy * (1 + factor);
+      } else if (mode === 'twirl-cw' || mode === 'twirl-ccw') {
+        const theta = twirlBaseAngle * weight;
+        const cosT = Math.cos(theta);
+        const sinT = Math.sin(theta);
+        srcCanvasX = cx + dx * cosT + dy * sinT;
+        srcCanvasY = cy - dx * sinT + dy * cosT;
+      }
+
+      const localSx = Math.max(0, Math.min(roiW - 1.0001, srcCanvasX - minX));
+      const localSy = Math.max(0, Math.min(roiH - 1.0001, srcCanvasY - minY));
+      const x0 = Math.floor(localSx);
+      const y0 = Math.floor(localSy);
+      const x1 = Math.min(roiW - 1, x0 + 1);
+      const y1 = Math.min(roiH - 1, y0 + 1);
+      const fx = localSx - x0;
+      const fy = localSy - y0;
+
+      const w00 = (1 - fx) * (1 - fy);
+      const w10 = fx * (1 - fy);
+      const w01 = (1 - fx) * fy;
+      const w11 = fx * fy;
+
+      const i00 = (y0 * roiW + x0) * 4;
+      const i10 = (y0 * roiW + x1) * 4;
+      const i01 = (y1 * roiW + x0) * 4;
+      const i11 = (y1 * roiW + x1) * 4;
+
+      dst[dstIdx] = Math.round(w00 * src[i00] + w10 * src[i10] + w01 * src[i01] + w11 * src[i11]);
+      dst[dstIdx + 1] = Math.round(w00 * src[i00 + 1] + w10 * src[i10 + 1] + w01 * src[i01 + 1] + w11 * src[i11 + 1]);
+      dst[dstIdx + 2] = Math.round(w00 * src[i00 + 2] + w10 * src[i10 + 2] + w01 * src[i01 + 2] + w11 * src[i11 + 2]);
+      dst[dstIdx + 3] = Math.round(w00 * src[i00 + 3] + w10 * src[i10 + 3] + w01 * src[i01 + 3] + w11 * src[i11 + 3]);
+    }
+  }
+
+  grid.writeImageData(layerId, { data: dst, width: roiW, height: roiH }, minX, minY, targetFormat, true);
+  return { x: minX, y: minY, width: roiW, height: roiH };
+}
+
+/**
+ * Async tile-native liquify step: offloads ROI bilinear displacement to the
+ * Rayon-parallel Rust backend when running in Tauri, falling back to sync JS on Web/Vitest.
+ */
+export async function applyLiquifyStepOnTileGridAsync(
+  params: TileGridLiquifyStepParams
+): Promise<DirtyRect | null> {
+  if (!isNativeRustAvailable()) {
+    return applyLiquifyStepOnTileGrid(params);
+  }
+
+  const {
+    grid,
+    layerId,
+    dimensions,
+    targetFormat,
+    cx,
+    cy,
+    prevX,
+    prevY,
+    settings,
+    pressure = 1.0,
+    beforeTileSnapshot,
+    selectionMask,
+  } = params;
+
+  const width = dimensions.width;
+  const height = dimensions.height;
+  if (width <= 0 || height <= 0) return null;
+
+  const radius = Math.max(2, Math.round(settings.size / 2));
+  const pad = Math.min(32, Math.max(4, Math.ceil(radius * 0.2)));
+  const minX = Math.max(0, Math.floor(cx - radius - pad));
+  const minY = Math.max(0, Math.floor(cy - radius - pad));
+  const maxX = Math.min(width, Math.ceil(cx + radius + pad));
+  const maxY = Math.min(height, Math.ceil(cy + radius + pad));
+
+  const roiW = maxX - minX;
+  const roiH = maxY - minY;
+  if (roiW <= 0 || roiH <= 0) return null;
+
+  const vx = cx - prevX;
+  const vy = cy - prevY;
+  const vLen = Math.hypot(vx, vy);
+  let ux = 0;
+  let uy = 0;
+  if (vLen > 0.0001) {
+    ux = vx / vLen;
+    uy = vy / vLen;
+  }
+
+  const mode = settings.mode;
+  const isPushMode = mode === 'push' || mode === 'push-left' || mode === 'push-right';
+  if (isPushMode && vLen < 0.0001) return null;
+
+  const minTx = pixelToTileCoord(minX, 0);
+  const minTy = pixelToTileCoord(minY, 0);
+  const maxTx = pixelToTileCoord(maxX - 1, 0);
+  const maxTy = pixelToTileCoord(maxY - 1, 0);
+
+  let hasAnyPixel = false;
+  for (let ty = minTy; ty <= maxTy && !hasAnyPixel; ty++) {
+    for (let tx = minTx; tx <= maxTx; tx++) {
+      if (grid.hasTile(layerId, tx, ty, 0)) {
+        hasAnyPixel = true;
+        break;
+      }
+      if (mode === 'reconstruct') {
+        const snap = beforeTileSnapshot.get(getTileKey(layerId, tx, ty, 0));
+        if (snap && snap.data) {
+          hasAnyPixel = true;
+          break;
+        }
+      }
+    }
+  }
+  if (!hasAnyPixel) return null;
+
+  for (let ty = minTy; ty <= maxTy; ty++) {
+    for (let tx = minTx; tx <= maxTx; tx++) {
+      grid.snapshotSingleTileInto(layerId, tx, ty, beforeTileSnapshot);
+    }
+  }
+
+  const srcBuf = grid.readImageData(layerId, minX, minY, roiW, roiH);
+  const hardnessFactor = Math.max(0, Math.min(1, settings.hardness / 100));
+  const effectivePressure = settings.usePressure ? Math.max(0.1, pressure) : 1.0;
+  const strengthFactor = (settings.strength / 100) * effectivePressure;
+
+  let initRoiData: Uint8ClampedArray | null = null;
+  if (mode === 'reconstruct') {
+    initRoiData = new Uint8ClampedArray(roiW * roiH * 4);
+    const scratch = new Uint8ClampedArray(BYTES_32BIT);
+    for (let ty = minTy; ty <= maxTy; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      for (let tx = minTx; tx <= maxTx; tx++) {
+        const snap = beforeTileSnapshot.get(getTileKey(layerId, tx, ty, 0));
+        if (!snap || !snap.data) continue;
+        let tileRgba: Uint8ClampedArray;
+        if (snap.format === 'color-32bit') {
+          tileRgba = new Uint8ClampedArray(snap.data.buffer, snap.data.byteOffset, BYTES_32BIT);
+        } else if (snap.format === 'monochrome-1bit') {
+          unpack1BitToRGBA(snap.data, scratch);
+          tileRgba = scratch;
+        } else {
+          unpack8BitToRGBA(snap.data, scratch);
+          tileRgba = scratch;
+        }
+        const tileDocX = tx * TILE_SIZE;
+        const interX0 = Math.max(minX, tileDocX);
+        const interY0 = Math.max(minY, tileDocY);
+        const interX1 = Math.min(maxX, tileDocX + TILE_SIZE);
+        const interY1 = Math.min(maxY, tileDocY + TILE_SIZE);
+        const copyW = interX1 - interX0;
+        if (copyW <= 0 || interY1 <= interY0) continue;
+        for (let py = interY0; py < interY1; py++) {
+          const sOff = ((py - tileDocY) * TILE_SIZE + (interX0 - tileDocX)) << 2;
+          const dOff = ((py - minY) * roiW + (interX0 - minX)) << 2;
+          initRoiData.set(tileRgba.subarray(sOff, sOff + (copyW << 2)), dOff);
+        }
+      }
+    }
+  }
+
+  let selMaskRoi: Uint8Array | null = null;
+  if (selectionMask) {
+    selMaskRoi = new Uint8Array(roiW * roiH);
+    for (let ry = 0; ry < roiH; ry++) {
+      const sOff = (minY + ry) * width + minX;
+      selMaskRoi.set(selectionMask.subarray(sOff, sOff + roiW), ry * roiW);
+    }
+  }
+
+  const dst = await liquifyStepNative({
+    srcRoi: srcBuf.data,
+    initRoi: initRoiData,
+    selMaskRoi,
+    roiW,
+    roiH,
+    minX,
+    minY,
+    cx,
+    cy,
+    ux,
+    uy,
+    vLen,
+    radius,
+    hardness: hardnessFactor,
+    strength: strengthFactor,
+    mode,
+  });
+
+  grid.writeImageData(layerId, { data: dst, width: roiW, height: roiH }, minX, minY, targetFormat, true);
+  return { x: minX, y: minY, width: roiW, height: roiH };
 }

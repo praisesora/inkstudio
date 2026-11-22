@@ -1,5 +1,6 @@
-import { CanvasColorMode, CanvasSelection, DirtyRect } from '../types/editor';
+import { CanvasColorMode, CanvasDimensions, CanvasSelection, DirtyRect, TileDelta } from '../types/editor';
 import { createSelectionMask } from './tonalEngine';
+import { SparseTileGrid, TileFormat, TileSnapshotEntry, releaseTemporaryCanvas } from './tileEngine';
 
 export type ShapeKind =
   | 'line'
@@ -527,4 +528,107 @@ export function rasterizeShapeToCanvas(
   destCtx.drawImage(off, rx, ry);
 
   return { x: rx, y: ry, width: rw, height: rh };
+}
+
+/**
+ * Tile-native shape rasterizer: renders strictly into a tight dirty-rect canvas and
+ * composites directly into SparseTileGrid tiles with zero full-document canvas allocation.
+ */
+export function rasterizeShapeToTileGrid(
+  grid: SparseTileGrid,
+  layerId: string,
+  dimensions: CanvasDimensions,
+  preview: ShapeDragPreview,
+  strokeColor: string,
+  fillColor: string,
+  selection: CanvasSelection | null,
+  colorMode: CanvasColorMode,
+  isMonoLayer: boolean,
+  alphaLocked: boolean = false
+): { dirtyRect: DirtyRect | null; tileDeltas: TileDelta[] } {
+  const geom = computeShapeGeometry(
+    preview.start,
+    preview.end,
+    preview.settings,
+    preview.shiftKey,
+    preview.altKey
+  );
+  if (geom.length < 1 && geom.width < 1 && geom.height < 1) {
+    return { dirtyRect: null, tileDeltas: [] };
+  }
+
+  const cw = dimensions.width;
+  const ch = dimensions.height;
+  const pad = Math.ceil(
+    Math.max(preview.settings.strokeWidth * 4, preview.settings.shape === 'arrow' ? 40 : 12)
+  );
+  const rx = Math.max(0, Math.floor(geom.x - pad));
+  const ry = Math.max(0, Math.floor(geom.y - pad));
+  const maxX = Math.min(cw, Math.ceil(geom.x + geom.width + pad));
+  const maxY = Math.min(ch, Math.ceil(geom.y + geom.height + pad));
+  const rw = maxX - rx;
+  const rh = maxY - ry;
+  if (rw <= 0 || rh <= 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const off = document.createElement('canvas');
+  off.width = rw;
+  off.height = rh;
+  const offCtx = off.getContext('2d', { willReadFrequently: true });
+  if (!offCtx) {
+    releaseTemporaryCanvas(off);
+    return { dirtyRect: null, tileDeltas: [] };
+  }
+
+  try {
+    offCtx.save();
+    offCtx.translate(-rx, -ry);
+    drawShapeToContext(offCtx, preview, strokeColor, fillColor);
+    offCtx.restore();
+
+    const binaryEdges = !preview.settings.antiAlias || colorMode === 'monochrome' || isMonoLayer;
+    const selMask = selection ? createSelectionMask(selection, cw, ch) : null;
+    const img = offCtx.getImageData(0, 0, rw, rh);
+
+    if (binaryEdges || selMask) {
+      const d = img.data;
+      for (let y = 0; y < rh; y++) {
+        const gy = ry + y;
+        for (let x = 0; x < rw; x++) {
+          const idx = (y * rw + x) * 4;
+          if (selMask) {
+            const gx = rx + x;
+            const m = selMask[gy * cw + gx];
+            if (m === 0) {
+              d[idx + 3] = 0;
+              continue;
+            } else if (m < 255) {
+              d[idx + 3] = Math.round((d[idx + 3] * m) / 255);
+            }
+          }
+          if (binaryEdges) {
+            d[idx + 3] = d[idx + 3] >= 128 ? 255 : 0;
+          }
+        }
+      }
+    }
+
+    const targetFormat: TileFormat = isMonoLayer || colorMode === 'monochrome' ? 'monochrome-1bit' : 'color-32bit';
+    const beforeSnapshot = new Map<string, TileSnapshotEntry>();
+    grid.compositeStrokeToTiles({
+      layerId,
+      strokeData: img,
+      destX: rx,
+      destY: ry,
+      format: targetFormat,
+      compositeOp: alphaLocked ? 'source-atop' : 'source-over',
+      opacity: 1.0,
+      snapshotOut: beforeSnapshot,
+      suppressNotify: true,
+    });
+    const dirtyRect: DirtyRect = { x: rx, y: ry, width: rw, height: rh };
+    const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+    return { dirtyRect, tileDeltas };
+  } finally {
+    releaseTemporaryCanvas(off);
+  }
 }

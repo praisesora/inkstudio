@@ -9,6 +9,8 @@ import {
   X,
 } from 'lucide-react';
 import { AnimationTimeline as TimelineData, LayerItem, AnimationExportFormat } from '../types/editor';
+import { SparseTileGrid } from '../utils/tileEngine';
+import { documentStore } from '../utils/documentStore';
 import {
   exportAnimationToGif,
   exportAnimationToApng,
@@ -21,7 +23,7 @@ export interface AnimationTimelineProps {
   timeline: TimelineData;
   onChangeTimeline: (timeline: TimelineData) => void;
   layers: LayerItem[];
-  layerCanvasesMap?: Map<string, HTMLCanvasElement>;
+  tileGrid?: SparseTileGrid;
   dimensions: { width: number; height: number };
   onAddCel: (frameIndex: number) => void;
   onDeleteCel: (frameIndex: number) => void;
@@ -33,7 +35,7 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
   timeline,
   onChangeTimeline,
   layers,
-  layerCanvasesMap = new Map(),
+  tileGrid,
   dimensions,
   onAddCel,
   onDeleteCel,
@@ -191,18 +193,20 @@ export const AnimationTimeline: React.FC<AnimationTimelineProps> = ({
 
       let blob: Blob;
       let filename = `animation_${Date.now()}`;
+      const grid = tileGrid ?? documentStore.getActiveTileGrid();
+      const emptyMap = new Map<string, HTMLCanvasElement>();
 
       if (exportFormat === 'gif') {
-        blob = await exportAnimationToGif(timeline, layers, layerCanvasesMap, dimensions, onProgress);
+        blob = await exportAnimationToGif(timeline, layers, emptyMap, dimensions, onProgress, grid);
         filename += '.gif';
       } else if (exportFormat === 'apng') {
-        blob = await exportAnimationToApng(timeline, layers, layerCanvasesMap, dimensions, onProgress);
+        blob = await exportAnimationToApng(timeline, layers, emptyMap, dimensions, onProgress, grid);
         filename += '.png';
       } else if (exportFormat === 'webm' || exportFormat === 'mp4') {
-        blob = await exportAnimationToVideo(timeline, layers, layerCanvasesMap, dimensions, onProgress);
+        blob = await exportAnimationToVideo(timeline, layers, emptyMap, dimensions, onProgress, grid);
         filename += exportFormat === 'mp4' ? '.mp4' : '.webm';
       } else {
-        blob = await exportAnimationToPngZip(timeline, layers, layerCanvasesMap, dimensions, onProgress);
+        blob = await exportAnimationToPngZip(timeline, layers, emptyMap, dimensions, onProgress, grid);
         filename += '.zip';
       }
 

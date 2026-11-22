@@ -1,6 +1,7 @@
 import { AppSettings, loadAppSettings, saveAppSettings } from '../types/settings';
 import { CrashedSessionInfo } from '../services/recoveryService';
-import { TonalCorrectionType, ProcessingBounds } from '../utils/tonalEngine';
+import { TonalCorrectionType, ProcessingBounds, TileHistogramMap } from '../utils/tonalEngine';
+import type { TileSnapshotEntry } from '../utils/tileEngine';
 import { safeLocalStorageSetItem, setStorageQuotaNotifier } from '../utils/safeStorage';
 import { createStore } from './createStore';
 import { useUpdaterStore } from './useUpdaterStore';
@@ -9,7 +10,8 @@ export interface TonalModalState {
   isOpen: boolean;
   type: TonalCorrectionType;
   targetLayerId: string;
-  beforeImageData: ImageData | null;
+  beforeTileSnapshot: Map<string, TileSnapshotEntry> | null;
+  histograms: TileHistogramMap | null;
   selectionMask: Uint8Array | null;
   bounds: ProcessingBounds;
 }
@@ -61,7 +63,8 @@ const DEFAULT_TONAL_MODAL_STATE: TonalModalState = {
   isOpen: false,
   type: 'brightness-contrast',
   targetLayerId: '',
-  beforeImageData: null,
+  beforeTileSnapshot: null,
+  histograms: null,
   selectionMask: null,
   bounds: { x0: 0, y0: 0, x1: 0, y1: 0 },
 };

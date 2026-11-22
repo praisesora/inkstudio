@@ -9,12 +9,12 @@ import { COMPOSITOR_FRAGMENT_SHADER, COMPOSITOR_INSTANCED_FRAGMENT_SHADER } from
 import { extractCoalescedEvents } from '../../components/CanvasArea';
 import { LayerPixelSampler } from '../colorMixingEngine';
 import {
-  drawRadialDot,
-  drawRadialCubicBezierSegment,
-  renderCompleteRadialStroke,
+  drawBrushDot,
+  drawBrushCubicBezierSegment,
+  renderCompleteStroke,
   centripetalCatmullRomToBezier,
-  RadialMixingOptions,
-} from '../stampEngine';
+  BrushRenderOptions,
+} from '../../engine/BrushEngine';
 
 describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
   let grid: SparseTileGrid;
@@ -217,11 +217,18 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
       { x: 45, y: 25, pressure: 0.8, width: 14 },
       { x: 70, y: 30, pressure: 0.75, width: 13 },
     ];
-    const mixingOpts: RadialMixingOptions = {
+    const flow = 0.62;
+    const spacing = 0.05;
+    const hardness = 0.55;
+    const mixingOpts: BrushRenderOptions = {
+      hardness,
+      flow,
+      spacing,
       blendTipsMode: 'darken',
       adjustDensityByGap: true,
       grain: 0.35,
       useTilt: false,
+      useGpu: false,
     };
 
     const liveStamps: Array<{ x: number; y: number; w: number; h: number; alpha: number; op: string }> = [];
@@ -265,20 +272,41 @@ describe('Zero-Flicker Stroke Handshake & WYSIWYG Monochrome Pipeline', () => {
 
     const liveCtx = makeMockCtx(liveStamps);
     const completeCtx = makeMockCtx(completeStamps);
-    const flow = 0.62;
-    const spacing = 0.05;
-    const hardness = 0.55;
+    const dabCounter = { count: 0 };
 
     // 1. Live incremental rendering (initial dot + segment 0->1 + tail segment 1->2)
-    drawRadialDot(liveCtx, pts[0], '#e03030', hardness, flow, false, false, mixingOpts, 1.0, 0);
+    drawBrushDot(liveCtx, pts[0], '#e03030', mixingOpts);
     let rem = Math.max(0.12, pts[0].width * spacing);
     const seg1 = centripetalCatmullRomToBezier(pts[0], pts[0], pts[1], pts[2]);
-    rem = drawRadialCubicBezierSegment(liveCtx, pts[0], seg1.c1, seg1.c2, pts[1], '#e03030', hardness, flow, spacing, false, false, rem, 1.0, 0, mixingOpts);
+    rem = drawBrushCubicBezierSegment(liveCtx, pts[0], seg1.c1, seg1.c2, pts[1], '#e03030', mixingOpts, rem, dabCounter);
     const seg2 = centripetalCatmullRomToBezier(pts[0], pts[1], pts[2], pts[2]);
-    drawRadialCubicBezierSegment(liveCtx, pts[1], seg2.c1, seg2.c2, pts[2], '#e03030', hardness, flow, spacing, false, false, rem, 1.0, 0, mixingOpts);
+    drawBrushCubicBezierSegment(liveCtx, pts[1], seg2.c1, seg2.c2, pts[2], '#e03030', mixingOpts, rem, dabCounter);
 
     // 2. Complete stroke rendering
-    renderCompleteRadialStroke(completeCtx, pts, '#e03030', hardness, flow, spacing, false, false, 1.0, 0, mixingOpts);
+    renderCompleteStroke(
+      completeCtx,
+      pts,
+      {
+        size: 14,
+        minSizeFactor: 0.2,
+        opacity: 1.0,
+        color: '#e03030',
+        flow,
+        spacing,
+        hardness,
+        smoothing: true,
+        stabilization: 0,
+        usePressure: true,
+        blendTipsMode: 'darken',
+        adjustDensityByGap: true,
+        grain: 0.35,
+        useTilt: false,
+        useGpu: false,
+      },
+      'brush',
+      'color',
+      false
+    );
 
     expect(liveStamps.length).toBeGreaterThan(5);
     expect(liveStamps.length).toBe(completeStamps.length);

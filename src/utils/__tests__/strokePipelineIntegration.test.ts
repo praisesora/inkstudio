@@ -10,14 +10,11 @@ import {
 } from '../../engine/StrokePipeline';
 import { CubicBezierSegment } from '../../engine/SplineGenerator';
 import {
-  canUseWebGlForTexturedBrush,
-  canUseWebGlForRadialBrush,
-  renderCompleteTexturedStroke,
-  renderCompleteRadialStroke,
-  TexturedBrushOptions,
-} from '../stampEngine';
-import { WebGlBrushEngine, GpuDab } from '../webglBrushEngine';
-import { renderCompleteStroke } from '../canvasUtils';
+  canUseWebGlForBrush,
+  renderCompleteStroke,
+  BrushRenderOptions,
+} from '../../engine/BrushEngine';
+import { WebGlBrushEngine, GpuDab } from '../../engine/WebGlBrushEngine';
 import { BrushSettings, Point } from '../../types/editor';
 
 function makeMock2DCtx(w = 1000, h = 1000) {
@@ -344,16 +341,37 @@ describe('WebGlBrushEngine Integration & Canvas 2D Fallback in stampEngine', () 
     try {
       // 1. Textured .sut/preset brush
       const texMock = makeMock2DCtx(256, 256);
-      const texOpts: TexturedBrushOptions = {
+      const texOpts: BrushRenderOptions = {
         size: 18,
         flow: 0.85,
         spacing: 0.1,
         antiAlias: 2,
+        tipImage: mockTipImage,
         useGpu: true,
         useTilt: true,
       };
-      expect(canUseWebGlForTexturedBrush(texOpts)).toBe(true);
-      renderCompleteTexturedStroke(texMock.ctx, samplePoints, '#224488', mockTipImage, texOpts);
+      expect(canUseWebGlForBrush(texOpts)).toBe(true);
+      renderCompleteStroke(
+        texMock.ctx,
+        samplePoints,
+        {
+          size: 18,
+          minSizeFactor: 0.2,
+          color: '#224488',
+          opacity: 1,
+          flow: 0.85,
+          spacing: 0.1,
+          usePressure: true,
+          smoothing: true,
+          stabilization: 0,
+          hardness: 1,
+          antiAlias: 2,
+          customTipImage: mockTipImage,
+          useGpu: true,
+          useTilt: true,
+        },
+        'brush'
+      );
 
       expect(renderSpy).toHaveBeenCalledTimes(1);
       expect(renderedBatches[0].length).toBeGreaterThan(5);
@@ -362,11 +380,26 @@ describe('WebGlBrushEngine Integration & Canvas 2D Fallback in stampEngine', () 
 
       // 2. Soft radial brush
       const radMock = makeMock2DCtx(256, 256);
-      expect(canUseWebGlForRadialBrush({ useGpu: true, antiAlias: 2 })).toBe(true);
-      renderCompleteRadialStroke(radMock.ctx, samplePoints, '#cc2244', 0.35, 0.9, 0.1, false, false, 1.0, 0, {
-        useGpu: true,
-        antiAlias: 2,
-      });
+      expect(canUseWebGlForBrush({ useGpu: true, antiAlias: 2 })).toBe(true);
+      renderCompleteStroke(
+        radMock.ctx,
+        samplePoints,
+        {
+          size: 18,
+          minSizeFactor: 0.2,
+          color: '#cc2244',
+          opacity: 1,
+          flow: 0.9,
+          spacing: 0.1,
+          usePressure: true,
+          smoothing: true,
+          stabilization: 0,
+          hardness: 0.35,
+          antiAlias: 2,
+          useGpu: true,
+        },
+        'brush'
+      );
 
       expect(renderSpy).toHaveBeenCalledTimes(2);
       expect(renderedBatches[1].length).toBeGreaterThan(5);
@@ -384,19 +417,34 @@ describe('WebGlBrushEngine Integration & Canvas 2D Fallback in stampEngine', () 
 
     try {
       // Eligibility gates
-      expect(canUseWebGlForTexturedBrush({ size: 10, antiAlias: 0, useGpu: true })).toBe(false);
-      expect(canUseWebGlForTexturedBrush({ size: 10, colorMixing: true, useGpu: true })).toBe(false);
-      expect(canUseWebGlForTexturedBrush({ size: 10, useGpu: false })).toBe(false);
-      expect(canUseWebGlForTexturedBrush({ size: 10, subTipImages: [mockTipImage, mockTipImage], useGpu: true })).toBe(false);
-      expect(canUseWebGlForRadialBrush({ antiAlias: 0, useGpu: true })).toBe(false);
-      expect(canUseWebGlForRadialBrush({ colorMixing: true, useGpu: true })).toBe(false);
+      expect(canUseWebGlForBrush({ size: 10, antiAlias: 0, useGpu: true, tipImage: mockTipImage })).toBe(false);
+      expect(canUseWebGlForBrush({ size: 10, colorMixing: true, useGpu: true, tipImage: mockTipImage })).toBe(false);
+      expect(canUseWebGlForBrush({ size: 10, useGpu: false, tipImage: mockTipImage })).toBe(false);
+      expect(canUseWebGlForBrush({ size: 10, tipImage: mockTipImage, subTipImages: [mockTipImage, mockTipImage], useGpu: true })).toBe(false);
+      expect(canUseWebGlForBrush({ antiAlias: 0, useGpu: true })).toBe(false);
+      expect(canUseWebGlForBrush({ colorMixing: true, useGpu: true })).toBe(false);
 
       // When renderDabsToContext returns false (e.g. context lost), falls back to Canvas 2D drawImage
       const fallbackMock = makeMock2DCtx(256, 256);
-      renderCompleteRadialStroke(fallbackMock.ctx, samplePoints, '#112233', 0.8, 0.9, 0.15, false, false, 1.0, 0, {
-        useGpu: true,
-        antiAlias: 2,
-      });
+      renderCompleteStroke(
+        fallbackMock.ctx,
+        samplePoints,
+        {
+          size: 18,
+          minSizeFactor: 0.2,
+          color: '#112233',
+          opacity: 1,
+          flow: 0.9,
+          spacing: 0.15,
+          usePressure: true,
+          smoothing: true,
+          stabilization: 0,
+          hardness: 0.8,
+          antiAlias: 2,
+          useGpu: true,
+        },
+        'brush'
+      );
       expect(renderSpy).toHaveBeenCalledTimes(1);
       expect(fallbackMock.raw.drawImage).toHaveBeenCalled();
     } finally {

@@ -4,7 +4,7 @@ import {
   PressureCurvePreset,
   PressureCurveSettings,
 } from '../types/settings';
-import { evaluateFastSpline } from '../engine/CspBrushEngine';
+import { evaluateFastSpline } from '../engine/BrushEngine';
 
 export { PRESSURE_CURVE_PRESETS };
 

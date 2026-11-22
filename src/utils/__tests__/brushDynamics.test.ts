@@ -3,12 +3,13 @@ import {
   rgbToHsv,
   hsvToRgb,
   applyColorDynamics,
-  drawRadialCubicBezierSegment,
-  drawRadialDot,
-  drawTexturedDot,
-  TexturedBrushOptions,
-} from '../stampEngine';
-import { WebGlBrushEngine } from '../webglBrushEngine';
+  drawBrushCubicBezierSegment,
+  drawBrushQuadraticBezierSegment,
+  drawBrushDot,
+  buildBrushRenderOptions,
+  BrushRenderOptions,
+} from '../../engine/BrushEngine';
+import { GpuDab } from '../../engine/WebGlBrushEngine';
 import { BrushSettings, BrushDynamics, Point } from '../../types/editor';
 
 function createMockCanvas(width: number = 200, height: number = 200) {
@@ -138,11 +139,17 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
     });
   });
 
-  describe('WebGL Brush Engine generateArcLengthDabs Jitter Matrix', () => {
-    const gpuEngine = WebGlBrushEngine.getInstance();
+  describe('Unified BrushEngine GPU Batch Dab Jitter Matrix', () => {
     const p0: Point = { x: 10, y: 10, pressure: 1.0, width: 20 };
     const control: Point = { x: 50, y: 10, pressure: 1.0, width: 20 };
     const p2: Point = { x: 90, y: 10, pressure: 1.0, width: 20 };
+
+    const emitGpuDabs = (settings: BrushSettings, color: string): GpuDab[] => {
+      const { ctx } = createMockCanvas();
+      const dabs: GpuDab[] = [];
+      drawBrushQuadraticBezierSegment(ctx, p0, control, p2, color, buildBrushRenderOptions(settings), 0, { count: 0 }, dabs);
+      return dabs;
+    };
 
     const baseSettings: BrushSettings = {
       size: 20,
@@ -185,10 +192,10 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         },
       };
 
-      const res1 = gpuEngine.generateArcLengthDabs(p0, control, p2, settings1, '#ff0000');
-      const res3 = gpuEngine.generateArcLengthDabs(p0, control, p2, settings3, '#ff0000');
+      const dabs1 = emitGpuDabs(settings1, '#ff0000');
+      const dabs3 = emitGpuDabs(settings3, '#ff0000');
 
-      expect(res3.dabs.length).toBe(res1.dabs.length * 3);
+      expect(dabs3.length).toBe(dabs1.length * 3);
     });
 
     it('applies size jitter variance', () => {
@@ -210,8 +217,8 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         },
       };
 
-      const res = gpuEngine.generateArcLengthDabs(p0, control, p2, settings, '#ff0000');
-      const widths = res.dabs.map((d) => d.width);
+      const dabs = emitGpuDabs(settings, '#ff0000');
+      const widths = dabs.map((d) => d.width);
       const minW = Math.min(...widths);
       const maxW = Math.max(...widths);
 
@@ -239,8 +246,8 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         },
       };
 
-      const res = gpuEngine.generateArcLengthDabs(p0, control, p2, settings, '#ff0000');
-      const angles = res.dabs.map((d) => d.angle);
+      const dabs = emitGpuDabs(settings, '#ff0000');
+      const angles = dabs.map((d) => d.angle);
       const minA = Math.min(...angles);
       const maxA = Math.max(...angles);
 
@@ -248,7 +255,6 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
     });
 
     it('applies scatter offset along normal', () => {
-      // Stroke is horizontal (y = 10), so perpendicular normal is along Y
       const settings: BrushSettings = {
         ...baseSettings,
         dynamics: {
@@ -267,8 +273,8 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         },
       };
 
-      const res = gpuEngine.generateArcLengthDabs(p0, control, p2, settings, '#ff0000');
-      const yCoords = res.dabs.map((d) => d.y);
+      const dabs = emitGpuDabs(settings, '#ff0000');
+      const yCoords = dabs.map((d) => d.y);
       const minY = Math.min(...yCoords);
       const maxY = Math.max(...yCoords);
 
@@ -294,8 +300,8 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         },
       };
 
-      const res = gpuEngine.generateArcLengthDabs(p0, control, p2, settings, '#ff0000');
-      const alphas = res.dabs.map((d) => d.alpha);
+      const dabs = emitGpuDabs(settings, '#ff0000');
+      const alphas = dabs.map((d) => d.alpha);
       const minA = Math.min(...alphas);
       const maxA = Math.max(...alphas);
 
@@ -322,16 +328,15 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         },
       };
 
-      const res = gpuEngine.generateArcLengthDabs(p0, control, p2, settings, '#ff0000');
-      const colors = res.dabs.map((d) => [d.r, d.g, d.b]);
-      // Check that not all dabs are identical pure red
+      const dabs = emitGpuDabs(settings, '#ff0000');
+      const colors = dabs.map((d) => [d.r, d.g, d.b]);
       const nonPureRed = colors.some(([r, g, b]) => g > 0.05 || b > 0.05 || r < 0.95);
       expect(nonPureRed).toBe(true);
     });
   });
 
-  describe('Stamp Engine 2D Jitter Matrix Execution', () => {
-    it('executes drawRadialCubicBezierSegment with dynamics count and scatter', () => {
+  describe('Unified BrushEngine CPU Fallback Jitter Matrix Execution', () => {
+    it('executes drawBrushCubicBezierSegment with dynamics count and scatter', () => {
       const { ctx, drawnDabs } = createMockCanvas();
       const p0: Point = { x: 10, y: 20, pressure: 1.0, width: 10 };
       const c1: Point = { x: 30, y: 20, pressure: 1.0, width: 10 };
@@ -353,28 +358,18 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         foregroundBackgroundJitter: 0.3,
       };
 
-      drawRadialCubicBezierSegment(
-        ctx,
-        p0,
-        c1,
-        c2,
-        p3,
-        '#ff0000',
-        1.0,
-        1.0,
-        0.1,
-        false,
-        false,
-        0,
-        1.0,
-        0,
-        { dynamics, secondaryColor: '#0000ff' }
-      );
+      drawBrushCubicBezierSegment(ctx, p0, c1, c2, p3, '#ff0000', {
+        hardness: 1.0,
+        flow: 1.0,
+        spacing: 0.1,
+        dynamics,
+        secondaryColor: '#0000ff',
+      });
 
       expect(drawnDabs.length).toBeGreaterThan(0);
     });
 
-    it('executes drawRadialDot with dynamics jitter', () => {
+    it('executes drawBrushDot (radial) with dynamics jitter', () => {
       const { ctx, drawnDabs } = createMockCanvas();
       const point: Point = { x: 50, y: 50, pressure: 1.0, width: 15 };
 
@@ -393,7 +388,9 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         foregroundBackgroundJitter: 0.2,
       };
 
-      drawRadialDot(ctx, point, '#336699', 0.9, 0.8, false, false, {
+      drawBrushDot(ctx, point, '#336699', {
+        hardness: 0.9,
+        flow: 0.8,
         dynamics,
         secondaryColor: '#ffffff',
       });
@@ -401,13 +398,14 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
       expect(drawnDabs.length).toBe(3);
     });
 
-    it('executes drawTexturedDot with dynamics count and jitter', () => {
+    it('executes drawBrushDot (textured) with dynamics count and jitter', () => {
       const { ctx, drawnDabs } = createMockCanvas();
       const point: Point = { x: 40, y: 40, pressure: 1.0, width: 20 };
       const tipImg: any = { naturalWidth: 64, naturalHeight: 64, width: 64, height: 64, src: 'tip.png' };
 
-      const options: TexturedBrushOptions = {
+      const options: BrushRenderOptions = {
         size: 20,
+        tipImage: tipImg,
         dynamics: {
           sizeJitter: 0.5,
           angleJitter: 0.5,
@@ -425,7 +423,7 @@ describe('Brush Dynamics & Multi-Axis Jitter Matrix', () => {
         secondaryColor: '#ffffff',
       };
 
-      drawTexturedDot(ctx, point, '#ff5500', tipImg, options);
+      drawBrushDot(ctx, point, '#ff5500', options);
       expect(drawnDabs.length).toBe(4);
     });
   });

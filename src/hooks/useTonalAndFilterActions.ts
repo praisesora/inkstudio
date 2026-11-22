@@ -8,17 +8,22 @@ import {
   FilterType,
   LayerItem,
   LayerStyles,
+  TileDelta,
 } from '../types/editor';
 import { documentStore } from '../utils/documentStore';
 import {
-  applyFilter,
+  TileFormat,
+  TileSnapshotEntry,
+  releaseTemporaryCanvas,
+} from '../utils/tileEngine';
+import {
+  applyFilterToTileGridAsync,
   FilmGrainParams,
   GaussianBlurParams,
   MotionBlurParams,
   UnsharpMaskParams,
 } from '../utils/filterEngine';
-import { applyScreentone, HalftoneDotShape } from '../utils/screentoneEngine';
-import { applyLayerEffects } from '../utils/layerEffectsEngine';
+import { HalftoneDotShape } from '../utils/screentoneEngine';
 import { get2DContext } from '../utils/canvasUtils';
 import {
   TonalCorrectionType,
@@ -27,8 +32,8 @@ import {
   HueSaturationParams,
   PosterizationParams,
   LevelCorrectionParams,
-  applyTonalFilter,
-  applyReverseGradient,
+  applyTonalToTileGrid,
+  computeHistogramsFromTileSnapshot,
   createSelectionMask,
   getProcessingBounds,
 } from '../utils/tonalEngine';
@@ -64,12 +69,7 @@ export interface UseTonalAndFilterActionsParams {
   activeLayer: LayerItem | undefined;
   activeLayerId: string;
   selection: CanvasSelection | null;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  layerSourceCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  materializeLayerCanvas: (layerId: string) => HTMLCanvasElement | null;
-  releaseLayerCanvas: (layerId: string) => void;
   setActiveLayerId: (id: string) => void;
-  getActiveCanvas: () => HTMLCanvasElement | null;
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   handleCommitFloatingSelection: () => void;
   pushHistoryStepRef: React.MutableRefObject<PushHistoryStepFn | null>;
@@ -100,18 +100,18 @@ export interface UseTonalAndFilterActionsParams {
     angle: number,
     dotShape: HalftoneDotShape,
     densityType: 'specified' | 'image'
-  ) => { id: string; canvas: HTMLCanvasElement };
+  ) => { id: string; tileDeltas: TileDelta[] };
   applyExpressionColorOfPreview: (
     layerId: string
-  ) => { beforeImageData: ImageData | null; afterImageData: ImageData | null } | null | undefined;
+  ) => { tileDeltas: TileDelta[] } | null | undefined;
   applyLayerColorPermanently: (
     layerId: string
-  ) => { beforeImageData: ImageData | null; afterImageData: ImageData | null } | null | undefined;
+  ) => { tileDeltas: TileDelta[] } | null | undefined;
   convertLayer: (
     layerId: string,
     targetMode: ExpressionColor,
     options?: { threshold?: number; expressBlack?: boolean; expressWhite?: boolean }
-  ) => { beforeImageData: ImageData | null; afterImageData: ImageData | null } | null | undefined;
+  ) => { tileDeltas: TileDelta[] } | null | undefined;
   showToast: (msg: string) => void;
 }
 
@@ -123,12 +123,7 @@ export function useTonalAndFilterActions({
   activeLayer,
   activeLayerId,
   selection,
-  layerCanvasesRef,
-  layerSourceCanvasesRef,
-  materializeLayerCanvas,
-  releaseLayerCanvas,
   setActiveLayerId,
-  getActiveCanvas,
   updateLayerThumbnail,
   handleCommitFloatingSelection,
   pushHistoryStepRef,
@@ -143,6 +138,19 @@ export function useTonalAndFilterActions({
   convertLayer,
   showToast,
 }: UseTonalAndFilterActionsParams) {
+  const resolveTargetFormat = useCallback(
+    (layerId: string, layer?: LayerItem): TileFormat => {
+      const isBg = layerId === 'layer-bg' || layerId.startsWith('layer-bg');
+      if (isBg) return 'color-32bit';
+      const l = layer ?? layers.find((item) => item.id === layerId);
+      if (colorMode === 'monochrome' || l?.expressionColor === 'monochrome') {
+        return 'monochrome-1bit';
+      }
+      return 'color-32bit';
+    },
+    [colorMode, layers]
+  );
+
   const handleOpenAdjustmentModal = useCallback(
     (
       layerId?: string,
@@ -208,111 +216,43 @@ export function useTonalAndFilterActions({
         showToast('Select an unlocked raster layer to apply filter');
         return;
       }
+      if (dimensions.width <= 0 || dimensions.height <= 0) return;
+
       const grid = documentStore.getActiveTileGrid();
-      const isTone = Boolean(
-        activeLayer.toneEnabled && layerSourceCanvasesRef.current?.get(activeLayerId)
-      );
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
-      const displayCanvas = layerCanvasesRef.current.get(activeLayerId);
+      const targetFormat = resolveTargetFormat(activeLayerId, activeLayer);
+      const targetLayerId = activeLayerId;
 
-      const width = dimensions.width;
-      const height = dimensions.height;
-      if (width <= 0 || height <= 0) return;
-
-      let beforeImageData: ImageData;
-      if (isTone && sourceCanvas) {
-        const sCtx = get2DContext(sourceCanvas);
-        if (!sCtx) return;
-        beforeImageData = sCtx.getImageData(0, 0, sourceCanvas.width, sourceCanvas.height);
-      } else {
-        const raw = grid.readImageData(activeLayerId, 0, 0, width, height);
-        beforeImageData = new ImageData(new Uint8ClampedArray(raw.data), width, height);
-      }
-
-      const rawFiltered = applyFilter(
-        new ImageData(
-          new Uint8ClampedArray(beforeImageData.data),
-          beforeImageData.width,
-          beforeImageData.height
-        ),
+      void applyFilterToTileGridAsync({
+        grid,
+        layerId: targetLayerId,
+        dimensions,
         type,
-        params
-      );
-
-      let finalImageData = rawFiltered;
-      if (selection) {
-        const selMask = createSelectionMask(selection, width, height);
-        if (selMask) {
-          finalImageData = new ImageData(new Uint8ClampedArray(beforeImageData.data), width, height);
-          const src = beforeImageData.data;
-          const flt = rawFiltered.data;
-          const dst = finalImageData.data;
-          for (let i = 0; i < selMask.length; i++) {
-            const m = selMask[i];
-            if (m === 0) continue;
-            const p = i * 4;
-            if (m === 255) {
-              dst[p] = flt[p];
-              dst[p + 1] = flt[p + 1];
-              dst[p + 2] = flt[p + 2];
-              dst[p + 3] = flt[p + 3];
-            } else {
-              const a = m / 255;
-              const inv = 1 - a;
-              dst[p] = Math.round(src[p] * inv + flt[p] * a);
-              dst[p + 1] = Math.round(src[p + 1] * inv + flt[p + 1] * a);
-              dst[p + 2] = Math.round(src[p + 2] * inv + flt[p + 2] * a);
-              dst[p + 3] = Math.round(src[p + 3] * inv + flt[p + 3] * a);
-            }
-          }
+        filterParams: params,
+        targetFormat,
+        selection,
+      }).then(({ dirtyRect, tileDeltas }) => {
+        if (tileDeltas.length > 0) {
+          pushHistoryStepRef.current?.(
+            'filter',
+            `Filter: ${type.replace('-', ' ')}`,
+            null,
+            null,
+            targetLayerId,
+            dirtyRect ?? undefined,
+            tileDeltas
+          );
         }
-      }
-
-      const isMono = colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
-      const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
-
-      if (isTone && sourceCanvas) {
-        get2DContext(sourceCanvas)?.putImageData(finalImageData, 0, 0);
-        const effDisplay = displayCanvas || materializeLayerCanvas(activeLayerId);
-        if (effDisplay) {
-          applyLayerEffects(sourceCanvas, effDisplay, activeLayer, dimensions.dpi ?? 600);
-          grid.ingestCanvas(activeLayerId, effDisplay, targetFormat);
-        }
-      } else {
-        grid.writeImageData(activeLayerId, finalImageData, 0, 0, targetFormat);
-        if (displayCanvas) {
-          get2DContext(displayCanvas)?.putImageData(finalImageData, 0, 0);
-          releaseLayerCanvas(activeLayerId);
-        }
-        if (sourceCanvas) {
-          get2DContext(sourceCanvas)?.putImageData(finalImageData, 0, 0);
-        }
-      }
-
-      pushHistoryStepRef.current?.(
-        'filter',
-        `Filter: ${type.replace('-', ' ')}`,
-        beforeImageData,
-        finalImageData,
-        activeLayerId
-      );
-      grid.notifyChange(true);
-      updateLayerThumbnail(activeLayerId, true);
-      showToast(`Filter applied: ${type.replace('-', ' ')}`);
+        updateLayerThumbnail(targetLayerId, true);
+        showToast(`Filter applied: ${type.replace('-', ' ')}`);
+      });
     },
     [
       hasOpenDocument,
       activeLayer,
       activeLayerId,
       selection,
-      dimensions.width,
-      dimensions.height,
-      dimensions.dpi,
-      layerCanvasesRef,
-      layerSourceCanvasesRef,
-      materializeLayerCanvas,
-      releaseLayerCanvas,
-      colorMode,
+      dimensions,
+      resolveTargetFormat,
       pushHistoryStepRef,
       updateLayerThumbnail,
       showToast,
@@ -354,7 +294,6 @@ export function useTonalAndFilterActions({
 
       const grid = documentStore.getActiveTileGrid();
       let targetLayerId = activeLayerId;
-      let targetLayer = layers.find((l) => l.id === targetLayerId);
       const hasPixels = grid.hasLayerTiles(targetLayerId);
 
       if (!hasPixels) {
@@ -367,7 +306,6 @@ export function useTonalAndFilterActions({
         );
         if (candidate) {
           targetLayerId = candidate.id;
-          targetLayer = candidate;
           setActiveLayerId(candidate.id);
           showToast(`Switched to "${candidate.name}" (active layer had no pixels)`);
         } else {
@@ -376,29 +314,20 @@ export function useTonalAndFilterActions({
         }
       }
 
-      const displayCanvas = materializeLayerCanvas(targetLayerId);
-      const isTone = Boolean(
-        targetLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-      );
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-      const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-
-      if (!canvas) {
-        showToast('Canvas not available for active layer.');
-        return;
-      }
-      const ctx = get2DContext(canvas);
-      if (!ctx) return;
-
-      const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const selectionMask = createSelectionMask(selection, canvas.width, canvas.height);
-      const bounds = getProcessingBounds(selection, canvas.width, canvas.height);
+      const beforeTileSnapshot = grid.snapshotLayerTiles(targetLayerId);
+      const selectionMask = createSelectionMask(selection, dimensions.width, dimensions.height);
+      const bounds = getProcessingBounds(selection, dimensions.width, dimensions.height);
+      const histograms =
+        type === 'level-correction'
+          ? computeHistogramsFromTileSnapshot(beforeTileSnapshot, dimensions, selectionMask)
+          : null;
 
       uiStoreActions.setTonalModalState({
         isOpen: true,
         type,
         targetLayerId,
-        beforeImageData,
+        beforeTileSnapshot,
+        histograms,
         selectionMask,
         bounds,
       });
@@ -408,10 +337,9 @@ export function useTonalAndFilterActions({
       activeLayer,
       activeLayerId,
       layers,
+      dimensions,
       selection,
       handleCommitFloatingSelection,
-      materializeLayerCanvas,
-      layerSourceCanvasesRef,
       setActiveLayerId,
       showToast,
     ]
@@ -420,124 +348,79 @@ export function useTonalAndFilterActions({
   const handleTonalPreviewChange = useCallback(
     (type: TonalCorrectionType, params: AnyTonalParams, enabled: boolean) => {
       const state = useUiStore.getState().tonalModalState;
-      if (!state.isOpen || !state.beforeImageData) return;
+      if (!state.isOpen || !state.beforeTileSnapshot) return;
+      const grid = documentStore.getActiveTileGrid();
       const targetLayerId = state.targetLayerId;
-      const targetLayer = layers.find((l) => l.id === targetLayerId);
-      const isTone = Boolean(
-        targetLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-      );
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-      const displayCanvas = layerCanvasesRef.current.get(targetLayerId);
-      const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-      if (!canvas) return;
-      const ctx = get2DContext(canvas);
-      if (!ctx) return;
 
       if (enabled) {
-        const previewData = ctx.createImageData(canvas.width, canvas.height);
-        applyTonalFilter(
-          state.beforeImageData,
-          previewData,
+        applyTonalToTileGrid({
+          grid,
+          layerId: targetLayerId,
+          dimensions,
+          beforeSnapshot: state.beforeTileSnapshot,
           type,
-          params,
-          state.selectionMask,
-          state.bounds
-        );
-        ctx.putImageData(previewData, 0, 0);
-      } else {
-        ctx.putImageData(state.beforeImageData, 0, 0);
-      }
-
-      if (isTone && sourceCanvas && displayCanvas) {
-        applyScreentone(sourceCanvas, displayCanvas, {
-          frequency: targetLayer?.toneFrequency ?? 60,
-          angle: targetLayer?.toneAngle ?? 45,
-          dotShape: targetLayer?.toneDotShape ?? 'circle',
-          dpi: dimensions.dpi ?? 600,
+          tonalParams: params,
+          targetFormat: resolveTargetFormat(targetLayerId),
+          selectionMask: state.selectionMask,
+          bounds: state.bounds,
         });
-      }
-
-      if (displayCanvas) {
-        const isMono =
-          colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
-        documentStore
-          .getActiveTileGrid()
-          .ingestCanvas(targetLayerId, displayCanvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-        documentStore.getActiveTileGrid().notifyChange(true);
+      } else {
+        grid.restoreLayerSnapshot(targetLayerId, state.beforeTileSnapshot, false);
       }
     },
-    [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi]
+    [dimensions, resolveTargetFormat]
   );
 
   const handleTonalApply = useCallback(
     (type: TonalCorrectionType, params: AnyTonalParams) => {
       const state = useUiStore.getState().tonalModalState;
-      if (!state.isOpen || !state.beforeImageData) return;
+      if (!state.isOpen || !state.beforeTileSnapshot) return;
+      const grid = documentStore.getActiveTileGrid();
       const targetLayerId = state.targetLayerId;
-      const targetLayer = layers.find((l) => l.id === targetLayerId);
-      const isTone = Boolean(
-        targetLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-      );
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-      const displayCanvas = layerCanvasesRef.current.get(targetLayerId);
-      const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-      if (!canvas) return;
-      const ctx = get2DContext(canvas);
-      if (!ctx) return;
 
-      const finalData = ctx.createImageData(canvas.width, canvas.height);
-      applyTonalFilter(
-        state.beforeImageData,
-        finalData,
+      const { tileDeltas } = applyTonalToTileGrid({
+        grid,
+        layerId: targetLayerId,
+        dimensions,
+        beforeSnapshot: state.beforeTileSnapshot,
         type,
-        params,
-        state.selectionMask,
-        state.bounds
-      );
-      ctx.putImageData(finalData, 0, 0);
+        tonalParams: params,
+        targetFormat: resolveTargetFormat(targetLayerId),
+        selectionMask: state.selectionMask,
+        bounds: state.bounds,
+      });
 
-      if (isTone && sourceCanvas && displayCanvas) {
-        applyScreentone(sourceCanvas, displayCanvas, {
-          frequency: targetLayer?.toneFrequency ?? 60,
-          angle: targetLayer?.toneAngle ?? 45,
-          dotShape: targetLayer?.toneDotShape ?? 'circle',
-          dpi: dimensions.dpi ?? 600,
-        });
-      }
-
-      updateLayerThumbnail(targetLayerId, true);
       const label = getTonalLabel(type);
-      pushHistoryStepRef.current?.(
-        'tonal-correction',
-        label,
-        state.beforeImageData,
-        finalData,
-        targetLayerId
-      );
-      documentStore.getActiveTileGrid().notifyChange(true);
-      if (!isTone) {
-        releaseLayerCanvas(targetLayerId);
+      if (tileDeltas.length > 0) {
+        pushHistoryStepRef.current?.(
+          'tonal-correction',
+          label,
+          null,
+          null,
+          targetLayerId,
+          undefined,
+          tileDeltas
+        );
       }
+      updateLayerThumbnail(targetLayerId, true);
 
       uiStoreActions.setTonalModalState({
         isOpen: false,
         type,
         targetLayerId: '',
-        beforeImageData: null,
+        beforeTileSnapshot: null,
+        histograms: null,
         selectionMask: null,
         bounds: { x0: 0, y0: 0, x1: 0, y1: 0 },
       });
       showToast(`Applied ${label}`);
     },
     [
-      layers,
-      layerCanvasesRef,
-      layerSourceCanvasesRef,
-      dimensions.dpi,
+      dimensions,
+      resolveTargetFormat,
       updateLayerThumbnail,
       getTonalLabel,
       pushHistoryStepRef,
-      releaseLayerCanvas,
       showToast,
     ]
   );
@@ -545,55 +428,22 @@ export function useTonalAndFilterActions({
   const handleTonalCancel = useCallback(() => {
     const state = useUiStore.getState().tonalModalState;
     if (!state.isOpen) return;
-    if (state.beforeImageData) {
-      const targetLayerId = state.targetLayerId;
-      const targetLayer = layers.find((l) => l.id === targetLayerId);
-      const isTone = Boolean(
-        targetLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-      );
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-      const displayCanvas = layerCanvasesRef.current.get(targetLayerId);
-      const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-      if (canvas) {
-        const ctx = get2DContext(canvas);
-        if (ctx) {
-          ctx.putImageData(state.beforeImageData, 0, 0);
-          if (isTone && sourceCanvas && displayCanvas) {
-            applyScreentone(sourceCanvas, displayCanvas, {
-              frequency: targetLayer?.toneFrequency ?? 60,
-              angle: targetLayer?.toneAngle ?? 45,
-              dotShape: targetLayer?.toneDotShape ?? 'circle',
-              dpi: dimensions.dpi ?? 600,
-            });
-          }
-          if (displayCanvas) {
-            const isMono =
-              colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
-            documentStore
-              .getActiveTileGrid()
-              .ingestCanvas(
-                targetLayerId,
-                displayCanvas,
-                isMono ? 'monochrome-1bit' : 'color-32bit'
-              );
-            documentStore.getActiveTileGrid().notifyChange(true);
-            if (!isTone) {
-              releaseLayerCanvas(targetLayerId);
-            }
-          }
-        }
-      }
+    if (state.beforeTileSnapshot && state.targetLayerId) {
+      documentStore
+        .getActiveTileGrid()
+        .restoreLayerSnapshot(state.targetLayerId, state.beforeTileSnapshot, false);
     }
 
     uiStoreActions.setTonalModalState({
       isOpen: false,
       type: state.type,
       targetLayerId: '',
-      beforeImageData: null,
+      beforeTileSnapshot: null,
+      histograms: null,
       selectionMask: null,
       bounds: { x0: 0, y0: 0, x1: 0, y1: 0 },
     });
-  }, [layers, colorMode, layerCanvasesRef, layerSourceCanvasesRef, dimensions.dpi, releaseLayerCanvas]);
+  }, []);
 
   const handleApplyReverseGradient = useCallback(() => {
     if (
@@ -608,42 +458,19 @@ export function useTonalAndFilterActions({
       handleCommitFloatingSelection();
     }
 
+    const grid = documentStore.getActiveTileGrid();
     let targetLayerId = activeLayerId;
-    let targetLayer = layers.find((l) => l.id === targetLayerId);
-    let displayCanvas = layerCanvasesRef.current.get(targetLayerId);
 
-    let hasPixels = false;
-    if (displayCanvas) {
-      const dCtx = get2DContext(displayCanvas);
-      if (dCtx) {
-        const dData = dCtx.getImageData(0, 0, displayCanvas.width, displayCanvas.height).data;
-        for (let i = 3; i < dData.length; i += 4) {
-          if (dData[i] > 0) {
-            hasPixels = true;
-            break;
-          }
-        }
-      }
-    }
-
-    if (!hasPixels) {
-      const candidate = layers.find((l) => {
-        if (l.id === targetLayerId || l.type !== 'raster' || !l.visible) return false;
-        const c = layerCanvasesRef.current.get(l.id);
-        if (!c) return false;
-        const cCtx = get2DContext(c);
-        if (!cCtx) return false;
-        const cData = cCtx.getImageData(0, 0, c.width, c.height).data;
-        for (let j = 3; j < cData.length; j += 4) {
-          if (cData[j] > 0) return true;
-        }
-        return false;
-      });
-
+    if (!grid.hasLayerTiles(targetLayerId)) {
+      const candidate = layers.find(
+        (l) =>
+          l.id !== targetLayerId &&
+          l.type === 'raster' &&
+          l.visible &&
+          grid.hasLayerTiles(l.id)
+      );
       if (candidate) {
         targetLayerId = candidate.id;
-        targetLayer = candidate;
-        displayCanvas = layerCanvasesRef.current.get(candidate.id);
         setActiveLayerId(candidate.id);
         showToast(`Switched to "${candidate.name}" (active layer had no pixels)`);
       } else {
@@ -652,53 +479,44 @@ export function useTonalAndFilterActions({
       }
     }
 
-    const isTone = Boolean(
-      targetLayer?.toneEnabled && layerSourceCanvasesRef.current?.get(targetLayerId)
-    );
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-    const canvas = isTone && sourceCanvas ? sourceCanvas : displayCanvas;
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
+    const beforeSnapshot = grid.snapshotLayerTiles(targetLayerId);
+    const mask = createSelectionMask(selection, dimensions.width, dimensions.height);
+    const bounds = getProcessingBounds(selection, dimensions.width, dimensions.height);
 
-    const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const afterImageData = ctx.createImageData(canvas.width, canvas.height);
-    afterImageData.data.set(beforeImageData.data);
+    const { tileDeltas } = applyTonalToTileGrid({
+      grid,
+      layerId: targetLayerId,
+      dimensions,
+      beforeSnapshot,
+      type: 'reverse-gradient',
+      tonalParams: {},
+      targetFormat: resolveTargetFormat(targetLayerId),
+      selectionMask: mask,
+      bounds,
+    });
 
-    const mask = createSelectionMask(selection, canvas.width, canvas.height);
-    const bounds = getProcessingBounds(selection, canvas.width, canvas.height);
-
-    applyReverseGradient(beforeImageData, afterImageData, mask, bounds);
-    ctx.putImageData(afterImageData, 0, 0);
-
-    if (isTone && sourceCanvas && displayCanvas) {
-      applyScreentone(sourceCanvas, displayCanvas, {
-        frequency: targetLayer?.toneFrequency ?? 60,
-        angle: targetLayer?.toneAngle ?? 45,
-        dotShape: targetLayer?.toneDotShape ?? 'circle',
-        dpi: dimensions.dpi ?? 600,
-      });
+    if (tileDeltas.length > 0) {
+      pushHistoryStepRef.current?.(
+        'tonal-correction',
+        'Reverse Gradient',
+        null,
+        null,
+        targetLayerId,
+        undefined,
+        tileDeltas
+      );
     }
-
     updateLayerThumbnail(targetLayerId, true);
-    pushHistoryStepRef.current?.(
-      'tonal-correction',
-      'Reverse Gradient',
-      beforeImageData,
-      afterImageData,
-      targetLayerId
-    );
     showToast('Inverted colors (Reverse Gradient)');
   }, [
     hasOpenDocument,
     activeLayer,
     activeLayerId,
     layers,
+    dimensions,
     selection,
     handleCommitFloatingSelection,
-    layerCanvasesRef,
-    layerSourceCanvasesRef,
-    dimensions.dpi,
+    resolveTargetFormat,
     updateLayerThumbnail,
     pushHistoryStepRef,
     setActiveLayerId,
@@ -707,43 +525,92 @@ export function useTonalAndFilterActions({
 
   const handleApplyMangaEffects = useCallback(
     (type: 'saturated' | 'stream', options: SaturatedLinesOptions | StreamLinesOptions) => {
-      const canvas = getActiveCanvas();
-      if (!canvas) return;
-      const ctx = get2DContext(canvas);
-      if (!ctx) return;
+      if (!activeLayerId || activeLayer?.locked || dimensions.width <= 0 || dimensions.height <= 0) {
+        return;
+      }
 
-      const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+      const grid = documentStore.getActiveTileGrid();
+      const targetFormat = resolveTargetFormat(activeLayerId, activeLayer);
+      const beforeSnapshot = new Map<string, TileSnapshotEntry>();
+      const CHUNK = 1024;
+      const chunkCanvas = document.createElement('canvas');
+      chunkCanvas.width = Math.min(CHUNK, dimensions.width);
+      chunkCanvas.height = Math.min(CHUNK, dimensions.height);
+      const cCtx = get2DContext(chunkCanvas);
+      if (!cCtx) {
+        releaseTemporaryCanvas(chunkCanvas);
+        return;
+      }
 
-      const renderOn = (target: HTMLCanvasElement) => {
-        const c = get2DContext(target);
-        if (!c) return;
-        if (type === 'saturated') {
-          renderSaturatedLines(c, canvas.width, canvas.height, options as SaturatedLinesOptions);
-        } else {
-          renderStreamLines(c, canvas.width, canvas.height, options as StreamLinesOptions);
+      try {
+        for (let cy = 0; cy < dimensions.height; cy += CHUNK) {
+          const ch = Math.min(CHUNK, dimensions.height - cy);
+          for (let cx = 0; cx < dimensions.width; cx += CHUNK) {
+            const cw = Math.min(CHUNK, dimensions.width - cx);
+            if (chunkCanvas.width !== cw) chunkCanvas.width = cw;
+            if (chunkCanvas.height !== ch) chunkCanvas.height = ch;
+
+            cCtx.setTransform(1, 0, 0, 1, 0, 0);
+            cCtx.clearRect(0, 0, cw, ch);
+            cCtx.save();
+            cCtx.translate(-cx, -cy);
+            if (type === 'saturated') {
+              renderSaturatedLines(
+                cCtx,
+                dimensions.width,
+                dimensions.height,
+                options as SaturatedLinesOptions
+              );
+            } else {
+              renderStreamLines(
+                cCtx,
+                dimensions.width,
+                dimensions.height,
+                options as StreamLinesOptions
+              );
+            }
+            cCtx.restore();
+
+            const img = cCtx.getImageData(0, 0, cw, ch);
+            grid.compositeStrokeToTiles({
+              layerId: activeLayerId,
+              strokeData: img,
+              destX: cx,
+              destY: cy,
+              format: targetFormat,
+              compositeOp: 'source-over',
+              opacity: 1.0,
+              snapshotOut: beforeSnapshot,
+              suppressNotify: true,
+            });
+          }
         }
-      };
+      } finally {
+        releaseTemporaryCanvas(chunkCanvas);
+      }
 
-      renderOn(canvas);
-      if (sourceCanvas) renderOn(sourceCanvas);
-
-      const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, activeLayerId);
+      grid.notifyChange(true);
       updateLayerThumbnail(activeLayerId, true);
-      pushHistoryStepRef.current?.(
-        'brush',
-        `Manga Effect (${type})`,
-        beforeImageData,
-        afterImageData,
-        activeLayerId
-      );
-      documentStore.getActiveTileGrid().notifyChange(true);
+      if (tileDeltas.length > 0) {
+        pushHistoryStepRef.current?.(
+          'brush',
+          `Manga Effect (${type})`,
+          null,
+          null,
+          activeLayerId,
+          undefined,
+          tileDeltas
+        );
+      }
       showToast(`Applied manga ${type} lines`);
     },
     [
-      getActiveCanvas,
       activeLayerId,
-      layerSourceCanvasesRef,
+      activeLayer,
+      dimensions.width,
+      dimensions.height,
+      resolveTargetFormat,
       updateLayerThumbnail,
       pushHistoryStepRef,
       showToast,
@@ -769,7 +636,7 @@ export function useTonalAndFilterActions({
   const handleConfirmTone = useCallback(
     (settings: SimpleToneSettings) => {
       uiStoreActions.setToneModalOpen(false);
-      const { id, canvas } = fillScreentoneSelection(
+      const { id, tileDeltas } = fillScreentoneSelection(
         selection,
         settings.density,
         settings.frequency,
@@ -777,15 +644,15 @@ export function useTonalAndFilterActions({
         settings.dotShape,
         settings.densityType
       );
-      const ctx = get2DContext(canvas);
-      if (ctx) {
-        const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      if (tileDeltas.length > 0) {
         pushHistoryStepRef.current?.(
           'screentone',
           `Screentone (${settings.density}%)`,
           null,
-          afterData,
-          id
+          null,
+          id,
+          selection?.bounds,
+          tileDeltas
         );
       }
       showToast(`Created Screentone Layer (${settings.density}%)`);
@@ -796,13 +663,15 @@ export function useTonalAndFilterActions({
   const handleApplyExpressionColor = useCallback(
     (layerId: string) => {
       const result = applyExpressionColorOfPreview(layerId);
-      if (result && result.beforeImageData && result.afterImageData) {
+      if (result && result.tileDeltas.length > 0) {
         pushHistoryStepRef.current?.(
           'expression-color',
           'Apply Expression Color',
-          result.beforeImageData,
-          result.afterImageData,
-          layerId
+          null,
+          null,
+          layerId,
+          undefined,
+          result.tileDeltas
         );
         showToast('Applied expression color to layer');
       }
@@ -813,13 +682,15 @@ export function useTonalAndFilterActions({
   const handleApplyLayerColor = useCallback(
     (layerId: string) => {
       const result = applyLayerColorPermanently(layerId);
-      if (result && result.beforeImageData && result.afterImageData) {
+      if (result && result.tileDeltas.length > 0) {
         pushHistoryStepRef.current?.(
           'layer-color',
           'Apply Layer Color Tint',
-          result.beforeImageData,
-          result.afterImageData,
-          layerId
+          null,
+          null,
+          layerId,
+          undefined,
+          result.tileDeltas
         );
         showToast('Applied tint to layer permanently');
       }
@@ -834,13 +705,15 @@ export function useTonalAndFilterActions({
       options?: { threshold?: number; expressBlack?: boolean; expressWhite?: boolean }
     ) => {
       const result = convertLayer(layerId, targetMode, options);
-      if (result && result.beforeImageData && result.afterImageData) {
+      if (result && result.tileDeltas.length > 0) {
         pushHistoryStepRef.current?.(
           'layer-convert',
           `Convert to ${targetMode.toUpperCase()}`,
-          result.beforeImageData,
-          result.afterImageData,
-          layerId
+          null,
+          null,
+          layerId,
+          undefined,
+          result.tileDeltas
         );
         showToast(`Converted layer to ${targetMode}`);
       }

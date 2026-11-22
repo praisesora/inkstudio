@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   BLEND_MODE_MAP,
   COMPOSITOR_FRAGMENT_SHADER,
+  COMPOSITOR_INSTANCED_FRAGMENT_SHADER,
   FOLDER_BLIT_FRAGMENT_SHADER,
   ViewportCompositor,
 } from '../compositor';
@@ -35,7 +36,7 @@ import {
   MOTION_BLUR_FRAGMENT_SHADER,
   WebGlFilterEngine,
 } from '../filterEngine';
-import { WebGlBrushEngine } from '../webglBrushEngine';
+import { WebGlBrushEngine } from '../../engine/WebGlBrushEngine';
 import { HistoryItem } from '../../types/editor';
 
 describe('CSP & Krita Rendering and Engine Optimizations', () => {
@@ -58,10 +59,30 @@ describe('CSP & Krita Rendering and Engine Optimizations', () => {
       expect(BLEND_MODE_MAP['add-glow']).toBe(14);
       expect(BLEND_MODE_MAP['color-dodge-glow']).toBe(15);
       expect(BLEND_MODE_MAP['divide']).toBe(16);
+      expect(BLEND_MODE_MAP['vivid-light']).toBe(17);
+      expect(BLEND_MODE_MAP['linear-light']).toBe(18);
+      expect(BLEND_MODE_MAP['pin-light']).toBe(19);
+      expect(BLEND_MODE_MAP['hard-mix']).toBe(20);
+      expect(BLEND_MODE_MAP['subtract']).toBe(21);
+      expect(BLEND_MODE_MAP['darker-color']).toBe(22);
+      expect(BLEND_MODE_MAP['lighter-color']).toBe(23);
+      expect(BLEND_MODE_MAP['hue']).toBe(24);
+      expect(BLEND_MODE_MAP['saturation']).toBe(25);
+      expect(BLEND_MODE_MAP['color']).toBe(26);
+      expect(BLEND_MODE_MAP['luminosity']).toBe(27);
 
       expect(COMPOSITOR_FRAGMENT_SHADER).toContain('vec3 evaluateBlendMode(vec3 Cb, vec3 Cs, int mode)');
       expect(COMPOSITOR_FRAGMENT_SHADER).toContain('uniform sampler2D u_backdropTexture;');
       expect(FOLDER_BLIT_FRAGMENT_SHADER).toContain('vec3 evaluateBlendModeFolder(vec3 Cb, vec3 Cs, int mode)');
+      for (const shader of [
+        COMPOSITOR_FRAGMENT_SHADER,
+        COMPOSITOR_INSTANCED_FRAGMENT_SHADER,
+        FOLDER_BLIT_FRAGMENT_SHADER,
+      ]) {
+        for (let code = 17; code <= 27; code++) {
+          expect(shader).toContain(`mode == ${code}`);
+        }
+      }
     });
 
     it('supports mask dirty-version invalidation on ViewportCompositor', () => {

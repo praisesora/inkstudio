@@ -5,10 +5,10 @@ import {
   safeLocalStorageSetItem,
 } from './safeStorage';
 
-const DB_NAME = 'SoraPaintBrushesDB';
+const DB_NAME = 'InkStudioBrushesDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'csp_brushes';
-export const BRUSH_INDEX_LS_KEY = 'sora_paint_custom_brushes';
+export const BRUSH_INDEX_LS_KEY = 'ink_studio_custom_brushes';
 
 export const CUSTOM_BRUSHES_CHANGED_EVENT = 'ink-custom-brushes-changed';
 

@@ -98,7 +98,7 @@ function loadInitialLiquifySettings(): LiquifySettings {
   };
   try {
     if (typeof localStorage !== 'undefined') {
-      const saved = localStorage.getItem('sora_paint_liquify_settings');
+      const saved = localStorage.getItem('ink_studio_liquify_settings');
       if (saved) return { ...defaults, ...(JSON.parse(saved) as Partial<LiquifySettings>) };
     }
   } catch {
@@ -110,7 +110,7 @@ function loadInitialLiquifySettings(): LiquifySettings {
 function loadInitialShapeSettings(): ShapeSettings {
   try {
     if (typeof localStorage !== 'undefined') {
-      const saved = localStorage.getItem('sora_paint_shape_settings');
+      const saved = localStorage.getItem('ink_studio_shape_settings');
       if (saved) return { ...DEFAULT_SHAPE_SETTINGS, ...(JSON.parse(saved) as Partial<ShapeSettings>) };
     }
   } catch {
@@ -528,7 +528,7 @@ export const toolStoreActions = {
   updateLiquifySettings(patch: Partial<LiquifySettings>): void {
     useToolStore.setState((prev) => {
       const next = { ...prev.liquifySettings, ...patch };
-      safeLocalStorageSetItem('sora_paint_liquify_settings', JSON.stringify(next), 'liquify settings');
+      safeLocalStorageSetItem('ink_studio_liquify_settings', JSON.stringify(next), 'liquify settings');
       return { liquifySettings: next };
     });
   },
@@ -536,7 +536,7 @@ export const toolStoreActions = {
   updateShapeSettings(patch: Partial<ShapeSettings>): void {
     useToolStore.setState((prev) => {
       const next = { ...prev.shapeSettings, ...patch };
-      safeLocalStorageSetItem('sora_paint_shape_settings', JSON.stringify(next), 'shape settings');
+      safeLocalStorageSetItem('ink_studio_shape_settings', JSON.stringify(next), 'shape settings');
       return { shapeSettings: next };
     });
   },

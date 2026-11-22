@@ -113,12 +113,35 @@ describe('PSD/PSB Blend Mode Mapping & Full Round-Trip', () => {
     expect(mapPsdBlendMode('darken')).toBe('darken');
     expect(mapPsdBlendMode('lighten')).toBe('lighten');
     expect(mapPsdBlendMode('normal')).toBe('normal');
+    expect(mapPsdBlendMode('vivid light')).toBe('vivid-light');
+    expect(mapPsdBlendMode('linear light')).toBe('linear-light');
+    expect(mapPsdBlendMode('pin light')).toBe('pin-light');
+    expect(mapPsdBlendMode('hard mix')).toBe('hard-mix');
+    expect(mapPsdBlendMode('subtract')).toBe('subtract');
+    expect(mapPsdBlendMode('subtraction')).toBe('subtract');
+    expect(mapPsdBlendMode('darker color')).toBe('darker-color');
+    expect(mapPsdBlendMode('lighter color')).toBe('lighter-color');
+    expect(mapPsdBlendMode('hue')).toBe('hue');
+    expect(mapPsdBlendMode('saturation')).toBe('saturation');
+    expect(mapPsdBlendMode('color')).toBe('color');
+    expect(mapPsdBlendMode('luminosity')).toBe('luminosity');
 
     expect(toAgPsdBlendMode('linear-burn')).toBe('linear burn');
     expect(toAgPsdBlendMode('add-glow')).toBe('linear dodge');
     expect(toAgPsdBlendMode('color-dodge-glow')).toBe('color dodge');
     expect(toAgPsdBlendMode('divide')).toBe('divide');
     expect(toAgPsdBlendMode('pass-through')).toBe('pass through');
+    expect(toAgPsdBlendMode('vivid-light')).toBe('vivid light');
+    expect(toAgPsdBlendMode('linear-light')).toBe('linear light');
+    expect(toAgPsdBlendMode('pin-light')).toBe('pin light');
+    expect(toAgPsdBlendMode('hard-mix')).toBe('hard mix');
+    expect(toAgPsdBlendMode('subtract')).toBe('subtract');
+    expect(toAgPsdBlendMode('darker-color')).toBe('darker color');
+    expect(toAgPsdBlendMode('lighter-color')).toBe('lighter color');
+    expect(toAgPsdBlendMode('hue')).toBe('hue');
+    expect(toAgPsdBlendMode('saturation')).toBe('saturation');
+    expect(toAgPsdBlendMode('color')).toBe('color');
+    expect(toAgPsdBlendMode('luminosity')).toBe('luminosity');
   });
 
   it('round-trips all blend modes through binary PSD export and import', async () => {
@@ -126,6 +149,7 @@ describe('PSD/PSB Blend Mode Mapping & Full Round-Trip', () => {
     const tileGrid = new SparseTileGrid();
 
     const allModes: BlendMode[] = BLEND_MODES.map((m) => m.value);
+    expect(allModes.length).toBeGreaterThanOrEqual(28);
     const layers: LayerItem[] = allModes.map((mode, idx) => {
       const id = `layer-mode-${idx}`;
       if (mode === 'pass-through') {

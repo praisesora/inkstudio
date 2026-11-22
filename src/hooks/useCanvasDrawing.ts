@@ -29,8 +29,6 @@ export function useCanvasDrawing({
   activeLayerId,
   activeLayerLocked = false,
   activeLayerVisible = true,
-  layerCanvasesRef,
-  layerSourceCanvasesRef,
   layers,
   onUpdateLayerThumbnail,
   isMaskMode = false,
@@ -47,7 +45,6 @@ export function useCanvasDrawing({
   onActiveConstraintAxisChange,
   activeSessionId = null,
   tileGrid,
-  materializeLayerCanvas,
 }: UseCanvasDrawingProps) {
   const effectiveDraftCanvasRef = draftCanvasRef ?? strokeCanvasRef;
 
@@ -139,39 +136,15 @@ export function useCanvasDrawing({
     onActiveConstraintAxisChange,
   ]);
 
-  const getCachedLayerCanvas = useCallback(
+  const getActiveMaskCanvas = useCallback(
     (layerId?: string): HTMLCanvasElement | null => {
+      if (!isMaskModeRef.current) return null;
       const targetId = layerId || activeLayerIdRef.current || activeLayerId;
-      if (isMaskModeRef.current && (!layerId || layerId === activeLayerIdRef.current)) {
-        const activeLayer = layersRef.current?.find((l) => l.id === targetId);
-        if (activeLayer?.maskCanvas) {
-          return activeLayer.maskCanvas;
-        }
-      }
-      return layerCanvasesRef.current.get(targetId) || null;
-    },
-    [activeLayerId, layerCanvasesRef]
-  );
-
-  const getActiveCanvas = useCallback(() => {
-    const targetId = activeLayerIdRef.current || activeLayerId;
-    if (isMaskModeRef.current) {
       const activeLayer = layersRef.current?.find((l) => l.id === targetId);
-      if (activeLayer?.maskCanvas) {
-        return activeLayer.maskCanvas;
-      }
-    }
-    const existing = layerCanvasesRef.current.get(targetId);
-    if (existing) return existing;
-    if (targetId && materializeLayerCanvas) {
-      return materializeLayerCanvas(targetId);
-    }
-    return (
-      layerCanvasesRef.current.get('layer-1') ||
-      layerCanvasesRef.current.values().next().value ||
-      null
-    );
-  }, [activeLayerId, layerCanvasesRef, materializeLayerCanvas]);
+      return activeLayer?.maskCanvas || null;
+    },
+    [activeLayerId]
+  );
 
   const history = useDrawingHistory({
     activeSessionId,
@@ -183,8 +156,6 @@ export function useCanvasDrawing({
     activeLayerIdRef,
     colorModeRef,
     layersRef,
-    layerCanvasesRef,
-    layerSourceCanvasesRef,
     onUpdateLayerThumbnail,
     onUpdateMaskThumbnailRef,
     isDrawingRef,
@@ -214,7 +185,6 @@ export function useCanvasDrawing({
     selectionRef,
     isMaskModeRef,
     layersRef,
-    layerSourceCanvasesRef,
     effectiveDraftCanvasRef,
     predictedCanvasRef,
     activeTileGridRef: history.activeTileGridRef,
@@ -227,7 +197,7 @@ export function useCanvasDrawing({
     onCollabStrokeChunkRef,
     onCollabStrokeFinishRef,
     onCollabCursorMoveRef,
-    getCachedLayerCanvas,
+    getActiveMaskCanvas,
     pushHistoryStep: history.pushHistoryStep,
     flushPendingHistoryTasks: history.flushPendingHistoryTasks,
     enqueueHistoryTask: history.enqueueHistoryTask,
@@ -238,7 +208,6 @@ export function useCanvasDrawing({
   return {
     interactionRef,
     isDrawingRef,
-    getActiveCanvas,
     pushHistoryStep: history.pushHistoryStep,
     flushPendingHistoryTasks: history.flushPendingHistoryTasks,
     handlePointerDown: brushSession.handlePointerDown,

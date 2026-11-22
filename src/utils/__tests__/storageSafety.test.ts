@@ -304,14 +304,14 @@ describe('Storage Safety, IndexedDB Migration & QuotaExceededError Handling', ()
     const heavyThumb = 'data:image/jpeg;base64,' + 'T'.repeat(12_000);
     const doc: RecentDocument = {
       id: 'recent-1',
-      title: 'Chapter1.sora',
-      path: 'C:\\Art\\Chapter1.sora',
+      title: 'Chapter1.ink',
+      path: 'C:\\Art\\Chapter1.ink',
       size: 2_500_000,
       coverUrl: heavyThumb,
       lastOpened: Date.now(),
       isStarred: true,
       isSaved: true,
-      fileType: '.sora',
+      fileType: '.ink',
     };
 
     // Seed legacy localStorage entry with coverUrl to test migration + strip
@@ -331,7 +331,7 @@ describe('Storage Safety, IndexedDB Migration & QuotaExceededError Handling', ()
     await saveRecentDocument({
       ...doc,
       id: 'recent-2',
-      title: 'Chapter2.sora',
+      title: 'Chapter2.ink',
       coverUrl: heavyThumb,
     });
     const fallbackRaw = localStorage.getItem(RECENT_DOCS_LS_KEY) || '';

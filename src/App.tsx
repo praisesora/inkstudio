@@ -9,7 +9,7 @@ import { screenToCanvas } from './utils/canvasUtils';
 import { createDefaultPageFrame } from './utils/frameEngine';
 import { AutoAction, AutoActionExecutionContext, executeAutoAction } from './utils/autoActionEngine';
 import { globalTimelapseManager } from './utils/timelapseEngine';
-import { globalTileGrid, parseTileKey } from './utils/tileEngine';
+import { globalTileGrid, TileSnapshotEntry } from './utils/tileEngine';
 import { documentStore } from './utils/documentStore';
 import { multiplayerService } from './services/multiplayerService';
 import { updaterService } from './services/updaterService';
@@ -66,7 +66,7 @@ export function App() {
   const strokeCanvasRef = draftCanvasRef;
   const selectiveUndoRef = useRef<(peerId?: string | number, strokeId?: string) => unknown>(() => {});
   const pushHistoryStepRef = useRef<PushHistoryStepFn | null>(null);
-  const getActiveCanvasRef = useRef<() => HTMLCanvasElement | null>(() => null);
+  const resetHistoryRef = useRef<((targetDocumentId?: string) => void) | null>(null);
   const flushPendingHistoryTasksRef = useRef<() => void>(() => {});
   const showToast = uiStoreActions.showToast;
 
@@ -115,10 +115,8 @@ export function App() {
         collapsed: false,
         parentId: null,
       };
-      const canvas = document.createElement('canvas');
-      canvas.width = dimensions.width;
-      canvas.height = dimensions.height;
-      layerMgr.registerLayerCanvas(newLayerId, canvas);
+      activeTileGrid.setLayerFormat(newLayerId, 'color-32bit');
+      activeTileGrid.markLayerIngested(newLayerId);
 
       layerMgr.setLayers((prev) => [newCelLayer, ...prev]);
       layerMgr.setActiveLayerId(newLayerId);
@@ -127,7 +125,7 @@ export function App() {
       handleUpdateAnimationTimeline(setFrameCel(currentTl, frameIndex, newLayerId));
       showToast(`Cel added for frame ${frameIndex + 1}`);
     },
-    [activeAnimationTimeline, dimensions, handleUpdateAnimationTimeline, layerMgr, showToast]
+    [activeAnimationTimeline, activeTileGrid, handleUpdateAnimationTimeline, layerMgr, showToast]
   );
 
   const handleDeleteAnimationCel = useCallback(
@@ -146,6 +144,10 @@ export function App() {
     activeDocumentId,
   });
 
+  const stableResetHistory = useCallback((targetDocumentId?: string) => {
+    resetHistoryRef.current?.(targetDocumentId);
+  }, []);
+
   // Multiplayer & Collaborative Layer Sync
   const collab = useCollabSync({
     hasOpenDocument,
@@ -154,19 +156,27 @@ export function App() {
     layers: layerMgr.layers,
     activeLayerId: layerMgr.activeLayerId,
     selectedLayerIds: layerMgr.selectedLayerIds,
-    layerCanvasesRef: layerMgr.layerCanvasesRef,
-    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
+    perspectiveRuler,
+    straightRuler,
+    animationTimeline: activeAnimationTimeline,
     pushHistoryStepRef,
     selectiveUndoRef,
     resetZoomAndCenter: nav.resetZoomAndCenter,
+    resetHistory: stableResetHistory,
+    setLayers: layerMgr.setLayers,
     setActiveLayerId: layerMgr.setActiveLayerId,
+    toggleLock: layerMgr.toggleLock,
     addLayer: layerMgr.addLayer,
     addRemoteLayer: layerMgr.addRemoteLayer,
     deleteLayer: layerMgr.deleteLayer,
     deleteRemoteLayer: layerMgr.deleteRemoteLayer,
+    applyRemoteLayerUpdate: layerMgr.applyRemoteLayerUpdate,
+    applyRemoteLayerTree: layerMgr.applyRemoteLayerTree,
+    applyRemoteMaskData: layerMgr.applyRemoteMaskData,
     deleteSelectedLayers: layerMgr.deleteSelectedLayers,
     groupSelectedLayers: layerMgr.groupSelectedLayers,
     syncRemoteDocument: layerMgr.syncRemoteDocument,
+    resizeCanvas: layerMgr.resizeCanvas,
     renameLayer: layerMgr.renameLayer,
     toggleVisibility: layerMgr.toggleVisibility,
     setOpacity: layerMgr.setOpacity,
@@ -175,7 +185,6 @@ export function App() {
     showToast,
   });
 
-  const stableGetActiveCanvas = useCallback(() => getActiveCanvasRef.current(), []);
   const stableFlushPendingHistoryTasks = useCallback(
     () => flushPendingHistoryTasksRef.current(),
     []
@@ -195,10 +204,6 @@ export function App() {
     activeLayer: layerMgr.activeLayer,
     activeLayerId: layerMgr.activeLayerId,
     selectedLayerIds: layerMgr.selectedLayerIds,
-    layerCanvasesRef: layerMgr.layerCanvasesRef,
-    layerSourceCanvasesRef: layerMgr.layerSourceCanvasesRef,
-    getActiveCanvas: stableGetActiveCanvas,
-    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
     tileGrid: activeTileGrid,
     flushPendingHistoryTasks: stableFlushPendingHistoryTasks,
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
@@ -258,7 +263,13 @@ export function App() {
   const drawing = useCanvasDrawing({
     dimensions,
     colorMode,
-    disabled: !hasOpenDocument || nav.isSpaceDown || nav.isPanning || nav.isRotating || nav.isZoomDragging,
+    disabled:
+      !hasOpenDocument ||
+      nav.isSpaceDown ||
+      nav.isPanning ||
+      nav.isRotating ||
+      nav.isZoomDragging ||
+      ((collab.isConnected || collab.isReconnecting) && collab.myRole === 'viewer'),
     viewportRef: nav.viewportRef,
     pan: nav.pan,
     zoom: nav.zoom,
@@ -269,13 +280,12 @@ export function App() {
     activeLayerId: layerMgr.activeLayerId,
     activeSessionId: activeDocumentId,
     tileGrid: activeTileGrid,
-    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
-    activeLayerLocked: layerMgr.activeLayer?.locked ?? false,
+    activeLayerLocked:
+      (layerMgr.activeLayer?.locked ?? false) ||
+      ((collab.isConnected || collab.isReconnecting) && !collab.canEditActiveLayer),
     activeLayerVisible: layerMgr.activeLayer
       ? layerMgr.isLayerEffectivelyVisible(layerMgr.activeLayer)
       : true,
-    layerCanvasesRef: layerMgr.layerCanvasesRef,
-    layerSourceCanvasesRef: layerMgr.layerSourceCanvasesRef,
     layers: hasOpenDocument ? layerMgr.layers : [],
     onUpdateLayerThumbnail: layerMgr.updateLayerThumbnail,
     isMaskMode: activeEditTarget === 'mask',
@@ -294,7 +304,7 @@ export function App() {
 
   selectiveUndoRef.current = drawing.selectiveUndo;
   pushHistoryStepRef.current = drawing.pushHistoryStep;
-  getActiveCanvasRef.current = drawing.getActiveCanvas;
+  resetHistoryRef.current = drawing.resetHistory;
   flushPendingHistoryTasksRef.current = drawing.flushPendingHistoryTasks;
 
   const handleUndo = useCallback(() => {
@@ -305,30 +315,12 @@ export function App() {
     if (collab.isConnected && collab.myPeer.id) {
       void drawing.selectiveUndo('local').then((undone) => {
         if (!undone || !multiplayerService.isConnected()) return;
-        if (undone.strokeId) {
-          multiplayerService.sendSelectiveUndo(undone.strokeId);
-        } else if (undone.tileDeltas && undone.tileDeltas.length > 0) {
+        if (undone.syncedRemotely) return;
+        if (undone.tileDeltas && undone.tileDeltas.length > 0) {
           const grid = documentStore.getActiveTileGrid();
-          for (const delta of undone.tileDeltas) {
-            const { layerId, tileX, tileY } = parseTileKey(delta.key);
-            const tile = grid.getTile(layerId, tileX, tileY, 0);
-            if (tile) {
-              multiplayerService.sendTileDelta(layerId, tile);
-            } else {
-              multiplayerService.sendTileDelta(layerId, {
-                layerId,
-                tileX,
-                tileY,
-                format: delta.format,
-                data: null,
-                dirty: true,
-                version: 0,
-                isPagedToDisk: false,
-                lastAccessTimestamp: Date.now(),
-                lod: 0,
-              });
-            }
-          }
+          multiplayerService.sendTileDeltas(undone.tileDeltas, grid, { force: true });
+        } else if (undone.strokeId) {
+          multiplayerService.sendSelectiveUndo(undone.strokeId);
         }
       });
     } else {
@@ -364,20 +356,16 @@ export function App() {
     activeLayerId: layerMgr.activeLayerId,
     selectedLayerIds: layerMgr.selectedLayerIds,
     selection: selectionTools.selection,
-    layerCanvasesRef: layerMgr.layerCanvasesRef,
-    layerSourceCanvasesRef: layerMgr.layerSourceCanvasesRef,
-    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
     flushPendingHistoryTasks: drawing.flushPendingHistoryTasks,
     isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
     getEffectiveOpacity: layerMgr.getEffectiveOpacity,
-    getActiveCanvas: drawing.getActiveCanvas,
     getCanvasCoords,
     setActiveLayerId: layerMgr.setActiveLayerId,
     upsertTextLayer: layerMgr.upsertTextLayer,
     upsertBalloonLayer: layerMgr.upsertBalloonLayer,
     createFrameFolder: layerMgr.createFrameFolder,
     divideFrameFolder: layerMgr.divideFrameFolder,
-    deleteLayer: layerMgr.deleteLayer,
+    deleteLayer: collab.handleDeleteLayer,
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
     pushHistoryStep: drawing.pushHistoryStep,
     showToast,
@@ -387,8 +375,8 @@ export function App() {
   const vectorTools = useVectorDrawing({
     activeLayer: layerMgr.activeLayer,
     activeLayerId: layerMgr.activeLayerId,
+    dimensions,
     colorMode,
-    getActiveCanvas: drawing.getActiveCanvas,
     getCanvasCoords,
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
     pushHistoryStep: drawing.pushHistoryStep,
@@ -404,12 +392,7 @@ export function App() {
     activeLayer: layerMgr.activeLayer,
     activeLayerId: layerMgr.activeLayerId,
     selection: selectionTools.selection,
-    layerCanvasesRef: layerMgr.layerCanvasesRef,
-    layerSourceCanvasesRef: layerMgr.layerSourceCanvasesRef,
-    materializeLayerCanvas: layerMgr.materializeLayerCanvas,
-    releaseLayerCanvas: layerMgr.releaseLayerCanvas,
     setActiveLayerId: layerMgr.setActiveLayerId,
-    getActiveCanvas: drawing.getActiveCanvas,
     updateLayerThumbnail: layerMgr.updateLayerThumbnail,
     handleCommitFloatingSelection: selectionTools.handleCommitFloatingSelection,
     pushHistoryStepRef,
@@ -430,7 +413,6 @@ export function App() {
     layers: layerMgr.layers,
     activeLayer: layerMgr.activeLayer,
     activeLayerId: layerMgr.activeLayerId,
-    layerCanvasesRef: layerMgr.layerCanvasesRef,
     getEffectiveOpacity: layerMgr.getEffectiveOpacity,
     isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
     setActiveLayerId: layerMgr.setActiveLayerId,
@@ -442,7 +424,7 @@ export function App() {
     resizeCanvas: layerMgr.resizeCanvas,
     copyLayer: layerMgr.copyLayer,
     pasteLayer: layerMgr.pasteLayer,
-    deleteLayer: layerMgr.deleteLayer,
+    deleteLayer: collab.handleDeleteLayer,
     pasteLayerFromFile: layerMgr.pasteLayerFromFile,
     resetZoomAndCenter: nav.resetZoomAndCenter,
     resetHistory: drawing.resetHistory,
@@ -563,7 +545,7 @@ export function App() {
       if (!hasOpenDocument) return;
       autoActionStoreActions.setIsPlaying(true);
       let currentLayerId = layerMgr.activeLayerId;
-      let groupStartBefore: ImageData | null = null;
+      let groupStartSnapshot: Map<string, TileSnapshotEntry> | null = null;
       let groupTargetLayerId = currentLayerId;
 
       const ctx: AutoActionExecutionContext = {
@@ -586,7 +568,7 @@ export function App() {
           return folder.id;
         },
         duplicateLayer: (id) => layerMgr.duplicateLayer(id),
-        deleteLayer: (id) => layerMgr.deleteLayer(id),
+        deleteLayer: (id) => collab.handleDeleteLayer(id),
         renameLayer: (id, name) => layerMgr.renameLayer(id, name),
         setBlendMode: (id, blendMode) => layerMgr.setBlendMode(id, blendMode),
         setOpacity: (id, opacity) => layerMgr.setOpacity(id, opacity),
@@ -616,28 +598,20 @@ export function App() {
           if (opts?.angle !== undefined) layerMgr.setToneAngle(id, opts.angle);
         },
         fillLayer: (id, color) => {
-          const canvas = layerMgr.materializeLayerCanvas(id);
-          if (!canvas) return;
-          const c2d = canvas.getContext('2d');
-          if (!c2d) return;
-          if (!groupStartBefore) {
-            groupStartBefore = c2d.getImageData(0, 0, canvas.width, canvas.height);
+          if (!groupStartSnapshot) {
+            groupStartSnapshot = activeTileGrid.snapshotLayerTiles(id);
             groupTargetLayerId = id;
           }
-          c2d.save();
-          c2d.fillStyle = color;
-          c2d.fillRect(0, 0, canvas.width, canvas.height);
-          c2d.restore();
-          activeTileGrid.ingestCanvas(id, canvas, 'color-32bit');
+          activeTileGrid.fillLayerSolidColor(id, dimensions.width, dimensions.height, color, 'color-32bit');
           activeTileGrid.notifyChange(true);
           layerMgr.updateLayerThumbnail(id, true);
         },
         clearLayer: (id) => {
-          activeTileGrid.clearLayer(id);
-          const canvas = layerMgr.layerCanvasesRef.current.get(id);
-          if (canvas) {
-            canvas.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+          if (!groupStartSnapshot) {
+            groupStartSnapshot = activeTileGrid.snapshotLayerTiles(id);
+            groupTargetLayerId = id;
           }
+          activeTileGrid.clearLayer(id);
           activeTileGrid.notifyChange(true);
           layerMgr.updateLayerThumbnail(id, true);
         },
@@ -657,19 +631,18 @@ export function App() {
           docLifecycle.handleExportImage();
         },
         endHistoryGroup: (label) => {
-          const targetCanvas = groupTargetLayerId
-            ? layerMgr.layerCanvasesRef.current.get(groupTargetLayerId)
-            : null;
-          const afterImg =
-            groupStartBefore && targetCanvas
-              ? targetCanvas.getContext('2d')?.getImageData(0, 0, targetCanvas.width, targetCanvas.height) ?? null
-              : null;
+          const targetId = groupTargetLayerId || currentLayerId;
+          const tileDeltas = groupStartSnapshot
+            ? activeTileGrid.computeDeltasFromSnapshot(groupStartSnapshot, targetId)
+            : undefined;
           drawing.pushHistoryStep(
             'auto-action',
             label,
-            groupStartBefore,
-            afterImg,
-            groupTargetLayerId || currentLayerId
+            null,
+            null,
+            targetId,
+            undefined,
+            tileDeltas && tileDeltas.length > 0 ? tileDeltas : undefined
           );
         },
       };
@@ -762,6 +735,19 @@ export function App() {
       const tool = useToolStore.getState().tool;
       const pt = getCanvasCoords(e);
 
+      // Collaborative role & owner-lock guard on canvas mutations
+      if ((collab.isConnected || collab.isReconnecting) && tool !== 'pipette') {
+        if (collab.myRole === 'viewer') {
+          showToast('Viewers have read-only access');
+          return;
+        }
+        const editPerm = collab.canEditLayerById(layerMgr.activeLayerId);
+        if (!editPerm.allowed) {
+          showToast(editPerm.reason || 'Layer is locked by its owner');
+          return;
+        }
+      }
+
       if (tool === 'brush' || tool === 'eraser') {
         const curLayer = layerMgr.activeLayer;
         if (curLayer?.type === 'text' || curLayer?.type === 'balloon') {
@@ -787,7 +773,21 @@ export function App() {
       if (selectionTools.handleSelectionPointerDown(e, pt)) return;
       shapeFillTools.handleShapeFillPointerDown(e, pt);
     },
-    [hasOpenDocument, getCanvasCoords, selectionTools, drawing, vectorTools, shapeFillTools]
+    [
+      hasOpenDocument,
+      getCanvasCoords,
+      selectionTools,
+      drawing,
+      vectorTools,
+      shapeFillTools,
+      collab.isConnected,
+      collab.isReconnecting,
+      collab.myRole,
+      collab.canEditLayerById,
+      layerMgr.activeLayer,
+      layerMgr.activeLayerId,
+      showToast,
+    ]
   );
 
   const handlePointerMove = useCallback(
@@ -880,7 +880,7 @@ export function App() {
     handleOpenLayerStylesModal: tonalActions.handleOpenLayerStylesModal,
     toggleLayerColor: layerMgr.toggleLayerColor,
     handleConvertLayer: tonalActions.handleConvertLayer,
-    deleteLayer: layerMgr.deleteLayer,
+    deleteLayer: collab.handleDeleteLayer,
     handleApplyFilter: handleRecordedApplyFilter,
     zoomIn: nav.zoomIn,
     zoomOut: nav.zoomOut,
@@ -935,8 +935,6 @@ export function App() {
       layers: layerMgr.layers,
       activeLayerId: layerMgr.activeLayerId,
       tileGrid: activeTileGrid,
-      layerCanvasesRef: layerMgr.layerCanvasesRef,
-      registerLayerCanvas: layerMgr.registerLayerCanvas,
       getEffectiveOpacity: layerMgr.getEffectiveOpacity,
       isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
       interactionRef: drawing.interactionRef,
@@ -989,8 +987,6 @@ export function App() {
       handlePointerUp,
       layerMgr.layers,
       layerMgr.activeLayerId,
-      layerMgr.layerCanvasesRef,
-      layerMgr.registerLayerCanvas,
       layerMgr.getEffectiveOpacity,
       layerMgr.isLayerEffectivelyVisible,
       layerMgr.setActiveLayerId,
@@ -1064,6 +1060,7 @@ export function App() {
       handleClearActiveLayer={collab.handleClearActiveLayer}
       handleMergeDown={handleMergeDown}
       isCollabConnected={collab.isConnected}
+      isCollabReconnecting={collab.isReconnecting}
       collabPeerCount={collab.peers.length + 1}
       onOpenCollabModal={handleOpenCollabModal}
       handleTriggerOpenFile={docLifecycle.handleTriggerOpenFile}
@@ -1086,7 +1083,8 @@ export function App() {
       handleToggleVisibility={collab.handleToggleVisibility}
       handleSetOpacity={handleRecordedSetOpacity}
       setBlendMode={handleRecordedSetBlendMode}
-      toggleLock={layerMgr.toggleLock}
+      toggleLock={collab.handleToggleLock}
+      toggleOwnerLock={collab.handleToggleOwnerLock}
       toggleAlphaLock={layerMgr.toggleAlphaLock}
       toggleClipping={handleRecordedToggleClipping}
       toggleCollapse={layerMgr.toggleCollapse}
@@ -1123,7 +1121,6 @@ export function App() {
       <DocumentLifecycleManager
         layers={layerMgr.layers}
         activeLayerId={layerMgr.activeLayerId}
-        layerCanvasesRef={layerMgr.layerCanvasesRef}
         needsAdaptiveFitRef={docLifecycle.needsAdaptiveFitRef}
         pendingFitDimsRef={docLifecycle.pendingFitDimsRef}
         resetToNewCanvas={layerMgr.resetToNewCanvas}
@@ -1182,7 +1179,6 @@ export function App() {
       <ModalHost
         layers={layerMgr.layers}
         activeLayer={layerMgr.activeLayer}
-        layerCanvasesRef={layerMgr.layerCanvasesRef}
         getEffectiveOpacity={layerMgr.getEffectiveOpacity}
         isLayerEffectivelyVisible={layerMgr.isLayerEffectivelyVisible}
         handleCreateNewCanvas={docLifecycle.handleCreateNewCanvas}
@@ -1201,14 +1197,22 @@ export function App() {
         setIsHostModalOpen={collab.setIsHostModalOpen}
         isCollabHost={collab.isHost}
         isCollabConnected={collab.isConnected}
+        collabConnectionStatus={collab.connectionStatus}
+        collabReconnectAttempt={collab.reconnectAttempt}
+        collabMyRole={collab.myRole}
         collabHostInfo={collab.hostInfo}
         collabPeers={collab.peers}
+        collabBannedPeerIds={collab.bannedPeerIds}
         collabMyPeer={collab.myPeer}
         updateMyName={collab.updateMyName}
         handleStartHosting={collab.handleStartHosting}
         stopHosting={collab.stopHosting}
         joinByInviteUrl={collab.joinByInviteUrl}
         leaveRoom={collab.leaveRoom}
+        onSetPeerRole={collab.setPeerRole}
+        onKickPeer={collab.kickPeer}
+        onBanPeer={collab.banPeer}
+        onUnbanPeer={collab.unbanPeer}
         clipboardInvite={collab.clipboardInvite}
         setClipboardInvite={collab.setClipboardInvite}
         webLandingInvite={collab.webLandingInvite}

@@ -7,7 +7,7 @@ import {
   NewCanvasOptions,
 } from '../types/editor';
 import { AppSettings, ResizeCanvasOptions } from '../types/settings';
-import { CollabPeer, SessionHostInfo } from '../types/multiplayer';
+import { CollabPeer, CollabRole, ConnectionStatus, SessionHostInfo } from '../types/multiplayer';
 import { ParsedInviteLink } from '../services/multiplayerService';
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType } from '../utils/tonalEngine';
@@ -39,7 +39,6 @@ export type InviteLinkPayload = ParsedInviteLink;
 export interface ModalHostProps {
   layers: LayerItem[];
   activeLayer: LayerItem | undefined;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   handleCreateNewCanvas: (options: NewCanvasOptions) => void;
@@ -69,8 +68,12 @@ export interface ModalHostProps {
   setIsHostModalOpen: (open: boolean) => void;
   isCollabHost: boolean;
   isCollabConnected: boolean;
+  collabConnectionStatus?: ConnectionStatus;
+  collabReconnectAttempt?: number;
+  collabMyRole?: CollabRole;
   collabHostInfo: SessionHostInfo | null;
   collabPeers: CollabPeer[];
+  collabBannedPeerIds?: string[];
   collabMyPeer: CollabPeer;
   updateMyName: (name: string) => void;
   handleStartHosting: (
@@ -83,6 +86,10 @@ export interface ModalHostProps {
   stopHosting: () => void;
   joinByInviteUrl: (rawUrl: string, nickname?: string, persistName?: boolean) => Promise<boolean>;
   leaveRoom: () => void;
+  onSetPeerRole?: (peerId: string | number, role: 'editor' | 'viewer') => void;
+  onKickPeer?: (peerId: string | number) => void;
+  onBanPeer?: (peerId: string | number) => void;
+  onUnbanPeer?: (peerId: string | number) => void;
   clipboardInvite: InviteLinkPayload | null;
   setClipboardInvite: (invite: InviteLinkPayload | null) => void;
   webLandingInvite: InviteLinkPayload | null;
@@ -105,7 +112,6 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
   ({
     layers,
     activeLayer,
-    layerCanvasesRef,
     getEffectiveOpacity,
     isLayerEffectivelyVisible,
     handleCreateNewCanvas,
@@ -124,14 +130,22 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     setIsHostModalOpen,
     isCollabHost,
     isCollabConnected,
+    collabConnectionStatus,
+    collabReconnectAttempt,
+    collabMyRole,
     collabHostInfo,
     collabPeers,
+    collabBannedPeerIds,
     collabMyPeer,
     updateMyName,
     handleStartHosting,
     stopHosting,
     joinByInviteUrl,
     leaveRoom,
+    onSetPeerRole,
+    onKickPeer,
+    onBanPeer,
+    onUnbanPeer,
     clipboardInvite,
     setClipboardInvite,
     webLandingInvite,
@@ -170,14 +184,14 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         compositeCanvas(
           dimensions,
           layers,
-          layerCanvasesRef.current,
+          undefined,
           getEffectiveOpacity,
           isLayerEffectivelyVisible,
           false,
           documentStore.getActiveTileGrid(),
           { colorMode }
         ),
-      [dimensions, layers, layerCanvasesRef, getEffectiveOpacity, isLayerEffectivelyVisible, colorMode]
+      [dimensions, layers, getEffectiveOpacity, isLayerEffectivelyVisible, colorMode]
     );
 
     const createWebtoonRegionRenderer = useCallback(
@@ -185,13 +199,13 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         createDocumentRegionRenderer(
           dimensions,
           layers,
-          layerCanvasesRef.current,
+          undefined,
           getEffectiveOpacity,
           isLayerEffectivelyVisible,
           documentStore.getActiveTileGrid(),
           { colorMode }
         ),
-      [dimensions, layers, layerCanvasesRef, getEffectiveOpacity, isLayerEffectivelyVisible, colorMode]
+      [dimensions, layers, getEffectiveOpacity, isLayerEffectivelyVisible, colorMode]
     );
 
     const activeDoc = documents.find((d) => d.id === activeDocumentId);
@@ -210,9 +224,10 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           isOpen={isNewCanvasModalOpen}
           onClose={() => uiStoreActions.setNewCanvasModalOpen(false)}
           onCreate={handleCreateNewCanvas}
-          initialWidth={dimensions.width}
-          initialHeight={dimensions.height}
-          initialDpi={dimensions.dpi || 300}
+          initialWidth={activeDoc ? dimensions.width : (appSettings.defaultWidth || 1920)}
+          initialHeight={activeDoc ? dimensions.height : (appSettings.defaultHeight || 1080)}
+          initialDpi={activeDoc ? (dimensions.dpi || 300) : (appSettings.defaultDpi || 300)}
+          initialColorMode={activeDoc ? colorMode : (appSettings.defaultColorMode || 'color')}
           initialName="Untitled*"
         />
 
@@ -240,7 +255,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         <TonalCorrectionModal
           isOpen={tonalModalState.isOpen}
           type={tonalModalState.type}
-          beforeImageData={tonalModalState.beforeImageData}
+          histograms={tonalModalState.histograms}
           selectionMask={tonalModalState.selectionMask}
           onClose={handleTonalCancel}
           onApply={handleTonalApply}
@@ -288,14 +303,22 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           onClose={() => setIsHostModalOpen(false)}
           isHost={isCollabHost}
           isConnected={isCollabConnected}
+          connectionStatus={collabConnectionStatus}
+          reconnectAttempt={collabReconnectAttempt}
+          myRole={collabMyRole}
           hostInfo={collabHostInfo}
           peers={collabPeers}
+          bannedPeerIds={collabBannedPeerIds}
           myPeer={collabMyPeer}
           onUpdateMyName={updateMyName}
           onStartHosting={handleStartHosting}
           onStopHosting={stopHosting}
           onJoinByInviteUrl={joinByInviteUrl}
           onLeaveRoom={leaveRoom}
+          onSetPeerRole={onSetPeerRole}
+          onKickPeer={onKickPeer}
+          onBanPeer={onBanPeer}
+          onUnbanPeer={onUnbanPeer}
           showToast={showToast}
         />
 

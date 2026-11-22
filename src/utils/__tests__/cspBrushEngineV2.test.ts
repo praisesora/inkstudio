@@ -13,7 +13,7 @@ import {
   applyCspPostCorrection,
   applyCspWatercolorEdge,
   CSP_PRESSURE_CURVE_PRESETS,
-} from '../../engine/CspBrushEngine';
+} from '../../engine/BrushEngine';
 import { stepBrushSizePreset } from '../brushPresetManager';
 import { BUILTIN_BRUSHES } from '../presetBrushes';
 import { Point } from '../../types/editor';

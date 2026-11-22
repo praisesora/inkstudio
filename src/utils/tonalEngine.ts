@@ -1,10 +1,22 @@
 import {
+  CanvasDimensions,
   CanvasSelection,
   AdjustmentLayerData,
   ToneCurvePoints,
   GradientStop,
   ColorBalanceAdjustmentData,
+  TileDelta,
 } from '../types/editor';
+import {
+  BYTES_32BIT,
+  SparseTileGrid,
+  TILE_SIZE,
+  TileFormat,
+  TileSnapshotEntry,
+  parseTileKey,
+  unpack1BitToRGBA,
+  unpack8BitToRGBA,
+} from './tileEngine';
 
 export type TonalCorrectionType =
   | 'brightness-contrast'
@@ -955,5 +967,167 @@ export function applyAdjustment(
     }
     return;
   }
+}
+
+export interface TileHistogramMap {
+  rgb: Uint32Array;
+  r: Uint32Array;
+  g: Uint32Array;
+  b: Uint32Array;
+}
+
+/**
+ * Computes RGB + luminance histograms directly from a SparseTileGrid tile snapshot
+ * without materializing a full-document ImageData buffer.
+ */
+export function computeHistogramsFromTileSnapshot(
+  snapshot: Map<string, TileSnapshotEntry>,
+  dimensions: CanvasDimensions,
+  selectionMask?: Uint8Array | null
+): TileHistogramMap {
+  const rgb = new Uint32Array(256);
+  const rHist = new Uint32Array(256);
+  const gHist = new Uint32Array(256);
+  const bHist = new Uint32Array(256);
+  const scratch = new Uint8ClampedArray(BYTES_32BIT);
+  const docW = dimensions.width;
+  const docH = dimensions.height;
+
+  for (const [key, entry] of snapshot.entries()) {
+    if (!entry.data) continue;
+    const { tileX, tileY } = parseTileKey(key);
+    const tileDocX = tileX * TILE_SIZE;
+    const tileDocY = tileY * TILE_SIZE;
+    const validW = Math.min(TILE_SIZE, docW - tileDocX);
+    const validH = Math.min(TILE_SIZE, docH - tileDocY);
+    if (validW <= 0 || validH <= 0) continue;
+
+    let rgba: Uint8ClampedArray;
+    if (entry.format === 'color-32bit') {
+      rgba = new Uint8ClampedArray(entry.data.buffer, entry.data.byteOffset, BYTES_32BIT);
+    } else if (entry.format === 'monochrome-1bit') {
+      unpack1BitToRGBA(entry.data, scratch);
+      rgba = scratch;
+    } else {
+      unpack8BitToRGBA(entry.data, scratch);
+      rgba = scratch;
+    }
+
+    for (let ly = 0; ly < validH; ly++) {
+      const gy = tileDocY + ly;
+      const selRow = gy * docW;
+      let off = (ly * TILE_SIZE) << 2;
+      for (let lx = 0; lx < validW; lx++, off += 4) {
+        if (rgba[off + 3] === 0) continue;
+        if (selectionMask && selectionMask[selRow + tileDocX + lx] === 0) continue;
+        const rv = rgba[off];
+        const gv = rgba[off + 1];
+        const bv = rgba[off + 2];
+        rHist[rv]++;
+        gHist[gv]++;
+        bHist[bv]++;
+        const lum = Math.round(0.299 * rv + 0.587 * gv + 0.114 * bv);
+        rgb[lum]++;
+      }
+    }
+  }
+
+  return { rgb, r: rHist, g: gHist, b: bHist };
+}
+
+/**
+ * Applies any point-wise tonal correction directly from a pre-edit tile snapshot into
+ * SparseTileGrid tiles (zero full-document canvas or full-document ImageData).
+ */
+export function applyTonalToTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  beforeSnapshot: Map<string, TileSnapshotEntry>;
+  type: TonalCorrectionType;
+  tonalParams: any;
+  targetFormat: TileFormat;
+  selectionMask?: Uint8Array | null;
+  bounds?: ProcessingBounds;
+}): { tileDeltas: TileDelta[] } {
+  const {
+    grid,
+    layerId,
+    dimensions,
+    beforeSnapshot,
+    type,
+    tonalParams,
+    targetFormat,
+    selectionMask,
+    bounds,
+  } = params;
+
+  const docW = dimensions.width;
+  const docH = dimensions.height;
+  const bX0 = bounds ? bounds.x0 : 0;
+  const bY0 = bounds ? bounds.y0 : 0;
+  const bX1 = bounds ? bounds.x1 : docW;
+  const bY1 = bounds ? bounds.y1 : docH;
+
+  const scratch = new Uint8ClampedArray(BYTES_32BIT);
+  const dstBuf = new Uint8ClampedArray(BYTES_32BIT);
+  const tileMaskBuf = selectionMask ? new Uint8Array(TILE_SIZE * TILE_SIZE) : null;
+
+  for (const [key, entry] of beforeSnapshot.entries()) {
+    if (!entry.data) continue;
+    const { tileX, tileY } = parseTileKey(key);
+    const tileDocX = tileX * TILE_SIZE;
+    const tileDocY = tileY * TILE_SIZE;
+
+    const ix0 = Math.max(bX0, tileDocX);
+    const iy0 = Math.max(bY0, tileDocY);
+    const ix1 = Math.min(bX1, tileDocX + TILE_SIZE, docW);
+    const iy1 = Math.min(bY1, tileDocY + TILE_SIZE, docH);
+    if (ix1 <= ix0 || iy1 <= iy0) continue;
+
+    let srcRgba: Uint8ClampedArray;
+    if (entry.format === 'color-32bit') {
+      srcRgba = new Uint8ClampedArray(entry.data.buffer, entry.data.byteOffset, BYTES_32BIT);
+    } else if (entry.format === 'monochrome-1bit') {
+      unpack1BitToRGBA(entry.data, scratch);
+      srcRgba = scratch;
+    } else {
+      unpack8BitToRGBA(entry.data, scratch);
+      srcRgba = scratch;
+    }
+
+    dstBuf.set(srcRgba);
+
+    let localMask: Uint8Array | null = null;
+    if (selectionMask && tileMaskBuf) {
+      tileMaskBuf.fill(0);
+      const localX0 = ix0 - tileDocX;
+      const localY0 = iy0 - tileDocY;
+      const localX1 = ix1 - tileDocX;
+      const localY1 = iy1 - tileDocY;
+      for (let ly = localY0; ly < localY1; ly++) {
+        const srcOff = (tileDocY + ly) * docW + tileDocX + localX0;
+        const dstOff = ly * TILE_SIZE + localX0;
+        tileMaskBuf.set(selectionMask.subarray(srcOff, srcOff + (localX1 - localX0)), dstOff);
+      }
+      localMask = tileMaskBuf;
+    }
+
+    const srcImg = { data: srcRgba, width: TILE_SIZE, height: TILE_SIZE } as ImageData;
+    const dstImg = { data: dstBuf, width: TILE_SIZE, height: TILE_SIZE } as ImageData;
+    const tileBounds: ProcessingBounds = {
+      x0: ix0 - tileDocX,
+      y0: iy0 - tileDocY,
+      x1: ix1 - tileDocX,
+      y1: iy1 - tileDocY,
+    };
+
+    applyTonalFilter(srcImg, dstImg, type, tonalParams, localMask, tileBounds);
+    grid.writeImageData(layerId, { data: dstBuf, width: TILE_SIZE, height: TILE_SIZE }, tileDocX, tileDocY, targetFormat, true);
+  }
+
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId);
+  grid.notifyChange(true);
+  return { tileDeltas };
 }
 

@@ -38,7 +38,7 @@
     "licenseFile": "../LICENSE",
     "fileAssociations": [
       {
-        "ext": ["sora", "ink"],
+        "ext": ["ink"],
         "name": "Ink Studio Project",
         "description": "Ink Studio Project File",
         "role": "Editor"

@@ -7,13 +7,15 @@ import {
   HueSaturationParams,
   PosterizationParams,
   LevelCorrectionParams,
+  TileHistogramMap,
   computeHistogram,
 } from '../utils/tonalEngine';
 
 interface TonalCorrectionModalProps {
   isOpen: boolean;
   type: TonalCorrectionType;
-  beforeImageData: ImageData | null;
+  histograms?: TileHistogramMap | null;
+  beforeImageData?: ImageData | null;
   selectionMask: Uint8Array | null;
   onClose: () => void;
   onApply: (type: TonalCorrectionType, params: any) => void;
@@ -51,6 +53,7 @@ const DEFAULT_LEVEL_CORRECTION: LevelCorrectionParams = {
 export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
   isOpen,
   type,
+  histograms,
   beforeImageData,
   selectionMask,
   onClose,
@@ -78,16 +81,18 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
 
   const histogramCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Compute histograms for level correction
+  // Use precomputed tile histograms (zero full-doc ImageData allocation) or fallback to ImageData
   const histogramMap = useMemo(() => {
-    if (!beforeImageData || type !== 'level-correction') return null;
+    if (type !== 'level-correction') return null;
+    if (histograms) return histograms;
+    if (!beforeImageData) return null;
     return {
       rgb: computeHistogram(beforeImageData, 'rgb', selectionMask),
       r: computeHistogram(beforeImageData, 'r', selectionMask),
       g: computeHistogram(beforeImageData, 'g', selectionMask),
       b: computeHistogram(beforeImageData, 'b', selectionMask),
     };
-  }, [beforeImageData, type, selectionMask]);
+  }, [histograms, beforeImageData, type, selectionMask]);
 
   // Reset state when opening
   useEffect(() => {

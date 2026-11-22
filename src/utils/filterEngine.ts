@@ -1,4 +1,16 @@
-import { FilterType } from '../types/editor';
+import { CanvasDimensions, CanvasSelection, DirtyRect, FilterType, TileDelta } from '../types/editor';
+import { applyFilterNative, isNativeRustAvailable } from './nativeBackend';
+import {
+  BYTES_32BIT,
+  SparseTileGrid,
+  TILE_SIZE,
+  TileFormat,
+  getTileKey,
+  pixelToTileCoord,
+  unpack1BitToRGBA,
+  unpack8BitToRGBA,
+} from './tileEngine';
+import { createSelectionMask } from './tonalEngine';
 
 export interface GaussianBlurParams {
   radius: number; // Blur radius in pixels (1 to 100)
@@ -687,5 +699,372 @@ export function applyFilterToCanvas(
   const filtered = applyFilter(imgData, type, params);
   ctx.putImageData(filtered, 0, 0);
   return true;
+}
+
+function makeImageDataBuffer(data: Uint8ClampedArray, width: number, height: number): ImageData {
+  if (typeof ImageData !== 'undefined') {
+    return new ImageData(new Uint8ClampedArray(data), width, height);
+  }
+  return { data: new Uint8ClampedArray(data), width, height } as ImageData;
+}
+
+/**
+ * Tile-native convolution filter processor: runs in halo-padded chunks strictly over
+ * the populated tile bounds of `layerId` (expanded by filter kernel halo).
+ * Seamless across chunk boundaries; zero full-document canvas/ImageData allocation.
+ */
+export function applyFilterToTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  type: FilterType;
+  filterParams: any;
+  targetFormat: TileFormat;
+  selection?: CanvasSelection | null;
+}): { dirtyRect: DirtyRect | null; tileDeltas: TileDelta[] } {
+  const { grid, layerId, dimensions, type, filterParams, targetFormat, selection } = params;
+  const docW = dimensions.width;
+  const docH = dimensions.height;
+  if (docW <= 0 || docH <= 0 || !grid.hasLayerTiles(layerId)) {
+    return { dirtyRect: null, tileDeltas: [] };
+  }
+
+  const tileBounds = grid.getLayerTileBounds(layerId, dimensions);
+  if (!tileBounds) return { dirtyRect: null, tileDeltas: [] };
+
+  let halo = 0;
+  if (type === 'gaussian-blur') {
+    halo = Math.min(256, Math.ceil((filterParams?.radius || 5) * 3) + 4);
+  } else if (type === 'unsharp-mask') {
+    halo = Math.min(256, Math.ceil((filterParams?.radius || 2) * 3) + 4);
+  } else if (type === 'motion-blur') {
+    halo = Math.min(256, Math.ceil((filterParams?.distance || 15) * 0.6) + 4);
+  }
+
+  let minX = Math.max(0, tileBounds.x - halo);
+  let minY = Math.max(0, tileBounds.y - halo);
+  let maxX = Math.min(docW, tileBounds.x + tileBounds.width + halo);
+  let maxY = Math.min(docH, tileBounds.y + tileBounds.height + halo);
+
+  if (selection) {
+    const sb = selection.bounds;
+    minX = Math.max(minX, Math.floor(sb.x));
+    minY = Math.max(minY, Math.floor(sb.y));
+    maxX = Math.min(maxX, Math.ceil(sb.x + sb.width));
+    maxY = Math.min(maxY, Math.ceil(sb.y + sb.height));
+  }
+
+  if (maxX <= minX || maxY <= minY) return { dirtyRect: null, tileDeltas: [] };
+
+  const dirtyRect: DirtyRect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+
+  // Freeze pre-filter tile snapshot for both halo-consistent reads and undo deltas
+  const beforeSnapshot = grid.snapshotTilesInRect(layerId, dirtyRect);
+  // Also ensure halo-border source tiles outside dirtyRect are readable without mutation
+  const readRect: DirtyRect = {
+    x: Math.max(0, minX - halo),
+    y: Math.max(0, minY - halo),
+    width: Math.min(docW, maxX + halo) - Math.max(0, minX - halo),
+    height: Math.min(docH, maxY + halo) - Math.max(0, minY - halo),
+  };
+  const sourceSnap = grid.snapshotTilesInRect(layerId, readRect);
+
+  const scratch = new Uint8ClampedArray(BYTES_32BIT);
+  const readFromSourceSnap = (rx: number, ry: number, rw: number, rh: number): Uint8ClampedArray => {
+    const out = new Uint8ClampedArray(rw * rh * 4);
+    const tx0 = pixelToTileCoord(rx, 0);
+    const ty0 = pixelToTileCoord(ry, 0);
+    const tx1 = pixelToTileCoord(rx + rw - 1, 0);
+    const ty1 = pixelToTileCoord(ry + rh - 1, 0);
+
+    for (let ty = ty0; ty <= ty1; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const entry = sourceSnap.get(getTileKey(layerId, tx, ty, 0));
+        if (!entry || !entry.data) continue;
+        let rgba: Uint8ClampedArray;
+        if (entry.format === 'color-32bit') {
+          rgba = new Uint8ClampedArray(entry.data.buffer, entry.data.byteOffset, BYTES_32BIT);
+        } else if (entry.format === 'monochrome-1bit') {
+          unpack1BitToRGBA(entry.data, scratch);
+          rgba = scratch;
+        } else {
+          unpack8BitToRGBA(entry.data, scratch);
+          rgba = scratch;
+        }
+        const tileDocX = tx * TILE_SIZE;
+        const ix0 = Math.max(rx, tileDocX);
+        const iy0 = Math.max(ry, tileDocY);
+        const ix1 = Math.min(rx + rw, tileDocX + TILE_SIZE);
+        const iy1 = Math.min(ry + rh, tileDocY + TILE_SIZE);
+        const copyW = ix1 - ix0;
+        if (copyW <= 0 || iy1 <= iy0) continue;
+        for (let py = iy0; py < iy1; py++) {
+          const sOff = ((py - tileDocY) * TILE_SIZE + (ix0 - tileDocX)) << 2;
+          const dOff = ((py - ry) * rw + (ix0 - rx)) << 2;
+          out.set(rgba.subarray(sOff, sOff + (copyW << 2)), dOff);
+        }
+      }
+    }
+    return out;
+  };
+
+  const selMask = selection ? createSelectionMask(selection, docW, docH) : null;
+  const CHUNK = 512;
+
+  for (let cy = minY; cy < maxY; cy += CHUNK) {
+    const ch = Math.min(CHUNK, maxY - cy);
+    for (let cx = minX; cx < maxX; cx += CHUNK) {
+      const cw = Math.min(CHUNK, maxX - cx);
+
+      const padLeft = Math.min(halo, cx);
+      const padTop = Math.min(halo, cy);
+      const padRight = Math.min(halo, docW - (cx + cw));
+      const padBottom = Math.min(halo, docH - (cy + ch));
+
+      const px = cx - padLeft;
+      const py = cy - padTop;
+      const pw = cw + padLeft + padRight;
+      const ph = ch + padTop + padBottom;
+
+      const srcPixels = readFromSourceSnap(px, py, pw, ph);
+      // Skip completely empty padded chunks
+      let hasAny = false;
+      for (let i = 3; i < srcPixels.length; i += 4) {
+        if (srcPixels[i] !== 0) {
+          hasAny = true;
+          break;
+        }
+      }
+      if (!hasAny) continue;
+
+      const chunkParams =
+        type === 'film-grain'
+          ? { ...filterParams, seed: ((filterParams?.seed || 1337) ^ ((cx * 73856093) ^ (cy * 19349663))) | 0 }
+          : filterParams;
+
+      const filtered = applyFilter(makeImageDataBuffer(srcPixels, pw, ph), type, chunkParams);
+      const outChunk = new Uint8ClampedArray(cw * ch * 4);
+
+      for (let ly = 0; ly < ch; ly++) {
+        const gy = cy + ly;
+        const srcRowOff = ((ly + padTop) * pw + padLeft) * 4;
+        const dstRowOff = ly * cw * 4;
+        if (!selMask) {
+          outChunk.set(filtered.data.subarray(srcRowOff, srcRowOff + cw * 4), dstRowOff);
+        } else {
+          const selRow = gy * docW;
+          for (let lx = 0; lx < cw; lx++) {
+            const gx = cx + lx;
+            const m = selMask[selRow + gx];
+            const sIdx = srcRowOff + lx * 4;
+            const dIdx = dstRowOff + lx * 4;
+            if (m === 0) {
+              outChunk[dIdx] = srcPixels[sIdx];
+              outChunk[dIdx + 1] = srcPixels[sIdx + 1];
+              outChunk[dIdx + 2] = srcPixels[sIdx + 2];
+              outChunk[dIdx + 3] = srcPixels[sIdx + 3];
+            } else if (m === 255 || m === 1) {
+              outChunk[dIdx] = filtered.data[sIdx];
+              outChunk[dIdx + 1] = filtered.data[sIdx + 1];
+              outChunk[dIdx + 2] = filtered.data[sIdx + 2];
+              outChunk[dIdx + 3] = filtered.data[sIdx + 3];
+            } else {
+              const a = m / 255;
+              const inv = 1 - a;
+              outChunk[dIdx] = Math.round(srcPixels[sIdx] * inv + filtered.data[sIdx] * a);
+              outChunk[dIdx + 1] = Math.round(srcPixels[sIdx + 1] * inv + filtered.data[sIdx + 1] * a);
+              outChunk[dIdx + 2] = Math.round(srcPixels[sIdx + 2] * inv + filtered.data[sIdx + 2] * a);
+              outChunk[dIdx + 3] = Math.round(srcPixels[sIdx + 3] * inv + filtered.data[sIdx + 3] * a);
+            }
+          }
+        }
+      }
+
+      grid.writeImageData(layerId, { data: outChunk, width: cw, height: ch }, cx, cy, targetFormat, true);
+    }
+  }
+
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+  grid.notifyChange(true);
+  return { dirtyRect, tileDeltas };
+}
+
+/**
+ * Async tile-native filter processor: offloads heavy convolution math to the parallel
+ * Rust Rayon backend when running in Tauri, falling back to sync JS on Web/Vitest.
+ */
+export async function applyFilterToTileGridAsync(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  type: FilterType;
+  filterParams: any;
+  targetFormat: TileFormat;
+  selection?: CanvasSelection | null;
+}): Promise<{ dirtyRect: DirtyRect | null; tileDeltas: TileDelta[] }> {
+  if (!isNativeRustAvailable()) {
+    return applyFilterToTileGrid(params);
+  }
+
+  const { grid, layerId, dimensions, type, filterParams, targetFormat, selection } = params;
+  const docW = dimensions.width;
+  const docH = dimensions.height;
+  if (docW <= 0 || docH <= 0 || !grid.hasLayerTiles(layerId)) {
+    return { dirtyRect: null, tileDeltas: [] };
+  }
+
+  const tileBounds = grid.getLayerTileBounds(layerId, dimensions);
+  if (!tileBounds) return { dirtyRect: null, tileDeltas: [] };
+
+  let halo = 0;
+  if (type === 'gaussian-blur') {
+    halo = Math.min(256, Math.ceil((filterParams?.radius || 5) * 3) + 4);
+  } else if (type === 'unsharp-mask') {
+    halo = Math.min(256, Math.ceil((filterParams?.radius || 2) * 3) + 4);
+  } else if (type === 'motion-blur') {
+    halo = Math.min(256, Math.ceil((filterParams?.distance || 15) * 0.6) + 4);
+  }
+
+  let minX = Math.max(0, tileBounds.x - halo);
+  let minY = Math.max(0, tileBounds.y - halo);
+  let maxX = Math.min(docW, tileBounds.x + tileBounds.width + halo);
+  let maxY = Math.min(docH, tileBounds.y + tileBounds.height + halo);
+
+  if (selection) {
+    const sb = selection.bounds;
+    minX = Math.max(minX, Math.floor(sb.x));
+    minY = Math.max(minY, Math.floor(sb.y));
+    maxX = Math.min(maxX, Math.ceil(sb.x + sb.width));
+    maxY = Math.min(maxY, Math.ceil(sb.y + sb.height));
+  }
+  if (maxX <= minX || maxY <= minY) return { dirtyRect: null, tileDeltas: [] };
+
+  const dirtyRect: DirtyRect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+  const beforeSnapshot = grid.snapshotTilesInRect(layerId, dirtyRect);
+  const readRect: DirtyRect = {
+    x: Math.max(0, minX - halo),
+    y: Math.max(0, minY - halo),
+    width: Math.min(docW, maxX + halo) - Math.max(0, minX - halo),
+    height: Math.min(docH, maxY + halo) - Math.max(0, minY - halo),
+  };
+  const sourceSnap = grid.snapshotTilesInRect(layerId, readRect);
+  const scratch = new Uint8ClampedArray(BYTES_32BIT);
+
+  const readFromSourceSnap = (rx: number, ry: number, rw: number, rh: number): Uint8ClampedArray => {
+    const out = new Uint8ClampedArray(rw * rh * 4);
+    const tx0 = pixelToTileCoord(rx, 0);
+    const ty0 = pixelToTileCoord(ry, 0);
+    const tx1 = pixelToTileCoord(rx + rw - 1, 0);
+    const ty1 = pixelToTileCoord(ry + rh - 1, 0);
+    for (let ty = ty0; ty <= ty1; ty++) {
+      const tileDocY = ty * TILE_SIZE;
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const entry = sourceSnap.get(getTileKey(layerId, tx, ty, 0));
+        if (!entry || !entry.data) continue;
+        let rgba: Uint8ClampedArray;
+        if (entry.format === 'color-32bit') {
+          rgba = new Uint8ClampedArray(entry.data.buffer, entry.data.byteOffset, BYTES_32BIT);
+        } else if (entry.format === 'monochrome-1bit') {
+          unpack1BitToRGBA(entry.data, scratch);
+          rgba = scratch;
+        } else {
+          unpack8BitToRGBA(entry.data, scratch);
+          rgba = scratch;
+        }
+        const tileDocX = tx * TILE_SIZE;
+        const ix0 = Math.max(rx, tileDocX);
+        const iy0 = Math.max(ry, tileDocY);
+        const ix1 = Math.min(rx + rw, tileDocX + TILE_SIZE);
+        const iy1 = Math.min(ry + rh, tileDocY + TILE_SIZE);
+        const copyW = ix1 - ix0;
+        if (copyW <= 0 || iy1 <= iy0) continue;
+        for (let py = iy0; py < iy1; py++) {
+          const sOff = ((py - tileDocY) * TILE_SIZE + (ix0 - tileDocX)) << 2;
+          const dOff = ((py - ry) * rw + (ix0 - rx)) << 2;
+          out.set(rgba.subarray(sOff, sOff + (copyW << 2)), dOff);
+        }
+      }
+    }
+    return out;
+  };
+
+  const selMask = selection ? createSelectionMask(selection, docW, docH) : null;
+  // Larger chunks in Rust (1024x1024) minimize IPC roundtrips while Rayon saturates CPU cores
+  const CHUNK = 1024;
+
+  for (let cy = minY; cy < maxY; cy += CHUNK) {
+    const ch = Math.min(CHUNK, maxY - cy);
+    for (let cx = minX; cx < maxX; cx += CHUNK) {
+      const cw = Math.min(CHUNK, maxX - cx);
+      const padLeft = Math.min(halo, cx);
+      const padTop = Math.min(halo, cy);
+      const padRight = Math.min(halo, docW - (cx + cw));
+      const padBottom = Math.min(halo, docH - (cy + ch));
+      const px = cx - padLeft;
+      const py = cy - padTop;
+      const pw = cw + padLeft + padRight;
+      const ph = ch + padTop + padBottom;
+
+      const srcPixels = readFromSourceSnap(px, py, pw, ph);
+      let hasAny = false;
+      for (let i = 3; i < srcPixels.length; i += 4) {
+        if (srcPixels[i] !== 0) {
+          hasAny = true;
+          break;
+        }
+      }
+      if (!hasAny) continue;
+
+      const chunkParams =
+        type === 'film-grain'
+          ? { ...filterParams, seed: ((filterParams?.seed || 1337) ^ ((cx * 73856093) ^ (cy * 19349663))) >>> 0 }
+          : (filterParams ?? {});
+
+      const filteredData = await applyFilterNative(srcPixels, pw, ph, type, chunkParams);
+      const outChunk = new Uint8ClampedArray(cw * ch * 4);
+
+      for (let ly = 0; ly < ch; ly++) {
+        const gy = cy + ly;
+        const srcRowOff = ((ly + padTop) * pw + padLeft) * 4;
+        const dstRowOff = ly * cw * 4;
+        if (!selMask) {
+          outChunk.set(filteredData.subarray(srcRowOff, srcRowOff + cw * 4), dstRowOff);
+        } else {
+          const selRow = gy * docW;
+          for (let lx = 0; lx < cw; lx++) {
+            const gx = cx + lx;
+            const m = selMask[selRow + gx];
+            const sIdx = srcRowOff + lx * 4;
+            const dIdx = dstRowOff + lx * 4;
+            if (m === 0) {
+              outChunk[dIdx] = srcPixels[sIdx];
+              outChunk[dIdx + 1] = srcPixels[sIdx + 1];
+              outChunk[dIdx + 2] = srcPixels[sIdx + 2];
+              outChunk[dIdx + 3] = srcPixels[sIdx + 3];
+            } else if (m === 255 || m === 1) {
+              outChunk[dIdx] = filteredData[sIdx];
+              outChunk[dIdx + 1] = filteredData[sIdx + 1];
+              outChunk[dIdx + 2] = filteredData[sIdx + 2];
+              outChunk[dIdx + 3] = filteredData[sIdx + 3];
+            } else {
+              const a = m / 255;
+              const inv = 1 - a;
+              outChunk[dIdx] = Math.round(srcPixels[sIdx] * inv + filteredData[sIdx] * a);
+              outChunk[dIdx + 1] = Math.round(srcPixels[sIdx + 1] * inv + filteredData[sIdx + 1] * a);
+              outChunk[dIdx + 2] = Math.round(srcPixels[sIdx + 2] * inv + filteredData[sIdx + 2] * a);
+              outChunk[dIdx + 3] = Math.round(srcPixels[sIdx + 3] * inv + filteredData[sIdx + 3] * a);
+            }
+          }
+        }
+      }
+
+      grid.writeImageData(layerId, { data: outChunk, width: cw, height: ch }, cx, cy, targetFormat, true);
+    }
+  }
+
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+  grid.notifyChange(true);
+  return { dirtyRect, tileDeltas };
 }
 

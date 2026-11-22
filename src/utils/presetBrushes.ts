@@ -4,7 +4,7 @@ import {
   BrushSettings,
   DEFAULT_BRUSH_DYNAMICS,
 } from '../types/editor';
-import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/CspBrushEngine';
+import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/BrushEngine';
 import {
   generateRealGPenTip,
   generateTexturedPenTip,

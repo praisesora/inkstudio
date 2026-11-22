@@ -77,8 +77,6 @@ interface CanvasAreaContainerProps {
   layers: LayerItem[];
   activeLayerId: string;
   tileGrid: SparseTileGrid;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  registerLayerCanvas: (id: string, canvas: HTMLCanvasElement | null) => void;
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   interactionRef: React.RefObject<HTMLDivElement | null>;
@@ -223,8 +221,6 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
       activeLayerId={props.activeLayerId}
       colorMode={colorMode}
       tileGrid={props.tileGrid}
-      layerCanvasesRef={props.layerCanvasesRef}
-      registerLayerCanvas={props.registerLayerCanvas}
       getEffectiveOpacity={props.getEffectiveOpacity}
       isLayerEffectivelyVisible={props.isLayerEffectivelyVisible}
       interactionRef={props.interactionRef}
@@ -364,6 +360,7 @@ export interface AppShellProps {
   handleClearActiveLayer: () => void;
   handleMergeDown: () => void;
   isCollabConnected: boolean;
+  isCollabReconnecting?: boolean;
   collabPeerCount: number;
   onOpenCollabModal: () => void;
   // Welcome props
@@ -390,6 +387,7 @@ export interface AppShellProps {
   handleSetOpacity: (id: string, opacity: number) => void;
   setBlendMode: (id: string, blendMode: BlendMode) => void;
   toggleLock: (id: string) => void;
+  toggleOwnerLock?: (id: string) => void;
   toggleAlphaLock: (id: string) => void;
   toggleClipping: (id: string) => void;
   toggleCollapse: (id: string) => void;
@@ -460,6 +458,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     handleClearActiveLayer,
     handleMergeDown,
     isCollabConnected,
+    isCollabReconnecting,
     collabPeerCount,
     onOpenCollabModal,
     handleTriggerOpenFile,
@@ -483,6 +482,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     handleSetOpacity,
     setBlendMode,
     toggleLock,
+    toggleOwnerLock,
     toggleAlphaLock,
     toggleClipping,
     toggleCollapse,
@@ -755,6 +755,8 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         onSetOpacity: handleSetOpacity,
         onSetBlendMode: setBlendMode,
         onToggleLock: toggleLock,
+        onToggleOwnerLock: toggleOwnerLock,
+        isCollabActive: Boolean(isCollabConnected || isCollabReconnecting),
         onToggleAlphaLock: toggleAlphaLock,
         onToggleClipping: toggleClipping,
         onToggleCollapse: toggleCollapse,
@@ -823,6 +825,9 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         handleSetOpacity,
         setBlendMode,
         toggleLock,
+        toggleOwnerLock,
+        isCollabConnected,
+        isCollabReconnecting,
         toggleAlphaLock,
         toggleClipping,
         toggleCollapse,
@@ -881,7 +886,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         <input
           ref={fileInputRef}
           type="file"
-          accept=".png,.jpg,.jpeg,.webp,.bmp,.gif,.svg,.psd,.psb,.clip,.csp,.lip,.sora,.ink,.inkb,.sut"
+          accept=".ink,.psd,.psb,.clip,.csp,.lip,.png,.jpg,.jpeg,.webp,.bmp,.gif,.svg,.inkb,.sut,.sora"
           onChange={handleFileInputChange}
           className="hidden"
         />
@@ -929,6 +934,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
           onRenameDocument={handleRenameDocument}
           commandHandlers={commandHandlers}
           isCollabConnected={isCollabConnected}
+          isCollabReconnecting={isCollabReconnecting}
           collabPeerCount={collabPeerCount}
           onOpenCollabModal={onOpenCollabModal}
           onOpenSettings={handleOpenSettings}

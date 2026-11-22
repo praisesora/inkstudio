@@ -1,4 +1,13 @@
-import { CanvasSelection, DirtyRect, WandSettings } from '../types/editor';
+import { CanvasDimensions, CanvasSelection, DirtyRect, LayerItem, TileDelta, WandSettings } from '../types/editor';
+import {
+  SparseTileGrid,
+  TILE_SIZE,
+  TileFormat,
+  TileSnapshotEntry,
+  pixelToTileCoord,
+  releaseTemporaryCanvas,
+} from './tileEngine';
+import { buildCompositedReferenceTile, parseColorToRgba } from './floodFill';
 
 /**
  * Checks whether a 2D point lies within an arbitrary polygon using ray-casting.
@@ -927,4 +936,554 @@ export function commitFloatingSelection(
     width: Math.max(floating.canvas.width + Math.abs(floating.x - floating.origX), floating.canvas.width),
     height: Math.max(floating.canvas.height + Math.abs(floating.y - floating.origY), floating.canvas.height),
   };
+}
+
+/**
+ * Tile-native Magic Wand selection directly from SparseTileGrid (zero full-canvas materialization).
+ */
+export function floodSelectWandOnTileGrid(params: {
+  grid: SparseTileGrid;
+  layers: LayerItem[];
+  activeLayerId: string;
+  dimensions: CanvasDimensions;
+  startX: number;
+  startY: number;
+  settings: WandSettings;
+}): {
+  mask: Uint8Array;
+  bounds: { x: number; y: number; width: number; height: number };
+} {
+  const { grid, layers, activeLayerId, dimensions, startX, startY, settings } = params;
+  const width = dimensions.width;
+  const height = dimensions.height;
+  const mask = new Uint8Array(width * height);
+  if (startX < 0 || startX >= width || startY < 0 || startY >= height) {
+    return { mask, bounds: { x: 0, y: 0, width: 0, height: 0 } };
+  }
+
+  let refLayers: LayerItem[] | null = null;
+  let singleLayerId = activeLayerId;
+  if (settings.referMode === 'all') {
+    refLayers = layers.filter((l) => l.visible && l.type !== 'folder' && l.type !== 'frame-folder');
+  } else if (settings.referMode === 'reference') {
+    const refLayer = layers.find((l) => l.isReference && l.visible);
+    singleLayerId = refLayer ? refLayer.id : activeLayerId;
+  }
+
+  const refTileCache = new Map<number, Uint8ClampedArray | null>();
+  const getRefTile = (tx: number, ty: number): Uint8ClampedArray | null => {
+    const key = (ty + 32768) * 65536 + (tx + 32768);
+    let cached = refTileCache.get(key);
+    if (cached !== undefined) return cached;
+    if (refLayers) {
+      cached = buildCompositedReferenceTile(grid, refLayers, tx, ty);
+    } else {
+      const tile = grid.getTile(singleLayerId, tx, ty, 0);
+      cached = tile && tile.data ? new Uint8ClampedArray(grid.getTileAsRGBA(tile)) : null;
+    }
+    refTileCache.set(key, cached);
+    return cached;
+  };
+
+  const sampleRgba = (x: number, y: number, out: [number, number, number, number]) => {
+    const tile = getRefTile(x >> 8, y >> 8);
+    if (!tile) {
+      out[0] = 0;
+      out[1] = 0;
+      out[2] = 0;
+      out[3] = 0;
+      return;
+    }
+    const off = (((y & 255) << 8) | (x & 255)) << 2;
+    out[0] = tile[off];
+    out[1] = tile[off + 1];
+    out[2] = tile[off + 2];
+    out[3] = tile[off + 3];
+  };
+
+  const seed: [number, number, number, number] = [0, 0, 0, 0];
+  sampleRgba(startX, startY, seed);
+  const [sR, sG, sB, sA] = seed;
+  const tolerance = settings.tolerance;
+  const tmp: [number, number, number, number] = [0, 0, 0, 0];
+
+  const colorDiff = (x: number, y: number): number => {
+    sampleRgba(x, y, tmp);
+    if (tmp[3] === 0 && sA === 0) return 0;
+    const dr = tmp[0] - sR;
+    const dg = tmp[1] - sG;
+    const db = tmp[2] - sB;
+    const da = tmp[3] - sA;
+    return Math.sqrt(dr * dr + dg * dg + db * db + da * da) / 2;
+  };
+
+  const matches = (x: number, y: number): boolean => colorDiff(x, y) <= tolerance;
+
+  let minX = width;
+  let maxX = -1;
+  let minY = height;
+  let maxY = -1;
+
+  const markPixel = (x: number, y: number) => {
+    mask[y * width + x] = 255;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  };
+
+  if (!settings.contiguous) {
+    const maxTx = pixelToTileCoord(width - 1, 0);
+    const maxTy = pixelToTileCoord(height - 1, 0);
+    for (let ty = 0; ty <= maxTy; ty++) {
+      const y0 = ty * TILE_SIZE;
+      const y1 = Math.min(height, y0 + TILE_SIZE);
+      for (let tx = 0; tx <= maxTx; tx++) {
+        const x0 = tx * TILE_SIZE;
+        const x1 = Math.min(width, x0 + TILE_SIZE);
+        const tile = getRefTile(tx, ty);
+        if (!tile) {
+          if (sA === 0 || Math.sqrt(sR * sR + sG * sG + sB * sB + sA * sA) / 2 <= tolerance) {
+            for (let y = y0; y < y1; y++) {
+              mask.fill(255, y * width + x0, y * width + x1);
+            }
+            if (x0 < minX) minX = x0;
+            if (x1 - 1 > maxX) maxX = x1 - 1;
+            if (y0 < minY) minY = y0;
+            if (y1 - 1 > maxY) maxY = y1 - 1;
+          }
+          continue;
+        }
+        for (let y = y0; y < y1; y++) {
+          for (let x = x0; x < x1; x++) {
+            if (matches(x, y)) markPixel(x, y);
+          }
+        }
+      }
+    }
+  } else {
+    const stack: number[] = [startX, startY];
+    while (stack.length > 0) {
+      const cy = stack.pop()!;
+      const cx = stack.pop()!;
+      if (mask[cy * width + cx] !== 0 || !matches(cx, cy)) continue;
+
+      let left = cx;
+      while (left > 0 && mask[cy * width + (left - 1)] === 0 && matches(left - 1, cy)) left--;
+      let right = cx;
+      while (right < width - 1 && mask[cy * width + (right + 1)] === 0 && matches(right + 1, cy)) right++;
+
+      for (let x = left; x <= right; x++) markPixel(x, cy);
+
+      const checkScanline = (ny: number) => {
+        if (ny < 0 || ny >= height) return;
+        let inRun = false;
+        for (let x = left; x <= right; x++) {
+          if (mask[ny * width + x] === 0 && matches(x, ny)) {
+            if (!inRun) {
+              stack.push(x, ny);
+              inRun = true;
+            }
+          } else {
+            inRun = false;
+          }
+        }
+      };
+      checkScanline(cy - 1);
+      checkScanline(cy + 1);
+    }
+  }
+
+  if (settings.antiAlias && maxX >= minX && maxY >= minY) {
+    const featherBuffer = featherSelection(mask, width, height, 1);
+    for (let y = Math.max(0, minY - 1); y <= Math.min(height - 1, maxY + 1); y++) {
+      const row = y * width;
+      for (let x = Math.max(0, minX - 1); x <= Math.min(width - 1, maxX + 1); x++) {
+        if (mask[row + x] === 0 && featherBuffer[row + x] > 0) {
+          if (colorDiff(x, y) <= tolerance + 4) {
+            mask[row + x] = featherBuffer[row + x];
+          }
+        }
+      }
+    }
+  }
+
+  const bounds =
+    maxX >= minX && maxY >= minY
+      ? { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 }
+      : { x: 0, y: 0, width: 0, height: 0 };
+
+  return { mask, bounds };
+}
+
+/**
+ * Tile-native clear selection: erases (or fills white on bg) strictly within selection bounds.
+ */
+export function clearSelectionInTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  selection: CanvasSelection;
+  isBackground: boolean;
+  targetFormat: TileFormat;
+  snapshotOut?: Map<string, TileSnapshotEntry>;
+}): { dirtyRect: DirtyRect | null; tileDeltas: TileDelta[] } {
+  const { grid, layerId, dimensions, selection, isBackground, targetFormat } = params;
+  const raw = selection.bounds;
+  if (!raw || raw.width <= 0 || raw.height <= 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const bx = Math.max(0, Math.floor(raw.x));
+  const by = Math.max(0, Math.floor(raw.y));
+  const bx1 = Math.min(dimensions.width, Math.ceil(raw.x + raw.width));
+  const by1 = Math.min(dimensions.height, Math.ceil(raw.y + raw.height));
+  const bw = bx1 - bx;
+  const bh = by1 - by;
+  if (bw <= 0 || bh <= 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const dirtyRect: DirtyRect = { x: bx, y: by, width: bw, height: bh };
+  const beforeSnapshot = params.snapshotOut ?? new Map<string, TileSnapshotEntry>();
+
+  // Fast rect path with zero mask/polygon overhead
+  const hasMask = Boolean(selection.mask && selection.maskWidth && selection.maskHeight);
+  const hasLasso =
+    selection.type === 'lasso' && Boolean(selection.polygon && selection.polygon.length >= 3);
+  if (!hasMask && !hasLasso) {
+    grid.clearRectInLayer(layerId, dirtyRect, isBackground, beforeSnapshot, true);
+    const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+    grid.notifyChange(true);
+    return { dirtyRect, tileDeltas };
+  }
+
+  // Mask or lasso path: chunked 512x512 compositing directly onto tiles
+  const CHUNK = 512;
+  const maskCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+  const mCtx = maskCanvas ? maskCanvas.getContext('2d', { willReadFrequently: true }) : null;
+
+  try {
+    for (let cy = by; cy < by1; cy += CHUNK) {
+      const ch = Math.min(CHUNK, by1 - cy);
+      for (let cx = bx; cx < bx1; cx += CHUNK) {
+        const cw = Math.min(CHUNK, bx1 - cx);
+        let chunkAlpha: Uint8ClampedArray;
+
+        if (selection.mask && selection.maskWidth && selection.maskHeight) {
+          chunkAlpha = new Uint8ClampedArray(cw * ch * 4);
+          const mw = selection.maskWidth;
+          const mh = selection.maskHeight;
+          const rgb = isBackground ? 255 : 0;
+          for (let ly = 0; ly < ch; ly++) {
+            const gy = cy + ly;
+            if (gy < 0 || gy >= mh) continue;
+            const mRow = gy * mw;
+            const dRow = ly * cw * 4;
+            for (let lx = 0; lx < cw; lx++) {
+              const gx = cx + lx;
+              const a = gx >= 0 && gx < mw ? selection.mask[mRow + gx] : 0;
+              if (a > 0) {
+                const off = dRow + lx * 4;
+                chunkAlpha[off] = rgb;
+                chunkAlpha[off + 1] = rgb;
+                chunkAlpha[off + 2] = rgb;
+                chunkAlpha[off + 3] = a;
+              }
+            }
+          }
+        } else if (maskCanvas && mCtx && selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+          if (maskCanvas.width !== cw) maskCanvas.width = cw;
+          if (maskCanvas.height !== ch) maskCanvas.height = ch;
+          mCtx.clearRect(0, 0, cw, ch);
+          mCtx.save();
+          mCtx.translate(-cx, -cy);
+          mCtx.fillStyle = isBackground ? '#ffffff' : '#000000';
+          mCtx.beginPath();
+          mCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+          for (let i = 1; i < selection.polygon.length; i++) {
+            mCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+          }
+          mCtx.closePath();
+          mCtx.fill();
+          mCtx.restore();
+          chunkAlpha = mCtx.getImageData(0, 0, cw, ch).data;
+        } else {
+          continue;
+        }
+
+        grid.compositeStrokeToTiles({
+          layerId,
+          strokeData: { data: chunkAlpha, width: cw, height: ch },
+          destX: cx,
+          destY: cy,
+          format: targetFormat,
+          compositeOp: isBackground ? 'source-over' : 'destination-out',
+          opacity: 1.0,
+          snapshotOut: beforeSnapshot,
+          suppressNotify: true,
+        });
+      }
+    }
+  } finally {
+    if (maskCanvas) releaseTemporaryCanvas(maskCanvas);
+  }
+
+  if (!isBackground) {
+    grid.pruneEmptyTiles(layerId);
+  }
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+  grid.notifyChange(true);
+  return { dirtyRect, tileDeltas };
+}
+
+/**
+ * Tile-native fill selection with solid color (zero full-canvas allocation).
+ */
+export function fillSelectionInTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  selection: CanvasSelection;
+  colorCss: string;
+  targetFormat: TileFormat;
+  alphaLocked?: boolean;
+}): { dirtyRect: DirtyRect | null; tileDeltas: TileDelta[] } {
+  const { grid, layerId, dimensions, selection, colorCss, targetFormat, alphaLocked = false } = params;
+  const raw = selection.bounds;
+  if (!raw || raw.width <= 0 || raw.height <= 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const bx = Math.max(0, Math.floor(raw.x));
+  const by = Math.max(0, Math.floor(raw.y));
+  const bx1 = Math.min(dimensions.width, Math.ceil(raw.x + raw.width));
+  const by1 = Math.min(dimensions.height, Math.ceil(raw.y + raw.height));
+  const bw = bx1 - bx;
+  const bh = by1 - by;
+  if (bw <= 0 || bh <= 0) return { dirtyRect: null, tileDeltas: [] };
+
+  const dirtyRect: DirtyRect = { x: bx, y: by, width: bw, height: bh };
+  const [r, g, b, a] = parseColorToRgba(colorCss);
+  const beforeSnapshot = new Map<string, TileSnapshotEntry>();
+  const CHUNK = 512;
+  const polyCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+  const pCtx = polyCanvas ? polyCanvas.getContext('2d', { willReadFrequently: true }) : null;
+
+  try {
+    for (let cy = by; cy < by1; cy += CHUNK) {
+      const ch = Math.min(CHUNK, by1 - cy);
+      for (let cx = bx; cx < bx1; cx += CHUNK) {
+        const cw = Math.min(CHUNK, bx1 - cx);
+        let chunkData: Uint8ClampedArray;
+
+        if (selection.mask && selection.maskWidth && selection.maskHeight) {
+          chunkData = new Uint8ClampedArray(cw * ch * 4);
+          const mw = selection.maskWidth;
+          const mh = selection.maskHeight;
+          for (let ly = 0; ly < ch; ly++) {
+            const gy = cy + ly;
+            if (gy < 0 || gy >= mh) continue;
+            const mRow = gy * mw;
+            const dRow = ly * cw * 4;
+            for (let lx = 0; lx < cw; lx++) {
+              const gx = cx + lx;
+              const ma = gx >= 0 && gx < mw ? selection.mask[mRow + gx] : 0;
+              if (ma > 0) {
+                const off = dRow + lx * 4;
+                chunkData[off] = r;
+                chunkData[off + 1] = g;
+                chunkData[off + 2] = b;
+                chunkData[off + 3] = Math.round((a * ma) / 255);
+              }
+            }
+          }
+        } else if (polyCanvas && pCtx && selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+          if (polyCanvas.width !== cw) polyCanvas.width = cw;
+          if (polyCanvas.height !== ch) polyCanvas.height = ch;
+          pCtx.clearRect(0, 0, cw, ch);
+          pCtx.save();
+          pCtx.translate(-cx, -cy);
+          pCtx.fillStyle = colorCss;
+          pCtx.beginPath();
+          pCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+          for (let i = 1; i < selection.polygon.length; i++) {
+            pCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+          }
+          pCtx.closePath();
+          pCtx.fill();
+          pCtx.restore();
+          chunkData = pCtx.getImageData(0, 0, cw, ch).data;
+        } else {
+          // Solid rect fill
+          chunkData = new Uint8ClampedArray(cw * ch * 4);
+          for (let off = 0; off < chunkData.length; off += 4) {
+            chunkData[off] = r;
+            chunkData[off + 1] = g;
+            chunkData[off + 2] = b;
+            chunkData[off + 3] = a;
+          }
+        }
+
+        grid.compositeStrokeToTiles({
+          layerId,
+          strokeData: { data: chunkData, width: cw, height: ch },
+          destX: cx,
+          destY: cy,
+          format: targetFormat,
+          compositeOp: alphaLocked ? 'source-atop' : 'source-over',
+          opacity: 1.0,
+          snapshotOut: beforeSnapshot,
+          suppressNotify: true,
+        });
+      }
+    }
+  } finally {
+    if (polyCanvas) releaseTemporaryCanvas(polyCanvas);
+  }
+
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+  grid.notifyChange(true);
+  return { dirtyRect, tileDeltas };
+}
+
+/**
+ * Tile-native selection lift: extracts ONLY `selection.bounds` from SparseTileGrid into a
+ * tight floatingCanvas, snapshots only the affected tiles, and clears the selected pixels in tiles.
+ */
+export function liftSelectionFromTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  selection: CanvasSelection;
+  isBackground: boolean;
+  targetFormat: TileFormat;
+}): {
+  floatingCanvas: HTMLCanvasElement;
+  beforeTileSnapshot: Map<string, TileSnapshotEntry>;
+  bounds: DirtyRect;
+} | null {
+  const { grid, layerId, dimensions, selection, isBackground, targetFormat } = params;
+  const raw = selection.bounds;
+  if (!raw || raw.width <= 0 || raw.height <= 0 || typeof document === 'undefined') return null;
+
+  const bx = Math.max(0, Math.floor(raw.x));
+  const by = Math.max(0, Math.floor(raw.y));
+  const bx1 = Math.min(dimensions.width, Math.ceil(raw.x + raw.width));
+  const by1 = Math.min(dimensions.height, Math.ceil(raw.y + raw.height));
+  const bw = bx1 - bx;
+  const bh = by1 - by;
+  if (bw <= 0 || bh <= 0) return null;
+
+  const b: DirtyRect = { x: bx, y: by, width: bw, height: bh };
+
+  const floatingCanvas = grid.createRegionCanvas(layerId, b);
+  if (!floatingCanvas) return null;
+  const floatCtx = floatingCanvas.getContext('2d', { willReadFrequently: true });
+  if (!floatCtx) {
+    releaseTemporaryCanvas(floatingCanvas);
+    return null;
+  }
+
+  // Apply selection mask / lasso clip to extracted floatingCanvas
+  if (selection.mask && selection.maskWidth && selection.maskHeight) {
+    const img = floatCtx.getImageData(0, 0, bw, bh);
+    const d = img.data;
+    const mw = selection.maskWidth;
+    const mh = selection.maskHeight;
+    for (let y = 0; y < bh; y++) {
+      const sy = by + y;
+      const mRow = sy * mw;
+      const dRow = y * bw * 4;
+      for (let x = 0; x < bw; x++) {
+        const sx = bx + x;
+        const ma = sy >= 0 && sy < mh && sx >= 0 && sx < mw ? selection.mask[mRow + sx] : 0;
+        const off = dRow + x * 4;
+        if (ma === 0) {
+          d[off + 3] = 0;
+        } else if (ma < 255) {
+          d[off + 3] = Math.round((d[off + 3] * ma) / 255);
+        }
+      }
+    }
+    floatCtx.putImageData(img, 0, 0);
+  } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+    floatCtx.save();
+    floatCtx.globalCompositeOperation = 'destination-in';
+    floatCtx.beginPath();
+    const poly = selection.polygon;
+    floatCtx.moveTo(poly[0].x - bx, poly[0].y - by);
+    for (let i = 1; i < poly.length; i++) {
+      floatCtx.lineTo(poly[i].x - bx, poly[i].y - by);
+    }
+    floatCtx.closePath();
+    floatCtx.fill();
+    floatCtx.restore();
+  }
+
+  const beforeTileSnapshot = grid.snapshotTilesInRect(layerId, b);
+  clearSelectionInTileGrid({
+    grid,
+    layerId,
+    dimensions,
+    selection,
+    isBackground,
+    targetFormat,
+    snapshotOut: beforeTileSnapshot,
+  });
+
+  return { floatingCanvas, beforeTileSnapshot, bounds: b };
+}
+
+/**
+ * Tile-native commit of a floating selection canvas back onto SparseTileGrid.
+ */
+export function commitFloatingSelectionToTileGrid(params: {
+  grid: SparseTileGrid;
+  layerId: string;
+  dimensions: CanvasDimensions;
+  floating: NonNullable<CanvasSelection['floating']>;
+  targetFormat: TileFormat;
+}): { dirtyRect: DirtyRect; tileDeltas: TileDelta[] } {
+  const { grid, layerId, dimensions, floating, targetFormat } = params;
+  const fCtx = floating.canvas.getContext('2d', { willReadFrequently: true });
+  const beforeSnapshot = new Map<string, TileSnapshotEntry>(floating.beforeTileSnapshot ?? []);
+
+  const dx = Math.round(floating.x);
+  const dy = Math.round(floating.y);
+  const fw = floating.canvas.width;
+  const fh = floating.canvas.height;
+
+  const clipX0 = Math.max(0, dx);
+  const clipY0 = Math.max(0, dy);
+  const clipX1 = Math.min(dimensions.width, dx + fw);
+  const clipY1 = Math.min(dimensions.height, dy + fh);
+
+  if (fCtx && clipX1 > clipX0 && clipY1 > clipY0) {
+    const srcX = clipX0 - dx;
+    const srcY = clipY0 - dy;
+    const copyW = clipX1 - clipX0;
+    const copyH = clipY1 - clipY0;
+    const imgData = fCtx.getImageData(srcX, srcY, copyW, copyH);
+    grid.compositeStrokeToTiles({
+      layerId,
+      strokeData: imgData,
+      destX: clipX0,
+      destY: clipY0,
+      format: targetFormat,
+      compositeOp: 'source-over',
+      opacity: 1.0,
+      snapshotOut: beforeSnapshot,
+      suppressNotify: true,
+    });
+  }
+
+  const minX = Math.max(0, Math.min(dx, Math.round(floating.origX)));
+  const minY = Math.max(0, Math.min(dy, Math.round(floating.origY)));
+  const maxX = Math.min(dimensions.width, Math.max(dx + fw, Math.round(floating.origX) + fw));
+  const maxY = Math.min(dimensions.height, Math.max(dy + fh, Math.round(floating.origY) + fh));
+  const dirtyRect: DirtyRect = {
+    x: minX,
+    y: minY,
+    width: Math.max(1, maxX - minX),
+    height: Math.max(1, maxY - minY),
+  };
+
+  const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, layerId, dirtyRect);
+  grid.notifyChange(true);
+  return { dirtyRect, tileDeltas };
 }

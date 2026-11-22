@@ -1,6 +1,7 @@
 import { readPsd, initializeCanvas, Layer as PsdLayer, LayerMaskData, PixelData } from 'ag-psd';
 import { BlendMode, CanvasColorMode, LayerItem, LoadedDocument } from '../types/editor';
 import { createCanvasThumbnail } from './canvasUtils';
+import { isNativeRustAvailable, parsePsdNative } from './nativeBackend';
 import { SparseTileGrid, releaseTemporaryCanvas } from './tileEngine';
 
 initializeCanvas(
@@ -31,11 +32,13 @@ export function mapPsdBlendMode(psdBlendMode?: string): BlendMode {
     case 'overlay':
       return 'overlay';
     case 'darken':
-    case 'darker color':
       return 'darken';
+    case 'darker color':
+      return 'darker-color';
     case 'lighten':
-    case 'lighter color':
       return 'lighten';
+    case 'lighter color':
+      return 'lighter-color';
     case 'color dodge':
       return 'color-dodge';
     case 'linear dodge':
@@ -45,21 +48,34 @@ export function mapPsdBlendMode(psdBlendMode?: string): BlendMode {
     case 'linear burn':
       return 'linear-burn';
     case 'hard light':
-    case 'vivid light':
-    case 'linear light':
-    case 'pin light':
-    case 'hard mix':
       return 'hard-light';
+    case 'vivid light':
+      return 'vivid-light';
+    case 'linear light':
+      return 'linear-light';
+    case 'pin light':
+      return 'pin-light';
+    case 'hard mix':
+      return 'hard-mix';
     case 'soft light':
       return 'soft-light';
     case 'difference':
+      return 'difference';
     case 'subtract':
     case 'subtraction':
-      return 'difference';
+      return 'subtract';
     case 'exclusion':
       return 'exclusion';
     case 'divide':
       return 'divide';
+    case 'hue':
+      return 'hue';
+    case 'saturation':
+      return 'saturation';
+    case 'color':
+      return 'color';
+    case 'luminosity':
+      return 'luminosity';
     case 'pass through':
       return 'pass-through';
     case 'normal':
@@ -230,6 +246,10 @@ export async function parsePsdFile(
   fileName: string,
   targetGrid?: SparseTileGrid
 ): Promise<LoadedDocument> {
+  if (isNativeRustAvailable()) {
+    return await parsePsdNative(buffer, fileName, targetGrid);
+  }
+
   const psd = readPsd(buffer, {
     skipLayerImageData: false,
     skipCompositeImageData: true,

@@ -8,6 +8,7 @@ import {
   getAccentContrastColor,
   hexToRgb,
   MODERN_ACCENTS,
+  NICKNAME_STORAGE_KEY,
 } from '../../types/settings';
 
 describe('settings theme & accent system', () => {
@@ -131,5 +132,14 @@ describe('settings theme & accent system', () => {
     const roundTripped = loadAppSettings();
     expect(roundTripped.autoCheckUpdates).toBe(false);
     expect(roundTripped.skippedUpdateVersion).toBe('1.2.3');
+  });
+
+  it('uses ink_studio_nickname and ignores removed legacy sora_paint_nickname key', () => {
+    localStorage.setItem('sora_paint_nickname', 'OldName');
+    expect(loadAppSettings().userName).toBe('');
+
+    localStorage.setItem(NICKNAME_STORAGE_KEY, 'InkArtist');
+    expect(NICKNAME_STORAGE_KEY).toBe('ink_studio_nickname');
+    expect(loadAppSettings().userName).toBe('InkArtist');
   });
 });

@@ -1,17 +1,75 @@
 import {
+  AccessDeniedCode,
+  AccessDeniedMessage,
+  AnimationSyncMessage,
+  BrushAssetDataMessage,
+  BrushAssetRequestMessage,
+  CanvasPingMessage,
+  CanvasResizeMessage,
   CollabPeer,
+  CollabRole,
+  CursorMoveMessage,
+  DocSyncResponseMessage,
+  LayerActionMessage,
+  LayerClearableField,
+  LayerMaskDataMessage,
+  LayerTreeSyncMessage,
+  LayerUpdateMessage,
   MultiplayerMessage,
-  StrokeStartMessage,
+  PeerBanMessage,
+  PeerKickMessage,
+  PeerRoleUpdateMessage,
+  PeerUnbanMessage,
+  PerspectiveRulerSyncMessage,
+  SelectiveUndoMessage,
+  StraightRulerSyncMessage,
   StrokeChunkMessage,
   StrokeFinishMessage,
-  CursorMoveMessage,
-  LayerActionMessage,
-  CanvasPingMessage,
+  StrokeStartMessage,
   TileStreamMessage,
-  SelectiveUndoMessage,
+  WireLayerItem,
 } from '../types/multiplayer';
-import { Point, BrushSettings, ToolType, DirtyRect, LayerItem, VectorStroke } from '../types/editor';
-import { TileBuffer, serializeTileBuffer, deserializeTileBuffer } from '../utils/tileEngine';
+import {
+  AnimationTimeline,
+  BrushSettings,
+  CanvasDimensions,
+  DirtyRect,
+  LayerItem,
+  Point,
+  TileDelta,
+  ToolType,
+  VectorStroke,
+} from '../types/editor';
+import { PerspectiveRuler, StraightRuler } from '../types/perspective';
+import { ResizeCanvasOptions } from '../types/settings';
+import {
+  SparseTileGrid,
+  TileBuffer,
+  parseTileKey,
+  serializeTileBuffer,
+  deserializeTileBufferStrict,
+} from '../utils/tileEngine';
+import {
+  MAX_BRUSH_ASSET_BYTES,
+  isAllowedBrushAssetMime,
+  isValidBrushAssetHash,
+  prepareBrushSettingsForWire,
+  sanitizeBrushAssetRefs,
+} from '../utils/brushAssetSync';
+import { lz4CompressBlock, lz4DecompressBlock } from '../utils/lz4';
+import {
+  MAX_SYNC_CANVAS_DIM,
+  extractMaskGrayscaleRect,
+  sanitizeAnimationTimeline,
+  sanitizeCanvasResize,
+  sanitizeClearedFields,
+  sanitizePerspectiveRuler,
+  sanitizeStraightRuler,
+  sanitizeWireLayer,
+  sanitizeWireLayerPatch,
+  sanitizeWireLayerTree,
+  serializeLayerForWire,
+} from '../utils/collabSyncUtils';
 
 type MessageHandler = (msg: MultiplayerMessage) => void;
 
@@ -25,11 +83,45 @@ export const CODE_STROKE_FINISH = 0x03;
 export const CODE_TILE_DELTA = 0x04;
 export const CODE_CURSOR_MOVE = 0x05;
 export const CODE_SELECTIVE_UNDO = 0x06;
+export const CODE_BRUSH_ASSET_DATA = 0x07;
+export const CODE_BRUSH_ASSET_REQUEST = 0x08;
+export const CODE_LAYER_MASK_DATA = 0x09;
+
+const MASK_FLAG_FULL_REPLACE = 0x01;
+const MASK_FLAG_LZ4 = 0x02;
+const MASK_FLAG_SOLID_FILL = 0x04;
+const MAX_MASK_CHUNK_DIM = 1024;
+const MAX_MASK_DECODE_BYTES = 4 * 1024 * 1024; // 4 MB safety ceiling per mask packet
 
 const MAX_BINARY_PACKET_BYTES = 16 * 1024 * 1024;
 const MAX_JSON_MESSAGE_CHARS = 8 * 1024 * 1024;
 const MAX_STROKE_CHUNK_POINTS = 4096;
+const STROKE_CHUNK_POINT_STRIDE = 20;
+const MAX_TILE_COORD = 4096;
 const WS_CONNECT_TIMEOUT_MS = 15000;
+const STATE_SYNC_THROTTLE_MS = 33;
+
+const TOOL_TYPES_LIST: ToolType[] = [
+  'brush',
+  'eraser',
+  'pipette',
+  'transform',
+  'select-rect',
+  'select-lasso',
+  'select-wand',
+  'select-pen',
+  'select-eraser',
+  'fill',
+  'text',
+  'frame',
+  'balloon',
+  'vector-edit',
+  'liquify',
+  'shape',
+  'object',
+];
+
+export const DEEP_LINK_SCHEME = 'inkstudio:';
 
 export interface ParsedInviteLink {
   roomName: string;
@@ -68,7 +160,7 @@ export function parseInviteUrl(raw: string): ParsedInviteLink | null {
     };
   }
 
-  if (parsedUrl.protocol === 'forsora:') {
+  if (parsedUrl.protocol === DEEP_LINK_SCHEME) {
     const host = parsedUrl.searchParams.get('host');
     const portParam = parsedUrl.searchParams.get('port');
     if (!host) return null;
@@ -120,8 +212,19 @@ function sanitizeRemoteBrushSettings(raw: unknown): BrushSettings | null {
           : 3,
       }
     : undefined;
+  const {
+    customTipDataUrl: _tipUrl,
+    customTipImage: _tipImg,
+    dualTipDataUrl: _dualUrl,
+    dualTipImage: _dualImg,
+    paperTexture: _paperUrl,
+    paperTextureImage: _paperImg,
+    subTips: _subTips,
+    subTipImages: _subImgs,
+    ...rest
+  } = bs;
   return {
-    ...bs,
+    ...rest,
     size,
     opacity,
     flow,
@@ -137,20 +240,387 @@ function isValidRemotePoint(pt: unknown): pt is Point {
   return Number.isFinite(p.x) && Number.isFinite(p.y);
 }
 
+/**
+ * Strictly validates and sanitizes untrusted remote JSON messages before dispatching.
+ * Returns null to drop malformed or malicious payloads.
+ */
+export function sanitizeIncomingJsonMessage(raw: unknown): MultiplayerMessage | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const msg = raw as Record<string, unknown>;
+  if (typeof msg.type !== 'string') return null;
+
+  const senderId =
+    typeof msg.senderId === 'string' || typeof msg.senderId === 'number'
+      ? msg.senderId
+      : undefined;
+  const seq =
+    typeof msg.seq === 'number' && Number.isSafeInteger(msg.seq) && msg.seq >= 0
+      ? msg.seq
+      : undefined;
+
+  const sanitized = sanitizeIncomingJsonBody(msg, senderId);
+  if (sanitized && seq !== undefined) {
+    sanitized.seq = seq;
+  }
+  return sanitized;
+}
+
+function sanitizeIncomingJsonBody(
+  msg: Record<string, unknown>,
+  senderId: string | number | undefined
+): MultiplayerMessage | null {
+  switch (msg.type) {
+    case 'LAYER_ADD': {
+      const layerItem = sanitizeWireLayer(msg.layerItem);
+      if (!layerItem) return null;
+      const insertIndex =
+        typeof msg.insertIndex === 'number' && Number.isInteger(msg.insertIndex) && msg.insertIndex >= 0
+          ? msg.insertIndex
+          : undefined;
+      return {
+        type: 'LAYER_ADD',
+        senderId,
+        layerId: layerItem.id,
+        layerItem,
+        insertIndex,
+      };
+    }
+
+    case 'LAYER_DELETE':
+    case 'LAYER_CLEAR': {
+      if (typeof msg.layerId !== 'string' || !msg.layerId || msg.layerId.length > 256) return null;
+      return {
+        type: msg.type,
+        senderId,
+        layerId: msg.layerId,
+      };
+    }
+
+    case 'LAYER_RENAME': {
+      if (
+        typeof msg.layerId !== 'string' ||
+        !msg.layerId ||
+        msg.layerId.length > 256 ||
+        typeof msg.newName !== 'string'
+      ) {
+        return null;
+      }
+      return {
+        type: 'LAYER_RENAME',
+        senderId,
+        layerId: msg.layerId,
+        newName: msg.newName.slice(0, 256),
+      };
+    }
+
+    case 'LAYER_VISIBILITY': {
+      if (
+        typeof msg.layerId !== 'string' ||
+        !msg.layerId ||
+        msg.layerId.length > 256 ||
+        typeof msg.visible !== 'boolean'
+      ) {
+        return null;
+      }
+      return {
+        type: 'LAYER_VISIBILITY',
+        senderId,
+        layerId: msg.layerId,
+        visible: msg.visible,
+      };
+    }
+
+    case 'LAYER_OPACITY': {
+      if (
+        typeof msg.layerId !== 'string' ||
+        !msg.layerId ||
+        msg.layerId.length > 256 ||
+        typeof msg.opacity !== 'number' ||
+        !Number.isFinite(msg.opacity)
+      ) {
+        return null;
+      }
+      return {
+        type: 'LAYER_OPACITY',
+        senderId,
+        layerId: msg.layerId,
+        opacity: Math.max(0, Math.min(1, msg.opacity)),
+      };
+    }
+
+    case 'LAYER_UPDATE': {
+      if (typeof msg.layerId !== 'string' || !msg.layerId || msg.layerId.length > 256) return null;
+      const patch = sanitizeWireLayerPatch(msg.patch);
+      const clearedFields = sanitizeClearedFields(msg.clearedFields);
+      if (Object.keys(patch).length === 0 && clearedFields.length === 0) return null;
+      const lamport =
+        typeof msg.lamport === 'number' && Number.isFinite(msg.lamport) ? msg.lamport : undefined;
+      return {
+        type: 'LAYER_UPDATE',
+        senderId,
+        layerId: msg.layerId,
+        patch,
+        clearedFields: clearedFields.length > 0 ? clearedFields : undefined,
+        lamport,
+      };
+    }
+
+    case 'LAYER_TREE_SYNC': {
+      const layers = sanitizeWireLayerTree(msg.layers);
+      if (!layers) return null;
+      const lamport =
+        typeof msg.lamport === 'number' && Number.isFinite(msg.lamport) ? msg.lamport : 0;
+      const dirtyTileLayerIds = Array.isArray(msg.dirtyTileLayerIds)
+        ? msg.dirtyTileLayerIds
+            .filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 256)
+            .slice(0, 512)
+        : undefined;
+      const removedLayerIds = Array.isArray(msg.removedLayerIds)
+        ? msg.removedLayerIds
+            .filter((x): x is string => typeof x === 'string' && x.length > 0 && x.length <= 256)
+            .slice(0, 512)
+        : undefined;
+      return {
+        type: 'LAYER_TREE_SYNC',
+        senderId,
+        layers,
+        lamport,
+        dirtyTileLayerIds,
+        removedLayerIds,
+      };
+    }
+
+    case 'PERSPECTIVE_RULER_SYNC': {
+      const perspectiveRuler = sanitizePerspectiveRuler(msg.perspectiveRuler);
+      if (perspectiveRuler === undefined) return null;
+      const lamport =
+        typeof msg.lamport === 'number' && Number.isFinite(msg.lamport) ? msg.lamport : undefined;
+      return {
+        type: 'PERSPECTIVE_RULER_SYNC',
+        senderId,
+        perspectiveRuler,
+        lamport,
+      };
+    }
+
+    case 'STRAIGHT_RULER_SYNC': {
+      const straightRuler = sanitizeStraightRuler(msg.straightRuler);
+      if (straightRuler === undefined) return null;
+      const lamport =
+        typeof msg.lamport === 'number' && Number.isFinite(msg.lamport) ? msg.lamport : undefined;
+      return {
+        type: 'STRAIGHT_RULER_SYNC',
+        senderId,
+        straightRuler,
+        lamport,
+      };
+    }
+
+    case 'ANIMATION_SYNC': {
+      const animationTimeline = sanitizeAnimationTimeline(msg.animationTimeline);
+      if (animationTimeline === undefined) return null;
+      const lamport =
+        typeof msg.lamport === 'number' && Number.isFinite(msg.lamport) ? msg.lamport : undefined;
+      return {
+        type: 'ANIMATION_SYNC',
+        senderId,
+        animationTimeline,
+        lamport,
+      };
+    }
+
+    case 'CANVAS_RESIZE': {
+      const safe = sanitizeCanvasResize(msg);
+      if (!safe) return null;
+      const lamport =
+        typeof msg.lamport === 'number' && Number.isFinite(msg.lamport) ? msg.lamport : undefined;
+      return {
+        type: 'CANVAS_RESIZE',
+        senderId,
+        dimensions: safe.dimensions,
+        options: safe.options,
+        lamport,
+      };
+    }
+
+    case 'DOC_SYNC_RESPONSE': {
+      const layers = sanitizeWireLayerTree(msg.layers);
+      const d = msg.dimensions as Record<string, unknown> | undefined;
+      if (!layers || !d || typeof d !== 'object') return null;
+      if (
+        typeof d.width !== 'number' ||
+        !Number.isFinite(d.width) ||
+        d.width < 1 ||
+        d.width > MAX_SYNC_CANVAS_DIM ||
+        typeof d.height !== 'number' ||
+        !Number.isFinite(d.height) ||
+        d.height < 1 ||
+        d.height > MAX_SYNC_CANVAS_DIM
+      ) {
+        return null;
+      }
+      const width = Math.round(d.width);
+      const height = Math.round(d.height);
+      const dpi =
+        typeof d.dpi === 'number' && Number.isFinite(d.dpi)
+          ? Math.max(36, Math.min(2400, Math.round(d.dpi)))
+          : undefined;
+      const colorMode =
+        msg.colorMode === 'color' || msg.colorMode === 'grayscale' || msg.colorMode === 'monochrome'
+          ? msg.colorMode
+          : 'color';
+
+      const perspectiveRuler =
+        msg.perspectiveRuler !== undefined
+          ? sanitizePerspectiveRuler(msg.perspectiveRuler) ?? null
+          : null;
+      const straightRuler =
+        msg.straightRuler !== undefined ? sanitizeStraightRuler(msg.straightRuler) ?? null : null;
+      const animationTimeline =
+        msg.animationTimeline !== undefined
+          ? sanitizeAnimationTimeline(msg.animationTimeline) ?? null
+          : null;
+
+      return {
+        type: 'DOC_SYNC_RESPONSE',
+        senderId,
+        targetPeerId: (msg.targetPeerId as string | number) ?? '',
+        roomName: typeof msg.roomName === 'string' ? msg.roomName.slice(0, 128) : undefined,
+        assignedLayerId:
+          typeof msg.assignedLayerId === 'string' ? msg.assignedLayerId.slice(0, 256) : undefined,
+        dimensions: { width, height, dpi },
+        colorMode,
+        layers,
+        perspectiveRuler,
+        straightRuler,
+        animationTimeline,
+      } as DocSyncResponseMessage;
+    }
+
+    case 'PEER_ROLE_UPDATE': {
+      const targetPeerId =
+        typeof msg.targetPeerId === 'string' || typeof msg.targetPeerId === 'number'
+          ? String(msg.targetPeerId).trim().slice(0, 128)
+          : '';
+      if (!targetPeerId) return null;
+      if (msg.role !== 'host' && msg.role !== 'editor' && msg.role !== 'viewer') return null;
+      return {
+        type: 'PEER_ROLE_UPDATE',
+        senderId,
+        targetPeerId,
+        role: msg.role,
+      };
+    }
+
+    case 'PEER_KICK':
+    case 'PEER_BAN': {
+      const targetPeerId =
+        typeof msg.targetPeerId === 'string' || typeof msg.targetPeerId === 'number'
+          ? String(msg.targetPeerId).trim().slice(0, 128)
+          : '';
+      if (!targetPeerId) return null;
+      const reason =
+        typeof msg.reason === 'string' && msg.reason.trim()
+          ? msg.reason.trim().slice(0, 256)
+          : undefined;
+      return {
+        type: msg.type,
+        senderId,
+        targetPeerId,
+        ...(reason ? { reason } : {}),
+      };
+    }
+
+    case 'PEER_UNBAN': {
+      const targetPeerId =
+        typeof msg.targetPeerId === 'string' || typeof msg.targetPeerId === 'number'
+          ? String(msg.targetPeerId).trim().slice(0, 128)
+          : '';
+      if (!targetPeerId) return null;
+      return {
+        type: 'PEER_UNBAN',
+        senderId,
+        targetPeerId,
+      };
+    }
+
+    case 'ACCESS_DENIED': {
+      const allowedCodes = new Set<AccessDeniedCode>([
+        'BANNED',
+        'KICKED',
+        'VIEWER_READONLY',
+        'LAYER_LOCKED',
+        'NOT_OWNER',
+        'FORBIDDEN',
+      ]);
+      const code: AccessDeniedCode = allowedCodes.has(msg.code as AccessDeniedCode)
+        ? (msg.code as AccessDeniedCode)
+        : 'FORBIDDEN';
+      const reason =
+        typeof msg.reason === 'string' && msg.reason.trim()
+          ? msg.reason.trim().slice(0, 256)
+          : 'Action not permitted';
+      const targetPeerId =
+        typeof msg.targetPeerId === 'string' || typeof msg.targetPeerId === 'number'
+          ? String(msg.targetPeerId).trim().slice(0, 128)
+          : undefined;
+      return {
+        type: 'ACCESS_DENIED',
+        senderId,
+        ...(targetPeerId ? { targetPeerId } : {}),
+        code,
+        reason,
+      };
+    }
+
+    default:
+      return msg as unknown as MultiplayerMessage;
+  }
+}
+
+export interface ConnectOptions {
+  isReconnect?: boolean;
+  sinceSeq?: number;
+}
+
 class MultiplayerService {
   private ws: WebSocket | null = null;
   private messageHandlers: Set<MessageHandler> = new Set();
   private closeHandlers: Set<() => void> = new Set();
   private errorHandlers: Set<(err: Event) => void> = new Set();
   private currentPeer: CollabPeer | null = null;
+  private localRole: CollabRole = 'editor';
 
-  // Lamport Logical Clock for Vector CRDT and deterministic ordering
+  // Lamport Logical Clock for Vector CRDT + authoritative server sequence tracking
   private lamportClock = 0;
+  private lastServerSeq = 0;
+
+  // Track already-broadcast brush asset hashes, tile versions, and tile delta batches
+  private sentAssetHashes: Set<string> = new Set();
+  private sentTileVersions: Map<string, number> = new Map();
+  private sentDeltaBatches: WeakSet<TileDelta[]> = new WeakSet();
 
   // Throttling for cursor movement (max 60fps)
   private lastCursorSendTime = 0;
   private pendingCursor: { x: number; y: number; isDrawing: boolean; tool: ToolType } | null = null;
   private cursorThrottleRaf: number | null = null;
+
+  // Trailing-edge throttles for high-frequency ruler / animation drag updates (~30Hz)
+  private perspectiveThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingPerspectiveRuler: PerspectiveRuler | null | undefined = undefined;
+  private straightThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingStraightRuler: StraightRuler | null | undefined = undefined;
+  private animationThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  private pendingAnimationTimeline: AnimationTimeline | null | undefined = undefined;
+
+  public clearSentAssetHashes(): void {
+    this.sentAssetHashes.clear();
+  }
+
+  public clearSyncDedupeCaches(): void {
+    this.sentAssetHashes.clear();
+    this.sentTileVersions.clear();
+  }
 
   public getNextLamport(): number {
     return ++this.lamportClock;
@@ -158,6 +628,27 @@ class MultiplayerService {
 
   public updateLamport(remoteLamport: number): void {
     this.lamportClock = Math.max(this.lamportClock, remoteLamport) + 1;
+  }
+
+  public getLastServerSeq(): number {
+    return this.lastServerSeq;
+  }
+
+  public updateServerSeq(seq: number): void {
+    if (Number.isSafeInteger(seq) && seq > this.lastServerSeq) {
+      this.lastServerSeq = seq;
+    }
+  }
+
+  public sendDocSyncRequest(sinceSeq?: number): void {
+    if (!this.isConnected() || !this.currentPeer) return;
+    this.sendMessage({
+      type: 'DOC_SYNC_REQUEST',
+      targetPeerId: this.currentPeer.id,
+      ...(sinceSeq !== undefined && Number.isSafeInteger(sinceSeq) && sinceSeq >= 0
+        ? { sinceSeq }
+        : {}),
+    });
   }
 
   public isConnected(): boolean {
@@ -168,14 +659,69 @@ class MultiplayerService {
     return this.currentPeer;
   }
 
+  public setLocalRole(role: CollabRole): void {
+    this.localRole = role;
+    if (this.currentPeer) {
+      this.currentPeer = {
+        ...this.currentPeer,
+        role,
+        isHost: role === 'host',
+      };
+    }
+  }
+
+  public getLocalRole(): CollabRole {
+    return this.localRole;
+  }
+
+  private canSendMutation(): boolean {
+    return this.localRole !== 'viewer';
+  }
+
   public getBufferedAmount(): number {
     return this.ws ? this.ws.bufferedAmount : 0;
   }
 
-  public connect(url: string, peer: CollabPeer, token?: string): Promise<void> {
+  private closeSocketQuietly(): void {
+    if (!this.ws) return;
+    const closingWs = this.ws;
+    this.ws = null;
+    try {
+      closingWs.onopen = null;
+      closingWs.onmessage = null;
+      closingWs.onclose = null;
+      closingWs.onerror = null;
+      closingWs.close();
+    } catch {
+      // ignore close errors
+    }
+  }
+
+  public connect(
+    url: string,
+    peer: CollabPeer,
+    token?: string,
+    options?: ConnectOptions
+  ): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.disconnect();
+      const isReconnect = Boolean(options?.isReconnect);
+      if (isReconnect) {
+        this.closeSocketQuietly();
+      } else {
+        this.disconnect();
+      }
       this.currentPeer = peer;
+      this.localRole = peer.isHost ? 'host' : peer.role ?? (isReconnect ? this.localRole : 'editor');
+
+      const resumeSeq =
+        isReconnect &&
+        typeof options?.sinceSeq === 'number' &&
+        Number.isSafeInteger(options.sinceSeq) &&
+        options.sinceSeq >= 0
+          ? options.sinceSeq
+          : isReconnect
+            ? this.lastServerSeq
+            : undefined;
 
       let connectUrl = url;
       let displayUrl = url;
@@ -232,10 +778,12 @@ class MultiplayerService {
             ws.close();
             return;
           }
-          // Send join handshake
+          // Send join handshake (carrying sinceSeq on reconnect for incremental op/tile catch-up)
           this.sendMessage({
             type: 'JOIN_REQUEST',
             peer: this.currentPeer!,
+            ...(isReconnect ? { isReconnect: true } : {}),
+            ...(resumeSeq !== undefined ? { sinceSeq: resumeSeq } : {}),
           });
           settleResolve();
         };
@@ -243,22 +791,35 @@ class MultiplayerService {
         ws.onmessage = async (event) => {
           if (this.ws !== ws) return;
           try {
-            if (event.data instanceof ArrayBuffer) {
-              const parsed = this.decodeBinaryPacket(event.data);
-              if (parsed) {
-                this.notifyHandlers(parsed);
-              }
-            } else if (event.data instanceof Blob) {
-              const buf = await event.data.arrayBuffer();
+            if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+              const buf =
+                event.data instanceof ArrayBuffer
+                  ? event.data
+                  : await event.data.arrayBuffer();
               const parsed = this.decodeBinaryPacket(buf);
               if (parsed) {
+                if (buf.byteLength >= 7) {
+                  const serverSeq = new DataView(buf).getUint32(3, true);
+                  if (serverSeq > 0) {
+                    parsed.seq = serverSeq;
+                    this.updateServerSeq(serverSeq);
+                  }
+                }
                 this.notifyHandlers(parsed);
               }
             } else if (typeof event.data === 'string') {
               if (event.data.length > MAX_JSON_MESSAGE_CHARS) return;
-              const data = JSON.parse(event.data) as MultiplayerMessage;
-              if (data && typeof data === 'object' && typeof data.type === 'string') {
-                this.notifyHandlers(data);
+              const raw = JSON.parse(event.data) as unknown;
+              const sanitized = sanitizeIncomingJsonMessage(raw);
+              if (sanitized) {
+                if (typeof sanitized.seq === 'number') {
+                  this.updateServerSeq(sanitized.seq);
+                }
+                const remoteLamport = (sanitized as { lamport?: unknown }).lamport;
+                if (typeof remoteLamport === 'number' && Number.isFinite(remoteLamport)) {
+                  this.updateLamport(remoteLamport);
+                }
+                this.notifyHandlers(sanitized);
               }
             }
           } catch (err) {
@@ -310,10 +871,29 @@ class MultiplayerService {
       }
     }
     this.currentPeer = null;
+    this.localRole = 'editor';
+    this.lastServerSeq = 0;
+    this.sentAssetHashes.clear();
+    this.sentTileVersions.clear();
     if (this.cursorThrottleRaf) {
       cancelAnimationFrame(this.cursorThrottleRaf);
       this.cursorThrottleRaf = null;
     }
+    if (this.perspectiveThrottleTimer) {
+      clearTimeout(this.perspectiveThrottleTimer);
+      this.perspectiveThrottleTimer = null;
+    }
+    this.pendingPerspectiveRuler = undefined;
+    if (this.straightThrottleTimer) {
+      clearTimeout(this.straightThrottleTimer);
+      this.straightThrottleTimer = null;
+    }
+    this.pendingStraightRuler = undefined;
+    if (this.animationThrottleTimer) {
+      clearTimeout(this.animationThrottleTimer);
+      this.animationThrottleTimer = null;
+    }
+    this.pendingAnimationTimeline = undefined;
   }
 
   public onMessage(handler: MessageHandler): () => void {
@@ -352,7 +932,7 @@ class MultiplayerService {
 
   // --- Binary Packet Encoding & Decoding ---
 
-  private decodeBinaryPacket(buf: ArrayBuffer): MultiplayerMessage | null {
+  public decodeBinaryPacket(buf: ArrayBuffer): MultiplayerMessage | null {
     if (buf.byteLength < 11 || buf.byteLength > MAX_BINARY_PACKET_BYTES) return null;
     const view = new DataView(buf);
 
@@ -370,25 +950,6 @@ class MultiplayerService {
     const payloadBytes = new Uint8Array(buf, 11, payloadLen);
     const decoder = new TextDecoder();
 
-    const TOOL_TYPES_LIST: ToolType[] = [
-      'brush',
-      'eraser',
-      'pipette',
-      'transform',
-      'select-rect',
-      'select-lasso',
-      'select-wand',
-      'select-pen',
-      'select-eraser',
-      'fill',
-      'text',
-      'frame',
-      'balloon',
-      'vector-edit',
-      'liquify',
-      'shape',
-    ];
-
     switch (code) {
       case CODE_STROKE_START: {
         const jsonStr = decoder.decode(payloadBytes);
@@ -397,12 +958,13 @@ class MultiplayerService {
         if (!safeSettings || !isValidRemotePoint(data?.startPoint)) return null;
         return {
           type: 'STROKE_START',
-          strokeId: String(data.strokeId || ''),
+          strokeId: String(data.strokeId || '').slice(0, 128),
           peerId: data.peerId,
           peerName: String(data.peerName || 'Peer').slice(0, 64),
           peerColor: String(data.peerColor || '#38bdf8').slice(0, 32),
-          layerId: String(data.layerId || ''),
+          layerId: String(data.layerId || '').slice(0, 256),
           brushSettings: safeSettings,
+          brushAssetRefs: sanitizeBrushAssetRefs(data.brushAssetRefs),
           tool: TOOL_TYPES_LIST.includes(data.tool) ? data.tool : 'brush',
           startPoint: {
             ...data.startPoint,
@@ -417,7 +979,7 @@ class MultiplayerService {
       }
 
       case CODE_STROKE_CHUNK: {
-        // Format: [strokeIdLen: uint16, strokeIdStr, peerIdLen: uint16, peerIdStr, pointCount: uint16, points...]
+        // Format: [strokeIdLen: u16, strokeId, peerIdLen: u16, peerId, pointCount: u16, points (20B each)...]
         let offset = 0;
         if (payloadBytes.byteLength < 6) return null;
         const pView = new DataView(payloadBytes.buffer, payloadBytes.byteOffset, payloadBytes.byteLength);
@@ -436,7 +998,10 @@ class MultiplayerService {
 
         const pointCount = pView.getUint16(offset, true);
         offset += 2;
-        if (pointCount > MAX_STROKE_CHUNK_POINTS || offset + pointCount * 16 > payloadBytes.byteLength) {
+        if (
+          pointCount > MAX_STROKE_CHUNK_POINTS ||
+          offset + pointCount * STROKE_CHUNK_POINT_STRIDE > payloadBytes.byteLength
+        ) {
           return null;
         }
 
@@ -446,13 +1011,21 @@ class MultiplayerService {
           const y = pView.getFloat32(offset + 4, true);
           const pressure = pView.getFloat32(offset + 8, true);
           const width = pView.getFloat32(offset + 12, true);
-          offset += 16;
+          const tiltX = pView.getInt8(offset + 16);
+          const tiltY = pView.getInt8(offset + 17);
+          const twist = (pView.getUint8(offset + 18) * 360) / 255;
+          const flags = pView.getUint8(offset + 19);
+          offset += STROKE_CHUNK_POINT_STRIDE;
           if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
           points.push({
             x,
             y,
             pressure: Number.isFinite(pressure) ? Math.max(0, Math.min(1, pressure)) : 0.5,
             width: Number.isFinite(width) ? Math.max(0.1, Math.min(2000, width)) : 1,
+            tiltX,
+            tiltY,
+            twist,
+            isCorner: (flags & 1) !== 0,
           });
         }
 
@@ -471,9 +1044,9 @@ class MultiplayerService {
         const data = JSON.parse(jsonStr);
         return {
           type: 'STROKE_FINISH',
-          strokeId: data.strokeId,
+          strokeId: String(data.strokeId || '').slice(0, 128),
           peerId: data.peerId,
-          layerId: data.layerId,
+          layerId: String(data.layerId || '').slice(0, 256),
           endPoint: data.endPoint,
           dirtyRect: data.dirtyRect,
           vectorStroke: data.vectorStroke,
@@ -481,18 +1054,29 @@ class MultiplayerService {
       }
 
       case CODE_TILE_DELTA: {
-        // Format: [layerIdLen: uint16, layerIdStr, serializedTileBuffer...]
+        // Format: [layerIdLen: u16, layerId, lz4SerializedTileBuffer...]
         let offset = 0;
         if (payloadBytes.byteLength < 2) return null;
         const pView = new DataView(payloadBytes.buffer, payloadBytes.byteOffset, payloadBytes.byteLength);
         const layerIdLen = pView.getUint16(offset, true);
         offset += 2;
-        if (offset + layerIdLen > payloadBytes.byteLength) return null;
+        if (layerIdLen === 0 || layerIdLen > 256 || offset + layerIdLen > payloadBytes.byteLength) {
+          return null;
+        }
         const layerId = decoder.decode(payloadBytes.subarray(offset, offset + layerIdLen));
         offset += layerIdLen;
 
         const tilePacket = payloadBytes.subarray(offset);
-        const tile = deserializeTileBuffer(layerId, tilePacket);
+        const tile = deserializeTileBufferStrict(layerId, tilePacket);
+        if (
+          !tile ||
+          tile.tileX < 0 ||
+          tile.tileY < 0 ||
+          tile.tileX >= MAX_TILE_COORD ||
+          tile.tileY >= MAX_TILE_COORD
+        ) {
+          return null;
+        }
 
         return {
           type: 'BINARY_TILE',
@@ -503,6 +1087,55 @@ class MultiplayerService {
           version: tile.version,
           data: tile.data,
         } as TileStreamMessage;
+      }
+
+      case CODE_BRUSH_ASSET_DATA: {
+        // Format: [hashLen: u8, hashUtf8, mimeLen: u8, mimeUtf8, rawBytes...]
+        if (payloadBytes.byteLength < 4) return null;
+        let offset = 0;
+        const hashLen = payloadBytes[offset++];
+        if (hashLen === 0 || hashLen > 64 || offset + hashLen + 1 > payloadBytes.byteLength) {
+          return null;
+        }
+        const hash = decoder.decode(payloadBytes.subarray(offset, offset + hashLen));
+        offset += hashLen;
+
+        const mimeLen = payloadBytes[offset++];
+        if (mimeLen === 0 || mimeLen > 64 || offset + mimeLen > payloadBytes.byteLength) {
+          return null;
+        }
+        const mime = decoder.decode(payloadBytes.subarray(offset, offset + mimeLen));
+        offset += mimeLen;
+
+        const rawLen = payloadBytes.byteLength - offset;
+        if (
+          !isValidBrushAssetHash(hash) ||
+          !isAllowedBrushAssetMime(mime) ||
+          rawLen === 0 ||
+          rawLen > MAX_BRUSH_ASSET_BYTES
+        ) {
+          return null;
+        }
+
+        const data = new Uint8Array(rawLen);
+        data.set(payloadBytes.subarray(offset));
+        return {
+          type: 'BRUSH_ASSET_DATA',
+          hash,
+          mime,
+          data,
+        } as BrushAssetDataMessage;
+      }
+
+      case CODE_BRUSH_ASSET_REQUEST: {
+        const jsonStr = decoder.decode(payloadBytes);
+        const data = JSON.parse(jsonStr);
+        if (!isValidBrushAssetHash(data?.hash)) return null;
+        return {
+          type: 'BRUSH_ASSET_REQUEST',
+          hash: data.hash,
+          targetPeerId: data.targetPeerId,
+        } as BrushAssetRequestMessage;
       }
 
       case CODE_CURSOR_MOVE: {
@@ -543,12 +1176,135 @@ class MultiplayerService {
         } as SelectiveUndoMessage;
       }
 
+      case CODE_LAYER_MASK_DATA: {
+        // Format: [layerIdLen: u16, layerId, flags: u8, x: u32, y: u32, width: u32, height: u32, body...]
+        if (payloadBytes.byteLength < 19) return null;
+        const pView = new DataView(payloadBytes.buffer, payloadBytes.byteOffset, payloadBytes.byteLength);
+        let offset = 0;
+        const layerIdLen = pView.getUint16(offset, true);
+        offset += 2;
+        if (layerIdLen === 0 || layerIdLen > 256 || offset + layerIdLen + 17 > payloadBytes.byteLength) {
+          return null;
+        }
+        const layerId = decoder.decode(payloadBytes.subarray(offset, offset + layerIdLen));
+        offset += layerIdLen;
+
+        const flags = payloadBytes[offset++];
+        const x = pView.getUint32(offset, true);
+        const y = pView.getUint32(offset + 4, true);
+        const width = pView.getUint32(offset + 8, true);
+        const height = pView.getUint32(offset + 12, true);
+        offset += 16;
+
+        if (
+          x > MAX_SYNC_CANVAS_DIM ||
+          y > MAX_SYNC_CANVAS_DIM ||
+          width === 0 ||
+          height === 0 ||
+          width > MAX_SYNC_CANVAS_DIM ||
+          height > MAX_SYNC_CANVAS_DIM
+        ) {
+          return null;
+        }
+
+        const isFullReplace = (flags & MASK_FLAG_FULL_REPLACE) !== 0;
+        const isCompressed = (flags & MASK_FLAG_LZ4) !== 0;
+        const isSolidFill = (flags & MASK_FLAG_SOLID_FILL) !== 0;
+        const body = payloadBytes.subarray(offset);
+
+        if (isSolidFill) {
+          if (body.byteLength !== 1) return null;
+          return {
+            type: 'BINARY_MASK',
+            layerId,
+            x,
+            y,
+            width,
+            height,
+            isFullReplace,
+            solidFill: body[0],
+            data: null,
+          } as LayerMaskDataMessage;
+        }
+
+        const expectedPixels = width * height;
+        if (expectedPixels <= 0 || expectedPixels > MAX_MASK_DECODE_BYTES) return null;
+
+        let data: Uint8Array | null;
+        if (isCompressed) {
+          data = lz4DecompressBlock(body, expectedPixels, MAX_MASK_DECODE_BYTES);
+          if (!data) return null;
+        } else {
+          if (body.byteLength !== expectedPixels) return null;
+          data = new Uint8Array(expectedPixels);
+          data.set(body);
+        }
+
+        return {
+          type: 'BINARY_MASK',
+          layerId,
+          x,
+          y,
+          width,
+          height,
+          isFullReplace,
+          data,
+        } as LayerMaskDataMessage;
+      }
+
       default:
         return null;
     }
   }
 
   // --- Drawing Events via Compact Binary Packets ---
+
+  public sendBrushAssetData(hash: string, mime: string, bytes: Uint8Array) {
+    if (!this.isConnected()) return;
+    if (!isValidBrushAssetHash(hash) || !isAllowedBrushAssetMime(mime)) return;
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_BRUSH_ASSET_BYTES) return;
+
+    const encoder = new TextEncoder();
+    const hashBytes = encoder.encode(hash);
+    const mimeBytes = encoder.encode(mime);
+    const payloadSize = 1 + hashBytes.length + 1 + mimeBytes.length + bytes.byteLength;
+    const packet = new Uint8Array(11 + payloadSize);
+    const view = new DataView(packet.buffer);
+
+    view.setUint8(0, BINARY_MAGIC_0);
+    view.setUint8(1, BINARY_MAGIC_1);
+    view.setUint8(2, CODE_BRUSH_ASSET_DATA);
+    view.setUint32(3, this.getNextLamport(), true);
+    view.setUint32(7, payloadSize, true);
+
+    let offset = 11;
+    packet[offset++] = hashBytes.length;
+    packet.set(hashBytes, offset);
+    offset += hashBytes.length;
+    packet[offset++] = mimeBytes.length;
+    packet.set(mimeBytes, offset);
+    offset += mimeBytes.length;
+    packet.set(bytes, offset);
+
+    this.sendBinary(packet);
+  }
+
+  public sendBrushAssetRequest(hash: string, targetPeerId?: string | number) {
+    if (!this.isConnected() || !isValidBrushAssetHash(hash)) return;
+
+    const encoder = new TextEncoder();
+    const payloadBytes = encoder.encode(JSON.stringify({ hash, targetPeerId }));
+    const packet = new Uint8Array(11 + payloadBytes.length);
+    const view = new DataView(packet.buffer);
+    view.setUint8(0, BINARY_MAGIC_0);
+    view.setUint8(1, BINARY_MAGIC_1);
+    view.setUint8(2, CODE_BRUSH_ASSET_REQUEST);
+    view.setUint32(3, this.getNextLamport(), true);
+    view.setUint32(7, payloadBytes.length, true);
+    packet.set(payloadBytes, 11);
+
+    this.sendBinary(packet);
+  }
 
   public sendStrokeStart(
     strokeId: string,
@@ -557,7 +1313,16 @@ class MultiplayerService {
     tool: ToolType,
     startPoint: Point
   ) {
-    if (!this.isConnected() || !this.currentPeer) return;
+    if (!this.isConnected() || !this.currentPeer || !this.canSendMutation()) return;
+
+    const { wireSettings, assetRefs, assets } = prepareBrushSettingsForWire(brushSettings);
+    for (let i = 0; i < assets.length; i++) {
+      const asset = assets[i];
+      if (!this.sentAssetHashes.has(asset.hash)) {
+        this.sendBrushAssetData(asset.hash, asset.mime, asset.bytes);
+        this.sentAssetHashes.add(asset.hash);
+      }
+    }
 
     const encoder = new TextEncoder();
     const payloadStr = JSON.stringify({
@@ -566,7 +1331,8 @@ class MultiplayerService {
       peerName: this.currentPeer.name,
       peerColor: this.currentPeer.color,
       layerId,
-      brushSettings,
+      brushSettings: wireSettings,
+      brushAssetRefs: assetRefs,
       tool,
       startPoint,
     });
@@ -585,7 +1351,7 @@ class MultiplayerService {
   }
 
   public sendStrokeChunk(strokeId: string, points: Point[]) {
-    if (!this.isConnected() || !this.currentPeer || points.length === 0) return;
+    if (!this.isConnected() || !this.currentPeer || !this.canSendMutation() || points.length === 0) return;
 
     const MAX_POINTS_PER_PACKET = 4096;
     if (points.length > MAX_POINTS_PER_PACKET) {
@@ -599,8 +1365,8 @@ class MultiplayerService {
     const strokeIdBytes = encoder.encode(strokeId);
     const peerIdBytes = encoder.encode(String(this.currentPeer.id));
 
-    // Size: 2 + strokeIdBytes.length + 2 + peerIdBytes.length + 2 + (points.length * 16)
-    const payloadSize = 6 + strokeIdBytes.length + peerIdBytes.length + points.length * 16;
+    const payloadSize =
+      6 + strokeIdBytes.length + peerIdBytes.length + points.length * STROKE_CHUNK_POINT_STRIDE;
     const packet = new Uint8Array(11 + payloadSize);
     const view = new DataView(packet.buffer);
 
@@ -630,7 +1396,14 @@ class MultiplayerService {
       view.setFloat32(offset + 4, pt.y, true);
       view.setFloat32(offset + 8, pt.pressure, true);
       view.setFloat32(offset + 12, pt.width, true);
-      offset += 16;
+      const tx = Math.max(-90, Math.min(90, Math.round(pt.tiltX ?? 0)));
+      const ty = Math.max(-90, Math.min(90, Math.round(pt.tiltY ?? 0)));
+      const tw = Math.max(0, Math.min(255, Math.round((((pt.twist ?? 0) % 360 + 360) % 360) * (255 / 360))));
+      view.setInt8(offset + 16, tx);
+      view.setInt8(offset + 17, ty);
+      view.setUint8(offset + 18, tw);
+      view.setUint8(offset + 19, pt.isCorner ? 1 : 0);
+      offset += STROKE_CHUNK_POINT_STRIDE;
     }
 
     this.sendBinary(packet);
@@ -643,7 +1416,7 @@ class MultiplayerService {
     dirtyRect?: DirtyRect,
     vectorStroke?: VectorStroke
   ) {
-    if (!this.isConnected() || !this.currentPeer) return;
+    if (!this.isConnected() || !this.currentPeer || !this.canSendMutation()) return;
 
     const encoder = new TextEncoder();
     const payloadStr = JSON.stringify({
@@ -669,10 +1442,17 @@ class MultiplayerService {
   }
 
   /**
-   * Stream a single sparse tile delta (e.g. from flood fill or progressive document sync).
+   * Stream a single LZ4-compressed binary tile (or 14-byte deletion tombstone when tile.data === null).
    */
   public sendTileDelta(layerId: string, tile: TileBuffer) {
-    if (!this.isConnected()) return;
+    if (!this.isConnected() || !this.canSendMutation()) return;
+
+    const tileKey = `${layerId}:${tile.tileX}:${tile.tileY}`;
+    if (tile.data === null) {
+      this.sentTileVersions.delete(tileKey);
+    } else if (tile.version > 0) {
+      this.sentTileVersions.set(tileKey, tile.version);
+    }
 
     const encoder = new TextEncoder();
     const layerIdBytes = encoder.encode(layerId);
@@ -699,10 +1479,117 @@ class MultiplayerService {
   }
 
   /**
+   * Broadcast authoritative LZ4-compressed BINARY_TILE packets for all tiles touched
+   * by a raster operation (stroke, fill, transform, liquify, filter, tonal, undo/redo).
+   * Idempotent per TileDelta[] reference unless options.force is set.
+   */
+  public sendTileDeltas(
+    deltas: TileDelta[],
+    grid: SparseTileGrid,
+    options?: { force?: boolean }
+  ): void {
+    if (!this.isConnected() || !this.canSendMutation() || !deltas || deltas.length === 0) return;
+    if (!options?.force && this.sentDeltaBatches.has(deltas)) return;
+    this.sentDeltaBatches.add(deltas);
+
+    const seenKeys = new Set<string>();
+    const queue: Array<{ layerId: string; tile: TileBuffer }> = [];
+
+    for (let i = 0; i < deltas.length; i++) {
+      const delta = deltas[i];
+      if (seenKeys.has(delta.key)) continue;
+      seenKeys.add(delta.key);
+
+      const { layerId, tileX, tileY } = parseTileKey(delta.key);
+      const tile = grid.getTile(layerId, tileX, tileY, 0);
+      if (tile && tile.data) {
+        queue.push({ layerId, tile });
+      } else {
+        queue.push({
+          layerId,
+          tile: {
+            layerId,
+            tileX,
+            tileY,
+            format: delta.format,
+            data: null,
+            dirty: true,
+            version: 0,
+            isPagedToDisk: false,
+            lastAccessTimestamp: 0,
+            lod: 0,
+          },
+        });
+      }
+    }
+
+    this.streamTileQueuePaced(queue);
+  }
+
+  /**
+   * Stream all populated LOD 0 tiles of a layer as LZ4-compressed BINARY_TILE packets.
+   * Deduplicates unchanged tile versions unless options.force is true.
+   */
+  public streamLayerTiles(
+    layerId: string,
+    grid: SparseTileGrid,
+    options?: { force?: boolean }
+  ): void {
+    if (!this.isConnected() || !this.canSendMutation()) return;
+    const tiles = grid.getLayerTiles(layerId);
+    if (tiles.length === 0) return;
+
+    const force = Boolean(options?.force);
+    const queue: Array<{ layerId: string; tile: TileBuffer }> = [];
+    for (let i = 0; i < tiles.length; i++) {
+      const t = tiles[i];
+      if (!t.data || t.data.byteLength === 0) continue;
+      if (!force && t.version > 0) {
+        const key = `${layerId}:${t.tileX}:${t.tileY}`;
+        if (this.sentTileVersions.get(key) === t.version) continue;
+      }
+      queue.push({ layerId, tile: t });
+    }
+    this.streamTileQueuePaced(queue);
+  }
+
+  private streamTileQueuePaced(queue: Array<{ layerId: string; tile: TileBuffer }>): void {
+    if (queue.length === 0 || !this.isConnected()) return;
+
+    const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+    // Small operations (typical strokes) flush synchronously before STROKE_FINISH for zero flicker
+    if (queue.length <= 32 && this.getBufferedAmount() <= MAX_BUFFERED_BYTES) {
+      for (let i = 0; i < queue.length; i++) {
+        this.sendTileDelta(queue[i].layerId, queue[i].tile);
+      }
+      return;
+    }
+
+    let idx = 0;
+    const BATCH_SIZE = 16;
+    const pump = () => {
+      if (!this.isConnected()) return;
+      if (this.getBufferedAmount() > MAX_BUFFERED_BYTES) {
+        setTimeout(pump, 20);
+        return;
+      }
+      const end = Math.min(idx + BATCH_SIZE, queue.length);
+      for (; idx < end; idx++) {
+        this.sendTileDelta(queue[idx].layerId, queue[idx].tile);
+      }
+      if (idx < queue.length) {
+        setTimeout(pump, 4);
+      }
+    };
+
+    pump();
+  }
+
+  /**
    * Broadcast a selective collaborative undo command (undoing a stroke without reverting peer strokes).
    */
   public sendSelectiveUndo(strokeId: string) {
-    if (!this.isConnected() || !this.currentPeer) return;
+    if (!this.isConnected() || !this.currentPeer || !this.canSendMutation()) return;
 
     const encoder = new TextEncoder();
     const payloadStr = JSON.stringify({
@@ -765,24 +1652,6 @@ class MultiplayerService {
     packet.set(peerIdBytes, offset);
     offset += peerIdBytes.length;
 
-    const TOOL_TYPES_LIST: ToolType[] = [
-      'brush',
-      'eraser',
-      'pipette',
-      'transform',
-      'select-rect',
-      'select-lasso',
-      'select-wand',
-      'select-pen',
-      'select-eraser',
-      'fill',
-      'text',
-      'frame',
-      'balloon',
-      'vector-edit',
-      'liquify',
-      'shape',
-    ];
     const toolIdx = Math.max(0, TOOL_TYPES_LIST.indexOf(this.pendingCursor.tool));
     view.setFloat32(offset, this.pendingCursor.x, true);
     view.setFloat32(offset + 4, this.pendingCursor.y, true);
@@ -793,21 +1662,22 @@ class MultiplayerService {
     this.pendingCursor = null;
   }
 
-  // --- Layer Synchronization ---
+  // --- Layer & Document State Synchronization ---
 
-  public sendLayerAdd(layerItem: LayerItem, imageDataUrl?: string) {
-    if (!this.isConnected()) return;
+  public sendLayerAdd(layerItem: LayerItem | WireLayerItem, insertIndex?: number) {
+    if (!this.isConnected() || !this.canSendMutation()) return;
+    const wireLayer = serializeLayerForWire(layerItem as LayerItem);
     const msg: LayerActionMessage = {
       type: 'LAYER_ADD',
-      layerId: layerItem.id,
-      layerItem,
-      imageDataUrl,
+      layerId: wireLayer.id,
+      layerItem: wireLayer,
+      ...(insertIndex !== undefined ? { insertIndex } : {}),
     };
     this.sendMessage(msg);
   }
 
   public sendLayerDelete(layerId: string) {
-    if (!this.isConnected()) return;
+    if (!this.isConnected() || !this.canSendMutation()) return;
     const msg: LayerActionMessage = {
       type: 'LAYER_DELETE',
       layerId,
@@ -816,7 +1686,7 @@ class MultiplayerService {
   }
 
   public sendLayerClear(layerId: string) {
-    if (!this.isConnected()) return;
+    if (!this.isConnected() || !this.canSendMutation()) return;
     const msg: LayerActionMessage = {
       type: 'LAYER_CLEAR',
       layerId,
@@ -825,7 +1695,7 @@ class MultiplayerService {
   }
 
   public sendLayerRename(layerId: string, newName: string) {
-    if (!this.isConnected()) return;
+    if (!this.isConnected() || !this.canSendMutation()) return;
     const msg: LayerActionMessage = {
       type: 'LAYER_RENAME',
       layerId,
@@ -835,7 +1705,7 @@ class MultiplayerService {
   }
 
   public sendLayerVisibility(layerId: string, visible: boolean) {
-    if (!this.isConnected()) return;
+    if (!this.isConnected() || !this.canSendMutation()) return;
     const msg: LayerActionMessage = {
       type: 'LAYER_VISIBILITY',
       layerId,
@@ -845,11 +1715,366 @@ class MultiplayerService {
   }
 
   public sendLayerOpacity(layerId: string, opacity: number) {
-    if (!this.isConnected()) return;
+    if (!this.isConnected() || !this.canSendMutation()) return;
     const msg: LayerActionMessage = {
       type: 'LAYER_OPACITY',
       layerId,
       opacity,
+    };
+    this.sendMessage(msg);
+  }
+
+  public sendLayerUpdate(
+    layerId: string,
+    patch: Partial<WireLayerItem>,
+    clearedFields?: LayerClearableField[]
+  ) {
+    if (!this.isConnected() || !this.canSendMutation() || !layerId) return;
+    const safePatch = sanitizeWireLayerPatch(patch);
+    const safeCleared = clearedFields && clearedFields.length > 0 ? sanitizeClearedFields(clearedFields) : [];
+    if (Object.keys(safePatch).length === 0 && safeCleared.length === 0) return;
+
+    const msg: LayerUpdateMessage = {
+      type: 'LAYER_UPDATE',
+      layerId,
+      patch: safePatch,
+      ...(safeCleared.length > 0 ? { clearedFields: safeCleared } : {}),
+      lamport: this.getNextLamport(),
+    };
+    this.sendMessage(msg);
+  }
+
+  public sendLayerTreeSync(
+    layers: Array<LayerItem | WireLayerItem>,
+    options?: { dirtyTileLayerIds?: string[]; removedLayerIds?: string[] }
+  ) {
+    if (!this.isConnected() || !this.canSendMutation() || layers.length === 0) return;
+    const wireLayers = layers.map((l) => serializeLayerForWire(l as LayerItem));
+    const msg: LayerTreeSyncMessage = {
+      type: 'LAYER_TREE_SYNC',
+      layers: wireLayers,
+      lamport: this.getNextLamport(),
+      ...(options?.dirtyTileLayerIds && options.dirtyTileLayerIds.length > 0
+        ? { dirtyTileLayerIds: options.dirtyTileLayerIds }
+        : {}),
+      ...(options?.removedLayerIds && options.removedLayerIds.length > 0
+        ? { removedLayerIds: options.removedLayerIds }
+        : {}),
+    };
+    this.sendMessage(msg);
+  }
+
+  // --- Binary Layer Mask Synchronization (LZ4 / 1-byte solid fill, auto-chunked <= 1024x1024) ---
+
+  private sendMaskPacket(
+    layerId: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    isFullReplace: boolean,
+    solidValue: number | null,
+    pixels: Uint8Array | null
+  ) {
+    if (!this.isConnected() || !this.canSendMutation() || !layerId || width <= 0 || height <= 0) return;
+
+    const encoder = new TextEncoder();
+    const layerIdBytes = encoder.encode(layerId);
+    if (layerIdBytes.length === 0 || layerIdBytes.length > 256) return;
+
+    let flags = isFullReplace ? MASK_FLAG_FULL_REPLACE : 0;
+    let body: Uint8Array;
+
+    if (solidValue !== null) {
+      flags |= MASK_FLAG_SOLID_FILL;
+      body = new Uint8Array([Math.max(0, Math.min(255, Math.round(solidValue)))]);
+    } else if (pixels) {
+      const compressed = lz4CompressBlock(pixels);
+      if (compressed.byteLength < pixels.byteLength) {
+        flags |= MASK_FLAG_LZ4;
+        body = compressed;
+      } else {
+        body = pixels;
+      }
+    } else {
+      return;
+    }
+
+    const payloadSize = 2 + layerIdBytes.length + 1 + 16 + body.byteLength;
+    const packet = new Uint8Array(11 + payloadSize);
+    const view = new DataView(packet.buffer);
+
+    view.setUint8(0, BINARY_MAGIC_0);
+    view.setUint8(1, BINARY_MAGIC_1);
+    view.setUint8(2, CODE_LAYER_MASK_DATA);
+    view.setUint32(3, this.getNextLamport(), true);
+    view.setUint32(7, payloadSize, true);
+
+    let offset = 11;
+    view.setUint16(offset, layerIdBytes.length, true);
+    offset += 2;
+    packet.set(layerIdBytes, offset);
+    offset += layerIdBytes.length;
+
+    packet[offset++] = flags;
+    view.setUint32(offset, x, true);
+    view.setUint32(offset + 4, y, true);
+    view.setUint32(offset + 8, width, true);
+    view.setUint32(offset + 12, height, true);
+    offset += 16;
+
+    packet.set(body, offset);
+    this.sendBinary(packet);
+  }
+
+  public sendLayerMaskSolid(
+    layerId: string,
+    width: number,
+    height: number,
+    value: number = 255,
+    isFullReplace: boolean = true
+  ) {
+    if (!this.isConnected() || width <= 0 || height <= 0) return;
+    this.sendMaskPacket(layerId, 0, 0, width, height, isFullReplace, value, null);
+  }
+
+  public sendLayerMaskData(layerId: string, maskCanvas: HTMLCanvasElement, rect?: DirtyRect) {
+    if (!this.isConnected() || !maskCanvas || maskCanvas.width <= 0 || maskCanvas.height <= 0) {
+      return;
+    }
+
+    const isFull = !rect;
+    const x0 = rect ? Math.max(0, Math.min(maskCanvas.width - 1, Math.floor(rect.x))) : 0;
+    const y0 = rect ? Math.max(0, Math.min(maskCanvas.height - 1, Math.floor(rect.y))) : 0;
+    const x1 = rect
+      ? Math.max(x0 + 1, Math.min(maskCanvas.width, Math.ceil(rect.x + rect.width)))
+      : maskCanvas.width;
+    const y1 = rect
+      ? Math.max(y0 + 1, Math.min(maskCanvas.height, Math.ceil(rect.y + rect.height)))
+      : maskCanvas.height;
+    const totalW = x1 - x0;
+    const totalH = y1 - y0;
+    if (totalW <= 0 || totalH <= 0) return;
+
+    // Small rects (<= 1024x1024) send in a single packet
+    if (totalW * totalH <= MAX_MASK_CHUNK_DIM * MAX_MASK_CHUNK_DIM) {
+      const extracted = extractMaskGrayscaleRect(maskCanvas, {
+        x: x0,
+        y: y0,
+        width: totalW,
+        height: totalH,
+      });
+      if (!extracted) return;
+      this.sendMaskPacket(
+        layerId,
+        extracted.x,
+        extracted.y,
+        extracted.width,
+        extracted.height,
+        isFull,
+        extracted.solidValue,
+        extracted.solidValue === null ? extracted.pixels : null
+      );
+      return;
+    }
+
+    // Large masks: chunk into <= 1024x1024 tiles so every packet stays well under the 8MB WS ceiling
+    const chunks: Array<{
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      solidValue: number | null;
+      pixels: Uint8Array | null;
+    }> = [];
+    for (let cy = y0; cy < y1; cy += MAX_MASK_CHUNK_DIM) {
+      const ch = Math.min(MAX_MASK_CHUNK_DIM, y1 - cy);
+      for (let cx = x0; cx < x1; cx += MAX_MASK_CHUNK_DIM) {
+        const cw = Math.min(MAX_MASK_CHUNK_DIM, x1 - cx);
+        const extracted = extractMaskGrayscaleRect(maskCanvas, {
+          x: cx,
+          y: cy,
+          width: cw,
+          height: ch,
+        });
+        if (!extracted) continue;
+        chunks.push({
+          x: extracted.x,
+          y: extracted.y,
+          width: extracted.width,
+          height: extracted.height,
+          solidValue: extracted.solidValue,
+          pixels: extracted.solidValue === null ? extracted.pixels : null,
+        });
+      }
+    }
+
+    if (chunks.length === 0) return;
+
+    // Fast collapse if all chunks share the same uniform solid fill
+    const firstSolid = chunks[0].solidValue;
+    if (firstSolid !== null && chunks.every((c) => c.solidValue === firstSolid)) {
+      this.sendMaskPacket(layerId, x0, y0, totalW, totalH, isFull, firstSolid, null);
+      return;
+    }
+
+    const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+    let idx = 0;
+    const pump = () => {
+      if (!this.isConnected()) return;
+      if (this.getBufferedAmount() > MAX_BUFFERED_BYTES) {
+        setTimeout(pump, 20);
+        return;
+      }
+      const end = Math.min(idx + 8, chunks.length);
+      for (; idx < end; idx++) {
+        const c = chunks[idx];
+        this.sendMaskPacket(layerId, c.x, c.y, c.width, c.height, false, c.solidValue, c.pixels);
+      }
+      if (idx < chunks.length) {
+        setTimeout(pump, 4);
+      }
+    };
+    pump();
+  }
+
+  // --- Perspective Ruler, Straight Ruler, Animation & Canvas Resize Sync ---
+
+  public sendPerspectiveRulerSync(perspectiveRuler: PerspectiveRuler | null, immediate = false) {
+    if (!this.isConnected() || !this.canSendMutation()) return;
+    this.pendingPerspectiveRuler = perspectiveRuler;
+    const flush = () => {
+      this.perspectiveThrottleTimer = null;
+      if (!this.isConnected() || !this.canSendMutation() || this.pendingPerspectiveRuler === undefined) return;
+      const value = this.pendingPerspectiveRuler;
+      this.pendingPerspectiveRuler = undefined;
+      const msg: PerspectiveRulerSyncMessage = {
+        type: 'PERSPECTIVE_RULER_SYNC',
+        perspectiveRuler: value,
+        lamport: this.getNextLamport(),
+      };
+      this.sendMessage(msg);
+    };
+    if (immediate) {
+      if (this.perspectiveThrottleTimer) clearTimeout(this.perspectiveThrottleTimer);
+      flush();
+    } else if (!this.perspectiveThrottleTimer) {
+      this.perspectiveThrottleTimer = setTimeout(flush, STATE_SYNC_THROTTLE_MS);
+    }
+  }
+
+  public sendStraightRulerSync(straightRuler: StraightRuler | null, immediate = false) {
+    if (!this.isConnected() || !this.canSendMutation()) return;
+    this.pendingStraightRuler = straightRuler;
+    const flush = () => {
+      this.straightThrottleTimer = null;
+      if (!this.isConnected() || !this.canSendMutation() || this.pendingStraightRuler === undefined) return;
+      const value = this.pendingStraightRuler;
+      this.pendingStraightRuler = undefined;
+      const msg: StraightRulerSyncMessage = {
+        type: 'STRAIGHT_RULER_SYNC',
+        straightRuler: value,
+        lamport: this.getNextLamport(),
+      };
+      this.sendMessage(msg);
+    };
+    if (immediate) {
+      if (this.straightThrottleTimer) clearTimeout(this.straightThrottleTimer);
+      flush();
+    } else if (!this.straightThrottleTimer) {
+      this.straightThrottleTimer = setTimeout(flush, STATE_SYNC_THROTTLE_MS);
+    }
+  }
+
+  public sendAnimationSync(animationTimeline: AnimationTimeline | null, immediate = false) {
+    if (!this.isConnected() || !this.canSendMutation()) return;
+    const wireTimeline: AnimationTimeline | null = animationTimeline
+      ? { ...animationTimeline, isPlaying: false }
+      : null;
+    this.pendingAnimationTimeline = wireTimeline;
+    const flush = () => {
+      this.animationThrottleTimer = null;
+      if (!this.isConnected() || !this.canSendMutation() || this.pendingAnimationTimeline === undefined) return;
+      const value = this.pendingAnimationTimeline;
+      this.pendingAnimationTimeline = undefined;
+      const msg: AnimationSyncMessage = {
+        type: 'ANIMATION_SYNC',
+        animationTimeline: value,
+        lamport: this.getNextLamport(),
+      };
+      this.sendMessage(msg);
+    };
+    if (immediate) {
+      if (this.animationThrottleTimer) clearTimeout(this.animationThrottleTimer);
+      flush();
+    } else if (!this.animationThrottleTimer) {
+      this.animationThrottleTimer = setTimeout(flush, STATE_SYNC_THROTTLE_MS);
+    }
+  }
+
+  public sendCanvasResize(dimensions: CanvasDimensions, options: ResizeCanvasOptions) {
+    if (!this.isConnected() || !this.canSendMutation()) return;
+    const msg: CanvasResizeMessage = {
+      type: 'CANVAS_RESIZE',
+      dimensions,
+      options,
+      lamport: this.getNextLamport(),
+    };
+    this.sendMessage(msg);
+  }
+
+  // --- Room Roles & Moderation (Host-authoritative) ---
+
+  public sendPeerRoleUpdate(targetPeerId: string | number, role: CollabRole) {
+    if (!this.isConnected() || this.localRole !== 'host') return;
+    const msg: PeerRoleUpdateMessage = {
+      type: 'PEER_ROLE_UPDATE',
+      targetPeerId,
+      role,
+    };
+    this.sendMessage(msg);
+  }
+
+  public sendPeerKick(targetPeerId: string | number, reason?: string) {
+    if (!this.isConnected() || this.localRole !== 'host') return;
+    const msg: PeerKickMessage = {
+      type: 'PEER_KICK',
+      targetPeerId,
+      ...(reason ? { reason } : {}),
+    };
+    this.sendMessage(msg);
+  }
+
+  public sendPeerBan(targetPeerId: string | number, reason?: string) {
+    if (!this.isConnected() || this.localRole !== 'host') return;
+    const msg: PeerBanMessage = {
+      type: 'PEER_BAN',
+      targetPeerId,
+      ...(reason ? { reason } : {}),
+    };
+    this.sendMessage(msg);
+  }
+
+  public sendPeerUnban(targetPeerId: string | number) {
+    if (!this.isConnected() || this.localRole !== 'host') return;
+    const msg: PeerUnbanMessage = {
+      type: 'PEER_UNBAN',
+      targetPeerId,
+    };
+    this.sendMessage(msg);
+  }
+
+  public sendAccessDenied(
+    code: AccessDeniedCode,
+    reason: string,
+    targetPeerId?: string | number
+  ) {
+    if (!this.isConnected()) return;
+    const msg: AccessDeniedMessage = {
+      type: 'ACCESS_DENIED',
+      code,
+      reason,
+      ...(targetPeerId !== undefined ? { targetPeerId } : {}),
     };
     this.sendMessage(msg);
   }

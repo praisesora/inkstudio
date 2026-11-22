@@ -2,11 +2,12 @@ import { describe, it, expect } from 'vitest';
 import { LayerItem, TextLayerData } from '../../types/editor';
 import { createDefaultSpeechBalloon } from '../balloonEngine';
 import { createRectFrame } from '../frameEngine';
-import { buildSoraProjectPayload, parseSoraProjectJson } from '../saveManager';
+import { parseInkProject, serializeInkProject } from '../saveManager';
+import { parseLegacySoraV1Json } from '../legacySoraMigrator';
 import { hitTestEditableVectorLayer } from '../vectorLayerRenderer';
 
-describe('Non-Destructive Text, Speech Balloon & Frame Folder .sora Serialization', () => {
-  it('round-trips text, speech balloon, and frame-folder vector metadata through .sora JSON without loss', () => {
+describe('Non-Destructive Text, Speech Balloon & Frame Folder .ink Serialization', () => {
+  it('round-trips text, speech balloon, and frame-folder vector metadata through .ink without loss and parses legacy .sora v1 JSON', async () => {
     const textData: TextLayerData = {
       x: 240,
       y: 180,
@@ -83,7 +84,7 @@ describe('Non-Destructive Text, Speech Balloon & Frame Folder .sora Serializatio
       },
     ];
 
-    const payload = buildSoraProjectPayload({
+    const serialized = await serializeInkProject({
       name: 'Chapter 01 Page 05',
       dimensions: { width: 1440, height: 2048, dpi: 600 },
       colorMode: 'monochrome',
@@ -93,11 +94,26 @@ describe('Non-Destructive Text, Speech Balloon & Frame Folder .sora Serializatio
       isLayerEffectivelyVisible: (l) => l.visible,
     });
 
-    const json = JSON.stringify(payload);
-    const restored = parseSoraProjectJson(json);
+    const restored = await parseInkProject(serialized.bytes);
 
-    expect(restored.version).toBe('1.2');
+    expect(restored.version).toBe('2.0');
     expect(restored.layers).toHaveLength(4);
+
+    // Also verify read-only legacy .sora v1 JSON migrator retains vector metadata
+    const legacyV1 = parseLegacySoraV1Json(
+      JSON.stringify({
+        app: 'Ink Studio',
+        version: '1.2',
+        name: 'Chapter 01 Page 05',
+        dimensions: { width: 1440, height: 2048, dpi: 600 },
+        colorMode: 'monochrome',
+        layers,
+        canvases: {},
+        masks: {},
+      })
+    );
+    expect(legacyV1.layers).toHaveLength(4);
+    expect(legacyV1.layers.find((l) => l.id === 'text-layer-1')?.textData).toEqual(textData);
 
     const restoredText = restored.layers.find((l) => l.id === 'text-layer-1');
     expect(restoredText?.type).toBe('text');

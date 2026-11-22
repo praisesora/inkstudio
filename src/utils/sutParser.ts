@@ -1,4 +1,3 @@
-import initSqlJs from 'sql.js';
 import { unzlibSync, inflateSync } from 'fflate';
 import {
   CspAngleDynamicsMode,
@@ -11,24 +10,11 @@ import {
   CspTaperSettings,
   CspTipFlipMode,
 } from '../types/editor';
-import { evaluateFastSpline } from '../engine/CspBrushEngine';
+import { evaluateFastSpline } from '../engine/BrushEngine';
+import { isNativeRustAvailable, parseSutSqliteNative } from './nativeBackend';
 
 const MAX_DECOMPRESSED_BLOB_BYTES = 64 * 1024 * 1024;
 const MAX_COMPRESSED_BLOB_BYTES = 16 * 1024 * 1024;
-
-let sqlJsPromise: Promise<any> | null = null;
-
-async function getSql() {
-  if (!sqlJsPromise) {
-    sqlJsPromise = initSqlJs({
-      locateFile: () => '/sql-wasm.wasm',
-    }).catch((err) => {
-      sqlJsPromise = null;
-      throw err;
-    });
-  }
-  return await sqlJsPromise;
-}
 
 /**
  * Searches for a byte sequence in a Uint8Array.
@@ -628,132 +614,78 @@ export async function parseSutFile(
   fileName: string = 'Brush.sut'
 ): Promise<CspBrush> {
   const rawBytes = fileBuffer instanceof Uint8Array ? fileBuffer : new Uint8Array(fileBuffer);
-  const sqliteData = extractSqliteFromBuffer(rawBytes);
-
-  if (!sqliteData) {
-    throw new Error('Invalid Clip Studio Paint file: No SQLite database header found in .sut');
+  if (!isNativeRustAvailable()) {
+    throw new Error('Parsing .sut files requires the native desktop Rust SQLite backend.');
   }
 
-  const SQL = await getSql();
-  let db: any = null;
+  const extracted = await parseSutSqliteNative(rawBytes);
 
-  try {
-    db = new SQL.Database(sqliteData);
+  let brushName = extracted.nodeName || fileName.replace(/\.sut$/i, '').trim();
 
-    const tablesQuery = db.exec("SELECT name FROM sqlite_master WHERE type='table'");
-    const tables: string[] = [];
-    if (tablesQuery.length > 0 && tablesQuery[0].values) {
-      for (const row of tablesQuery[0].values) {
-        if (row[0]) tables.push(String(row[0]));
-      }
-    }
+  let brushSize = 16;
+  let minSizeFactor = 0.2;
+  let opacity = 1.0;
+  let flow = 0.85;
+  let adjustDensityByGap = false;
+  let blendTipsMode: CspBlendTipsMode = 'darken';
+  let spacing = 0.08;
+  let hardness = 1.0;
+  let thickness = 1.0;
+  let thicknessVertical = false;
+  let flipH: CspTipFlipMode = 'none';
+  let flipV: CspTipFlipMode = 'none';
+  let angle = 0;
+  let angleDynamics: CspAngleDynamicsMode = 'none';
+  let rotationRandomScale = 0;
+  let antiAlias = 2;
+  let stabilization = 0;
+  let postCorrection = 0;
+  let sharpCorners = true;
+  let usePressure = true;
+  let useVelocity = false;
+  let useTilt = false;
+  let pressureCurve: [number, number][] | undefined = undefined;
+  let velocityCurve: [number, number][] | undefined = undefined;
+  let sizeSensor: CspSensorConfig | undefined = undefined;
+  let opacitySensor: CspSensorConfig | undefined = undefined;
+  let densitySensor: CspSensorConfig | undefined = undefined;
+  let colorMixing = false;
+  let amountOfPaint = 0.7;
+  let densityOfPaint = 0.8;
+  let colorStretch = 0.6;
+  let mixingMode: 'blend' | 'running_color' | 'smear' = 'blend';
+  let wetEdge = 0;
+  let wetEdgeRadius = 3.0;
+  let wetEdgeAlphaPower = 20;
+  let wetEdgeValuePower = 0;
+  let textureDensity = 0;
+  let paperTextureScale = 1.0;
+  let paperTextureRotate = 0;
+  let paperTextureMode: CspPaperTextureMode = 'subtract';
+  let paperTextureBrightness = 0;
+  let paperTextureContrast = 0;
+  let paperTextureInverted = false;
+  let spray: CspSpraySettings | undefined = undefined;
+  let taper: CspTaperSettings | undefined = undefined;
+  let isRibbon = false;
+  let dualBrush = false;
+  let dualBrushCompositeMode = 'multiply';
+  let rawPatternArrayBlob: Uint8Array | null = null;
+  let rawTextureImageBlob: Uint8Array | null = null;
+  let rawDualPatternBlob: Uint8Array | null = null;
 
-    let brushName = fileName.replace(/\.sut$/i, '').trim();
-    let variantId: number | null = null;
-
-    if (tables.includes('Node')) {
-      try {
-        const nodeRes = db.exec('SELECT NodeName, NodeVariantId FROM Node LIMIT 1');
-        if (nodeRes.length > 0 && nodeRes[0].values && nodeRes[0].values.length > 0) {
-          const row = nodeRes[0].values[0];
-          if (row[0] && typeof row[0] === 'string' && row[0].trim().length > 0) {
-            brushName = row[0].trim();
-          }
-          if (row[1] !== null && row[1] !== undefined && Number.isFinite(Number(row[1]))) {
-            variantId = Math.trunc(Number(row[1]));
-          }
-        }
-      } catch {
-        // Fallback to filename
-      }
-    }
-
-    let brushSize = 16;
-    let minSizeFactor = 0.2;
-    let opacity = 1.0;
-    let flow = 0.85;
-    let adjustDensityByGap = false;
-    let blendTipsMode: CspBlendTipsMode = 'darken';
-    let spacing = 0.08;
-    let hardness = 1.0;
-    let thickness = 1.0;
-    let thicknessVertical = false;
-    let flipH: CspTipFlipMode = 'none';
-    let flipV: CspTipFlipMode = 'none';
-    let angle = 0;
-    let angleDynamics: CspAngleDynamicsMode = 'none';
-    let rotationRandomScale = 0;
-    let antiAlias = 2;
-    let stabilization = 0;
-    let postCorrection = 0;
-    let sharpCorners = true;
-    let usePressure = true;
-    let useVelocity = false;
-    let useTilt = false;
-    let pressureCurve: [number, number][] | undefined = undefined;
-    let velocityCurve: [number, number][] | undefined = undefined;
-    let sizeSensor: CspSensorConfig | undefined = undefined;
-    let opacitySensor: CspSensorConfig | undefined = undefined;
-    let densitySensor: CspSensorConfig | undefined = undefined;
-    let colorMixing = false;
-    let amountOfPaint = 0.7;
-    let densityOfPaint = 0.8;
-    let colorStretch = 0.6;
-    let mixingMode: 'blend' | 'running_color' | 'smear' = 'blend';
-    let wetEdge = 0;
-    let wetEdgeRadius = 3.0;
-    let wetEdgeAlphaPower = 20;
-    let wetEdgeValuePower = 0;
-    let textureDensity = 0;
-    let paperTextureScale = 1.0;
-    let paperTextureRotate = 0;
-    let paperTextureMode: CspPaperTextureMode = 'subtract';
-    let paperTextureBrightness = 0;
-    let paperTextureContrast = 0;
-    let paperTextureInverted = false;
-    let spray: CspSpraySettings | undefined = undefined;
-    let taper: CspTaperSettings | undefined = undefined;
-    let isRibbon = false;
-    let dualBrush = false;
-    let dualBrushCompositeMode = 'multiply';
-    let rawPatternArrayBlob: Uint8Array | null = null;
-    let rawTextureImageBlob: Uint8Array | null = null;
-    let rawDualPatternBlob: Uint8Array | null = null;
-
-    if (tables.includes('Variant')) {
-      try {
-        const pragmaCols = db.exec('PRAGMA table_info(Variant)');
-        const colNames: string[] = [];
-        if (pragmaCols.length > 0 && pragmaCols[0].values) {
-          for (const row of pragmaCols[0].values) {
-            colNames.push(String(row[1]));
-          }
-        }
-
-        const colMap = new Map<string, string>();
-        for (const c of colNames) {
-          colMap.set(c.toLowerCase(), c);
-        }
-
-        const varRes =
-          variantId !== null
-            ? db.exec('SELECT * FROM Variant WHERE _PW_ID = ? LIMIT 1', [variantId])
-            : db.exec('SELECT * FROM Variant LIMIT 1');
-
-        if (varRes.length > 0 && varRes[0].values && varRes[0].values.length > 0) {
-          const row = varRes[0].values[0];
-          const getVal = (aliases: string[]): any => {
-            for (const a of aliases) {
-              const exact = colMap.get(a.toLowerCase());
-              if (exact) {
-                const idx = varRes[0].columns.indexOf(exact);
-                if (idx !== -1 && row[idx] !== null && row[idx] !== undefined) {
-                  return row[idx];
-                }
-              }
+  if (extracted.variantValues.size > 0) {
+    try {
+      {
+        const getVal = (aliases: string[]): any => {
+          for (const a of aliases) {
+            const v = extracted.variantValues.get(a.toLowerCase());
+            if (v !== undefined && v !== null) {
+              return v;
             }
-            return null;
-          };
+          }
+          return null;
+        };
 
           // Size
           const rawSize = getVal(['BrushSize', 'Size', 'PenSize', 'BrushSizeVal', 'LineWidth']);
@@ -1055,48 +987,39 @@ export async function parseSutFile(
       }
     }
 
-    // 4. MaterialFile extraction
+    // 4. MaterialFile extraction (from native Rust rusqlite rows)
     const materialMap = new Map<string, { mainPng: Uint8Array; width: number; height: number }>();
     const allMaterialsList: { mainPng: Uint8Array; catalogPath: string; width: number; height: number }[] = [];
 
-    if (tables.includes('MaterialFile')) {
-      try {
-        const matRes = db.exec('SELECT _PW_ID, OriginalPath, FileData, CatalogPath FROM MaterialFile');
-        if (matRes.length > 0 && matRes[0].values) {
-          for (const row of matRes[0].values) {
-            const fileData = row[2];
-            const catPath = row[3] ? String(row[3]) : '';
-            const pwId = String(row[0]);
+    for (const mat of extracted.materials) {
+      const fileData = mat.fileData;
+      const catPath = mat.catalogPath || '';
+      const pwId = mat.pwId;
 
-            if (fileData instanceof Uint8Array && fileData.length > 0) {
-              const mainPng = extractMaterialPng(fileData);
-              if (mainPng) {
-                let width = 64;
-                let height = 64;
-                if (mainPng.length >= 24) {
-                  const view = new DataView(mainPng.buffer, mainPng.byteOffset, mainPng.byteLength);
-                  width = view.getUint32(16, false);
-                  height = view.getUint32(20, false);
-                }
-
-                const entry = { mainPng, width, height };
-                if (catPath) materialMap.set(catPath, entry);
-                materialMap.set(pwId, entry);
-
-                const uuidMatch = catPath.match(
-                  /[a-f0-9]{10}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{10}/i
-                );
-                if (uuidMatch) {
-                  materialMap.set(uuidMatch[0], entry);
-                }
-
-                allMaterialsList.push({ mainPng, catalogPath: catPath, width, height });
-              }
-            }
+      if (fileData.length > 0) {
+        const mainPng = extractMaterialPng(fileData);
+        if (mainPng) {
+          let width = 64;
+          let height = 64;
+          if (mainPng.length >= 24) {
+            const view = new DataView(mainPng.buffer, mainPng.byteOffset, mainPng.byteLength);
+            width = view.getUint32(16, false);
+            height = view.getUint32(20, false);
           }
+
+          const entry = { mainPng, width, height };
+          if (catPath) materialMap.set(catPath, entry);
+          materialMap.set(pwId, entry);
+
+          const uuidMatch = catPath.match(
+            /[a-f0-9]{10}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{10}/i
+          );
+          if (uuidMatch) {
+            materialMap.set(uuidMatch[0], entry);
+          }
+
+          allMaterialsList.push({ mainPng, catalogPath: catPath, width, height });
         }
-      } catch {
-        // MaterialFile fallback
       }
     }
 
@@ -1261,13 +1184,4 @@ export async function parseSutFile(
     };
 
     return cspBrush;
-  } finally {
-    if (db) {
-      try {
-        db.close();
-      } catch {
-        // Ignore close error
-      }
-    }
-  }
 }

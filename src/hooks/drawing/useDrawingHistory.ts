@@ -18,10 +18,10 @@ import {
 } from '../../utils/tileEngine';
 import { UndoCacheManager, globalUndoCache } from '../../utils/undoCache';
 import { documentStore } from '../../utils/documentStore';
+import { multiplayerService } from '../../services/multiplayerService';
 import { recoveryService } from '../../services/recoveryService';
 import { renderVectorLayer } from '../../utils/vectorEngine';
 import { createCanvasThumbnail, formatTime, get2DContext } from '../../utils/canvasUtils';
-import { applyLayerEffects } from '../../utils/layerEffectsEngine';
 import { isBackgroundLayerId, LastStrokeEndState, PushHistoryStepFn } from './types';
 
 type IdleCallbackWindow = Window & {
@@ -39,8 +39,6 @@ export interface UseDrawingHistoryParams {
   activeLayerIdRef: React.MutableRefObject<string>;
   colorModeRef: React.MutableRefObject<CanvasColorMode>;
   layersRef: React.MutableRefObject<LayerItem[] | undefined>;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  layerSourceCanvasesRef?: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   onUpdateLayerThumbnail: (layerId: string) => void;
   onUpdateMaskThumbnailRef: React.MutableRefObject<((layerId: string) => void) | undefined>;
   isDrawingRef: React.MutableRefObject<boolean>;
@@ -52,6 +50,7 @@ export interface SelectiveUndoResult {
   strokeId?: string;
   layerId: string;
   tileDeltas?: TileDelta[];
+  syncedRemotely?: boolean;
 }
 
 export interface UseDrawingHistoryResult {
@@ -86,8 +85,6 @@ export function useDrawingHistory({
   activeLayerIdRef,
   colorModeRef,
   layersRef,
-  layerCanvasesRef,
-  layerSourceCanvasesRef,
   onUpdateLayerThumbnail,
   onUpdateMaskThumbnailRef,
   isDrawingRef,
@@ -325,6 +322,18 @@ export function useDrawingHistory({
         const sessionKey = docId || recoveryService.getCurrentSessionId() || 'default-session';
         recoveryService.logStrokeDelta(sessionKey, tileDeltas, vectorDelta, targetLayerId);
       }
+
+      // Broadcast authoritative LZ4 BINARY_TILEs after any local raster op (fill, transform, liquify, filter, tonal, shape, etc.)
+      // Strokes are already broadcast immediately on pointerup and deduped via WeakSet inside sendTileDeltas.
+      if (
+        !peerId &&
+        !isMaskEdit &&
+        tileDeltas &&
+        tileDeltas.length > 0 &&
+        multiplayerService.isConnected()
+      ) {
+        multiplayerService.sendTileDeltas(tileDeltas, grid);
+      }
     },
     [colorModeRef, dimensionsRef, ensureInitialHistory, layersRef, persistSessionHistory, syncHistoryState]
   );
@@ -419,10 +428,7 @@ export function useDrawingHistory({
             const item = historyRef.current[i];
             if (item) {
               const targetLayerId = item.layerId || activeLayerId;
-              const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
-              const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
               const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-              const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
               const deltas = await undoCache.resolveDeltas(item);
 
               if (item.isMaskEdit && targetLayer?.maskCanvas) {
@@ -439,88 +445,76 @@ export function useDrawingHistory({
                   mCtx.putImageData(item.beforeImageData, mx, my);
                   targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
                   onUpdateMaskThumbnailRef.current?.(targetLayerId);
+                  if (multiplayerService.isConnected()) {
+                    multiplayerService.sendLayerMaskData(
+                      targetLayerId,
+                      targetLayer.maskCanvas,
+                      item.dirtyRect
+                    );
+                  }
                 }
               } else if (item.vectorStrokesDelta && targetLayer) {
                 targetLayer.vectorStrokes = item.vectorStrokesDelta.before;
-                const tempVec = canvas || document.createElement('canvas');
-                if (!canvas) {
-                  tempVec.width = dims.width;
-                  tempVec.height = dims.height;
+                const isMono = targetLayer.expressionColor === 'monochrome';
+                grid.clearLayer(targetLayerId);
+                if (targetLayer.vectorStrokes.length > 0) {
+                  let minX = dims.width;
+                  let minY = dims.height;
+                  let maxX = 0;
+                  let maxY = 0;
+                  for (const st of targetLayer.vectorStrokes) {
+                    if (st.deleted || !st.bounds) continue;
+                    const pad = Math.ceil(Math.max(16, st.baseWidth || 10));
+                    if (st.bounds.minX - pad < minX) minX = st.bounds.minX - pad;
+                    if (st.bounds.minY - pad < minY) minY = st.bounds.minY - pad;
+                    if (st.bounds.maxX + pad > maxX) maxX = st.bounds.maxX + pad;
+                    if (st.bounds.maxY + pad > maxY) maxY = st.bounds.maxY + pad;
+                  }
+                  const vx = Math.max(0, Math.floor(minX));
+                  const vy = Math.max(0, Math.floor(minY));
+                  const vw = Math.max(0, Math.min(dims.width, Math.ceil(maxX)) - vx);
+                  const vh = Math.max(0, Math.min(dims.height, Math.ceil(maxY)) - vy);
+                  if (vw > 0 && vh > 0) {
+                    const tempVec = document.createElement('canvas');
+                    tempVec.width = vw;
+                    tempVec.height = vh;
+                    const cCtx = get2DContext(tempVec);
+                    if (cCtx) {
+                      cCtx.save();
+                      cCtx.translate(-vx, -vy);
+                      renderVectorLayer(cCtx, targetLayer.vectorStrokes);
+                      cCtx.restore();
+                      const subData = cCtx.getImageData(0, 0, vw, vh);
+                      grid.writeImageData(
+                        targetLayerId,
+                        subData,
+                        vx,
+                        vy,
+                        isMono ? 'monochrome-1bit' : 'color-32bit'
+                      );
+                    }
+                    releaseTemporaryCanvas(tempVec);
+                  }
                 }
-                const cCtx = get2DContext(tempVec);
-                if (cCtx) {
-                  cCtx.clearRect(0, 0, tempVec.width, tempVec.height);
-                  renderVectorLayer(cCtx, targetLayer.vectorStrokes);
-                  const isMono = targetLayer.expressionColor === 'monochrome';
-                  grid.clearLayer(targetLayerId);
-                  grid.ingestCanvas(
-                    targetLayerId,
-                    tempVec,
-                    isMono ? 'monochrome-1bit' : 'color-32bit'
-                  );
+                if (multiplayerService.isConnected()) {
+                  multiplayerService.sendLayerUpdate(targetLayerId, {
+                    vectorStrokes: targetLayer.vectorStrokes,
+                  });
                 }
-                if (!canvas) releaseTemporaryCanvas(tempVec);
               } else if (deltas && deltas.length > 0) {
                 grid.applyTileDeltas(deltas, 'undo');
+                if (multiplayerService.isConnected()) {
+                  multiplayerService.sendTileDeltas(deltas, grid, { force: true });
+                }
 
                 const affectedLayerIds = new Set<string>();
                 for (const d of deltas) {
                   affectedLayerIds.add(parseTileKey(d.key).layerId);
                 }
-                if (affectedLayerIds.size === 0) {
-                  affectedLayerIds.add(targetLayerId);
-                }
                 for (const lid of affectedLayerIds) {
-                  const lCanvas = layerCanvasesRef.current.get(lid) || null;
-                  const lSourceCanvas = layerSourceCanvasesRef?.current?.get(lid);
-                  const lLayer = layersRef.current?.find((l) => l.id === lid);
-                  const lIsTone = Boolean(lLayer?.toneEnabled && lSourceCanvas);
-                  if (lIsTone && lSourceCanvas) {
-                    grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
-                    if (lCanvas && lLayer) {
-                      applyLayerEffects(
-                        lSourceCanvas,
-                        lCanvas,
-                        lLayer,
-                        dimensionsRef.current.dpi ?? 600,
-                        item.dirtyRect
-                      );
-                    }
-                  } else if (lCanvas) {
-                    grid.renderLayerToCanvas(lid, lCanvas, item.dirtyRect);
-                    if (lSourceCanvas) {
-                      grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
-                    }
-                  }
                   if (lid !== targetLayerId) {
                     onUpdateLayerThumbnail(lid);
                   }
-                }
-              } else if (isToneStep && sourceCanvas) {
-                const sCtx = get2DContext(sourceCanvas);
-                if (sCtx) {
-                  if (item.dirtyRect && item.beforeImageData) {
-                    sCtx.putImageData(item.beforeImageData, item.dirtyRect.x, item.dirtyRect.y);
-                  } else if (item.beforeImageData) {
-                    sCtx.putImageData(item.beforeImageData, 0, 0);
-                  } else if (item.type === 'initial') {
-                    if (isBackgroundLayerId(targetLayerId)) {
-                      sCtx.fillStyle = '#ffffff';
-                      sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-                    } else {
-                      sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-                    }
-                  }
-                }
-
-                if (canvas && targetLayer) {
-                  applyLayerEffects(
-                    sourceCanvas,
-                    canvas,
-                    targetLayer,
-                    dimensionsRef.current.dpi ?? 600,
-                    item.dirtyRect
-                  );
                 }
               } else {
                 const isMono =
@@ -555,13 +549,6 @@ export function useDrawingHistory({
                     grid.clearLayer(targetLayerId);
                   }
                 }
-
-                if (canvas) {
-                  grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-                }
-                if (sourceCanvas) {
-                  grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-                }
               }
 
               onUpdateLayerThumbnail(targetLayerId);
@@ -573,10 +560,7 @@ export function useDrawingHistory({
             const dataToApply = item?.afterImageData || item?.imageData;
             if (item) {
               const targetLayerId = item.layerId || activeLayerId;
-              const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
-              const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
               const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-              const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
               const deltas = await undoCache.resolveDeltas(item);
 
               if (item.isMaskEdit && targetLayer?.maskCanvas) {
@@ -593,88 +577,76 @@ export function useDrawingHistory({
                   mCtx.putImageData(dataToApply, mx, my);
                   targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
                   onUpdateMaskThumbnailRef.current?.(targetLayerId);
+                  if (multiplayerService.isConnected()) {
+                    multiplayerService.sendLayerMaskData(
+                      targetLayerId,
+                      targetLayer.maskCanvas,
+                      item.dirtyRect
+                    );
+                  }
                 }
               } else if (item.vectorStrokesDelta && targetLayer) {
                 targetLayer.vectorStrokes = item.vectorStrokesDelta.after;
-                const tempVec = canvas || document.createElement('canvas');
-                if (!canvas) {
-                  tempVec.width = dims.width;
-                  tempVec.height = dims.height;
+                const isMono = targetLayer.expressionColor === 'monochrome';
+                grid.clearLayer(targetLayerId);
+                if (targetLayer.vectorStrokes.length > 0) {
+                  let minX = dims.width;
+                  let minY = dims.height;
+                  let maxX = 0;
+                  let maxY = 0;
+                  for (const st of targetLayer.vectorStrokes) {
+                    if (st.deleted || !st.bounds) continue;
+                    const pad = Math.ceil(Math.max(16, st.baseWidth || 10));
+                    if (st.bounds.minX - pad < minX) minX = st.bounds.minX - pad;
+                    if (st.bounds.minY - pad < minY) minY = st.bounds.minY - pad;
+                    if (st.bounds.maxX + pad > maxX) maxX = st.bounds.maxX + pad;
+                    if (st.bounds.maxY + pad > maxY) maxY = st.bounds.maxY + pad;
+                  }
+                  const vx = Math.max(0, Math.floor(minX));
+                  const vy = Math.max(0, Math.floor(minY));
+                  const vw = Math.max(0, Math.min(dims.width, Math.ceil(maxX)) - vx);
+                  const vh = Math.max(0, Math.min(dims.height, Math.ceil(maxY)) - vy);
+                  if (vw > 0 && vh > 0) {
+                    const tempVec = document.createElement('canvas');
+                    tempVec.width = vw;
+                    tempVec.height = vh;
+                    const cCtx = get2DContext(tempVec);
+                    if (cCtx) {
+                      cCtx.save();
+                      cCtx.translate(-vx, -vy);
+                      renderVectorLayer(cCtx, targetLayer.vectorStrokes);
+                      cCtx.restore();
+                      const subData = cCtx.getImageData(0, 0, vw, vh);
+                      grid.writeImageData(
+                        targetLayerId,
+                        subData,
+                        vx,
+                        vy,
+                        isMono ? 'monochrome-1bit' : 'color-32bit'
+                      );
+                    }
+                    releaseTemporaryCanvas(tempVec);
+                  }
                 }
-                const cCtx = get2DContext(tempVec);
-                if (cCtx) {
-                  cCtx.clearRect(0, 0, tempVec.width, tempVec.height);
-                  renderVectorLayer(cCtx, targetLayer.vectorStrokes);
-                  const isMono = targetLayer.expressionColor === 'monochrome';
-                  grid.clearLayer(targetLayerId);
-                  grid.ingestCanvas(
-                    targetLayerId,
-                    tempVec,
-                    isMono ? 'monochrome-1bit' : 'color-32bit'
-                  );
+                if (multiplayerService.isConnected()) {
+                  multiplayerService.sendLayerUpdate(targetLayerId, {
+                    vectorStrokes: targetLayer.vectorStrokes,
+                  });
                 }
-                if (!canvas) releaseTemporaryCanvas(tempVec);
               } else if (deltas && deltas.length > 0) {
                 grid.applyTileDeltas(deltas, 'redo');
+                if (multiplayerService.isConnected()) {
+                  multiplayerService.sendTileDeltas(deltas, grid, { force: true });
+                }
 
                 const affectedLayerIds = new Set<string>();
                 for (const d of deltas) {
                   affectedLayerIds.add(parseTileKey(d.key).layerId);
                 }
-                if (affectedLayerIds.size === 0) {
-                  affectedLayerIds.add(targetLayerId);
-                }
                 for (const lid of affectedLayerIds) {
-                  const lCanvas = layerCanvasesRef.current.get(lid) || null;
-                  const lSourceCanvas = layerSourceCanvasesRef?.current?.get(lid);
-                  const lLayer = layersRef.current?.find((l) => l.id === lid);
-                  const lIsTone = Boolean(lLayer?.toneEnabled && lSourceCanvas);
-                  if (lIsTone && lSourceCanvas) {
-                    grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
-                    if (lCanvas && lLayer) {
-                      applyLayerEffects(
-                        lSourceCanvas,
-                        lCanvas,
-                        lLayer,
-                        dimensionsRef.current.dpi ?? 600,
-                        item.dirtyRect
-                      );
-                    }
-                  } else if (lCanvas) {
-                    grid.renderLayerToCanvas(lid, lCanvas, item.dirtyRect);
-                    if (lSourceCanvas) {
-                      grid.renderLayerToCanvas(lid, lSourceCanvas, item.dirtyRect);
-                    }
-                  }
                   if (lid !== targetLayerId) {
                     onUpdateLayerThumbnail(lid);
                   }
-                }
-              } else if (isToneStep && sourceCanvas) {
-                const sCtx = get2DContext(sourceCanvas);
-                if (sCtx) {
-                  if (item.dirtyRect && dataToApply) {
-                    sCtx.putImageData(dataToApply, item.dirtyRect.x, item.dirtyRect.y);
-                  } else if (dataToApply) {
-                    sCtx.putImageData(dataToApply, 0, 0);
-                  } else if (item.type === 'initial') {
-                    if (isBackgroundLayerId(targetLayerId)) {
-                      sCtx.fillStyle = '#ffffff';
-                      sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-                    } else {
-                      sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-                    }
-                  }
-                }
-
-                if (canvas && targetLayer) {
-                  applyLayerEffects(
-                    sourceCanvas,
-                    canvas,
-                    targetLayer,
-                    dimensionsRef.current.dpi ?? 600,
-                    item.dirtyRect
-                  );
                 }
               } else {
                 const isMono =
@@ -709,13 +681,6 @@ export function useDrawingHistory({
                     grid.clearLayer(targetLayerId);
                   }
                 }
-
-                if (canvas) {
-                  grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-                }
-                if (sourceCanvas) {
-                  grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-                }
               }
 
               onUpdateLayerThumbnail(targetLayerId);
@@ -740,8 +705,6 @@ export function useDrawingHistory({
       dimensionsRef,
       flushPendingHistoryTasks,
       isDrawingRef,
-      layerCanvasesRef,
-      layerSourceCanvasesRef,
       layersRef,
       onUpdateLayerThumbnail,
       onUpdateMaskThumbnailRef,
@@ -817,14 +780,13 @@ export function useDrawingHistory({
 
         const item = history[targetItemIdx];
         const targetLayerId = item.layerId || activeLayerId;
-        const canvas = layerCanvasesRef.current.get(targetLayerId) || null;
-        const sourceCanvas = layerSourceCanvasesRef?.current?.get(targetLayerId);
         const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
-        const isToneStep = Boolean(targetLayer?.toneEnabled && sourceCanvas);
         const grid = activeTileGridRef.current;
         const undoCache = activeUndoCacheRef.current;
         const dims = dimensionsRef.current;
         let resolvedDeltas: TileDelta[] | null = null;
+        let syncedRemotely = false;
+        const isLocalUndo = !peerIdToUndo || peerIdToUndo === 'local';
 
         if (item.isMaskEdit && targetLayer?.maskCanvas) {
           const mCtx = get2DContext(targetLayer.maskCanvas);
@@ -840,44 +802,68 @@ export function useDrawingHistory({
             mCtx.putImageData(item.beforeImageData, mx, my);
             targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
             onUpdateMaskThumbnailRef.current?.(targetLayerId);
+            if (isLocalUndo && multiplayerService.isConnected()) {
+              multiplayerService.sendLayerMaskData(
+                targetLayerId,
+                targetLayer.maskCanvas,
+                item.dirtyRect
+              );
+              syncedRemotely = true;
+            }
           }
         } else if (item.vectorStrokesDelta && targetLayer) {
           targetLayer.vectorStrokes = item.vectorStrokesDelta.before;
-          const tempVec = canvas || document.createElement('canvas');
-          if (!canvas) {
-            tempVec.width = dims.width;
-            tempVec.height = dims.height;
+          const isMono = targetLayer.expressionColor === 'monochrome';
+          grid.clearLayer(targetLayerId);
+          if (targetLayer.vectorStrokes.length > 0) {
+            let minX = dims.width;
+            let minY = dims.height;
+            let maxX = 0;
+            let maxY = 0;
+            for (const st of targetLayer.vectorStrokes) {
+              if (st.deleted || !st.bounds) continue;
+              const pad = Math.ceil(Math.max(16, st.baseWidth || 10));
+              if (st.bounds.minX - pad < minX) minX = st.bounds.minX - pad;
+              if (st.bounds.minY - pad < minY) minY = st.bounds.minY - pad;
+              if (st.bounds.maxX + pad > maxX) maxX = st.bounds.maxX + pad;
+              if (st.bounds.maxY + pad > maxY) maxY = st.bounds.maxY + pad;
+            }
+            const vx = Math.max(0, Math.floor(minX));
+            const vy = Math.max(0, Math.floor(minY));
+            const vw = Math.max(0, Math.min(dims.width, Math.ceil(maxX)) - vx);
+            const vh = Math.max(0, Math.min(dims.height, Math.ceil(maxY)) - vy);
+            if (vw > 0 && vh > 0) {
+              const tempVec = document.createElement('canvas');
+              tempVec.width = vw;
+              tempVec.height = vh;
+              const cCtx = get2DContext(tempVec);
+              if (cCtx) {
+                cCtx.save();
+                cCtx.translate(-vx, -vy);
+                renderVectorLayer(cCtx, targetLayer.vectorStrokes);
+                cCtx.restore();
+                const subData = cCtx.getImageData(0, 0, vw, vh);
+                grid.writeImageData(
+                  targetLayerId,
+                  subData,
+                  vx,
+                  vy,
+                  isMono ? 'monochrome-1bit' : 'color-32bit'
+                );
+              }
+              releaseTemporaryCanvas(tempVec);
+            }
           }
-          const cCtx = get2DContext(tempVec);
-          if (cCtx) {
-            cCtx.clearRect(0, 0, tempVec.width, tempVec.height);
-            renderVectorLayer(cCtx, targetLayer.vectorStrokes);
-            const isMono = targetLayer.expressionColor === 'monochrome';
-            grid.clearLayer(targetLayerId);
-            grid.ingestCanvas(targetLayerId, tempVec, isMono ? 'monochrome-1bit' : 'color-32bit');
+          if (isLocalUndo && multiplayerService.isConnected()) {
+            multiplayerService.sendLayerUpdate(targetLayerId, {
+              vectorStrokes: targetLayer.vectorStrokes,
+            });
+            syncedRemotely = true;
           }
-          if (!canvas) releaseTemporaryCanvas(tempVec);
         } else {
           resolvedDeltas = await undoCache.resolveDeltas(item);
           if (resolvedDeltas && resolvedDeltas.length > 0) {
             grid.applyTileDeltas(resolvedDeltas, 'undo');
-            if (isToneStep && sourceCanvas) {
-              grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-              if (canvas && targetLayer) {
-                applyLayerEffects(
-                  sourceCanvas,
-                  canvas,
-                  targetLayer,
-                  dimensionsRef.current.dpi ?? 600,
-                  item.dirtyRect
-                );
-              }
-            } else if (canvas) {
-              grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-              if (sourceCanvas) {
-                grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-              }
-            }
           } else if (item.beforeImageData) {
             const isMono =
               !isBackgroundLayerId(targetLayerId) &&
@@ -902,12 +888,6 @@ export function useDrawingHistory({
               by,
               isMono ? 'monochrome-1bit' : 'color-32bit'
             );
-            if (canvas) {
-              grid.renderLayerToCanvas(targetLayerId, canvas, item.dirtyRect);
-            }
-            if (sourceCanvas) {
-              grid.renderLayerToCanvas(targetLayerId, sourceCanvas, item.dirtyRect);
-            }
           }
         }
 
@@ -926,6 +906,7 @@ export function useDrawingHistory({
           strokeId: item.strokeId,
           layerId: targetLayerId,
           tileDeltas: resolvedDeltas ?? undefined,
+          syncedRemotely,
         };
       });
 
@@ -941,8 +922,6 @@ export function useDrawingHistory({
       dimensionsRef,
       flushPendingHistoryTasks,
       isDrawingRef,
-      layerCanvasesRef,
-      layerSourceCanvasesRef,
       layersRef,
       onUpdateLayerThumbnail,
       onUpdateMaskThumbnailRef,
@@ -970,6 +949,9 @@ export function useDrawingHistory({
       const beforeStrokes = [...(activeLayer.vectorStrokes || [])];
       activeLayer.vectorStrokes = [];
       vectorDelta = { before: beforeStrokes, after: [] };
+      if (multiplayerService.isConnected()) {
+        multiplayerService.sendLayerUpdate(activeLayerId, { vectorStrokes: [] });
+      }
     }
 
     if (isBg) {
@@ -984,32 +966,6 @@ export function useDrawingHistory({
       activeLayerId,
       isBg ? fullRect : undefined
     );
-
-    const canvas = layerCanvasesRef.current.get(activeLayerId);
-    if (canvas) {
-      const ctx = get2DContext(canvas);
-      if (ctx) {
-        if (isBg) {
-          ctx.fillStyle = '#ffffff';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-        } else {
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-        }
-      }
-    }
-
-    const sourceCanvas = layerSourceCanvasesRef?.current?.get(activeLayerId);
-    if (sourceCanvas) {
-      const sCtx = get2DContext(sourceCanvas);
-      if (sCtx) {
-        if (isBg) {
-          sCtx.fillStyle = '#ffffff';
-          sCtx.fillRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-        } else {
-          sCtx.clearRect(0, 0, sourceCanvas.width, sourceCanvas.height);
-        }
-      }
-    }
 
     onUpdateLayerThumbnail(activeLayerId);
     pushHistoryStep(
@@ -1027,8 +983,6 @@ export function useDrawingHistory({
     activeLayerId,
     activeLayerLocked,
     dimensionsRef,
-    layerCanvasesRef,
-    layerSourceCanvasesRef,
     layersRef,
     onUpdateLayerThumbnail,
     pushHistoryStep,

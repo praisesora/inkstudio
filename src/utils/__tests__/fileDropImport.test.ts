@@ -93,6 +93,7 @@ describe('fileDropImport utilities', () => {
       'malware.exe',
       'notes.txt',
       'archive.zip',
+      'project.ink',
       'project.sora',
       'file.png.exe',
       '.png',

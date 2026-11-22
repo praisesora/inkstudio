@@ -72,8 +72,6 @@ export interface UseCanvasDrawingProps {
   activeLayerId: string;
   activeLayerLocked?: boolean;
   activeLayerVisible?: boolean;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  layerSourceCanvasesRef?: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   layers?: LayerItem[];
   onUpdateLayerThumbnail: (layerId: string) => void;
   isMaskMode?: boolean;
@@ -102,7 +100,6 @@ export interface UseCanvasDrawingProps {
   onActiveConstraintAxisChange?: (axis: ConstraintAxis | null) => void;
   activeSessionId?: string | null;
   tileGrid?: SparseTileGrid;
-  materializeLayerCanvas?: (layerId: string) => HTMLCanvasElement | null;
 }
 
 export function isBackgroundLayerId(id: string): boolean {

@@ -8,16 +8,19 @@ import {
   CspSpraySettings,
   CspTipFlipMode,
 } from '../types/editor';
-import { PENCIL_CONFIGS, PencilGrade, getPaperGrain, getGraphiteTipMaster } from './pencilEngine';
-import { getTintedTipMaster, getRadialDabMaster, drawSingleStamp } from './stampEngine';
 import { getBuiltinBrushConfig } from './presetBrushes';
 import {
+  getLegacyPencilPresetDefaults,
+  getPaperGrain,
+  getTintedTipMaster,
+  getRadialDabMaster,
+  drawSingleStamp,
   evaluateFastSpline,
   dabHashFloat,
   computeGapAdjustedAlpha,
   resolveTipFlipSigns,
   applyCspPaperTextureAlpha,
-} from '../engine/CspBrushEngine';
+} from '../engine/BrushEngine';
 
 export interface BrushPreviewOptions {
   preset?: BrushPresetId;
@@ -115,18 +118,17 @@ export function renderBrushStrokePreview(
 
   const preset = options.preset || (options.customTipImage ? 'custom' : 'g-pen');
   const builtinCfg =
-    !options.customTipImage && options.preset ? getBuiltinBrushConfig(options.preset) : null;
+    !options.customTipImage && options.preset
+      ? getBuiltinBrushConfig(options.preset) || getLegacyPencilPresetDefaults(options.preset)
+      : null;
   const tipImage = options.customTipImage || builtinCfg?.customTipImage;
-  const isPencil = !tipImage && preset.startsWith('pencil');
-  const pencilConfig = isPencil ? PENCIL_CONFIGS[preset as PencilGrade] : null;
 
-  const size = options.size ?? pencilConfig?.defaultSize ?? builtinCfg?.size ?? 14;
-  const flow = options.flow ?? pencilConfig?.flow ?? builtinCfg?.flow ?? 0.85;
+  const size = options.size ?? builtinCfg?.size ?? 14;
+  const flow = options.flow ?? builtinCfg?.flow ?? 0.85;
   const opacity = options.opacity ?? builtinCfg?.opacity ?? 1.0;
-  const grain = options.grain ?? pencilConfig?.grain ?? builtinCfg?.grain ?? 0;
-  const hardness = options.hardness ?? pencilConfig?.hardness ?? builtinCfg?.hardness ?? 1.0;
-  const minSizeFactor =
-    options.minSizeFactor ?? pencilConfig?.minSizeFactor ?? builtinCfg?.minSizeFactor ?? 0.15;
+  const grain = options.grain ?? builtinCfg?.grain ?? 0;
+  const hardness = options.hardness ?? builtinCfg?.hardness ?? 1.0;
+  const minSizeFactor = options.minSizeFactor ?? builtinCfg?.minSizeFactor ?? 0.15;
   const thickness = options.thickness ?? builtinCfg?.thickness ?? 1.0;
   const thicknessVertical = Boolean(options.thicknessVertical ?? builtinCfg?.thicknessVertical);
   const customTipAngle = options.customTipAngle ?? builtinCfg?.customTipAngle ?? 0;
@@ -137,7 +139,7 @@ export function renderBrushStrokePreview(
   const paperContrast = options.paperTextureContrast ?? builtinCfg?.paperTextureContrast ?? 0;
   const paperBrightness = options.paperTextureBrightness ?? builtinCfg?.paperTextureBrightness ?? 0;
   const paperInverted = Boolean(options.paperTextureInverted ?? builtinCfg?.paperTextureInverted);
-  const spacing = options.spacing ?? builtinCfg?.spacing ?? (isPencil ? 0.07 : 0.045);
+  const spacing = options.spacing ?? builtinCfg?.spacing ?? 0.045;
   const blendTipsMode = options.blendTipsMode ?? builtinCfg?.blendTipsMode ?? 'darken';
   const adjustByGap = Boolean(options.adjustDensityByGap ?? builtinCfg?.adjustDensityByGap);
   const aaLevel = clamp(
@@ -424,53 +426,6 @@ export function renderBrushStrokePreview(
       }
     }
     offCtx.restore();
-  } else if (isPencil && pencilConfig) {
-    offCtx.save();
-    offCtx.globalAlpha = clamp(opacity, 0.05, 1.0);
-
-    const graphiteMaster = getGraphiteTipMaster(preset as PencilGrade, strokeColor);
-    const baseThreshold = pencilConfig.thresholdBase;
-    const sens = pencilConfig.thresholdPressureSensitivity;
-    const effFlow = flow * pencilConfig.flow;
-    const effSpacing = clamp(spacing, 0.02, 0.12);
-
-    let distanceAcc = 0;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const p1 = pts[i];
-      const p2 = pts[i + 1];
-      const segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-      const stepCount = Math.max(1, Math.ceil(segDist / 0.6));
-      for (let s = 0; s < stepCount; s++) {
-        const t = s / stepCount;
-        const curX = p1.x + t * (p2.x - p1.x);
-        const curY = p1.y + t * (p2.y - p1.y);
-        const curW = p1.width + t * (p2.width - p1.width);
-        const curP = p1.pressure + t * (p2.pressure - p1.pressure);
-        const curTipAlpha = p1.tipAlpha + t * (p2.tipAlpha - p1.tipAlpha);
-
-        const requiredStep = Math.max(0.4, curW * effSpacing);
-        distanceAcc += segDist / stepCount;
-        if (distanceAcc >= requiredStep) {
-          distanceAcc = 0;
-          const paperHeight = getPaperGrain(curX * 1.6, curY * 1.6);
-          const effThreshold = Math.max(15, baseThreshold - curP * sens + (1 - grain) * 40);
-
-          if (paperHeight >= effThreshold) {
-            const heightFactor = Math.min(1.0, (paperHeight - effThreshold + 25) / 55);
-            const dabAlpha = clamp(
-              effFlow * (0.35 + 0.65 * curP) * heightFactor * curTipAlpha,
-              0.04,
-              1.0
-            );
-            drawSingleStamp(offCtx, graphiteMaster, curX, curY, curW, curW, 0, dabAlpha);
-          } else if (curP > 0.55) {
-            const dabAlpha = clamp(effFlow * 0.16 * curP * curTipAlpha, 0.02, 1.0);
-            drawSingleStamp(offCtx, graphiteMaster, curX, curY, curW, curW, 0, dabAlpha);
-          }
-        }
-      }
-    }
-    offCtx.restore();
   } else {
     offCtx.save();
     const effHardness = clamp(hardness, 0.0, 1.0);
@@ -549,7 +504,22 @@ export function renderBrushStrokePreview(
           const baseW = Math.max(0.7, curW);
           const stampW = thicknessVertical ? baseW * thickness : baseW;
           const stampH = thicknessVertical ? baseW : baseW * thickness;
-          const alpha = clamp(opacity * effFlow * curTipAlpha, 0.02, 1.0);
+          let alpha = clamp(opacity * effFlow * curTipAlpha, 0.02, 1.0);
+          if (grain > 0.01) {
+            const curP = p1.pressure + t * (p2.pressure - p1.pressure);
+            const gNorm = getPaperGrain((curX * 1.4) / Math.max(0.2, paperScale), (curY * 1.4) / Math.max(0.2, paperScale)) / 255.0;
+            alpha = applyCspPaperTextureAlpha(
+              alpha,
+              gNorm,
+              grain,
+              curP,
+              paperMode,
+              paperBrightness,
+              paperContrast,
+              paperInverted
+            );
+          }
+          if (alpha <= 0.005) continue;
           drawSingleStamp(
             offCtx,
             master,

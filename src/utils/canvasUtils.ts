@@ -1,21 +1,5 @@
-import { Point, CanvasDimensions, BlendMode, ToolType, BrushSettings, CanvasColorMode, LayerItem } from '../types/editor';
-import { enforceColorMode } from './colorUtils';
-import { drawPencilCubicBezierSegment, drawPencilDot, PencilGrade } from './pencilEngine';
-import {
-  renderCompleteTexturedStroke,
-  TexturedBrushOptions,
-  drawRadialCubicBezierSegment,
-  drawRadialDot,
-  centripetalCatmullRomToBezier,
-  renderCompleteRadialStroke,
-  RadialMixingOptions,
-} from './stampEngine';
-import { LayerPixelSampler, PaintReservoir } from './colorMixingEngine';
-import { GpuDab } from './webglBrushEngine';
-import {
-  evaluateFastSpline,
-  applyCspPostCorrection,
-} from '../engine/CspBrushEngine';
+import { Point, CanvasDimensions, BlendMode, LayerItem } from '../types/editor';
+import { evaluateFastSpline } from '../engine/BrushEngine';
 
 export const CANVAS_2D_CONTEXT_OPTIONS: CanvasRenderingContext2DSettings = {
   alpha: true,
@@ -85,147 +69,37 @@ export function getMidPoint(p1: Point, p2: Point): Point {
   };
 }
 
-/**
- * Evaluates a quadratic Bézier curve at parameter t (0 <= t <= 1).
- */
-export function getQuadraticBezierPoint(
-  p0: Point,
-  control: Point,
-  p2: Point,
-  t: number
-): { x: number; y: number; width: number } {
-  const invT = 1 - t;
-  const invT2 = invT * invT;
-  const t2 = t * t;
-  const twoInvTT = 2 * invT * t;
-
-  return {
-    x: invT2 * p0.x + twoInvTT * control.x + t2 * p2.x,
-    y: invT2 * p0.y + twoInvTT * control.y + t2 * p2.y,
-    width: invT * p0.width + t * p2.width,
-  };
-}
-
-/**
- * Converts 4 Catmull-Rom spline knots (p0, p1, p2, p3) into cubic Bézier control points (c1, c2).
- */
-export function catmullRomToBezier(
-  p0: Point,
-  p1: Point,
-  p2: Point,
-  p3: Point
-): { c1: Point; c2: Point } {
-  return centripetalCatmullRomToBezier(p0, p1, p2, p3);
-}
-
-/**
- * Draws a smooth tapered segment along a cubic Bézier curve using analytical radial dabbing.
- */
-export function drawSmoothCubicBezierSegment(
-  ctx: CanvasRenderingContext2D,
-  p0: Point,
-  c1: Point,
-  c2: Point,
-  p3: Point,
-  color: string,
-  isEraser: boolean = false,
-  hardness: number = 1.0,
-  flow: number = 1.0,
-  spacing: number = 0.06,
-  remainderDist: number = 0,
-  thickness: number = 1.0,
-  angleRad: number = 0,
-  mixingOptions?: RadialMixingOptions,
-  batchGpuDabs?: GpuDab[]
-): number {
-  return drawRadialCubicBezierSegment(
-    ctx,
-    p0,
-    c1,
-    c2,
-    p3,
-    color,
-    hardness,
-    flow,
-    spacing,
-    isEraser,
-    false,
-    remainderDist,
-    thickness,
-    angleRad,
-    mixingOptions,
-    batchGpuDabs
-  );
-}
-
-/**
- * Draws a smooth tapered segment along a quadratic Bézier curve by elevating to cubic.
- */
-export function drawSmoothBezierSegment(
-  ctx: CanvasRenderingContext2D,
-  start: Point,
-  control: Point,
-  end: Point,
-  color: string,
-  isEraser: boolean = false,
-  hardness: number = 1.0,
-  flow: number = 1.0,
-  spacing: number = 0.06,
-  remainderDist: number = 0
-): number {
-  const c1: Point = {
-    x: start.x + (2.0 / 3.0) * (control.x - start.x),
-    y: start.y + (2.0 / 3.0) * (control.y - start.y),
-    pressure: start.pressure + (2.0 / 3.0) * (control.pressure - start.pressure),
-    width: start.width + (2.0 / 3.0) * (control.width - start.width),
-  };
-  const c2: Point = {
-    x: end.x + (2.0 / 3.0) * (control.x - end.x),
-    y: end.y + (2.0 / 3.0) * (control.y - end.y),
-    pressure: end.pressure + (2.0 / 3.0) * (control.pressure - end.pressure),
-    width: end.width + (2.0 / 3.0) * (control.width - end.width),
-  };
-  return drawSmoothCubicBezierSegment(ctx, start, c1, c2, end, color, isEraser, hardness, flow, spacing, remainderDist);
-}
-
-/**
- * Draws a single dot (e.g. on pointer down without movement).
- */
-export function drawDot(
-  ctx: CanvasRenderingContext2D,
-  point: Point,
-  color: string,
-  isEraser: boolean = false,
-  hardness: number = 1.0,
-  flow: number = 1.0,
-  mixingOptions?: RadialMixingOptions,
-  thickness: number = 1.0,
-  angleRad: number = 0,
-  batchGpuDabs?: GpuDab[]
-) {
-  drawRadialDot(ctx, point, color, hardness, flow, isEraser, false, mixingOptions, thickness, angleRad, batchGpuDabs);
-}
-
 let _sharedThumbCanvas: HTMLCanvasElement | null = null;
 
 export const BLEND_MODES: { value: BlendMode; label: string }[] = [
   { value: 'pass-through', label: 'Pass Through' },
   { value: 'normal', label: 'Normal' },
-  { value: 'multiply', label: 'Multiply' },
-  { value: 'linear-burn', label: 'Linear Burn' },
-  { value: 'color-burn', label: 'Color Burn' },
   { value: 'darken', label: 'Darken' },
+  { value: 'multiply', label: 'Multiply' },
+  { value: 'color-burn', label: 'Color Burn' },
+  { value: 'linear-burn', label: 'Linear Burn' },
+  { value: 'darker-color', label: 'Darker Color' },
+  { value: 'lighten', label: 'Lighten' },
   { value: 'screen', label: 'Screen' },
   { value: 'color-dodge', label: 'Color Dodge' },
   { value: 'color-dodge-glow', label: 'Glow Dodge' },
   { value: 'add-glow', label: 'Add (Glow)' },
-  { value: 'lighten', label: 'Lighten' },
+  { value: 'lighter-color', label: 'Lighter Color' },
   { value: 'overlay', label: 'Overlay' },
   { value: 'soft-light', label: 'Soft Light' },
   { value: 'hard-light', label: 'Hard Light' },
+  { value: 'vivid-light', label: 'Vivid Light' },
+  { value: 'linear-light', label: 'Linear Light' },
+  { value: 'pin-light', label: 'Pin Light' },
+  { value: 'hard-mix', label: 'Hard Mix' },
   { value: 'difference', label: 'Difference' },
   { value: 'exclusion', label: 'Exclusion' },
+  { value: 'subtract', label: 'Subtract' },
   { value: 'divide', label: 'Divide' },
+  { value: 'hue', label: 'Hue' },
+  { value: 'saturation', label: 'Saturation' },
+  { value: 'color', label: 'Color' },
+  { value: 'luminosity', label: 'Luminosity' },
 ];
 
 export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalCompositeOperation {
@@ -240,8 +114,10 @@ export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalComposi
     case 'overlay':
       return 'overlay';
     case 'darken':
+    case 'darker-color':
       return 'darken';
     case 'lighten':
+    case 'lighter-color':
       return 'lighten';
     case 'color-dodge':
     case 'color-dodge-glow':
@@ -252,14 +128,27 @@ export function getCanvasCompositeOperation(blendMode: BlendMode): GlobalComposi
     case 'add-glow':
       return 'lighter';
     case 'hard-light':
+    case 'vivid-light':
+    case 'linear-light':
+    case 'pin-light':
+    case 'hard-mix':
       return 'hard-light';
     case 'soft-light':
       return 'soft-light';
     case 'difference':
+    case 'subtract':
     case 'divide':
       return 'difference';
     case 'exclusion':
       return 'exclusion';
+    case 'hue':
+      return 'hue';
+    case 'saturation':
+      return 'saturation';
+    case 'color':
+      return 'color';
+    case 'luminosity':
+      return 'luminosity';
     default:
       return 'source-over';
   }
@@ -549,255 +438,16 @@ export function applyParametricTaper(
   return points;
 }
 
-export function renderCompleteStroke(
-  ctx: CanvasRenderingContext2D,
-  points: Point[],
-  brushSettings: BrushSettings,
-  tool: ToolType,
-  colorMode: CanvasColorMode = 'color',
-  isBgEraser: boolean = false,
-  underlyingCanvas?: HTMLCanvasElement,
-  alphaLocked: boolean = false,
-  explicitSampler?: LayerPixelSampler,
-  allowGpuForMonochrome: boolean = false
-) {
-  if (!points || points.length === 0) return;
-
-  const isMono = colorMode === 'monochrome';
-  const postCorrLevel = brushSettings.postCorrection ?? 0;
-  const postCorrectedPoints =
-    postCorrLevel > 0 && points.length >= 3
-      ? applyCspPostCorrection(points, postCorrLevel, brushSettings.sharpCorners !== false)
-      : points;
-
-  const hasTaper = Boolean(brushSettings.taper?.useOut || brushSettings.taper?.useIn);
-  const effectivePoints =
-    isMono && !hasTaper
-      ? postCorrectedPoints.map((p) => (p.width < 1.25 ? { ...p, width: 1.25 } : p))
-      : postCorrectedPoints;
-
-  const isEraser = tool === 'eraser';
-  const isPencil = !isEraser && !brushSettings.customTipImage && (brushSettings.preset?.startsWith('pencil') ?? false);
-  const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(brushSettings.color, colorMode);
-  const strokeHardness = isMono ? 1.0 : (brushSettings.hardness ?? 1.0);
-  const strokeFlow = isMono ? 1.0 : (brushSettings.flow ?? 1.0);
-  const strokeSpacing = brushSettings.spacing ?? 0.08;
-  const isTransparentInk = Boolean(brushSettings.isTransparentInk);
-  const useTilt = Boolean(brushSettings.useTilt);
-  const effectiveAntiAlias = isMono
-    ? allowGpuForMonochrome && (brushSettings.antiAlias ?? 2) !== 0 && brushSettings.useGpu !== false
-      ? (brushSettings.antiAlias ?? 2)
-      : 0
-    : brushSettings.antiAlias;
-
-  // Textured Custom Tip (Clip Studio Paint SUT Brush & Procedural Tip Presets)
-  if (brushSettings.customTipImage) {
-    const tipOptions: TexturedBrushOptions = {
-      size: brushSettings.size,
-      minSizeFactor: brushSettings.minSizeFactor,
-      opacity: brushSettings.opacity,
-      flow: strokeFlow,
-      adjustDensityByGap: brushSettings.adjustDensityByGap,
-      blendTipsMode: brushSettings.blendTipsMode,
-      spacing: strokeSpacing,
-      thickness: brushSettings.thickness,
-      thicknessVertical: brushSettings.thicknessVertical,
-      flipH: brushSettings.flipH,
-      flipV: brushSettings.flipV,
-      isColorTip: brushSettings.isColorTip,
-      angle: brushSettings.customTipAngle,
-      angleDynamics: brushSettings.customTipAngleDynamics,
-      rotationRandomScale: brushSettings.customTipRotationRandomScale,
-      hardness: strokeHardness,
-      antiAlias: effectiveAntiAlias,
-      pressureCurve: brushSettings.pressureCurve,
-      velocityCurve: brushSettings.velocityCurve,
-      usePressure: brushSettings.usePressure,
-      useVelocity: brushSettings.useVelocity,
-      useTilt,
-      tiltScale: brushSettings.tiltScale,
-      sizeSensor: brushSettings.sizeSensor,
-      opacitySensor: brushSettings.opacitySensor,
-      densitySensor: brushSettings.densitySensor,
-      subTips: brushSettings.subTips,
-      subTipOrder: brushSettings.subTipOrder,
-      subTipImages: brushSettings.subTipImages,
-      spray: brushSettings.spray,
-      taper: brushSettings.taper,
-      colorMixing: brushSettings.colorMixing,
-      perceptualMixing: brushSettings.perceptualMixing,
-      amountOfPaint: brushSettings.amountOfPaint,
-      densityOfPaint: brushSettings.densityOfPaint,
-      colorStretch: brushSettings.colorStretch,
-      mixingMode: brushSettings.mixingMode,
-      wetEdge: brushSettings.wetEdge,
-      wetEdgeRadius: brushSettings.wetEdgeRadius,
-      wetEdgeAlphaPower: brushSettings.wetEdgeAlphaPower,
-      wetEdgeValuePower: brushSettings.wetEdgeValuePower,
-      grain: brushSettings.grain ?? brushSettings.textureDensity,
-      paperTextureMode: brushSettings.paperTextureMode,
-      paperTextureBrightness: brushSettings.paperTextureBrightness,
-      paperTextureContrast: brushSettings.paperTextureContrast,
-      paperTextureInverted: brushSettings.paperTextureInverted,
-      paperTextureImage: brushSettings.paperTextureImage,
-      paperTextureScale: brushSettings.paperTextureScale,
-      paperTextureRotate: brushSettings.paperTextureRotate,
-      dualBrush: brushSettings.dualBrush,
-      dualTipImage: brushSettings.dualTipImage,
-      dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
-      useGpu: brushSettings.useGpu !== false,
-      underlyingCanvas: underlyingCanvas || ctx.canvas,
-      sampler: brushSettings.colorMixing
-        ? (explicitSampler || (underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined))
-        : undefined,
-      reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
-      isEraser: isEraser && !isBgEraser,
-      isBgEraser,
-      alphaLocked,
-      isTransparentInk,
-      dynamics: brushSettings.dynamics,
-      secondaryColor: brushSettings.secondaryColor,
-    };
-    renderCompleteTexturedStroke(ctx, effectivePoints, strokeColor, brushSettings.customTipImage, tipOptions);
-    return;
-  }
-
-  const radialMixing: RadialMixingOptions = {
-    colorMixing: brushSettings.colorMixing,
-    perceptualMixing: brushSettings.perceptualMixing,
-    amountOfPaint: brushSettings.amountOfPaint,
-    densityOfPaint: brushSettings.densityOfPaint,
-    colorStretch: brushSettings.colorStretch,
-    mixingMode: brushSettings.mixingMode,
-    underlyingCanvas: underlyingCanvas || ctx.canvas,
-    sampler: brushSettings.colorMixing
-      ? (explicitSampler || (underlyingCanvas ? new LayerPixelSampler(underlyingCanvas) : undefined))
-      : undefined,
-    reservoir: brushSettings.colorMixing && !isEraser ? new PaintReservoir(strokeColor) : undefined,
-    alphaLocked,
-    isTransparentInk,
-    dynamics: brushSettings.dynamics,
-    secondaryColor: brushSettings.secondaryColor,
-    useGpu: brushSettings.useGpu !== false,
-    dualBrush: brushSettings.dualBrush,
-    dualTipImage: brushSettings.dualTipImage,
-    dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
-    useTilt,
-    tiltScale: brushSettings.tiltScale,
-    thicknessVertical: brushSettings.thicknessVertical,
-    flipH: brushSettings.flipH,
-    flipV: brushSettings.flipV,
-    antiAlias: effectiveAntiAlias,
-    angleDynamics: brushSettings.customTipAngleDynamics,
-    rotationRandomScale: brushSettings.customTipRotationRandomScale,
-    adjustDensityByGap: brushSettings.adjustDensityByGap,
-    blendTipsMode: brushSettings.blendTipsMode,
-    grain: brushSettings.grain ?? brushSettings.textureDensity,
-    paperTextureMode: brushSettings.paperTextureMode,
-    paperTextureBrightness: brushSettings.paperTextureBrightness,
-    paperTextureContrast: brushSettings.paperTextureContrast,
-    paperTextureInverted: brushSettings.paperTextureInverted,
-    paperTextureImage: brushSettings.paperTextureImage,
-    paperTextureScale: brushSettings.paperTextureScale,
-    paperTextureRotate: brushSettings.paperTextureRotate,
-    sizeSensor: brushSettings.sizeSensor,
-    opacitySensor: brushSettings.opacitySensor,
-    densitySensor: brushSettings.densitySensor,
-    taper: brushSettings.taper,
-  };
-
-  if (isPencil) {
-    const grade = (brushSettings.preset as PencilGrade) || 'pencil-2b';
-    const pencilTilt = brushSettings.useTilt ?? true;
-    drawPencilDot(
-      ctx,
-      effectivePoints[0],
-      strokeColor,
-      grade,
-      isMono ? 1.0 : (brushSettings.flow ?? 0.74),
-      brushSettings.grain ?? 1.0,
-      strokeHardness,
-      alphaLocked,
-      isTransparentInk
-    );
-
-    if (effectivePoints.length === 1) return;
-
-    const pFlow = isMono ? 1.0 : (brushSettings.flow ?? 0.74);
-    const pGrain = brushSettings.grain ?? 1.0;
-    let accDist = Math.max(0.25, effectivePoints[0].width * (brushSettings.spacing ?? 0.07));
-
-    if (effectivePoints.length === 2) {
-      const p0 = effectivePoints[0];
-      const p1 = effectivePoints[1];
-      const { c1, c2 } = catmullRomToBezier(p0, p0, p1, p1);
-      drawPencilCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
-      return;
-    }
-
-    const p0 = effectivePoints[0];
-    const p1 = effectivePoints[1];
-    const p2 = effectivePoints[2];
-    const first = catmullRomToBezier(p0, p0, p1, p2);
-    accDist = drawPencilCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
-
-    for (let i = 2; i < effectivePoints.length - 1; i++) {
-      const seg = catmullRomToBezier(effectivePoints[i - 2], effectivePoints[i - 1], effectivePoints[i], effectivePoints[i + 1]);
-      accDist = drawPencilCubicBezierSegment(ctx, effectivePoints[i - 1], seg.c1, seg.c2, effectivePoints[i], strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
-    }
-
-    const n = effectivePoints.length;
-    const pPrev2 = effectivePoints[n - 3];
-    const pPrev = effectivePoints[n - 2];
-    const pLast = effectivePoints[n - 1];
-    const last = catmullRomToBezier(pPrev2, pPrev, pLast, pLast);
-    drawPencilCubicBezierSegment(ctx, pPrev, last.c1, last.c2, pLast, strokeColor, grade, pFlow, pGrain, strokeHardness, accDist, alphaLocked, isTransparentInk, pencilTilt);
-    return;
-  }
-
-  const baseAngleRad = ((brushSettings.customTipAngle ?? 0) * Math.PI) / 180;
-  const baseThickness = brushSettings.thickness ?? 1.0;
-
-  if (effectivePoints.length === 1) {
-    drawDot(
-      ctx,
-      effectivePoints[0],
-      strokeColor,
-      isEraser && !isBgEraser,
-      strokeHardness,
-      strokeFlow,
-      radialMixing,
-      baseThickness,
-      baseAngleRad
-    );
-    return;
-  }
-
-  renderCompleteRadialStroke(
-    ctx,
-    effectivePoints,
-    strokeColor,
-    strokeHardness,
-    strokeFlow,
-    strokeSpacing,
-    isEraser && !isBgEraser,
-    isBgEraser,
-    baseThickness,
-    baseAngleRad,
-    radialMixing
-  );
-}
-
 let sampleCanvas: HTMLCanvasElement | null = null;
 let sampleCtx: CanvasRenderingContext2D | null = null;
 
 /**
  * Samples the composited RGBA pixel color across all visible layers at (x, y).
- * Uses a cached 1x1 canvas for minimal overhead and zero latency.
+ * Reads directly from SparseTileGrid in O(visible layers) with zero full-canvas allocation.
  */
 export function sampleCompositedColor(
   layers: LayerItem[],
-  layerCanvasesMap: Map<string, HTMLCanvasElement>,
+  source: SparseTileGrid | Map<string, HTMLCanvasElement>,
   x: number,
   y: number,
   isLayerVisible: (layer: LayerItem) => boolean,
@@ -812,27 +462,66 @@ export function sampleCompositedColor(
     return null;
   }
 
-  if (!sampleCanvas) {
+  const isTileGrid = 'getPixelRGBA' in source;
+
+  if (!sampleCanvas && typeof document !== 'undefined') {
     sampleCanvas = document.createElement('canvas');
     sampleCanvas.width = 1;
     sampleCanvas.height = 1;
     sampleCtx = sampleCanvas.getContext('2d', { willReadFrequently: true });
   }
-  if (!sampleCtx) return null;
-
-  sampleCtx.clearRect(0, 0, 1, 1);
 
   const renderOrder = layers.slice().reverse();
-  for (const layer of renderOrder) {
-    if (layer.type === 'folder' || !isLayerVisible(layer)) continue;
-    const lCanvas = layerCanvasesMap.get(layer.id);
-    if (!lCanvas) continue;
 
-    sampleCtx.save();
-    sampleCtx.globalAlpha = getLayerOpacity(layer);
-    sampleCtx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
-    sampleCtx.drawImage(lCanvas, px, py, 1, 1, 0, 0, 1, 1);
-    sampleCtx.restore();
+  if (isTileGrid && !sampleCtx) {
+    // Pure math headless fallback
+    let accR = 0, accG = 0, accB = 0, accA = 0;
+    const pixel: [number, number, number, number] = [0, 0, 0, 0];
+    for (const layer of renderOrder) {
+      if (layer.type === 'folder' || layer.type === 'frame-folder' || !isLayerVisible(layer)) continue;
+      source.getPixelRGBA(layer.id, px, py, pixel);
+      if (pixel[3] === 0) continue;
+      const sA = (pixel[3] / 255) * getLayerOpacity(layer);
+      const outA = sA + accA * (1 - sA);
+      if (outA > 0) {
+        accR = (pixel[0] * sA + accR * accA * (1 - sA)) / outA;
+        accG = (pixel[1] * sA + accG * accA * (1 - sA)) / outA;
+        accB = (pixel[2] * sA + accB * accA * (1 - sA)) / outA;
+        accA = outA;
+      }
+    }
+    if (accA <= 0) return '#ffffff';
+    const r = Math.round(accR * accA + 255 * (1 - accA));
+    const g = Math.round(accG * accA + 255 * (1 - accA));
+    const b = Math.round(accB * accA + 255 * (1 - accA));
+    const toHex = (n: number) => Math.max(0, Math.min(255, n)).toString(16).padStart(2, '0');
+    return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+  }
+
+  if (!sampleCtx) return null;
+  sampleCtx.clearRect(0, 0, 1, 1);
+
+  const pixel: [number, number, number, number] = [0, 0, 0, 0];
+  for (const layer of renderOrder) {
+    if (layer.type === 'folder' || layer.type === 'frame-folder' || !isLayerVisible(layer)) continue;
+    if (isTileGrid) {
+      source.getPixelRGBA(layer.id, px, py, pixel);
+      if (pixel[3] === 0) continue;
+      sampleCtx.save();
+      sampleCtx.globalAlpha = getLayerOpacity(layer);
+      sampleCtx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
+      sampleCtx.fillStyle = `rgba(${pixel[0]},${pixel[1]},${pixel[2]},${pixel[3] / 255})`;
+      sampleCtx.fillRect(0, 0, 1, 1);
+      sampleCtx.restore();
+    } else {
+      const lCanvas = source.get(layer.id);
+      if (!lCanvas) continue;
+      sampleCtx.save();
+      sampleCtx.globalAlpha = getLayerOpacity(layer);
+      sampleCtx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
+      sampleCtx.drawImage(lCanvas, px, py, 1, 1, 0, 0, 1, 1);
+      sampleCtx.restore();
+    }
   }
 
   if (floatingSelection?.canvas) {

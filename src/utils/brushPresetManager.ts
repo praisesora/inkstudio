@@ -47,10 +47,10 @@ export function stepBrushSizePreset(currentSize: number, direction: -1 | 1): num
   }
 }
 
-export const STORAGE_KEY_SETTINGS = 'sora_paint_brush_settings_by_id';
-export const STORAGE_KEY_ACTIVE_PRESET = 'sora_paint_active_brush_preset';
-export const STORAGE_KEY_BOTTOM_TAB = 'sora_paint_left_bottom_tab';
-const STORAGE_KEY_PRESET_SCHEMA = 'sora_paint_brush_preset_schema_v';
+export const STORAGE_KEY_SETTINGS = 'ink_studio_brush_settings_by_id';
+export const STORAGE_KEY_ACTIVE_PRESET = 'ink_studio_active_brush_preset';
+export const STORAGE_KEY_BOTTOM_TAB = 'ink_studio_left_bottom_tab';
+const STORAGE_KEY_PRESET_SCHEMA = 'ink_studio_brush_preset_schema_v';
 const BUILTIN_PRESET_SCHEMA_VERSION = 2;
 const SKETCH_PRESET_IDS = [
   'mechanical-pencil',

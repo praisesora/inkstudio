@@ -21,18 +21,17 @@ import {
 import { ViewportCompositor } from '../compositor';
 import {
   buildGpuExportTilePlan,
-  buildSoraProjectPayload,
   compositeCanvas,
   compositeCanvasAsync,
   computeMaxLayerStyleMargin,
   createDocumentRegionRenderer,
   exportImage,
-  extractSoraPreview,
-  isSoraV2Bytes,
-  parseSoraProject,
+  extractInkPreview,
+  isInkProjectBytes,
+  parseInkProject,
   SaveProgress,
   serializeDocument,
-  serializeSoraV2,
+  serializeInkProject,
 } from '../saveManager';
 
 function createMockMaskCanvas(width: number, height: number, fillFn: (x: number, y: number) => number): HTMLCanvasElement {
@@ -59,22 +58,20 @@ function createMockMaskCanvas(width: number, height: number, fillFn: (x: number,
   } as unknown as HTMLCanvasElement;
 }
 
-describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
+describe('.ink Binary Format & Round-Trip Serialization', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it('round-trips 1-bit, 8-bit, 32-bit native SparseTileGrid tiles, masks, vectors, text, balloons, frames, perspective, animation, and timelapse without toDataURL', async () => {
+  it('round-trips 1-bit, 8-bit, 32-bit native SparseTileGrid tiles, masks, vectors, text, balloons, frames, perspective, animation, and timelapse', async () => {
     const grid = new SparseTileGrid();
 
-    // 1. 1-bit monochrome ink tile at (2, 3)
     const monoTile = grid.getOrCreateTile('layer-mono', 2, 3, 'monochrome-1bit', 0);
     setPixel1Bit(monoTile.data!, 5, 7, 1);
     setPixel1Bit(monoTile.data!, 200, 123, 1);
     monoTile.version = 9;
     grid.setLayerFormat('layer-mono', 'monochrome-1bit');
 
-    // 2. 8-bit grayscale tone tile at (0, 1)
     const grayTile = grid.getOrCreateTile('layer-gray', 0, 1, 'grayscale-8bit', 0);
     grayTile.data![0] = 42;
     grayTile.data![256 * 10 + 15] = 199;
@@ -82,7 +79,6 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     grayTile.version = 4;
     grid.setLayerFormat('layer-gray', 'grayscale-8bit');
 
-    // 3. 32-bit RGBA color tile at (1, 0) + negative/offset tile at (4, 5)
     const colorTile = grid.getOrCreateTile('layer-color', 1, 0, 'color-32bit', 0);
     colorTile.data![0] = 220;
     colorTile.data![1] = 40;
@@ -112,7 +108,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     const textData: TextLayerData = {
       x: 300,
       y: 220,
-      text: 'SORA V2!\nLINE TWO',
+      text: 'INK V2!\nLINE TWO',
       fontFamily: 'Anime Ace',
       fontSize: 36,
       lineSpacing: 1.4,
@@ -197,7 +193,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
       },
       {
         id: 'layer-text',
-        name: 'SORA V2!',
+        name: 'INK V2!',
         type: 'text',
         visible: true,
         opacity: 1,
@@ -294,7 +290,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     ];
 
     const progressLog: SaveProgress[] = [];
-    const serialized = await serializeSoraV2(
+    const serialized = await serializeInkProject(
       {
         name: 'Manga Page 01',
         dimensions: { width: 7016, height: 9921, dpi: 600 },
@@ -312,12 +308,11 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
       grid
     );
 
-    // Must be compact ZIP binary starting with PK\x03\x04
-    expect(isSoraV2Bytes(serialized.bytes)).toBe(true);
+    expect(serialized.manifest.format).toBe('ink-v2');
+    expect(isInkProjectBytes(serialized.bytes)).toBe(true);
     expect(serialized.bytes[0]).toBe(0x50);
     expect(serialized.bytes[1]).toBe(0x4b);
 
-    // Inspect ZIP structure directly: manifest + native tile files + mask file
     const entries = unzipSync(serialized.bytes);
     expect(entries['manifest.json']).toBeDefined();
     expect(entries['tiles/layer-mono/2_3.bin']).toBeDefined();
@@ -325,22 +320,19 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     expect(entries['tiles/layer-color/1_0.bin']).toBeDefined();
     expect(entries['masks/layer-mono.bin']).toBeDefined();
 
-    // Progress indicator reached 100%
     expect(progressLog.length).toBeGreaterThanOrEqual(3);
     expect(progressLog[progressLog.length - 1].phase).toBe('done');
     expect(progressLog[progressLog.length - 1].percent).toBe(100);
 
-    // Round-trip parse with auto-detection
-    const parsed = await parseSoraProject(serialized.bytes);
-    expect(parsed.format).toBe('v2');
+    const parsed = await parseInkProject(serialized.bytes);
+    expect(parsed.format).toBe('ink-v2');
     expect(parsed.version).toBe('2.0');
     expect(parsed.name).toBe('Manga Page 01');
     expect(parsed.dimensions).toEqual({ width: 7016, height: 9921, dpi: 600 });
     expect(parsed.layers).toHaveLength(8);
     expect(parsed.tileGrid).toBeDefined();
 
-    // Verify 1-bit tile exact binary round-trip
-    const restoredMono = parsed.tileGrid!.getTile('layer-mono', 2, 3, 0);
+    const restoredMono = parsed.tileGrid.getTile('layer-mono', 2, 3, 0);
     expect(restoredMono).toBeDefined();
     expect(restoredMono!.format).toBe('monochrome-1bit');
     expect(restoredMono!.data!.byteLength).toBe(BYTES_1BIT);
@@ -349,8 +341,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     expect(getPixel1Bit(restoredMono!.data!, 0, 0)).toBe(0);
     expect(restoredMono!.version).toBe(9);
 
-    // Verify 8-bit tile exact binary round-trip
-    const restoredGray = parsed.tileGrid!.getTile('layer-gray', 0, 1, 0);
+    const restoredGray = parsed.tileGrid.getTile('layer-gray', 0, 1, 0);
     expect(restoredGray).toBeDefined();
     expect(restoredGray!.format).toBe('grayscale-8bit');
     expect(restoredGray!.data!.byteLength).toBe(BYTES_8BIT);
@@ -359,8 +350,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     expect(restoredGray!.data![BYTES_8BIT - 1]).toBe(255);
     expect(restoredGray!.version).toBe(4);
 
-    // Verify 32-bit tile exact binary round-trip
-    const restoredColor = parsed.tileGrid!.getTile('layer-color', 1, 0, 0);
+    const restoredColor = parsed.tileGrid.getTile('layer-color', 1, 0, 0);
     expect(restoredColor).toBeDefined();
     expect(restoredColor!.format).toBe('color-32bit');
     expect(restoredColor!.data!.byteLength).toBe(BYTES_32BIT);
@@ -368,8 +358,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     expect(Array.from(restoredColor!.data!.subarray(BYTES_32BIT - 4))).toEqual([12, 34, 56, 180]);
     expect(restoredColor!.version).toBe(12);
 
-    // Verify binary mask round-trip
-    const restoredMask = parsed.masksBinary?.get('layer-mono');
+    const restoredMask = parsed.masksBinary.get('layer-mono');
     expect(restoredMask).toBeDefined();
     expect(restoredMask!.width).toBe(16);
     expect(restoredMask!.height).toBe(8);
@@ -377,7 +366,6 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     expect(restoredMask!.data[17]).toBe(17);
     expect(restoredMask!.data[127]).toBe(127);
 
-    // Verify non-destructive vector, text, balloon, frame, styles, screentone, perspective, animation, timelapse
     expect(parsed.layers.find((l) => l.id === 'layer-vector')?.vectorStrokes).toEqual([vectorStroke]);
     expect(parsed.layers.find((l) => l.id === 'layer-text')?.textData).toEqual(textData);
     expect(parsed.layers.find((l) => l.id === 'layer-balloon')?.balloonData?.text).toBe('BOOM!');
@@ -395,7 +383,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     });
   });
 
-  it('hydrates paged-out scratch disk tiles cleanly during .sora v2 save without data loss', async () => {
+  it('hydrates paged-out scratch disk tiles cleanly during .ink save without data loss', async () => {
     const driver = new InMemoryScratchDiskDriver();
     const grid = new SparseTileGrid({
       sessionId: 'paged-save-test',
@@ -408,7 +396,6 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     tile.data![5000] = 88;
     const rawCopy = new Uint8Array(tile.data!);
 
-    // Simulate SSD scratch eviction: write tile to scratch driver and drop RAM pointer
     await driver.writeTiles('paged-save-test', [
       { layerId: 'layer-1', tileX: 0, tileY: 0, data: rawCopy },
     ]);
@@ -429,7 +416,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
       },
     ];
 
-    const saved = await serializeSoraV2(
+    const saved = await serializeInkProject(
       {
         name: 'Paged Doc',
         dimensions: { width: 512, height: 512, dpi: 300 },
@@ -443,56 +430,16 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
       grid
     );
 
-    const parsed = await parseSoraProject(saved.bytes);
-    const restored = parsed.tileGrid!.getTile('layer-1', 0, 0, 0);
+    const parsed = await parseInkProject(saved.bytes);
+    const restored = parsed.tileGrid.getTile('layer-1', 0, 0, 0);
     expect(restored?.data?.[100]).toBe(177);
     expect(restored?.data?.[5000]).toBe(88);
   });
 
-  it('auto-detects legacy v1.2 JSON (string & UTF-8 bytes with BOM) and preserves backward compatibility', async () => {
-    const layers: LayerItem[] = [
-      {
-        id: 'layer-bg',
-        name: 'Background',
-        type: 'raster',
-        visible: true,
-        opacity: 1,
-        blendMode: 'normal',
-        locked: false,
-        parentId: null,
-      },
-    ];
-
-    const v1Payload = buildSoraProjectPayload({
-      name: 'Legacy Project',
-      dimensions: { width: 1440, height: 900, dpi: 300 },
-      colorMode: 'color',
-      layers,
-      layerCanvasesMap: new Map(),
-      getEffectiveOpacity: (l) => l.opacity,
-      isLayerEffectivelyVisible: (l) => l.visible,
-    });
-    const jsonString = JSON.stringify(v1Payload);
-
-    // String input
-    const parsedStr = await parseSoraProject(jsonString);
-    expect(parsedStr.format).toBe('v1');
-    expect(parsedStr.version).toBe('1.2');
-    expect(parsedStr.name).toBe('Legacy Project');
-    expect(parsedStr.layers).toHaveLength(1);
-
-    // UTF-8 ArrayBuffer with BOM
-    const utf8WithBom = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(jsonString)]);
-    expect(isSoraV2Bytes(utf8WithBom)).toBe(false);
-    const parsedBytes = await parseSoraProject(utf8WithBom.buffer);
-    expect(parsedBytes.format).toBe('v1');
-    expect(parsedBytes.name).toBe('Legacy Project');
-  });
-
-  it('extracts preview.png via extractSoraPreview without decompressing tiles, and supports SORA magic wrapper', async () => {
+  it('extracts preview.png via extractInkPreview without decompressing tiles and rejects legacy SORA magic wrapper in primary parser', async () => {
     const fakePng = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
     const manifest = {
-      format: 'sora-v2',
+      format: 'ink-v2',
       app: 'Ink Studio',
       version: '2.0',
       tileSize: 256,
@@ -512,19 +459,14 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
       'preview.png': fakePng,
     });
 
-    // Direct ZIP
-    expect(Array.from(extractSoraPreview(zipBytes)!)).toEqual(Array.from(fakePng));
+    expect(Array.from(extractInkPreview(zipBytes)!)).toEqual(Array.from(fakePng));
 
-    // With optional 8-byte SORA\x00\x02 header prefix
     const wrapped = new Uint8Array(8 + zipBytes.byteLength);
     wrapped.set([0x53, 0x4f, 0x52, 0x41, 0x00, 0x02, 0x00, 0x00], 0);
     wrapped.set(zipBytes, 8);
-    expect(isSoraV2Bytes(wrapped)).toBe(true);
-    expect(Array.from(extractSoraPreview(wrapped)!)).toEqual(Array.from(fakePng));
-
-    const parsed = await parseSoraProject(wrapped);
-    expect(parsed.format).toBe('v2');
-    expect(parsed.previewDataUrl).toMatch(/^data:image\/png;base64,/);
+    expect(isInkProjectBytes(wrapped)).toBe(false);
+    expect(extractInkPreview(wrapped)).toBeNull();
+    await expect(parseInkProject(wrapped)).rejects.toThrow(/expected binary ZIP container/);
   });
 
   it('sanitizes unsafe layer IDs and rejects path traversal and corrupted tile payloads', async () => {
@@ -533,7 +475,7 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
     const tile = grid.getOrCreateTile(weirdId, 0, 0, 'monochrome-1bit', 0);
     setPixel1Bit(tile.data!, 3, 4, 1);
 
-    const saved = await serializeSoraV2(
+    const saved = await serializeInkProject(
       {
         name: 'Safe Keys',
         dimensions: { width: 256, height: 256, dpi: 300 },
@@ -558,21 +500,19 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
       grid
     );
 
-    const parsed = await parseSoraProject(saved.bytes);
-    const restored = parsed.tileGrid!.getTile(weirdId, 0, 0, 0);
+    const parsed = await parseInkProject(saved.bytes);
+    const restored = parsed.tileGrid.getTile(weirdId, 0, 0, 0);
     expect(restored).toBeDefined();
     expect(getPixel1Bit(restored!.data!, 3, 4)).toBe(1);
 
-    // Path traversal archive rejected
     const evilZip = zipSync({
       'manifest.json': new TextEncoder().encode(
         JSON.stringify({ dimensions: { width: 256, height: 256 }, layers: [] })
       ),
       '../escape.bin': new Uint8Array([1, 2, 3]),
     });
-    await expect(parseSoraProject(evilZip)).rejects.toThrow(/Unsafe archive path/);
+    await expect(parseInkProject(evilZip)).rejects.toThrow(/Unsafe archive path/);
 
-    // Truncated / mismatched tile payload rejected
     const corruptZip = zipSync({
       'manifest.json': new TextEncoder().encode(
         JSON.stringify({
@@ -581,47 +521,47 @@ describe('.sora v2 Binary Format & Round-Trip Serialization', () => {
           layerTileKeys: { l1: 'l1' },
         })
       ),
-      'tiles/l1/0_0.bin': new Uint8Array([0, 1, 0, 0, 0, 0, 32, 0, 0, 0xff]), // claims 8192 bytes, only 1 byte present
+      'tiles/l1/0_0.bin': new Uint8Array([0, 1, 0, 0, 0, 0, 32, 0, 0, 0xff]),
     });
-    await expect(parseSoraProject(corruptZip)).rejects.toThrow(/length mismatch/);
+    await expect(parseInkProject(corruptZip)).rejects.toThrow(/length mismatch/);
   });
 
-  it('serializeDocument writes binary .sora v2 Blob instead of legacy JSON', async () => {
+  it('serializeDocument writes binary .ink Blob and refuses read-only .sora writes', async () => {
     const grid = new SparseTileGrid();
     const t = grid.getOrCreateTile('l1', 0, 0, 'monochrome-1bit', 0);
     setPixel1Bit(t.data!, 10, 10, 1);
 
-    const res = await serializeDocument(
-      {
-        name: 'Doc',
-        dimensions: { width: 512, height: 512, dpi: 600 },
-        colorMode: 'monochrome',
-        layers: [
-          {
-            id: 'l1',
-            name: 'Ink',
-            type: 'raster',
-            visible: true,
-            opacity: 1,
-            blendMode: 'normal',
-            locked: false,
-            parentId: null,
-          },
-        ],
-        layerCanvasesMap: new Map(),
-        tileGrid: grid,
-        getEffectiveOpacity: () => 1,
-        isLayerEffectivelyVisible: () => true,
-      },
-      '.sora'
-    );
+    const docData = {
+      name: 'Doc',
+      dimensions: { width: 512, height: 512, dpi: 600 },
+      colorMode: 'monochrome' as const,
+      layers: [
+        {
+          id: 'l1',
+          name: 'Ink',
+          type: 'raster' as const,
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal' as const,
+          locked: false,
+          parentId: null,
+        },
+      ],
+      layerCanvasesMap: new Map(),
+      tileGrid: grid,
+      getEffectiveOpacity: () => 1,
+      isLayerEffectivelyVisible: () => true,
+    };
 
+    const res = await serializeDocument(docData, '.ink');
     expect(res.data).toBeInstanceOf(Blob);
     const buf = await (res.data as Blob).arrayBuffer();
-    expect(isSoraV2Bytes(buf)).toBe(true);
-    const parsed = await parseSoraProject(buf);
-    expect(parsed.format).toBe('v2');
-    expect(getPixel1Bit(parsed.tileGrid!.getTile('l1', 0, 0, 0)!.data!, 10, 10)).toBe(1);
+    expect(isInkProjectBytes(buf)).toBe(true);
+    const parsed = await parseInkProject(buf);
+    expect(parsed.format).toBe('ink-v2');
+    expect(getPixel1Bit(parsed.tileGrid.getTile('l1', 0, 0, 0)!.data!, 10, 10)).toBe(1);
+
+    await expect(serializeDocument(docData, '.sora')).rejects.toThrow(/read-only/i);
   });
 });
 
@@ -663,26 +603,21 @@ describe('Pixel-Accurate GPU Tiled Export & CPU Fallback', () => {
     ];
 
     const margin = computeMaxLayerStyleMargin(layers);
-    // dropShadow extent = ceil(20 + 16 * 1.5) + 2 = 46; hidden layer ignored
     expect(margin).toBe(46);
 
     const plan = buildGpuExportTilePlan(4500, 3000, 2048, margin);
-    // innerStep = 2048 - 92 = 1956 -> ceil(4500/1956) = 3 cols, ceil(3000/1956) = 2 rows = 6 tiles
     expect(plan.tiles).toHaveLength(6);
     expect(plan.fboWidth).toBeLessThanOrEqual(2048);
     expect(plan.fboHeight).toBeLessThanOrEqual(2048);
 
-    // Top-left tile has 0 left/top pad, positive right/bottom halo pad
     expect(plan.tiles[0].padLeft).toBe(0);
     expect(plan.tiles[0].padTop).toBe(0);
     expect(plan.tiles[0].padRight).toBe(margin);
     expect(plan.tiles[0].padBottom).toBe(margin);
 
-    // Interior/second column tile has left halo pad for seamless shadow/stroke stitching
     expect(plan.tiles[1].padLeft).toBe(margin);
     expect(plan.tiles[1].originX).toBe(plan.tiles[1].tileX - margin);
 
-    // Exact full-canvas coverage with zero gaps or overlaps
     const totalArea = plan.tiles.reduce((acc, t) => acc + t.width * t.height, 0);
     expect(totalArea).toBe(4500 * 3000);
   });
@@ -760,7 +695,6 @@ describe('Pixel-Accurate GPU Tiled Export & CPU Fallback', () => {
       },
     ];
 
-    // 1. Sync compositeCanvas (transparent PNG) on a 3000x1500 doc -> splits horizontally into 2 tiles
     const outCanvas = compositeCanvas(
       { width: 3000, height: 1500, dpi: 600 },
       layers,
@@ -776,7 +710,6 @@ describe('Pixel-Accurate GPU Tiled Export & CPU Fallback', () => {
     expect(drawImageCalls).toHaveLength(2);
     expect(disposeSpy).toHaveBeenCalledTimes(1);
 
-    // Verify 1:1 zoom, dpr=1, bypassStackCache, transparentBackground=true
     const firstCallArgs = renderSpy.mock.calls[0];
     expect(firstCallArgs[1].zoom).toBe(1);
     expect(firstCallArgs[1].rotation).toBe(0);
@@ -784,12 +717,10 @@ describe('Pixel-Accurate GPU Tiled Export & CPU Fallback', () => {
     expect(firstCallArgs[4]?.bypassStackCache).toBe(true);
     expect(firstCallArgs[4]?.devicePixelRatio).toBe(1);
 
-    // Verify stitched regions cover exact [0..3000] x [0..1500]
     expect(drawImageCalls[0].dx).toBe(0);
     expect(drawImageCalls[0].dw + drawImageCalls[1].dw).toBe(3000);
     expect(drawImageCalls[1].dx).toBe(drawImageCalls[0].dw);
 
-    // 2. Async exportImage for JPEG -> transparentBackground=false (white background)
     renderSpy.mockClear();
     const exported = await exportImage(
       {
@@ -810,7 +741,6 @@ describe('Pixel-Accurate GPU Tiled Export & CPU Fallback', () => {
     expect(renderSpy).toHaveBeenCalledTimes(1);
     expect(renderSpy.mock.calls[0][4]?.transparentBackground).toBe(false);
 
-    // 3. Reusable region renderer for tall Webtoon slices
     renderSpy.mockClear();
     const renderer = createDocumentRegionRenderer(
       { width: 800, height: 5000, dpi: 300 },

@@ -13,7 +13,6 @@ import {
   IScratchDiskDriver,
   createDefaultScratchDiskDriver,
   globalTileGrid,
-  releaseTemporaryCanvas,
 } from './tileEngine';
 import { UndoCacheManager, MAX_RAM_UNDO_STEPS } from './undoCache';
 
@@ -30,8 +29,6 @@ export class TileGridSession {
   public readonly undoCache: UndoCacheManager;
   public history: HistoryItem[] = [];
   public historyIndex: number = -1;
-  public readonly layerCanvases: Map<string, HTMLCanvasElement> = new Map();
-  public readonly layerSourceCanvases: Map<string, HTMLCanvasElement> = new Map();
   public lastAccessedAt: number;
   public isActive: boolean = false;
   private disposed: boolean = false;
@@ -64,34 +61,9 @@ export class TileGridSession {
   }
 
   /**
-   * Releases any transiently materialized display canvases (safe because SparseTileGrid
-   * is the authoritative pixel store; source canvases for non-destructive effects are preserved).
-   */
-  public releaseTransientDisplayCanvases(): number {
-    let released = 0;
-    for (const [layerId, canvas] of Array.from(this.layerCanvases.entries())) {
-      if (this.layerSourceCanvases.has(layerId)) continue;
-      releaseTemporaryCanvas(canvas);
-      this.layerCanvases.delete(layerId);
-      released++;
-    }
-    return released;
-  }
-
-  /**
-   * Releases a single layer's tiles and any temporary/source canvases.
+   * Releases a single layer's tiles.
    */
   public clearLayerResources(layerId: string): void {
-    const display = this.layerCanvases.get(layerId);
-    if (display) {
-      releaseTemporaryCanvas(display);
-      this.layerCanvases.delete(layerId);
-    }
-    const source = this.layerSourceCanvases.get(layerId);
-    if (source) {
-      releaseTemporaryCanvas(source);
-      this.layerSourceCanvases.delete(layerId);
-    }
     this.tileGrid.clearLayer(layerId);
   }
 
@@ -105,22 +77,12 @@ export class TileGridSession {
   }
 
   /**
-   * Permanently disposes all tiles, scratch disk state, undo cache, and canvases for this tab.
+   * Permanently disposes all tiles, scratch disk state, and undo cache for this tab.
    */
   public async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     this.isActive = false;
-
-    for (const canvas of this.layerCanvases.values()) {
-      releaseTemporaryCanvas(canvas);
-    }
-    this.layerCanvases.clear();
-
-    for (const canvas of this.layerSourceCanvases.values()) {
-      releaseTemporaryCanvas(canvas);
-    }
-    this.layerSourceCanvases.clear();
 
     this.history = [];
     this.historyIndex = -1;
@@ -205,7 +167,6 @@ export class DocumentStore {
       if (prevSession && !prevSession.isDisposed()) {
         prevSession.isActive = false;
         prevSession.touch();
-        prevSession.releaseTransientDisplayCanvases();
         if (this.offloadInactiveUndoOnSwitch) {
           void prevSession.undoCache.offloadAllToDisk(prevSession.history).catch(() => {});
         }

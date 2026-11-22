@@ -1,5 +1,5 @@
 /**
- * Real-Time Color Mixing & Subtractive Pigment Engine for Sora Paint.
+ * Real-Time Color Mixing & Subtractive Pigment Engine for Ink Studio.
  * Implements authentic Clip Studio Paint (CSP) & Photoshop Mixer Brush mathematics:
  * - Subtractive Pigment Mixing (OKLab + Kubelka-Munk absorption / scattering)
  *   (Yellow + Blue = vibrant Green, Red + Blue = Violet, Red + Yellow = Orange)

@@ -3,19 +3,25 @@ import {
   CanvasColorMode,
   CanvasDimensions,
   CanvasSelection,
+  DirtyRect,
   LayerItem,
   TransformSession,
 } from '../../types/editor';
 import { documentStore } from '../../utils/documentStore';
-import { SparseTileGrid } from '../../utils/tileEngine';
-import { compositeVisibleLayers } from '../../utils/floodFill';
+import {
+  SparseTileGrid,
+  TileFormat,
+  TileSnapshotEntry,
+  releaseTemporaryCanvas,
+} from '../../utils/tileEngine';
 import {
   isPointInSelection,
-  liftSelectionToFloating,
-  commitFloatingSelection,
   computePolygonBounds,
-  getCanvasContentBounds,
-  floodSelectWand,
+  floodSelectWandOnTileGrid,
+  clearSelectionInTileGrid,
+  fillSelectionInTileGrid,
+  liftSelectionFromTileGrid,
+  commitFloatingSelectionToTileGrid,
   expandSelection,
   contractSelection,
   featherSelection,
@@ -30,11 +36,138 @@ import {
   createDefaultPerspectiveQuad,
   createDefaultMeshPoints,
 } from '../../utils/transformEngine';
-import { applyScreentone } from '../../utils/screentoneEngine';
-import { applyLayerEffects } from '../../utils/layerEffectsEngine';
 import { get2DContext } from '../../utils/canvasUtils';
 import { useToolStore, toolStoreActions } from '../../stores';
 import { PushHistoryStepFn } from './types';
+
+function computeTransformDestRect(
+  session: TransformSession,
+  docW: number,
+  docH: number
+): DirtyRect | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  const includePt = (px: number, py: number) => {
+    if (px < minX) minX = px;
+    if (py < minY) minY = py;
+    if (px > maxX) maxX = px;
+    if (py > maxY) maxY = py;
+  };
+
+  if (session.mode === 'perspective' && session.perspectiveQuad) {
+    for (const p of session.perspectiveQuad) includePt(p.x, p.y);
+  } else if (session.mode === 'mesh' && session.meshPoints) {
+    for (const row of session.meshPoints) {
+      for (const p of row) includePt(p.x, p.y);
+    }
+  } else {
+    const cx = session.x + session.width / 2;
+    const cy = session.y + session.height / 2;
+    const rad = (session.rotation * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const hw = session.width / 2;
+    const hh = session.height / 2;
+    const corners: [number, number][] = [
+      [-hw, -hh],
+      [hw, -hh],
+      [hw, hh],
+      [-hw, hh],
+    ];
+    for (const [lx, ly] of corners) {
+      includePt(cx + lx * cos - ly * sin, cy + lx * sin + ly * cos);
+    }
+  }
+
+  const x0 = Math.max(0, Math.floor(minX - 2));
+  const y0 = Math.max(0, Math.floor(minY - 2));
+  const x1 = Math.min(docW, Math.ceil(maxX + 2));
+  const y1 = Math.min(docH, Math.ceil(maxY + 2));
+  if (x1 <= x0 || y1 <= y0) return null;
+  return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+}
+
+function compositeTransformedIntoTileGrid(
+  grid: SparseTileGrid,
+  layerId: string,
+  sourceCanvas: HTMLCanvasElement,
+  session: TransformSession,
+  dimensions: CanvasDimensions,
+  targetFormat: TileFormat,
+  beforeSnapshot: Map<string, TileSnapshotEntry>
+): DirtyRect | null {
+  const destRect = computeTransformDestRect(session, dimensions.width, dimensions.height);
+  if (!destRect) return null;
+
+  const CHUNK = 1024;
+  const chunkCanvas = document.createElement('canvas');
+  chunkCanvas.width = Math.min(CHUNK, destRect.width);
+  chunkCanvas.height = Math.min(CHUNK, destRect.height);
+  const cCtx = get2DContext(chunkCanvas);
+  if (!cCtx) {
+    releaseTemporaryCanvas(chunkCanvas);
+    return null;
+  }
+
+  try {
+    const x1 = destRect.x + destRect.width;
+    const y1 = destRect.y + destRect.height;
+
+    for (let cy = destRect.y; cy < y1; cy += CHUNK) {
+      const ch = Math.min(CHUNK, y1 - cy);
+      for (let cx = destRect.x; cx < x1; cx += CHUNK) {
+        const cw = Math.min(CHUNK, x1 - cx);
+        if (chunkCanvas.width !== cw) chunkCanvas.width = cw;
+        if (chunkCanvas.height !== ch) chunkCanvas.height = ch;
+
+        cCtx.setTransform(1, 0, 0, 1, 0, 0);
+        cCtx.clearRect(0, 0, cw, ch);
+        cCtx.save();
+        cCtx.translate(-cx, -cy);
+
+        if (session.mode === 'perspective' && session.perspectiveQuad) {
+          renderPerspectiveQuad(cCtx, sourceCanvas, session.perspectiveQuad, 24);
+        } else if (session.mode === 'mesh' && session.meshPoints) {
+          renderMeshWarp(cCtx, sourceCanvas, session.meshPoints, 6);
+        } else {
+          const midX = session.x + session.width / 2;
+          const midY = session.y + session.height / 2;
+          cCtx.translate(midX, midY);
+          cCtx.rotate((session.rotation * Math.PI) / 180);
+          cCtx.scale(session.flipH ? -1 : 1, session.flipV ? -1 : 1);
+          cCtx.drawImage(
+            sourceCanvas,
+            -session.width / 2,
+            -session.height / 2,
+            session.width,
+            session.height
+          );
+        }
+        cCtx.restore();
+
+        const img = cCtx.getImageData(0, 0, cw, ch);
+        grid.compositeStrokeToTiles({
+          layerId,
+          strokeData: img,
+          destX: cx,
+          destY: cy,
+          format: targetFormat,
+          compositeOp: 'source-over',
+          opacity: 1.0,
+          snapshotOut: beforeSnapshot,
+          suppressNotify: true,
+        });
+      }
+    }
+  } finally {
+    releaseTemporaryCanvas(chunkCanvas);
+  }
+
+  return destRect;
+}
 
 export interface UseSelectionToolsParams {
   dimensions: CanvasDimensions;
@@ -43,10 +176,6 @@ export interface UseSelectionToolsParams {
   activeLayer: LayerItem | undefined;
   activeLayerId: string;
   selectedLayerIds: string[];
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  layerSourceCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
-  getActiveCanvas: () => HTMLCanvasElement | null;
-  materializeLayerCanvas?: (layerId: string) => HTMLCanvasElement | null;
   tileGrid?: SparseTileGrid;
   flushPendingHistoryTasks?: () => void;
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
@@ -87,10 +216,6 @@ export function useSelectionTools({
   activeLayer,
   activeLayerId,
   selectedLayerIds,
-  layerCanvasesRef,
-  layerSourceCanvasesRef,
-  getActiveCanvas,
-  materializeLayerCanvas,
   tileGrid,
   flushPendingHistoryTasks,
   updateLayerThumbnail,
@@ -105,55 +230,17 @@ export function useSelectionTools({
     [tileGrid]
   );
 
-  const markCanvasPopulated = useCallback((c: HTMLCanvasElement | null | undefined) => {
-    if (!c) return;
-    (c as unknown as { __isBlank?: boolean }).__isBlank = false;
-    (c as unknown as { __isSolidWhite?: boolean }).__isSolidWhite = false;
-  }, []);
-
-  /**
-   * Flushes any deferred brush/history tasks and synchronizes a layer's cached 2D canvas
-   * from the authoritative SparseTileGrid so selection & transform never read stale tiles.
-   */
-  const getSyncedLayerCanvas = useCallback(
-    (layerId: string): HTMLCanvasElement | null => {
-      flushPendingHistoryTasks?.();
-      const canvas =
-        layerCanvasesRef.current.get(layerId) ??
-        materializeLayerCanvas?.(layerId) ??
-        (layerId === activeLayerId ? getActiveCanvas() : null);
-      if (!canvas) return null;
-
-      const grid = getGrid();
+  const resolveLayerFormat = useCallback(
+    (layerId: string): TileFormat => {
+      const isBg = layerId === 'layer-bg' || layerId.startsWith('layer-bg');
+      if (isBg) return 'color-32bit';
       const lyr = layers.find((l) => l.id === layerId);
-      const src = layerSourceCanvasesRef.current?.get(layerId);
-      const hasTiles = grid.hasLayerTiles(layerId);
-
-      if (lyr?.toneEnabled && src) {
-        grid.renderLayerToCanvas(layerId, src);
-        if (hasTiles) markCanvasPopulated(src);
-        markCanvasPopulated(canvas);
-      } else {
-        grid.renderLayerToCanvas(layerId, canvas);
-        if (hasTiles) markCanvasPopulated(canvas);
-        if (src) {
-          grid.renderLayerToCanvas(layerId, src);
-          if (hasTiles) markCanvasPopulated(src);
-        }
+      if (colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome') {
+        return 'monochrome-1bit';
       }
-      return canvas;
+      return 'color-32bit';
     },
-    [
-      flushPendingHistoryTasks,
-      layerCanvasesRef,
-      materializeLayerCanvas,
-      activeLayerId,
-      getActiveCanvas,
-      getGrid,
-      layers,
-      layerSourceCanvasesRef,
-      markCanvasPopulated,
-    ]
+    [colorMode, layers]
   );
 
   const selectionMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -181,41 +268,29 @@ export function useSelectionTools({
   const handleCommitFloatingSelection = useCallback(() => {
     if (!selection?.floating) return;
     const targetLayerId = selection.floating.layerId || activeLayerId;
-    const canvas =
-      layerCanvasesRef.current.get(targetLayerId) ||
-      materializeLayerCanvas?.(targetLayerId) ||
-      getActiveCanvas();
-    if (!canvas) return;
-
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-    commitFloatingSelection(canvas, selection.floating, sourceCanvas);
-    markCanvasPopulated(canvas);
-    markCanvasPopulated(sourceCanvas);
-
     const grid = getGrid();
-    const ctx = get2DContext(canvas);
-    if (ctx) {
-      const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      if (selection.floating.beforeImageData) {
-        pushHistoryStep(
-          'selection-move',
-          'Move Selection',
-          selection.floating.beforeImageData,
-          afterData,
-          targetLayerId
-        );
-      } else {
-        const lyr = layers.find((l) => l.id === targetLayerId);
-        const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-        grid.writeImageData(
-          targetLayerId,
-          afterData,
-          0,
-          0,
-          isMono ? 'monochrome-1bit' : 'color-32bit'
-        );
-      }
-      grid.notifyChange(true);
+    const targetFormat = resolveLayerFormat(targetLayerId);
+
+    const { dirtyRect, tileDeltas } = commitFloatingSelectionToTileGrid({
+      grid,
+      layerId: targetLayerId,
+      dimensions,
+      floating: selection.floating,
+      targetFormat,
+    });
+
+    releaseTemporaryCanvas(selection.floating.canvas);
+
+    if (tileDeltas.length > 0) {
+      pushHistoryStep(
+        'selection-move',
+        'Move Selection',
+        null,
+        null,
+        targetLayerId,
+        dirtyRect,
+        tileDeltas
+      );
     }
 
     updateLayerThumbnail(targetLayerId, true);
@@ -223,14 +298,9 @@ export function useSelectionTools({
   }, [
     selection,
     activeLayerId,
-    layers,
-    colorMode,
-    layerCanvasesRef,
-    materializeLayerCanvas,
-    getActiveCanvas,
-    layerSourceCanvasesRef,
-    markCanvasPopulated,
+    dimensions,
     getGrid,
+    resolveLayerFormat,
     pushHistoryStep,
     updateLayerThumbnail,
   ]);
@@ -244,211 +314,106 @@ export function useSelectionTools({
 
   const handleClearSelection = useCallback(() => {
     if (!selection) return;
+    flushPendingHistoryTasks?.();
     const grid = getGrid();
+
     if (selection.floating) {
       const targetLayerId = selection.floating.layerId || activeLayerId;
-      const canvas =
-        layerCanvasesRef.current.get(targetLayerId) ||
-        materializeLayerCanvas?.(targetLayerId) ||
-        getActiveCanvas();
-      if (canvas && selection.floating.beforeImageData) {
-        const ctx = get2DContext(canvas);
-        if (ctx) {
-          const afterData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      if (selection.floating.beforeTileSnapshot) {
+        const tileDeltas = grid.computeDeltasFromSnapshot(
+          selection.floating.beforeTileSnapshot,
+          targetLayerId
+        );
+        if (tileDeltas.length > 0) {
           pushHistoryStep(
             'clear',
             'Clear Selection',
-            selection.floating.beforeImageData,
-            afterData,
-            targetLayerId
+            null,
+            null,
+            targetLayerId,
+            selection.bounds,
+            tileDeltas
           );
-          grid.notifyChange(true);
         }
       }
+      releaseTemporaryCanvas(selection.floating.canvas);
+      grid.notifyChange(true);
+      updateLayerThumbnail(targetLayerId, true);
       setSelection(null);
       return;
     }
 
-    const canvas = getSyncedLayerCanvas(activeLayerId);
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
-
-    const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
     const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
+    const targetFormat = resolveLayerFormat(activeLayerId);
+    const { dirtyRect, tileDeltas } = clearSelectionInTileGrid({
+      grid,
+      layerId: activeLayerId,
+      dimensions,
+      selection,
+      isBackground: isBg,
+      targetFormat,
+    });
 
-    const clearOn = (target: HTMLCanvasElement) => {
-      const c = get2DContext(target);
-      if (!c) return;
-      c.save();
-      c.setTransform(1, 0, 0, 1, 0, 0);
-      if (selection.mask && selection.maskWidth && selection.maskHeight) {
-        const maskCanvas = document.createElement('canvas');
-        maskCanvas.width = selection.maskWidth;
-        maskCanvas.height = selection.maskHeight;
-        const mCtx = maskCanvas.getContext('2d');
-        if (mCtx) {
-          const mImg = mCtx.createImageData(selection.maskWidth, selection.maskHeight);
-          const count = Math.min(selection.mask.length, selection.maskWidth * selection.maskHeight);
-          for (let i = 0; i < count; i++) {
-            if (isBg) {
-              mImg.data[i * 4] = 255;
-              mImg.data[i * 4 + 1] = 255;
-              mImg.data[i * 4 + 2] = 255;
-            }
-            mImg.data[i * 4 + 3] = selection.mask[i];
-          }
-          mCtx.putImageData(mImg, 0, 0);
-          c.globalCompositeOperation = isBg ? 'source-over' : 'destination-out';
-          c.drawImage(maskCanvas, 0, 0);
-        }
-      } else if (selection.type === 'rect') {
-        if (isBg) {
-          c.fillStyle = '#ffffff';
-          c.fillRect(
-            selection.bounds.x,
-            selection.bounds.y,
-            selection.bounds.width,
-            selection.bounds.height
-          );
-        } else {
-          c.clearRect(
-            selection.bounds.x,
-            selection.bounds.y,
-            selection.bounds.width,
-            selection.bounds.height
-          );
-        }
-      } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
-        c.beginPath();
-        c.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-        for (let i = 1; i < selection.polygon.length; i++) {
-          c.lineTo(selection.polygon[i].x, selection.polygon[i].y);
-        }
-        c.closePath();
-        if (isBg) {
-          c.fillStyle = '#ffffff';
-          c.fill();
-        } else {
-          c.globalCompositeOperation = 'destination-out';
-          c.fillStyle = 'rgba(0, 0, 0, 1)';
-          c.fill();
-        }
-      }
-      c.restore();
-    };
-
-    clearOn(canvas);
-    if (sourceCanvas) clearOn(sourceCanvas);
-    markCanvasPopulated(canvas);
-    markCanvasPopulated(sourceCanvas);
-
-    const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    if (tileDeltas.length > 0) {
+      pushHistoryStep(
+        'clear',
+        'Clear Selection',
+        null,
+        null,
+        activeLayerId,
+        dirtyRect ?? undefined,
+        tileDeltas
+      );
+    }
     updateLayerThumbnail(activeLayerId, true);
-    pushHistoryStep('clear', 'Clear Selection', beforeImageData, afterImageData, activeLayerId);
-    grid.notifyChange(true);
   }, [
     selection,
+    flushPendingHistoryTasks,
     getGrid,
-    getSyncedLayerCanvas,
-    getActiveCanvas,
-    materializeLayerCanvas,
     activeLayerId,
-    layerCanvasesRef,
-    layerSourceCanvasesRef,
-    markCanvasPopulated,
+    dimensions,
+    resolveLayerFormat,
     updateLayerThumbnail,
     pushHistoryStep,
   ]);
 
   const handleFillSelectionColor = useCallback(() => {
     if (!selection) return;
-    const canvas = getSyncedLayerCanvas(activeLayerId);
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
-
+    flushPendingHistoryTasks?.();
+    const grid = getGrid();
     const primaryColor = useToolStore.getState().primaryColor;
-    const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+    const targetFormat = resolveLayerFormat(activeLayerId);
 
-    const fillOn = (target: HTMLCanvasElement) => {
-      const c = get2DContext(target);
-      if (!c) return;
-      c.save();
-      c.setTransform(1, 0, 0, 1, 0, 0);
-      if (selection.mask && selection.maskWidth && selection.maskHeight) {
-        const maskCanvas = document.createElement('canvas');
-        maskCanvas.width = selection.maskWidth;
-        maskCanvas.height = selection.maskHeight;
-        const mCtx = maskCanvas.getContext('2d');
-        if (mCtx) {
-          mCtx.fillStyle = primaryColor;
-          mCtx.fillRect(0, 0, selection.maskWidth, selection.maskHeight);
-          const mImg = mCtx.getImageData(0, 0, selection.maskWidth, selection.maskHeight);
-          const count = Math.min(selection.mask.length, selection.maskWidth * selection.maskHeight);
-          for (let i = 0; i < count; i++) {
-            mImg.data[i * 4 + 3] = Math.round((mImg.data[i * 4 + 3] * selection.mask[i]) / 255);
-          }
-          mCtx.putImageData(mImg, 0, 0);
-          c.drawImage(maskCanvas, 0, 0);
-        }
-      } else {
-        c.fillStyle = primaryColor;
-        if (selection.type === 'rect') {
-          c.fillRect(
-            selection.bounds.x,
-            selection.bounds.y,
-            selection.bounds.width,
-            selection.bounds.height
-          );
-        } else if (
-          selection.type === 'lasso' &&
-          selection.polygon &&
-          selection.polygon.length >= 3
-        ) {
-          c.beginPath();
-          c.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-          for (let i = 1; i < selection.polygon.length; i++) {
-            c.lineTo(selection.polygon[i].x, selection.polygon[i].y);
-          }
-          c.closePath();
-          c.fill();
-        }
-      }
-      c.restore();
-    };
+    const { dirtyRect, tileDeltas } = fillSelectionInTileGrid({
+      grid,
+      layerId: activeLayerId,
+      dimensions,
+      selection,
+      colorCss: primaryColor,
+      targetFormat,
+      alphaLocked: Boolean(activeLayer?.alphaLocked),
+    });
 
-    fillOn(canvas);
-    markCanvasPopulated(canvas);
-    if (sourceCanvas) {
-      fillOn(sourceCanvas);
-      markCanvasPopulated(sourceCanvas);
-      if (activeLayer?.toneEnabled) {
-        applyLayerEffects(
-          sourceCanvas,
-          canvas,
-          activeLayer,
-          dimensions.dpi ?? 600,
-          selection.bounds
-        );
-      }
+    if (tileDeltas.length > 0) {
+      pushHistoryStep(
+        'fill',
+        'Fill Selection',
+        null,
+        null,
+        activeLayerId,
+        dirtyRect ?? undefined,
+        tileDeltas
+      );
     }
-
-    const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
     updateLayerThumbnail(activeLayerId, true);
-    pushHistoryStep('fill', 'Fill Selection', beforeImageData, afterImageData, activeLayerId);
-    getGrid().notifyChange(true);
   }, [
     selection,
-    getSyncedLayerCanvas,
+    flushPendingHistoryTasks,
+    getGrid,
     activeLayerId,
     activeLayer,
-    layerSourceCanvasesRef,
-    markCanvasPopulated,
-    getGrid,
-    dimensions.dpi,
+    dimensions,
+    resolveLayerFormat,
     updateLayerThumbnail,
     pushHistoryStep,
   ]);
@@ -579,39 +544,33 @@ export function useSelectionTools({
       return;
     }
 
+    flushPendingHistoryTasks?.();
     const grid = getGrid();
 
     if (selection) {
       let floatCanvas = selection.floating?.canvas;
       const targetLayerId = selection.floating?.layerId || activeLayerId;
       const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
-      const canvas = floatCanvas
-        ? layerCanvasesRef.current.get(targetLayerId) ||
-          materializeLayerCanvas?.(targetLayerId) ||
-          getActiveCanvas()
-        : getSyncedLayerCanvas(targetLayerId);
-      if (!canvas) return;
-      const ctx = get2DContext(canvas);
-      if (!ctx) return;
+      const targetFormat = resolveLayerFormat(targetLayerId);
 
       let floatX = selection.floating?.x ?? selection.bounds.x;
       let floatY = selection.floating?.y ?? selection.bounds.y;
-      let beforeData = selection.floating?.beforeImageData;
+      let beforeTileSnapshot = selection.floating?.beforeTileSnapshot;
 
       if (!floatCanvas) {
-        const sourceCanvas = layerSourceCanvasesRef.current?.get(targetLayerId);
-        const lifted = liftSelectionToFloating(canvas, selection, sourceCanvas, isBg);
+        const lifted = liftSelectionFromTileGrid({
+          grid,
+          layerId: targetLayerId,
+          dimensions,
+          selection,
+          isBackground: isBg,
+          targetFormat,
+        });
         if (!lifted) return;
         floatCanvas = lifted.floatingCanvas;
         floatX = lifted.bounds.x;
         floatY = lifted.bounds.y;
-        beforeData = lifted.beforeImageData;
-        markCanvasPopulated(canvas);
-        markCanvasPopulated(sourceCanvas);
-        const targetLayer = layers.find((l) => l.id === targetLayerId);
-        const isMono = colorMode === 'monochrome' || targetLayer?.expressionColor === 'monochrome';
-        grid.ingestCanvas(targetLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-        grid.notifyChange(true);
+        beforeTileSnapshot = lifted.beforeTileSnapshot;
         updateLayerThumbnail(targetLayerId, true);
       }
 
@@ -626,7 +585,7 @@ export function useSelectionTools({
         active: true,
         layerId: targetLayerId,
         sourceCanvas: floatCanvas,
-        beforeImageData: beforeData || ctx.getImageData(0, 0, canvas.width, canvas.height),
+        beforeTileSnapshot: beforeTileSnapshot ?? new Map(),
         bounds: { x: floatX, y: floatY, width: floatCanvas.width, height: floatCanvas.height },
         x: floatX,
         y: floatY,
@@ -650,26 +609,14 @@ export function useSelectionTools({
         : [];
 
       if (isMultiLayer && multiTargetLayers.length > 1) {
-        const layerBeforeImages = new Map<string, ImageData>();
-        const layerSourceCanvases = new Map<string, HTMLCanvasElement>();
-
         let minX = Infinity;
         let minY = Infinity;
         let maxX = -Infinity;
         let maxY = -Infinity;
 
         for (const lyr of multiTargetLayers) {
-          const c = getSyncedLayerCanvas(lyr.id);
-          if (!c) continue;
-          const cCtx = get2DContext(c);
-          if (!cCtx) continue;
-          const bData = cCtx.getImageData(0, 0, c.width, c.height);
-          layerBeforeImages.set(lyr.id, bData);
-
-          const cb = getCanvasContentBounds(
-            c,
-            lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg')
-          );
+          const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
+          const cb = grid.getLayerContentBounds(lyr.id, dimensions, isLayerBg);
           if (cb) {
             minX = Math.min(minX, cb.x);
             minY = Math.min(minY, cb.y);
@@ -683,12 +630,15 @@ export function useSelectionTools({
           return;
         }
 
-        const b = {
+        const b: DirtyRect = {
           x: Math.max(0, minX),
           y: Math.max(0, minY),
           width: Math.max(1, maxX - minX),
           height: Math.max(1, maxY - minY),
         };
+
+        const layerBeforeSnapshots = new Map<string, Map<string, TileSnapshotEntry>>();
+        const layerSourceCanvases = new Map<string, HTMLCanvasElement>();
 
         const compositeCanvas = document.createElement('canvas');
         compositeCanvas.width = b.width;
@@ -697,19 +647,9 @@ export function useSelectionTools({
 
         const orderedLayers = multiTargetLayers.slice().reverse();
         for (const lyr of orderedLayers) {
-          const c = layerCanvasesRef.current.get(lyr.id);
-          if (!c) continue;
-          const cCtx = get2DContext(c);
-          if (!cCtx) continue;
-
-          const sCanvas = document.createElement('canvas');
-          sCanvas.width = b.width;
-          sCanvas.height = b.height;
-          const sCtx = get2DContext(sCanvas);
-          if (sCtx) {
-            sCtx.drawImage(c, -b.x, -b.y);
-            layerSourceCanvases.set(lyr.id, sCanvas);
-          }
+          const sCanvas = grid.createRegionCanvas(lyr.id, b);
+          if (!sCanvas) continue;
+          layerSourceCanvases.set(lyr.id, sCanvas);
 
           if (compCtx) {
             compCtx.save();
@@ -719,35 +659,9 @@ export function useSelectionTools({
           }
 
           const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
-          cCtx.save();
-          cCtx.setTransform(1, 0, 0, 1, 0, 0);
-          if (isLayerBg) {
-            cCtx.fillStyle = '#ffffff';
-            cCtx.fillRect(b.x, b.y, b.width, b.height);
-          } else {
-            cCtx.clearRect(b.x, b.y, b.width, b.height);
-          }
-          cCtx.restore();
-          markCanvasPopulated(c);
-
-          const existingSrc = layerSourceCanvasesRef.current?.get(lyr.id);
-          if (existingSrc) {
-            const escCtx = get2DContext(existingSrc);
-            if (escCtx) {
-              escCtx.save();
-              escCtx.setTransform(1, 0, 0, 1, 0, 0);
-              if (isLayerBg) {
-                escCtx.fillStyle = '#ffffff';
-                escCtx.fillRect(b.x, b.y, b.width, b.height);
-              } else {
-                escCtx.clearRect(b.x, b.y, b.width, b.height);
-              }
-              escCtx.restore();
-            }
-            markCanvasPopulated(existingSrc);
-          }
-          const isMono = colorMode === 'monochrome' || lyr.expressionColor === 'monochrome';
-          grid.ingestCanvas(lyr.id, c, isMono ? 'monochrome-1bit' : 'color-32bit');
+          const beforeSnap = new Map<string, TileSnapshotEntry>();
+          grid.clearRectInLayer(lyr.id, b, isLayerBg, beforeSnap, true);
+          layerBeforeSnapshots.set(lyr.id, beforeSnap);
           updateLayerThumbnail(lyr.id, true);
         }
         grid.notifyChange(true);
@@ -758,10 +672,9 @@ export function useSelectionTools({
           layerId: activeLayerId,
           layerIds: multiTargetLayers.map((l) => l.id),
           layerSourceCanvases,
-          layerBeforeImages,
+          layerBeforeSnapshots,
           sourceCanvas: compositeCanvas,
-          beforeImageData:
-            layerBeforeImages.get(activeLayerId) || Array.from(layerBeforeImages.values())[0],
+          beforeTileSnapshot: layerBeforeSnapshots.get(activeLayerId),
           bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
           x: b.x,
           y: b.y,
@@ -782,63 +695,22 @@ export function useSelectionTools({
       }
 
       const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
-      const canvas = getSyncedLayerCanvas(activeLayerId);
-      if (!canvas) return;
-      const ctx = get2DContext(canvas);
-      if (!ctx) return;
-
-      const beforeImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const contentBounds = getCanvasContentBounds(canvas, isBg);
+      const contentBounds = grid.getLayerContentBounds(activeLayerId, dimensions, isBg);
       let b = contentBounds;
       if (!b) {
         if (isBg) {
-          b = { x: 0, y: 0, width: canvas.width, height: canvas.height };
+          b = { x: 0, y: 0, width: dimensions.width, height: dimensions.height };
         } else {
           showToast('Active layer is empty');
           return;
         }
       }
 
-      const sourceCanvas = document.createElement('canvas');
-      sourceCanvas.width = b.width;
-      sourceCanvas.height = b.height;
-      const sCtx = get2DContext(sourceCanvas);
-      if (sCtx) {
-        const sliceData = ctx.getImageData(b.x, b.y, b.width, b.height);
-        sCtx.putImageData(sliceData, 0, 0);
-      }
+      const sourceCanvas = grid.createRegionCanvas(activeLayerId, b);
+      if (!sourceCanvas) return;
 
-      ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      if (isBg) {
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(b.x, b.y, b.width, b.height);
-      } else {
-        ctx.clearRect(b.x, b.y, b.width, b.height);
-      }
-      ctx.restore();
-      markCanvasPopulated(canvas);
-
-      const existingSourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
-      if (existingSourceCanvas) {
-        const escCtx = get2DContext(existingSourceCanvas);
-        if (escCtx) {
-          escCtx.save();
-          escCtx.setTransform(1, 0, 0, 1, 0, 0);
-          if (isBg) {
-            escCtx.fillStyle = '#ffffff';
-            escCtx.fillRect(b.x, b.y, b.width, b.height);
-          } else {
-            escCtx.clearRect(b.x, b.y, b.width, b.height);
-          }
-          escCtx.restore();
-        }
-        markCanvasPopulated(existingSourceCanvas);
-      }
-
-      const isMono = colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-      grid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-      grid.notifyChange(true);
+      const beforeTileSnapshot = new Map<string, TileSnapshotEntry>();
+      grid.clearRectInLayer(activeLayerId, b, isBg, beforeTileSnapshot, false);
       updateLayerThumbnail(activeLayerId, true);
 
       const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
@@ -846,7 +718,7 @@ export function useSelectionTools({
         active: true,
         layerId: activeLayerId,
         sourceCanvas,
-        beforeImageData,
+        beforeTileSnapshot,
         bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
         x: b.x,
         y: b.y,
@@ -866,19 +738,15 @@ export function useSelectionTools({
     toolStoreActions.setToolRaw('transform');
   }, [
     transformSession,
+    flushPendingHistoryTasks,
     getGrid,
-    getSyncedLayerCanvas,
-    materializeLayerCanvas,
-    getActiveCanvas,
-    markCanvasPopulated,
+    resolveLayerFormat,
+    dimensions,
     selection,
     activeLayerId,
     activeLayer,
-    colorMode,
     selectedLayerIds,
     layers,
-    layerCanvasesRef,
-    layerSourceCanvasesRef,
     updateLayerThumbnail,
     showToast,
   ]);
@@ -893,164 +761,85 @@ export function useSelectionTools({
       transformSession.layerSourceCanvases
     ) {
       for (const lId of transformSession.layerIds) {
-        const c = layerCanvasesRef.current.get(lId) || materializeLayerCanvas?.(lId);
         const sCanvas = transformSession.layerSourceCanvases.get(lId);
-        if (!c || !sCanvas) continue;
-        const cCtx = get2DContext(c);
-        if (!cCtx) continue;
+        if (!sCanvas) continue;
+        const targetFormat = resolveLayerFormat(lId);
+        const beforeSnap = new Map<string, TileSnapshotEntry>(
+          transformSession.layerBeforeSnapshots?.get(lId) ?? []
+        );
 
-        const drawLayerTransformed = (targetCtx: CanvasRenderingContext2D) => {
-          targetCtx.save();
-          targetCtx.setTransform(1, 0, 0, 1, 0, 0);
-          if (transformSession.mode === 'perspective' && transformSession.perspectiveQuad) {
-            renderPerspectiveQuad(targetCtx, sCanvas, transformSession.perspectiveQuad, 24);
-          } else if (transformSession.mode === 'mesh' && transformSession.meshPoints) {
-            renderMeshWarp(targetCtx, sCanvas, transformSession.meshPoints, 6);
-          } else {
-            const cx = transformSession.x + transformSession.width / 2;
-            const cy = transformSession.y + transformSession.height / 2;
-            targetCtx.translate(cx, cy);
-            targetCtx.rotate((transformSession.rotation * Math.PI) / 180);
-            targetCtx.scale(transformSession.flipH ? -1 : 1, transformSession.flipV ? -1 : 1);
-            targetCtx.drawImage(
-              sCanvas,
-              -transformSession.width / 2,
-              -transformSession.height / 2,
-              transformSession.width,
-              transformSession.height
-            );
-          }
-          targetCtx.restore();
-        };
+        const destRect = compositeTransformedIntoTileGrid(
+          grid,
+          lId,
+          sCanvas,
+          transformSession,
+          dimensions,
+          targetFormat,
+          beforeSnap
+        );
 
-        drawLayerTransformed(cCtx);
-        markCanvasPopulated(c);
-
-        const existingSrc = layerSourceCanvasesRef.current?.get(lId);
-        if (existingSrc) {
-          const sCtx = get2DContext(existingSrc);
-          if (sCtx) drawLayerTransformed(sCtx);
-          markCanvasPopulated(existingSrc);
-        }
-
-        const lyr = layers.find((l) => l.id === lId);
-        if (lyr?.toneEnabled && existingSrc) {
-          applyScreentone(existingSrc, c, {
-            frequency: lyr.toneFrequency ?? 60,
-            angle: lyr.toneAngle ?? 45,
-            dotShape: lyr.toneDotShape ?? 'circle',
-            dpi: dimensions.dpi ?? 600,
-          });
-        }
-
-        const beforeDataForLayer = transformSession.layerBeforeImages?.get(lId);
-        const afterDataForLayer = cCtx.getImageData(0, 0, c.width, c.height);
-        const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-        grid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
-        if (beforeDataForLayer) {
+        const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnap, lId);
+        if (tileDeltas.length > 0) {
           pushHistoryStep(
             'transform',
             'Batch Free Transform',
-            beforeDataForLayer,
-            afterDataForLayer,
-            lId
+            null,
+            null,
+            lId,
+            destRect ?? undefined,
+            tileDeltas
           );
         }
+        releaseTemporaryCanvas(sCanvas);
         updateLayerThumbnail(lId, true);
       }
 
+      releaseTemporaryCanvas(transformSession.sourceCanvas);
       grid.notifyChange(true);
       setTransformSession(null);
       toolStoreActions.setToolRaw('brush');
       return;
     }
 
-    const canvas =
-      layerCanvasesRef.current.get(transformSession.layerId) ||
-      materializeLayerCanvas?.(transformSession.layerId) ||
-      getActiveCanvas();
-    if (!canvas) return;
-    const ctx = get2DContext(canvas);
-    if (!ctx) return;
+    const targetLayerId = transformSession.layerId;
+    const targetFormat = resolveLayerFormat(targetLayerId);
+    const beforeSnap = new Map<string, TileSnapshotEntry>(
+      transformSession.beforeTileSnapshot ?? []
+    );
 
-    const sourceCanvas = layerSourceCanvasesRef.current?.get(transformSession.layerId);
+    const destRect = compositeTransformedIntoTileGrid(
+      grid,
+      targetLayerId,
+      transformSession.sourceCanvas,
+      transformSession,
+      dimensions,
+      targetFormat,
+      beforeSnap
+    );
 
-    const drawTransformed = (targetCtx: CanvasRenderingContext2D) => {
-      targetCtx.save();
-      targetCtx.setTransform(1, 0, 0, 1, 0, 0);
-      if (transformSession.mode === 'perspective' && transformSession.perspectiveQuad) {
-        renderPerspectiveQuad(
-          targetCtx,
-          transformSession.sourceCanvas,
-          transformSession.perspectiveQuad,
-          24
-        );
-      } else if (transformSession.mode === 'mesh' && transformSession.meshPoints) {
-        renderMeshWarp(targetCtx, transformSession.sourceCanvas, transformSession.meshPoints, 6);
-      } else {
-        const cx = transformSession.x + transformSession.width / 2;
-        const cy = transformSession.y + transformSession.height / 2;
-        targetCtx.translate(cx, cy);
-        targetCtx.rotate((transformSession.rotation * Math.PI) / 180);
-        targetCtx.scale(transformSession.flipH ? -1 : 1, transformSession.flipV ? -1 : 1);
-        targetCtx.drawImage(
-          transformSession.sourceCanvas,
-          -transformSession.width / 2,
-          -transformSession.height / 2,
-          transformSession.width,
-          transformSession.height
-        );
-      }
-      targetCtx.restore();
-    };
-
-    drawTransformed(ctx);
-    markCanvasPopulated(canvas);
-    if (sourceCanvas) {
-      const sCtx = get2DContext(sourceCanvas);
-      if (sCtx) drawTransformed(sCtx);
-      markCanvasPopulated(sourceCanvas);
-    }
-
-    const layer = layers.find((l) => l.id === transformSession.layerId);
-    if (layer?.toneEnabled && sourceCanvas) {
-      applyScreentone(sourceCanvas, canvas, {
-        frequency: layer.toneFrequency ?? 60,
-        angle: layer.toneAngle ?? 45,
-        dotShape: layer.toneDotShape ?? 'circle',
-        dpi: dimensions.dpi ?? 600,
-      });
-    }
-
-    const afterImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    if (transformSession.beforeImageData) {
+    const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnap, targetLayerId);
+    if (tileDeltas.length > 0) {
       pushHistoryStep(
         'transform',
         'Free Transform',
-        transformSession.beforeImageData,
-        afterImageData,
-        transformSession.layerId
+        null,
+        null,
+        targetLayerId,
+        destRect ?? undefined,
+        tileDeltas
       );
-    } else {
-      const isMono = colorMode === 'monochrome' || layer?.expressionColor === 'monochrome';
-      grid.ingestCanvas(transformSession.layerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
     }
-    grid.notifyChange(true);
 
-    updateLayerThumbnail(transformSession.layerId, true);
+    releaseTemporaryCanvas(transformSession.sourceCanvas);
+    grid.notifyChange(true);
+    updateLayerThumbnail(targetLayerId, true);
     setTransformSession(null);
     toolStoreActions.setToolRaw('brush');
   }, [
     transformSession,
     getGrid,
-    colorMode,
-    layerCanvasesRef,
-    materializeLayerCanvas,
-    getActiveCanvas,
-    markCanvasPopulated,
-    layers,
-    layerSourceCanvasesRef,
-    dimensions.dpi,
+    resolveLayerFormat,
+    dimensions,
     pushHistoryStep,
     updateLayerThumbnail,
   ]);
@@ -1059,90 +848,31 @@ export function useSelectionTools({
     if (!transformSession) return;
     const grid = getGrid();
 
-    if (transformSession.layerBeforeImages && transformSession.layerBeforeImages.size > 0) {
-      for (const [lId, beforeData] of transformSession.layerBeforeImages.entries()) {
-        const c = layerCanvasesRef.current.get(lId) || materializeLayerCanvas?.(lId);
-        if (c && beforeData) {
-          const ctx = get2DContext(c);
-          ctx?.putImageData(beforeData, 0, 0);
-          markCanvasPopulated(c);
-
-          const lyr = layers.find((l) => l.id === lId);
-          const sourceCanvas = layerSourceCanvasesRef.current?.get(lId);
-          if (sourceCanvas) {
-            const sCtx = get2DContext(sourceCanvas);
-            sCtx?.putImageData(beforeData, 0, 0);
-            markCanvasPopulated(sourceCanvas);
-
-            if (lyr?.toneEnabled) {
-              applyScreentone(sourceCanvas, c, {
-                frequency: lyr.toneFrequency ?? 60,
-                angle: lyr.toneAngle ?? 45,
-                dotShape: lyr.toneDotShape ?? 'circle',
-                dpi: dimensions.dpi ?? 600,
-              });
-            }
-          }
-          const isMono = colorMode === 'monochrome' || lyr?.expressionColor === 'monochrome';
-          grid.ingestCanvas(lId, c, isMono ? 'monochrome-1bit' : 'color-32bit');
-          updateLayerThumbnail(lId, true);
+    if (transformSession.layerBeforeSnapshots && transformSession.layerBeforeSnapshots.size > 0) {
+      for (const [lId, beforeSnap] of transformSession.layerBeforeSnapshots.entries()) {
+        grid.restoreLayerSnapshot(lId, beforeSnap, true);
+        updateLayerThumbnail(lId, true);
+      }
+      if (transformSession.layerSourceCanvases) {
+        for (const sCanvas of transformSession.layerSourceCanvases.values()) {
+          releaseTemporaryCanvas(sCanvas);
         }
       }
+      releaseTemporaryCanvas(transformSession.sourceCanvas);
       grid.notifyChange(true);
       setTransformSession(null);
       toolStoreActions.setToolRaw('brush');
       return;
     }
 
-    const canvas =
-      layerCanvasesRef.current.get(transformSession.layerId) ||
-      materializeLayerCanvas?.(transformSession.layerId) ||
-      getActiveCanvas();
-    if (canvas && transformSession.beforeImageData) {
-      const ctx = get2DContext(canvas);
-      ctx?.putImageData(transformSession.beforeImageData, 0, 0);
-      markCanvasPopulated(canvas);
-
-      const layer = layers.find((l) => l.id === transformSession.layerId);
-      const sourceCanvas = layerSourceCanvasesRef.current?.get(transformSession.layerId);
-      if (sourceCanvas) {
-        const sCtx = get2DContext(sourceCanvas);
-        sCtx?.putImageData(transformSession.beforeImageData, 0, 0);
-        markCanvasPopulated(sourceCanvas);
-
-        if (layer?.toneEnabled) {
-          applyScreentone(sourceCanvas, canvas, {
-            frequency: layer.toneFrequency ?? 60,
-            angle: layer.toneAngle ?? 45,
-            dotShape: layer.toneDotShape ?? 'circle',
-            dpi: dimensions.dpi ?? 600,
-          });
-        }
-      }
-      const isMono = colorMode === 'monochrome' || layer?.expressionColor === 'monochrome';
-      grid.ingestCanvas(
-        transformSession.layerId,
-        canvas,
-        isMono ? 'monochrome-1bit' : 'color-32bit'
-      );
-      grid.notifyChange(true);
+    if (transformSession.beforeTileSnapshot) {
+      grid.restoreLayerSnapshot(transformSession.layerId, transformSession.beforeTileSnapshot, false);
       updateLayerThumbnail(transformSession.layerId, true);
     }
+    releaseTemporaryCanvas(transformSession.sourceCanvas);
     setTransformSession(null);
     toolStoreActions.setToolRaw('brush');
-  }, [
-    transformSession,
-    getGrid,
-    colorMode,
-    layerCanvasesRef,
-    materializeLayerCanvas,
-    getActiveCanvas,
-    markCanvasPopulated,
-    layers,
-    layerSourceCanvasesRef,
-    dimensions.dpi,
-    updateLayerThumbnail,
-  ]);
+  }, [transformSession, getGrid, updateLayerThumbnail]);
 
   const handleSelectionPointerDown = useCallback(
     (e: React.PointerEvent<HTMLElement>, pt: { x: number; y: number }): boolean => {
@@ -1158,29 +888,18 @@ export function useSelectionTools({
         const py = Math.floor(pt.y);
         if (px < 0 || px >= dimensions.width || py < 0 || py >= dimensions.height) return true;
 
-        let sampleCanvas: HTMLCanvasElement | null = null;
-        if (wandSettings.referMode === 'all') {
-          flushPendingHistoryTasks?.();
-          sampleCanvas = compositeVisibleLayers(layers, layerCanvasesRef.current, dimensions, getGrid());
-        } else if (wandSettings.referMode === 'reference') {
-          const refLayer = layers.find((l) => l.isReference && l.visible);
-          if (refLayer) {
-            sampleCanvas = getSyncedLayerCanvas(refLayer.id);
-          } else {
-            sampleCanvas = getSyncedLayerCanvas(activeLayerId);
-          }
-        } else {
-          sampleCanvas = getSyncedLayerCanvas(activeLayerId);
-        }
-
-        if (!sampleCanvas) return true;
-        const sCtx = get2DContext(sampleCanvas);
-        if (!sCtx) return true;
-
+        flushPendingHistoryTasks?.();
         const w = dimensions.width;
         const h = dimensions.height;
-        const sampleImageData = sCtx.getImageData(0, 0, w, h);
-        const { mask, bounds } = floodSelectWand(sampleImageData, w, h, px, py, wandSettings);
+        const { mask, bounds } = floodSelectWandOnTileGrid({
+          grid: getGrid(),
+          layers,
+          activeLayerId,
+          dimensions,
+          startX: px,
+          startY: py,
+          settings: wandSettings,
+        });
 
         if (!bounds || bounds.width === 0 || bounds.height === 0) {
           setSelection(null);
@@ -1287,19 +1006,19 @@ export function useSelectionTools({
         e.preventDefault();
         if (selection && isPointInSelection(pt.x, pt.y, selection)) {
           if (!selection.floating) {
-            const canvas = getSyncedLayerCanvas(activeLayerId);
-            if (!canvas) return true;
-            const sourceCanvas = layerSourceCanvasesRef.current?.get(activeLayerId);
+            flushPendingHistoryTasks?.();
+            const grid = getGrid();
             const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
-            const lifted = liftSelectionToFloating(canvas, selection, sourceCanvas, isBg);
+            const targetFormat = resolveLayerFormat(activeLayerId);
+            const lifted = liftSelectionFromTileGrid({
+              grid,
+              layerId: activeLayerId,
+              dimensions,
+              selection,
+              isBackground: isBg,
+              targetFormat,
+            });
             if (lifted) {
-              markCanvasPopulated(canvas);
-              markCanvasPopulated(sourceCanvas);
-              const grid = getGrid();
-              const isMono =
-                colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome';
-              grid.ingestCanvas(activeLayerId, canvas, isMono ? 'monochrome-1bit' : 'color-32bit');
-              grid.notifyChange(true);
               updateLayerThumbnail(activeLayerId, true);
               const floatingObj = {
                 canvas: lifted.floatingCanvas,
@@ -1308,7 +1027,7 @@ export function useSelectionTools({
                 origX: lifted.bounds.x,
                 origY: lifted.bounds.y,
                 layerId: activeLayerId,
-                beforeImageData: lifted.beforeImageData,
+                beforeTileSnapshot: lifted.beforeTileSnapshot,
               };
               setSelection({
                 ...selection,
@@ -1367,15 +1086,10 @@ export function useSelectionTools({
       handleCommitFloatingSelection,
       flushPendingHistoryTasks,
       getGrid,
-      getSyncedLayerCanvas,
-      markCanvasPopulated,
+      resolveLayerFormat,
       dimensions,
       layers,
-      layerCanvasesRef,
       activeLayerId,
-      layerSourceCanvasesRef,
-      colorMode,
-      activeLayer,
       updateLayerThumbnail,
     ]
   );

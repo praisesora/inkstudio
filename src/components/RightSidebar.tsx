@@ -21,6 +21,7 @@ import {
   Frame,
   Type,
   MessageSquare,
+  Shield,
 } from 'lucide-react';
 import {
   HistoryItemMeta,
@@ -129,6 +130,8 @@ export interface RightSidebarProps {
   onSetOpacity: (id: string, opacity: number) => void;
   onSetBlendMode: (id: string, blendMode: BlendMode) => void;
   onToggleLock: (id: string) => void;
+  onToggleOwnerLock?: (id: string) => void;
+  isCollabActive?: boolean;
   onToggleAlphaLock?: (id: string) => void;
   onToggleClipping?: (id: string) => void;
   onToggleCollapse: (id: string) => void;
@@ -229,6 +232,8 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onSetOpacity,
   onSetBlendMode,
   onToggleLock,
+  onToggleOwnerLock,
+  isCollabActive = false,
   onToggleAlphaLock,
   onToggleClipping,
   onToggleCollapse,
@@ -770,6 +775,24 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                             <Unlock className="w-3 h-3" />
                           )}
                         </button>
+                        {isCollabActive && onToggleOwnerLock && activeLayer.id !== 'layer-bg' && (
+                          <button
+                            type="button"
+                            onClick={() => onToggleOwnerLock(activeLayer.id)}
+                            title={
+                              activeLayer.reservedByPeerId
+                                ? `Owner-Locked by ${activeLayer.reservedByPeerName || 'Owner'} (click to unlock)`
+                                : 'Lock Layer to Owner (prevents edits by other peers)'
+                            }
+                            className={`w-5 h-5 rounded flex items-center justify-center transition-colors cursor-pointer ${
+                              activeLayer.reservedByPeerId
+                                ? 'bg-amber-500/20 text-amber-300'
+                                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+                            }`}
+                          >
+                            <Shield className="w-3 h-3" />
+                          </button>
+                        )}
                       </div>
 
                       <div className="flex items-center gap-0.5">
@@ -1127,6 +1150,14 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                           {layer.toneEnabled && <span>{layer.toneFrequency ?? 60}L</span>}
                           {hasStyles && <span>fx</span>}
                           {layer.opacity < 0.99 && <span>{Math.round(layer.opacity * 100)}%</span>}
+                          {layer.reservedByPeerId && (
+                            <span
+                              title={`Locked by ${layer.reservedByPeerName || 'owner'}`}
+                              className="text-amber-400 flex items-center"
+                            >
+                              <Shield className="w-2.5 h-2.5" />
+                            </span>
+                          )}
                           {layer.locked && <Lock className="w-2.5 h-2.5" />}
                         </div>
                       </div>

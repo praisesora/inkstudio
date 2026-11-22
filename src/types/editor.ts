@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { PerspectiveRuler, StraightRuler } from './perspective';
-import type { SparseTileGrid } from '../utils/tileEngine';
+import type { SparseTileGrid, TileSnapshotEntry } from '../utils/tileEngine';
 export type {
   ShapeKind,
   ShapeDrawMode,
@@ -360,7 +360,6 @@ export interface DocumentTab {
   } | null;
   layers: LayerItem[];
   activeLayerId: string;
-  layerCanvasesMap?: Map<string, HTMLCanvasElement>;
   historyList?: HistoryItemMeta[];
   historyIndex?: number;
   perspectiveRuler?: PerspectiveRuler | null;
@@ -536,6 +535,7 @@ export interface CanvasSelection {
     origY: number;
     layerId: string;
     beforeImageData?: ImageData;
+    beforeTileSnapshot?: Map<string, TileSnapshotEntry>;
   } | null;
 }
 
@@ -543,7 +543,8 @@ export interface TransformSession {
   active: boolean;
   layerId: string;
   sourceCanvas: HTMLCanvasElement;
-  beforeImageData: ImageData;
+  beforeImageData?: ImageData;
+  beforeTileSnapshot?: Map<string, TileSnapshotEntry>;
   bounds: { x: number; y: number; width: number; height: number };
   x: number;
   y: number;
@@ -561,26 +562,41 @@ export interface TransformSession {
   layerIds?: string[];
   layerSourceCanvases?: Map<string, HTMLCanvasElement>;
   layerBeforeImages?: Map<string, ImageData>;
+  layerBeforeSnapshots?: Map<string, Map<string, TileSnapshotEntry>>;
 }
 
-export type BlendMode =
-  | 'normal'
-  | 'multiply'
-  | 'screen'
-  | 'overlay'
-  | 'darken'
-  | 'lighten'
-  | 'color-dodge'
-  | 'color-burn'
-  | 'hard-light'
-  | 'soft-light'
-  | 'difference'
-  | 'exclusion'
-  | 'pass-through'
-  | 'linear-burn'
-  | 'add-glow'
-  | 'color-dodge-glow'
-  | 'divide';
+export const ALL_BLEND_MODES = [
+  'normal',
+  'multiply',
+  'screen',
+  'overlay',
+  'darken',
+  'lighten',
+  'color-dodge',
+  'color-burn',
+  'hard-light',
+  'soft-light',
+  'difference',
+  'exclusion',
+  'pass-through',
+  'linear-burn',
+  'add-glow',
+  'color-dodge-glow',
+  'divide',
+  'vivid-light',
+  'linear-light',
+  'pin-light',
+  'hard-mix',
+  'subtract',
+  'darker-color',
+  'lighter-color',
+  'hue',
+  'saturation',
+  'color',
+  'luminosity',
+] as const;
+
+export type BlendMode = (typeof ALL_BLEND_MODES)[number];
 
 export interface HistoryItemMeta {
   id: string;
@@ -800,7 +816,9 @@ export interface LayerItem {
   balloonData?: SpeechBalloon;
   // Legacy Speech Balloon array
   balloons?: SpeechBalloon[];
-  // Collaborative Layer Soft-Locking
+  // Collaborative Layer Ownership & Owner-Locking
+  ownerPeerId?: string | number;
+  ownerPeerName?: string;
   reservedByPeerId?: string | number;
   reservedByPeerName?: string;
 }
@@ -874,7 +892,7 @@ export interface NewCanvasOptions {
   defaultFrequency?: number;
 }
 
-export interface SoraTimelapseMetadata {
+export interface InkTimelapseMetadata {
   enabled: boolean;
   frameCount: number;
   fps?: number;
@@ -891,7 +909,7 @@ export interface LoadedDocument {
   tileGrid?: SparseTileGrid;
   perspectiveRuler?: PerspectiveRuler | null;
   animationTimeline?: AnimationTimeline | null;
-  timelapse?: SoraTimelapseMetadata | null;
+  timelapse?: InkTimelapseMetadata | null;
   previewDataUrl?: string;
 }
 

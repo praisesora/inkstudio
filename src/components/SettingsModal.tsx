@@ -31,6 +31,8 @@ import {
   MouseWheelAction,
   ModernAccentColor,
   MODERN_ACCENTS,
+  NICKNAME_CUSTOMIZED_STORAGE_KEY,
+  NICKNAME_STORAGE_KEY,
   ShortcutCategory,
   resolveModernAccentColor,
 } from '../types/settings';
@@ -498,8 +500,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     onChange={(e) => {
                       const val = e.target.value;
                       handleChange('userName', val);
-                      safeLocalStorageSetItem('sora_paint_nickname', val, 'artist name');
-                      safeLocalStorageSetItem('ink_nickname_customized', val.trim() ? '1' : '0', 'artist name flag');
+                      safeLocalStorageSetItem(NICKNAME_STORAGE_KEY, val, 'artist name');
+                      safeLocalStorageSetItem(NICKNAME_CUSTOMIZED_STORAGE_KEY, val.trim() ? '1' : '0', 'artist name flag');
                     }}
                     placeholder="Artist"
                     className="w-full bg-[#161616] px-3 py-1.5 rounded text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"

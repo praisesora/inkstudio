@@ -23,6 +23,7 @@ import { importBrushFile, isSupportedBrushFileName } from '../utils/inkbBrushFor
 import { documentStore } from '../utils/documentStore';
 import { shortcutManager } from '../utils/shortcutManager';
 import { recoveryService, CrashedSessionInfo } from '../services/recoveryService';
+import { multiplayerService } from '../services/multiplayerService';
 import {
   documentStoreActions,
   toolStoreActions,
@@ -45,7 +46,6 @@ export interface UseDocumentLifecycleParams {
   layers: LayerItem[];
   activeLayer: LayerItem | undefined;
   activeLayerId: string;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   getEffectiveOpacity: (layer: LayerItem) => number;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   setActiveLayerId: (id: string) => void;
@@ -84,7 +84,6 @@ export function useDocumentLifecycle({
   layers,
   activeLayer,
   activeLayerId,
-  layerCanvasesRef,
   getEffectiveOpacity,
   isLayerEffectivelyVisible,
   setActiveLayerId,
@@ -279,6 +278,9 @@ export function useDocumentLifecycle({
       needsAdaptiveFitRef.current = true;
       resetZoomAndCenter(newDims);
       resetHistory();
+      if (multiplayerService.isConnected()) {
+        multiplayerService.sendCanvasResize(newDims, options);
+      }
       showToast(`Canvas resized to ${newDims.width} × ${newDims.height} px`);
     },
     [resetHistory, resetZoomAndCenter, resizeCanvas, showToast]
@@ -370,7 +372,14 @@ export function useDocumentLifecycle({
           isSaved: true,
         }).catch(console.warn);
 
-        showToast(`Opened ${file.name}`);
+        const openedExt = file.name.includes('.')
+          ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+          : '';
+        showToast(
+          openedExt === '.sora'
+            ? `Migrated legacy ${file.name} (read-only) — save as .ink`
+            : `Opened ${file.name}`
+        );
       } catch (err: unknown) {
         console.error('Failed to open file:', err);
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -611,7 +620,6 @@ export function useDocumentLifecycle({
         dimensions,
         colorMode,
         layers,
-        layerCanvasesMap: layerCanvasesRef.current,
         tileGrid: documentStore.getActiveTileGrid(),
         getEffectiveOpacity,
         isLayerEffectivelyVisible,
@@ -632,7 +640,6 @@ export function useDocumentLifecycle({
       documentName,
       getEffectiveOpacity,
       isLayerEffectivelyVisible,
-      layerCanvasesRef,
       layers,
     ]
   );
@@ -643,9 +650,14 @@ export function useDocumentLifecycle({
     };
     const docData = buildSaveData(onProgress);
 
-    if (!savedFileInfo?.handle) {
+    const preferredExt =
+      savedFileInfo?.extension && savedFileInfo.extension.toLowerCase() !== '.sora'
+        ? savedFileInfo.extension
+        : '.ink';
+
+    if (!savedFileInfo?.handle || savedFileInfo.extension?.toLowerCase() === '.sora') {
       try {
-        const info = await promptSaveAs(docData, savedFileInfo?.extension || '.sora');
+        const info = await promptSaveAs(docData, preferredExt);
         documentStoreActions.setSavedFileInfo(info);
         documentStoreActions.setDocumentName(info.name);
         documentStoreActions.setDocuments((prev) =>
@@ -695,7 +707,7 @@ export function useDocumentLifecycle({
       } catch (err: unknown) {
         console.warn('Direct handle save failed, prompting with Save As:', err);
         try {
-          const info = await promptSaveAs(docData, savedFileInfo.extension || '.sora');
+          const info = await promptSaveAs(docData, preferredExt);
           documentStoreActions.setSavedFileInfo(info);
           documentStoreActions.setDocumentName(info.name);
           documentStoreActions.setDocuments((prev) =>
@@ -733,7 +745,10 @@ export function useDocumentLifecycle({
     const docData = buildSaveData(onProgress);
 
     try {
-      const defaultExt = savedFileInfo?.extension || '.sora';
+      const defaultExt =
+        savedFileInfo?.extension && savedFileInfo.extension.toLowerCase() !== '.sora'
+          ? savedFileInfo.extension
+          : '.ink';
       const info = await promptSaveAs(docData, defaultExt);
       documentStoreActions.setSavedFileInfo(info);
       documentStoreActions.setDocumentName(info.name);
@@ -853,7 +868,6 @@ export function useDocumentLifecycle({
 export interface DocumentLifecycleManagerProps {
   layers: LayerItem[];
   activeLayerId: string;
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
   needsAdaptiveFitRef: React.MutableRefObject<boolean>;
   pendingFitDimsRef: React.MutableRefObject<CanvasDimensions | null>;
   resetToNewCanvas: (
@@ -876,7 +890,6 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
   ({
     layers,
     activeLayerId,
-    layerCanvasesRef,
     needsAdaptiveFitRef,
     pendingFitDimsRef,
     resetToNewCanvas,
@@ -1035,7 +1048,7 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
           }
         }
       );
-    }, [activeDocumentId, layerCanvasesRef]);
+    }, [activeDocumentId]);
 
     // 5. Keep active document tab's metadata in sync
     useEffect(() => {

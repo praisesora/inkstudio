@@ -10,6 +10,7 @@ import {
 } from '../../types/editor';
 import { SparseTileGrid, releaseTemporaryCanvas } from '../../utils/tileEngine';
 import { documentStore } from '../../utils/documentStore';
+import { multiplayerService } from '../../services/multiplayerService';
 import {
   applyVectorEraser,
   computeStrokeBounds,
@@ -35,7 +36,6 @@ export interface CommitVectorStrokeArgs {
   strokeColor: string;
   dims: CanvasDimensions;
   grid: SparseTileGrid;
-  canvas: HTMLCanvasElement | null;
   mergedDirty: { minX: number; minY: number; maxX: number; maxY: number } | null;
   strokeId: string | null;
   pushHistoryStep: PushHistoryStepFn;
@@ -52,7 +52,6 @@ export function commitVectorStrokeOrErase({
   strokeColor,
   dims,
   grid,
-  canvas,
   mergedDirty,
   strokeId,
   pushHistoryStep,
@@ -116,14 +115,6 @@ export function commitVectorStrokeOrErase({
         );
       }
       releaseTemporaryCanvas(tempVec);
-      if (canvas) {
-        grid.renderLayerToCanvas(currentLayerId, canvas, {
-          x: vx,
-          y: vy,
-          width: vw,
-          height: vh,
-        });
-      }
     }
 
     pushHistoryStep(
@@ -140,6 +131,9 @@ export function commitVectorStrokeOrErase({
       undefined,
       strokeId || undefined
     );
+    if (multiplayerService.isConnected()) {
+      multiplayerService.sendLayerUpdate(currentLayerId, { vectorStrokes: updatedStrokes });
+    }
     return undefined;
   }
 
@@ -189,14 +183,6 @@ export function commitVectorStrokeOrErase({
       );
     }
     releaseTemporaryCanvas(tempVec);
-    if (canvas) {
-      grid.renderLayerToCanvas(currentLayerId, canvas, {
-        x: vx,
-        y: vy,
-        width: vw,
-        height: vh,
-      });
-    }
   }
 
   pushHistoryStep(
@@ -220,8 +206,8 @@ export function commitVectorStrokeOrErase({
 export interface UseVectorDrawingParams {
   activeLayer: LayerItem | undefined;
   activeLayerId: string;
+  dimensions: CanvasDimensions;
   colorMode: CanvasColorMode;
-  getActiveCanvas: () => HTMLCanvasElement | null;
   getCanvasCoords: (e: React.PointerEvent<HTMLElement> | PointerEvent) => { x: number; y: number };
   updateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   pushHistoryStep: PushHistoryStepFn;
@@ -238,8 +224,8 @@ export interface UseVectorDrawingResult {
 export function useVectorDrawing({
   activeLayer,
   activeLayerId,
+  dimensions,
   colorMode,
-  getActiveCanvas,
   getCanvasCoords,
   updateLayerThumbnail,
   pushHistoryStep,
@@ -277,6 +263,19 @@ export function useVectorDrawing({
       const vectorEditSettings = useToolStore.getState().vectorEditSettings;
       const radius = vectorEditSettings.radius || 35;
       let updated = false;
+      let dirtyMinX = Infinity;
+      let dirtyMinY = Infinity;
+      let dirtyMaxX = -Infinity;
+      let dirtyMaxY = -Infinity;
+
+      const expandDirty = (st: VectorStroke) => {
+        if (!st.bounds) return;
+        const pad = Math.ceil(Math.max(16, (st.baseWidth || 10) * 1.5));
+        if (st.bounds.minX - pad < dirtyMinX) dirtyMinX = st.bounds.minX - pad;
+        if (st.bounds.minY - pad < dirtyMinY) dirtyMinY = st.bounds.minY - pad;
+        if (st.bounds.maxX + pad > dirtyMaxX) dirtyMaxX = st.bounds.maxX + pad;
+        if (st.bounds.maxY + pad > dirtyMaxY) dirtyMaxY = st.bounds.maxY + pad;
+      };
 
       const newStrokes = activeLayer.vectorStrokes.map((stroke) => {
         if (stroke.deleted) return stroke;
@@ -289,41 +288,56 @@ export function useVectorDrawing({
           return stroke;
         }
 
+        let nextStroke = stroke;
         if (vectorEditSettings.mode === 'pinch') {
           if (Math.hypot(delta.x, delta.y) > 0.05) {
             updated = true;
-            return pinchVectorStroke(stroke, pt, radius, delta);
+            nextStroke = pinchVectorStroke(stroke, pt, radius, delta);
           }
         } else if (vectorEditSettings.mode === 'width') {
           updated = true;
-          return modifyStrokeWidth(stroke, pt, radius, vectorEditSettings.widthFactor);
+          nextStroke = modifyStrokeWidth(stroke, pt, radius, vectorEditSettings.widthFactor);
         } else if (vectorEditSettings.mode === 'simplify') {
           updated = true;
-          return simplifyVectorStroke(stroke, vectorEditSettings.simplifyTolerance);
+          nextStroke = simplifyVectorStroke(stroke, vectorEditSettings.simplifyTolerance);
         }
-        return stroke;
+        if (nextStroke !== stroke) {
+          expandDirty(stroke);
+          expandDirty(nextStroke);
+        }
+        return nextStroke;
       });
 
       if (updated) {
         activeLayer.vectorStrokes = newStrokes;
-        const canvas = getActiveCanvas();
-        if (canvas) {
-          const ctx = get2DContext(canvas);
+        const grid = documentStore.getActiveTileGrid();
+        const isMono =
+          colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
+        const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+
+        const vx = Math.max(0, Math.floor(dirtyMinX));
+        const vy = Math.max(0, Math.floor(dirtyMinY));
+        const vx1 = Math.min(dimensions.width, Math.ceil(dirtyMaxX));
+        const vy1 = Math.min(dimensions.height, Math.ceil(dirtyMaxY));
+        const vw = vx1 - vx;
+        const vh = vy1 - vy;
+
+        if (vw > 0 && vh > 0) {
+          const temp = document.createElement('canvas');
+          temp.width = vw;
+          temp.height = vh;
+          const ctx = get2DContext(temp);
           if (ctx) {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(-vx, -vy);
             renderVectorLayer(ctx, newStrokes);
-            const isMono =
-              colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome';
-            documentStore
-              .getActiveTileGrid()
-              .ingestCanvas(
-                activeLayerId,
-                canvas,
-                isMono ? 'monochrome-1bit' : 'color-32bit'
-              );
-            documentStore.getActiveTileGrid().notifyChange(true);
-            updateLayerThumbnail(activeLayerId, true);
+            ctx.restore();
+            const subData = ctx.getImageData(0, 0, vw, vh);
+            grid.writeImageData(activeLayerId, subData, vx, vy, targetFormat);
           }
+          releaseTemporaryCanvas(temp);
+          grid.notifyChange(true);
+          updateLayerThumbnail(activeLayerId, true);
         }
       }
       return true;
@@ -332,7 +346,8 @@ export function useVectorDrawing({
       activeLayer,
       activeLayerId,
       colorMode,
-      getActiveCanvas,
+      dimensions.height,
+      dimensions.width,
       getCanvasCoords,
       updateLayerThumbnail,
     ]
@@ -343,6 +358,7 @@ export function useVectorDrawing({
     isVectorEditingRef.current = false;
     const vectorEditSettings = useToolStore.getState().vectorEditSettings;
     if (activeLayer?.vectorStrokes && vectorEditBeforeStrokesRef.current) {
+      const updatedStrokes = [...activeLayer.vectorStrokes];
       pushHistoryStep(
         'brush',
         `Correct Line (${vectorEditSettings.mode})`,
@@ -353,9 +369,12 @@ export function useVectorDrawing({
         undefined,
         {
           before: vectorEditBeforeStrokesRef.current,
-          after: [...activeLayer.vectorStrokes],
+          after: updatedStrokes,
         }
       );
+      if (multiplayerService.isConnected()) {
+        multiplayerService.sendLayerUpdate(activeLayerId, { vectorStrokes: updatedStrokes });
+      }
       documentStore.getActiveTileGrid().notifyChange(true);
     }
     vectorEditBeforeStrokesRef.current = null;

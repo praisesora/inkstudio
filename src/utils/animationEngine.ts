@@ -1,5 +1,6 @@
 import { zipSync } from 'fflate';
 import { AnimationTimeline, OnionSkinSettings, LayerItem } from '../types/editor';
+import { SparseTileGrid, releaseTemporaryCanvas } from './tileEngine';
 
 export interface OnionSkinFrameInfo {
   frame: number;
@@ -152,7 +153,7 @@ export function renderTintedCanvas(
 
 /**
  * Composites a single animation frame onto an offscreen canvas.
- * Renders background layers, optional colored onion skinning, active cel, and foreground layers.
+ * Reads directly from SparseTileGrid (or optional legacy layerCanvases map for tests).
  */
 export function renderAnimationFrame(
   frameIndex: number,
@@ -160,13 +161,23 @@ export function renderAnimationFrame(
   layers: LayerItem[],
   layerCanvases: Map<string, HTMLCanvasElement>,
   dimensions: { width: number; height: number },
-  includeOnionSkin: boolean = false
+  includeOnionSkin: boolean = false,
+  tileGrid?: SparseTileGrid
 ): HTMLCanvasElement {
   const canvas = document.createElement('canvas');
   canvas.width = dimensions.width;
   canvas.height = dimensions.height;
   const ctx = canvas.getContext('2d');
   if (!ctx) return canvas;
+
+  const acquireLayerCanvas = (id: string): { c: HTMLCanvasElement | null; temp: boolean } => {
+    const existing = layerCanvases.get(id);
+    if (existing) return { c: existing, temp: false };
+    if (tileGrid && tileGrid.hasLayerTiles(id)) {
+      return { c: tileGrid.exportLayerToCanvas(id, dimensions.width, dimensions.height), temp: true };
+    }
+    return { c: null, temp: false };
+  };
 
   // Clear canvas
   ctx.clearRect(0, 0, dimensions.width, dimensions.height);
@@ -204,7 +215,7 @@ export function renderAnimationFrame(
             currentFrame: frameIndex,
           });
           for (const info of onionFrames) {
-            const oc = layerCanvases.get(info.layerId);
+            const { c: oc, temp } = acquireLayerCanvas(info.layerId);
             if (oc) {
               const tinted = renderTintedCanvas(oc, info.tint, info.opacity);
               ctx.save?.();
@@ -212,10 +223,12 @@ export function renderAnimationFrame(
               ctx.globalCompositeOperation = 'source-over';
               ctx.drawImage(tinted, 0, 0);
               ctx.restore?.();
+              releaseTemporaryCanvas(tinted);
+              if (temp) releaseTemporaryCanvas(oc);
             }
           }
         }
-        const celCanvas = layerCanvases.get(activeCelLayerId);
+        const { c: celCanvas, temp: celTemp } = acquireLayerCanvas(activeCelLayerId);
         if (celCanvas) {
           ctx.save?.();
           ctx.globalAlpha = getEffOpacity(layer);
@@ -224,12 +237,13 @@ export function renderAnimationFrame(
           ctx.globalAlpha = 1.0;
           ctx.globalCompositeOperation = 'source-over';
           ctx.restore?.();
+          if (celTemp) releaseTemporaryCanvas(celCanvas);
         }
       }
       continue;
     }
 
-    const c = layerCanvases.get(layer.id);
+    const { c, temp } = acquireLayerCanvas(layer.id);
     if (c) {
       ctx.save?.();
       ctx.globalAlpha = getEffOpacity(layer);
@@ -238,6 +252,7 @@ export function renderAnimationFrame(
       ctx.globalAlpha = 1.0;
       ctx.globalCompositeOperation = 'source-over';
       ctx.restore?.();
+      if (temp) releaseTemporaryCanvas(c);
     }
   }
 
@@ -248,13 +263,15 @@ export function renderAnimationFrame(
       currentFrame: frameIndex,
     });
     for (const info of onionFrames) {
-      const c = layerCanvases.get(info.layerId);
+      const { c, temp } = acquireLayerCanvas(info.layerId);
       if (c) {
         const tinted = renderTintedCanvas(c, info.tint, info.opacity);
         ctx.save?.();
         ctx.globalAlpha = 1.0;
         ctx.drawImage(tinted, 0, 0);
         ctx.restore?.();
+        releaseTemporaryCanvas(tinted);
+        if (temp) releaseTemporaryCanvas(c);
       }
     }
   }
@@ -284,14 +301,15 @@ export async function exportAnimationToPngZip(
   layers: LayerItem[],
   layerCanvases: Map<string, HTMLCanvasElement>,
   dimensions: { width: number; height: number },
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number) => void,
+  tileGrid?: SparseTileGrid
 ): Promise<Blob> {
   const files: Record<string, Uint8Array> = {};
   const total = timeline.totalFrames;
 
   for (let f = 0; f < total; f++) {
     onProgress?.(f + 1, total);
-    const frameCanvas = renderAnimationFrame(f, timeline, layers, layerCanvases, dimensions, false);
+    const frameCanvas = renderAnimationFrame(f, timeline, layers, layerCanvases, dimensions, false, tileGrid);
 
     // Convert canvas to PNG bytes via DataURL
     const dataUrl = frameCanvas.toDataURL('image/png');
@@ -318,7 +336,8 @@ export async function exportAnimationToVideo(
   layers: LayerItem[],
   layerCanvases: Map<string, HTMLCanvasElement>,
   dimensions: { width: number; height: number },
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number) => void,
+  tileGrid?: SparseTileGrid
 ): Promise<Blob> {
   const { fps, totalFrames } = timeline;
 
@@ -366,9 +385,10 @@ export async function exportAnimationToVideo(
       }
 
       onProgress?.(frame + 1, totalFrames);
-      const frameCanvas = renderAnimationFrame(frame, timeline, layers, layerCanvases, dimensions, false);
+      const frameCanvas = renderAnimationFrame(frame, timeline, layers, layerCanvases, dimensions, false, tileGrid);
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.drawImage(frameCanvas, 0, 0);
+      releaseTemporaryCanvas(frameCanvas);
 
       frame++;
       setTimeout(renderNext, delayMs);
@@ -386,7 +406,8 @@ export async function exportAnimationToGif(
   layers: LayerItem[],
   layerCanvases: Map<string, HTMLCanvasElement>,
   dimensions: { width: number; height: number },
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number) => void,
+  tileGrid?: SparseTileGrid
 ): Promise<Blob> {
   const { fps, totalFrames } = timeline;
   const width = Math.min(1280, dimensions.width);
@@ -415,10 +436,11 @@ export async function exportAnimationToGif(
 
   for (let f = 0; f < totalFrames; f++) {
     onProgress?.(f + 1, totalFrames);
-    const fullCanvas = renderAnimationFrame(f, timeline, layers, layerCanvases, dimensions, false);
+    const fullCanvas = renderAnimationFrame(f, timeline, layers, layerCanvases, dimensions, false, tileGrid);
 
     rCtx.clearRect(0, 0, width, height);
     rCtx.drawImage(fullCanvas, 0, 0, width, height);
+    releaseTemporaryCanvas(fullCanvas);
     const imgData = rCtx.getImageData(0, 0, width, height);
     const pixels = imgData.data;
 
@@ -506,7 +528,8 @@ export async function exportAnimationToApng(
   layers: LayerItem[],
   layerCanvases: Map<string, HTMLCanvasElement>,
   dimensions: { width: number; height: number },
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number) => void,
+  tileGrid?: SparseTileGrid
 ): Promise<Blob> {
   const { fps, totalFrames } = timeline;
   const numFrames = totalFrames;
@@ -515,8 +538,9 @@ export async function exportAnimationToApng(
   const framePngBuffers: ArrayBuffer[] = [];
   for (let f = 0; f < numFrames; f++) {
     onProgress?.(f + 1, numFrames);
-    const canvas = renderAnimationFrame(f, timeline, layers, layerCanvases, dimensions, false);
+    const canvas = renderAnimationFrame(f, timeline, layers, layerCanvases, dimensions, false, tileGrid);
     const dataUrl = canvas.toDataURL('image/png');
+    releaseTemporaryCanvas(canvas);
     const base64 = dataUrl.split(',')[1];
     const binStr = atob(base64);
     const buf = new Uint8Array(binStr.length);

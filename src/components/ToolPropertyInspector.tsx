@@ -35,7 +35,7 @@ import {
   DEFAULT_BRUSH_PRESET_ID,
 } from '../utils/brushPresetManager';
 import { renderBrushStrokePreview } from '../utils/brushPreview';
-import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/CspBrushEngine';
+import { CSP_PRESSURE_CURVE_PRESETS } from '../engine/BrushEngine';
 import { useToolStore, toolStoreActions, useUiStore, uiStoreActions } from '../stores';
 
 interface CompactSliderProps {

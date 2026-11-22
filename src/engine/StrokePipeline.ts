@@ -420,6 +420,52 @@ export class StrokePipeline {
   }
 
   /**
+   * Advances the deterministic Catmull-Rom + corner-snapping spline window using an already-stabilized
+   * sample (e.g. remote STROKE_CHUNK preview points) without double-applying input stabilization.
+   */
+  public pushStabilizedKnot(
+    x: number,
+    y: number,
+    pressure: number,
+    width: number,
+    tiltX: number = 0,
+    tiltY: number = 0,
+    twist: number = 0,
+    timestamp: number = 0,
+    isCorner: boolean = false,
+    padExtra: number = 0,
+    onSegment?: (seg: CubicBezierSegment, isCorner: boolean) => void
+  ): void {
+    const dtMs = this.hasLastRaw ? Math.max(1, timestamp - this.lastRawTime) : 1;
+    const vx = this.hasLastRaw ? (x - this.lastRawX) / dtMs : 0;
+    const vy = this.hasLastRaw ? (y - this.lastRawY) / dtMs : 0;
+
+    this.lastRawX = x;
+    this.lastRawY = y;
+    this.lastRawTime = timestamp;
+    this.lastVx = vx;
+    this.lastVy = vy;
+    this.hasLastRaw = true;
+
+    this.expandDirtyRect(x, y, width + padExtra);
+    this.advanceSplineKnot(
+      x,
+      y,
+      pressure,
+      width,
+      tiltX,
+      tiltY,
+      twist,
+      timestamp,
+      vx,
+      vy,
+      isCorner,
+      padExtra,
+      onSegment
+    );
+  }
+
+  /**
    * Zero-allocation write of a single raw pointer sample into the Float64Array ring buffer.
    * If the buffer is full (2048 unread samples), advances tailIndex to drop the oldest unread sample safely.
    */

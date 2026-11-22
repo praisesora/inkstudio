@@ -43,8 +43,8 @@ describe('recentDocumentsManager', () => {
   it('saves and updates recent documents correctly', async () => {
     const newDoc: RecentDocument = {
       id: 'test-doc-123',
-      title: 'Manga_Test.sora',
-      path: 'C:\\Users\\Test\\Manga_Test.sora',
+      title: 'Manga_Test.ink',
+      path: 'C:\\Users\\Test\\Manga_Test.ink',
       size: 2048000,
       isStarred: false,
       lastOpened: Date.now(),
@@ -54,14 +54,14 @@ describe('recentDocumentsManager', () => {
     const docs = await loadRecentDocuments();
     const found = docs.find((d) => d.id === 'test-doc-123');
     expect(found).toBeDefined();
-    expect(found?.title).toBe('Manga_Test.sora');
+    expect(found?.title).toBe('Manga_Test.ink');
   });
 
   it('toggles star state of documents', async () => {
     const testDoc: RecentDocument = {
       id: 'star-toggle-doc',
-      title: 'Star_Test.sora',
-      path: 'C:\\Users\\Test\\Star_Test.sora',
+      title: 'Star_Test.ink',
+      path: 'C:\\Users\\Test\\Star_Test.ink',
       size: 1024,
       isStarred: false,
       lastOpened: Date.now(),
@@ -76,8 +76,8 @@ describe('recentDocumentsManager', () => {
   it('removes documents from app list', async () => {
     const testDoc: RecentDocument = {
       id: 'doc-to-remove',
-      title: 'Remove_Test.sora',
-      path: 'C:\\Users\\Test\\Remove_Test.sora',
+      title: 'Remove_Test.ink',
+      path: 'C:\\Users\\Test\\Remove_Test.ink',
       size: 1024,
       isStarred: false,
       lastOpened: Date.now(),
@@ -91,8 +91,8 @@ describe('recentDocumentsManager', () => {
   it('handles permanent delete calls gracefully', async () => {
     const testDoc: RecentDocument = {
       id: 'doc-to-perm-delete',
-      title: 'Temp.sora',
-      path: 'C:\\Invalid\\NonExistent\\Temp.sora',
+      title: 'Temp.ink',
+      path: 'C:\\Invalid\\NonExistent\\Temp.ink',
       size: 1024,
       isStarred: false,
       lastOpened: Date.now(),
@@ -109,7 +109,7 @@ describe('recentDocumentsManager', () => {
     const unsavedDummy: RecentDocument = {
       id: 'doc-unsaved-1',
       title: 'Untitled*',
-      path: 'InkStudio\\Untitled.sora',
+      path: 'InkStudio\\Untitled.ink',
       size: 524288,
       isStarred: false,
       lastOpened: Date.now(),
@@ -121,7 +121,7 @@ describe('recentDocumentsManager', () => {
     const notSavedDoc: RecentDocument = {
       id: 'doc-unsaved-2',
       title: 'Manga Draft',
-      path: 'C:\\Draft.sora',
+      path: 'C:\\Draft.ink',
       size: 1024,
       isStarred: false,
       lastOpened: Date.now(),
@@ -132,13 +132,13 @@ describe('recentDocumentsManager', () => {
     // Valid actually saved document
     const savedDoc: RecentDocument = {
       id: 'doc-saved-1',
-      title: 'Finished_Page.sora',
-      path: 'C:\\Users\\Artist\\Documents\\Finished_Page.sora',
+      title: 'Finished_Page.ink',
+      path: 'C:\\Users\\Artist\\Documents\\Finished_Page.ink',
       size: 1572864,
       isStarred: false,
       lastOpened: Date.now(),
       isSaved: true,
-      fileType: '.sora',
+      fileType: '.ink',
     };
     await saveRecentDocument(savedDoc);
 

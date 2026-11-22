@@ -1,5 +1,6 @@
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 import {
+  ALL_BLEND_MODES,
   BlendMode,
   BrushDynamics,
   BrushSettings,
@@ -53,25 +54,7 @@ const VALID_TEXTURE_MODES = new Set<CspPaperTextureMode>([
   'overlay',
   'outline',
 ]);
-const VALID_BLEND_MODES = new Set<BlendMode>([
-  'normal',
-  'multiply',
-  'screen',
-  'overlay',
-  'darken',
-  'lighten',
-  'color-dodge',
-  'color-burn',
-  'hard-light',
-  'soft-light',
-  'difference',
-  'exclusion',
-  'pass-through',
-  'linear-burn',
-  'add-glow',
-  'color-dodge-glow',
-  'divide',
-]);
+const VALID_BLEND_MODES = new Set<BlendMode>(ALL_BLEND_MODES);
 
 interface InkbArchivePayload {
   format: typeof INKB_FORMAT;

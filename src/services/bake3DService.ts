@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { LayerItem, BlendMode } from '../types/editor';
+import { documentStore } from '../utils/documentStore';
 import { multiplayerService } from './multiplayerService';
 import { applyScreentoneCPU } from '../utils/screentoneEngine';
 
@@ -326,11 +327,12 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
     onInsertLayer(layer, rasterCanvas);
   }
 
-  // 5. Multiplayer Broadcast: Send standard 2D raster pixels, zero 3D overhead
+  // 5. Multiplayer Broadcast: Send layer metadata + LZ4 BINARY_TILE raster pixels (no base64 data URLs)
   if (onBroadcastLayer) {
     onBroadcastLayer(layer, dataUrl);
   } else if (multiplayerService.isConnected()) {
-    multiplayerService.sendLayerAdd(layer, dataUrl);
+    multiplayerService.sendLayerAdd(layer);
+    multiplayerService.streamLayerTiles(layer.id, documentStore.getActiveTileGrid());
   }
 
   return { layer, canvas: rasterCanvas, dataUrl };
@@ -968,9 +970,14 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     onBroadcastLayer(lineLayer, lineDataUrl);
     toneLayersStackOrder.forEach((l, i) => onBroadcastLayer(l, toneCanvasesStackOrder[i].toDataURL('image/png')));
   } else if (multiplayerService.isConnected()) {
+    const activeGrid = documentStore.getActiveTileGrid();
     multiplayerService.sendLayerAdd(folderLayer);
-    multiplayerService.sendLayerAdd(lineLayer, lineDataUrl);
-    toneLayersStackOrder.forEach((l, i) => multiplayerService.sendLayerAdd(l, toneCanvasesStackOrder[i].toDataURL('image/png')));
+    multiplayerService.sendLayerAdd(lineLayer);
+    multiplayerService.streamLayerTiles(lineLayer.id, activeGrid);
+    toneLayersStackOrder.forEach((l) => {
+      multiplayerService.sendLayerAdd(l);
+      multiplayerService.streamLayerTiles(l.id, activeGrid);
+    });
   }
 
   return {

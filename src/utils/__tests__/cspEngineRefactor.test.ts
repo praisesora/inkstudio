@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { InputStabilizer } from '../../engine/InputStabilizer';
 import { TaperEngine } from '../../engine/TaperEngine';
 import { SplineGenerator, SplinePoint } from '../../engine/SplineGenerator';
-import { WebGlBrushEngine } from '../webglBrushEngine';
+import { WebGlBrushEngine } from '../../engine/WebGlBrushEngine';
 
 describe('Clip Studio Paint Drawing Engine Refactor Tests', () => {
   describe('Phase 3: Adaptive Corner-Snapping Stabilizer (InputStabilizer)', () => {

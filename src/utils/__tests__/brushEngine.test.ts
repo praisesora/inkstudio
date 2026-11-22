@@ -4,24 +4,21 @@ import {
   buildCubicArcLengthTable,
   getCubicPointAtArcLength,
   getRadialDabMaster,
-  drawRadialCubicBezierSegment,
+  drawBrushCubicBezierSegment,
+  drawBrushDot,
   drawSingleStamp,
-  RadialMixingOptions,
-} from '../stampEngine';
-import {
   renderCompleteStroke,
-  applyParametricTaper,
-} from '../canvasUtils';
+  getPaperGrain,
+  LEGACY_PENCIL_PRESETS,
+  LegacyPencilGrade,
+  BrushRenderOptions,
+  buildBrushRenderOptions,
+} from '../../engine/BrushEngine';
+import { applyParametricTaper } from '../canvasUtils';
 import {
   PaintReservoir,
   LayerPixelSampler,
 } from '../colorMixingEngine';
-import {
-  getPaperGrain,
-  PENCIL_CONFIGS,
-  PencilGrade,
-  drawPencilDot,
-} from '../pencilEngine';
 import { calculatePreviewWidth } from '../brushPreview';
 import { Point, BrushSettings } from '../../types/editor';
 
@@ -238,13 +235,13 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       expect(Math.abs(h1 - h2)).toBeLessThan(15);
     });
 
-    it('preserves hardness and density ordering across pencil grades', () => {
-      const grades: PencilGrade[] = ['pencil-f', 'pencil-hb', 'pencil-2b', 'pencil-4b'];
+    it('preserves hardness and flow ordering across legacy pencil presets', () => {
+      const grades: LegacyPencilGrade[] = ['pencil-f', 'pencil-hb', 'pencil-2b', 'pencil-4b'];
       for (let i = 0; i < grades.length - 1; i++) {
-        const harder = PENCIL_CONFIGS[grades[i]];
-        const softer = PENCIL_CONFIGS[grades[i + 1]];
-        expect(harder.hardness).toBeGreaterThanOrEqual(softer.hardness);
-        expect(softer.particleDensity).toBeGreaterThanOrEqual(harder.particleDensity);
+        const harder = LEGACY_PENCIL_PRESETS[grades[i]];
+        const softer = LEGACY_PENCIL_PRESETS[grades[i + 1]];
+        expect(harder.hardness!).toBeGreaterThanOrEqual(softer.hardness!);
+        expect(softer.flow!).toBeGreaterThanOrEqual(harder.flow!);
       }
     });
   });
@@ -262,18 +259,14 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       const seg2 = centripetalCatmullRomToBezier(p0, p1, p2, p2);
 
       const spacing = 0.05; // required step = 10 * 0.05 = 0.5px
-      const remainder1 = drawRadialCubicBezierSegment(
+      const remainder1 = drawBrushCubicBezierSegment(
         ctx,
         p0,
         seg1.c1,
         seg1.c2,
         p1,
         '#000000',
-        1.0,
-        1.0,
-        spacing,
-        false,
-        false,
+        { hardness: 1.0, flow: 1.0, spacing },
         0
       );
 
@@ -284,18 +277,14 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       expect(dabCountBefore).toBeGreaterThan(150);
 
       // Thread remainder1 into segment 2
-      const remainder2 = drawRadialCubicBezierSegment(
+      const remainder2 = drawBrushCubicBezierSegment(
         ctx,
         p1,
         seg2.c1,
         seg2.c2,
         p2,
         '#000000',
-        1.0,
-        1.0,
-        spacing,
-        false,
-        false,
+        { hardness: 1.0, flow: 1.0, spacing },
         remainder1
       );
 
@@ -319,18 +308,14 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       const p1: Point = { x: 0.2, y: 0, pressure: 1.0, width: 20 }; // Very short move (0.2px)
 
       const spacing = 0.1; // required step = 2.0px
-      const remainder = drawRadialCubicBezierSegment(
+      const remainder = drawBrushCubicBezierSegment(
         ctx,
         p0,
         p0,
         p1,
         p1,
         '#000000',
-        1.0,
-        1.0,
-        spacing,
-        false,
-        false,
+        { hardness: 1.0, flow: 1.0, spacing },
         1.0
       );
 
@@ -394,7 +379,10 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       const p2: Point = { x: 80, y: 100, pressure: 1.0, width: 10 };
       const p3: Point = { x: 120, y: 100, pressure: 1.0, width: 10 };
 
-      const mixingOptions: RadialMixingOptions = {
+      const mixingOptions: BrushRenderOptions = {
+        hardness: 1.0,
+        flow: 1.0,
+        spacing: 0.05,
         colorMixing: true,
         amountOfPaint: 0.5,
         densityOfPaint: 1.0,
@@ -410,23 +398,7 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       expect(reservoir.b).toBe(0);
 
       // Draw segment crossing from x=30 to x=80 (traversing the black patch at 40..60)
-      drawRadialCubicBezierSegment(
-        dCtx,
-        p0,
-        p1,
-        p2,
-        p3,
-        '#ff0000',
-        1.0,
-        1.0,
-        0.05,
-        false,
-        false,
-        0,
-        1.0,
-        0,
-        mixingOptions
-      );
+      drawBrushCubicBezierSegment(dCtx, p0, p1, p2, p3, '#ff0000', mixingOptions, 0);
 
       // After crossing black patch: reservoir must have mixed and darkened significantly
       expect(reservoir.isLoadedWithCanvasColor).toBe(true);
@@ -615,7 +587,12 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       const c2Upright: Point = { x: 70, y: 50, pressure: 1.0, width: 20, tiltX: 0, tiltY: 0 };
       const p3Upright: Point = { x: 90, y: 50, pressure: 1.0, width: 20, tiltX: 0, tiltY: 0 };
 
-      drawRadialCubicBezierSegment(ctxUpright, p0Upright, c1Upright, c2Upright, p3Upright, '#000000', 1.0, 1.0, 0.1);
+      drawBrushCubicBezierSegment(ctxUpright, p0Upright, c1Upright, c2Upright, p3Upright, '#000000', {
+        hardness: 1.0,
+        flow: 1.0,
+        spacing: 0.1,
+        useTilt: true,
+      });
 
       // Tilted flat along X axis (tiltX = 65 degrees)
       const p0Tilted: Point = { x: 10, y: 50, pressure: 1.0, width: 20, tiltX: 65, tiltY: 0 };
@@ -623,7 +600,12 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       const c2Tilted: Point = { x: 70, y: 50, pressure: 1.0, width: 20, tiltX: 65, tiltY: 0 };
       const p3Tilted: Point = { x: 90, y: 50, pressure: 1.0, width: 20, tiltX: 65, tiltY: 0 };
 
-      drawRadialCubicBezierSegment(ctxTilted, p0Tilted, c1Tilted, c2Tilted, p3Tilted, '#000000', 1.0, 1.0, 0.1);
+      drawBrushCubicBezierSegment(ctxTilted, p0Tilted, c1Tilted, c2Tilted, p3Tilted, '#000000', {
+        hardness: 1.0,
+        flow: 1.0,
+        spacing: 0.1,
+        useTilt: true,
+      });
 
       expect(canvasUpright.drawnDabs.length).toBeGreaterThan(0);
       expect(canvasTilted.drawnDabs.length).toBeGreaterThan(0);
@@ -635,17 +617,31 @@ describe('Brush & Spline Engine (CSP / Photoshop Architectural Parity)', () => {
       expect(avgTiltedW).toBeGreaterThan(avgUprightW * 1.5);
     });
 
-    it('widens pencil footprint when stylus is tilted flat', () => {
+    it('widens pencil preset footprint when stylus is tilted flat (via unified BrushEngine)', () => {
       const canvasUpright = createMockCanvas(200, 200);
       const ctxUpright = canvasUpright.getContext('2d') as unknown as CanvasRenderingContext2D;
       const canvasTilted = createMockCanvas(200, 200);
       const ctxTilted = canvasTilted.getContext('2d') as unknown as CanvasRenderingContext2D;
 
+      const pencilOpts = buildBrushRenderOptions({
+        preset: 'pencil-2b',
+        size: 10,
+        minSizeFactor: 0.2,
+        color: '#222326',
+        opacity: 1,
+        flow: 0.74,
+        spacing: 0.06,
+        usePressure: true,
+        smoothing: true,
+        stabilization: 0,
+        hardness: 0.65,
+      });
+
       const pUpright: Point = { x: 50, y: 50, pressure: 0.7, width: 10, tiltX: 0, tiltY: 0 };
-      drawPencilDot(ctxUpright, pUpright, '#222326', 'pencil-2b');
+      drawBrushDot(ctxUpright, pUpright, '#222326', pencilOpts);
 
       const pTilted: Point = { x: 50, y: 50, pressure: 0.7, width: 10, tiltX: 70, tiltY: 0 };
-      drawPencilDot(ctxTilted, pTilted, '#222326', 'pencil-2b');
+      drawBrushDot(ctxTilted, pTilted, '#222326', pencilOpts);
 
       expect(canvasUpright.drawnDabs.length).toBe(1);
       expect(canvasTilted.drawnDabs.length).toBe(1);

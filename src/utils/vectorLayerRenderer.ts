@@ -110,45 +110,88 @@ export function hitTestEditableVectorLayer(
 
 /**
  * Re-renders a non-destructive text or balloon layer from its vector definition into
- * SparseTileGrid (and updates any materialized display canvas) without quality loss.
+ * SparseTileGrid using a tight bounding-box scratch canvas (zero full-doc canvas allocation).
  */
 export function syncVectorObjectLayerToGrid(
   layer: LayerItem,
   dimensions: CanvasDimensions,
-  tileGrid: SparseTileGrid,
-  layerCanvasesMap?: Map<string, HTMLCanvasElement>
+  tileGrid: SparseTileGrid
 ): void {
   if (typeof document === 'undefined') return;
   if (layer.type !== 'text' && layer.type !== 'balloon') return;
   if (dimensions.width <= 0 || dimensions.height <= 0) return;
 
-  const existingCanvas = layerCanvasesMap?.get(layer.id);
-  const targetCanvas = existingCanvas ?? document.createElement('canvas');
-  if (!existingCanvas) {
-    targetCanvas.width = dimensions.width;
-    targetCanvas.height = dimensions.height;
+  let minX = 0;
+  let minY = 0;
+  let maxX = dimensions.width;
+  let maxY = dimensions.height;
+
+  if (layer.type === 'text' && layer.textData) {
+    const b = getTextLayerBounds(layer.textData);
+    const pad = Math.ceil(Math.max(32, (layer.textData.outlineWidth ?? 0) * 4 + layer.textData.fontSize));
+    minX = Math.max(0, Math.floor(b.x - pad));
+    minY = Math.max(0, Math.floor(b.y - pad));
+    maxX = Math.min(dimensions.width, Math.ceil(b.x + b.width + pad));
+    maxY = Math.min(dimensions.height, Math.ceil(b.y + b.height + pad));
+  } else if (layer.type === 'balloon' && layer.balloonData) {
+    const bd = layer.balloonData;
+    const flashExtra =
+      bd.shape === 'jagged-flash' ? Math.max(bd.bounds.width, bd.bounds.height) * 0.25 : 0;
+    const pad = Math.ceil(
+      Math.max(48, (bd.strokeWidth ?? 3) * 4 + (bd.fontSize ?? 24) * 2 + flashExtra)
+    );
+    let bx0 = bd.bounds.x;
+    let by0 = bd.bounds.y;
+    let bx1 = bd.bounds.x + bd.bounds.width;
+    let by1 = bd.bounds.y + bd.bounds.height;
+    if (bd.tail) {
+      const pts = [bd.tail.start, bd.tail.control1, bd.tail.control2, bd.tail.tip];
+      for (const p of pts) {
+        if (!p) continue;
+        bx0 = Math.min(bx0, p.x);
+        by0 = Math.min(by0, p.y);
+        bx1 = Math.max(bx1, p.x);
+        by1 = Math.max(by1, p.y);
+      }
+    }
+    minX = Math.max(0, Math.floor(bx0 - pad));
+    minY = Math.max(0, Math.floor(by0 - pad));
+    maxX = Math.min(dimensions.width, Math.ceil(bx1 + pad));
+    maxY = Math.min(dimensions.height, Math.ceil(by1 + pad));
   }
 
-  const ctx = targetCanvas.getContext('2d');
-  if (!ctx) {
-    if (!existingCanvas) releaseTemporaryCanvas(targetCanvas);
+  const rw = maxX - minX;
+  const rh = maxY - minY;
+  const format = layer.expressionColor === 'monochrome' ? 'monochrome-1bit' : 'color-32bit';
+  tileGrid.clearLayer(layer.id);
+  tileGrid.setLayerFormat(layer.id, format);
+  tileGrid.markLayerIngested(layer.id);
+
+  if (rw <= 0 || rh <= 0) {
+    tileGrid.notifyChange(true);
     return;
   }
 
-  ctx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
+  const targetCanvas = document.createElement('canvas');
+  targetCanvas.width = rw;
+  targetCanvas.height = rh;
+  const ctx = targetCanvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) {
+    releaseTemporaryCanvas(targetCanvas);
+    return;
+  }
 
+  ctx.save();
+  ctx.translate(-minX, -minY);
   if (layer.type === 'text' && layer.textData) {
     renderTextLayerData(ctx, layer.textData);
   } else if (layer.type === 'balloon' && layer.balloonData) {
     renderBalloonLayerData(ctx, layer.balloonData);
   }
+  ctx.restore();
 
-  const format = layer.expressionColor === 'monochrome' ? 'monochrome-1bit' : 'color-32bit';
-  tileGrid.clearLayer(layer.id);
-  tileGrid.ingestCanvas(layer.id, targetCanvas, format);
+  const imgData = ctx.getImageData(0, 0, rw, rh);
+  tileGrid.writeImageData(layer.id, imgData, minX, minY, format, true);
   tileGrid.notifyChange(true);
-
-  if (!existingCanvas) {
-    releaseTemporaryCanvas(targetCanvas);
-  }
+  releaseTemporaryCanvas(targetCanvas);
 }

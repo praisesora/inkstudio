@@ -50,6 +50,7 @@ export interface HeaderProps {
   onRenameDocument?: (id: string, newName: string) => void;
   commandHandlers?: WorkspaceCommandHandlers;
   isCollabConnected?: boolean;
+  isCollabReconnecting?: boolean;
   collabPeerCount?: number;
   onOpenCollabModal?: () => void;
   onOpenSettings?: () => void;
@@ -80,6 +81,7 @@ export const Header: React.FC<HeaderProps> = React.memo(({
   hasOpenDocument = true,
   commandHandlers,
   isCollabConnected = false,
+  isCollabReconnecting = false,
   collabPeerCount = 1,
   onOpenCollabModal,
   onOpenSettings,
@@ -281,15 +283,27 @@ export const Header: React.FC<HeaderProps> = React.memo(({
           <button
             type="button"
             onClick={onOpenCollabModal}
-            title={isCollabConnected ? `Collab (${collabPeerCount} online)` : 'Collaborative Session'}
+            title={
+              isCollabReconnecting
+                ? 'Collab: Reconnecting...'
+                : isCollabConnected
+                  ? `Collab (${collabPeerCount} online)`
+                  : 'Collaborative Session'
+            }
             className={`h-6 px-1.5 rounded flex items-center gap-1 text-[11px] transition-colors cursor-pointer ${
-              isCollabConnected
-                ? 'bg-[#2c2c2c] text-[var(--accent)]'
-                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+              isCollabReconnecting
+                ? 'bg-amber-500/20 text-amber-300 animate-pulse'
+                : isCollabConnected
+                  ? 'bg-[#2c2c2c] text-[var(--accent)]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
             }`}
           >
             <Users className="w-3.5 h-3.5" />
-            {isCollabConnected && <span className="font-mono text-[10px]">{collabPeerCount}</span>}
+            {isCollabReconnecting ? (
+              <span className="font-mono text-[10px]">...</span>
+            ) : (
+              isCollabConnected && <span className="font-mono text-[10px]">{collabPeerCount}</span>
+            )}
           </button>
         )}
 

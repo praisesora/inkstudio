@@ -213,8 +213,8 @@ describe('Per-Document Isolation, Shared RAM Budgets & Sparse Tile Memory Optimi
       });
     }
 
-    expect(doc.layerCanvases.size).toBe(0);
-    expect(doc.layerSourceCanvases.size).toBe(0);
+    expect('layerCanvases' in doc).toBe(false);
+    expect('layerSourceCanvases' in doc).toBe(false);
     const stats = doc.tileGrid.getMemoryStats();
     expect(stats.tileCount).toBe(0);
     expect(stats.activeBytes).toBe(0);
@@ -224,7 +224,7 @@ describe('Per-Document Isolation, Shared RAM Budgets & Sparse Tile Memory Optimi
     const afterStroke = doc.tileGrid.getMemoryStats();
     expect(afterStroke.tileCount).toBe(1);
     expect(afterStroke.activeBytes).toBe(BYTES_32BIT);
-    expect(doc.layerCanvases.size).toBe(0);
+    expect('layerCanvases' in doc).toBe(false);
 
     // Batch-deleting layers cleans up tiles cleanly
     const delRes = computeBatchDeleteLayers(layers, ['raster-empty-5', 'raster-empty-6'], 'raster-empty-5');
@@ -246,10 +246,6 @@ describe('Per-Document Isolation, Shared RAM Budgets & Sparse Tile Memory Optimi
     doc.historyIndex = 0;
     await store.registerUndoStep('doc-closable', item);
 
-    // Attach a mock materialized canvas to verify width/height zeroing on close
-    const mockCanvas = { width: 4000, height: 6000 } as HTMLCanvasElement;
-    doc.layerCanvases.set('layer-1', mockCanvas);
-
     await store.closeSession('doc-closable');
 
     expect(store.hasSession('doc-closable')).toBe(false);
@@ -258,9 +254,7 @@ describe('Per-Document Isolation, Shared RAM Budgets & Sparse Tile Memory Optimi
     expect(doc.tileGrid.getMemoryStats().activeBytes).toBe(0);
     expect(doc.undoCache.getRamStepCount()).toBe(0);
     expect(doc.undoCache.getCompressedRamCount()).toBe(0);
-    expect(doc.layerCanvases.size).toBe(0);
-    expect(mockCanvas.width).toBe(0);
-    expect(mockCanvas.height).toBe(0);
+    expect('layerCanvases' in doc).toBe(false);
   });
 
   it('builds and samples layer thumbnails directly from LOD 3 tiles without reading a full-size canvas', () => {

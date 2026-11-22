@@ -425,7 +425,7 @@ describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in 
     const docs: DocumentTab[] = [
       {
         id: 'doc-1',
-        name: 'Chapter1.sora',
+        name: 'Chapter1.ink',
         isDirty: true,
         dimensions: { width: 1920, height: 1080, dpi: 300 },
         colorMode: 'color',
@@ -434,7 +434,7 @@ describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in 
       },
       {
         id: 'doc-2',
-        name: 'Cover.sora',
+        name: 'Cover.ink',
         isDirty: false,
         dimensions: { width: 2480, height: 3508, dpi: 600 },
         colorMode: 'monochrome',

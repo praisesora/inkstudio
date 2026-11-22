@@ -366,6 +366,8 @@ function sanitizePressureCurve(raw: unknown): PressureCurveSettings {
 }
 
 const SETTINGS_KEY = 'ink_studio_app_settings';
+export const NICKNAME_STORAGE_KEY = 'ink_studio_nickname';
+export const NICKNAME_CUSTOMIZED_STORAGE_KEY = 'ink_nickname_customized';
 
 export function loadAppSettings(): AppSettings {
   try {
@@ -381,7 +383,7 @@ export function loadAppSettings(): AppSettings {
       };
     }
     const raw = localStorage.getItem(SETTINGS_KEY);
-    const legacyName = localStorage.getItem('sora_paint_nickname') || '';
+    const storedNickname = localStorage.getItem(NICKNAME_STORAGE_KEY) || '';
     if (raw) {
       const parsed = JSON.parse(raw);
       const validTheme: ThemePreset = 'modern';
@@ -418,7 +420,7 @@ export function loadAppSettings(): AppSettings {
       return {
         ...DEFAULT_APP_SETTINGS,
         ...parsed,
-        userName: parsed.userName !== undefined ? parsed.userName : legacyName,
+        userName: parsed.userName !== undefined ? parsed.userName : storedNickname,
         hasPromptedName: parsed.hasPromptedName !== undefined ? parsed.hasPromptedName : true,
         themePreset: validTheme,
         modernAccent: validAccent,
@@ -431,10 +433,10 @@ export function loadAppSettings(): AppSettings {
         modifierKeys: sanitizeModifierKeys(parsed.modifierKeys),
         pressureCurve: sanitizePressureCurve(parsed.pressureCurve),
       };
-    } else if (legacyName) {
+    } else if (storedNickname) {
       return {
         ...DEFAULT_APP_SETTINGS,
-        userName: legacyName,
+        userName: storedNickname,
         hasPromptedName: true,
         shortcuts: {},
         modifierKeys: { ...DEFAULT_MODIFIER_KEY_SETTINGS },

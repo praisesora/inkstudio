@@ -1,29 +1,58 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { safeLocalStorageSetItem } from '../utils/safeStorage';
 import {
+  AccessDeniedMessage,
   CollabPeer,
+  CollabRole,
+  ConnectionStatus,
   SessionHostInfo,
   MultiplayerMessage,
   StrokeStartMessage,
   StrokeChunkMessage,
   StrokeFinishMessage,
+  BrushAssetDataMessage,
+  BrushAssetRequestMessage,
   CursorMoveMessage,
   JoinAcceptedMessage,
+  LayerMaskDataMessage,
+  PeerBanMessage,
+  PeerKickMessage,
+  PeerRoleUpdateMessage,
+  PeerUnbanMessage,
   TileStreamMessage,
   SelectiveUndoMessage,
+  WireLayerItem,
 } from '../types/multiplayer';
 import {
   multiplayerService,
   ParsedInviteLink,
   parseInviteUrl,
 } from '../services/multiplayerService';
-import { LayerItem, CanvasDimensions, CanvasColorMode } from '../types/editor';
-import { TILE_SIZE, TileBuffer } from '../utils/tileEngine';
+import {
+  getBrushAssetRecord,
+  registerRemoteBrushAsset,
+} from '../utils/brushAssetSync';
+import { serializeLayerForWire } from '../utils/collabSyncUtils';
+import {
+  normalizeRole,
+  peerIdEquals,
+  validateIncomingRemoteMutation,
+} from '../utils/collabPermissions';
+import {
+  AnimationTimeline,
+  CanvasColorMode,
+  CanvasDimensions,
+  LayerItem,
+} from '../types/editor';
+import { PerspectiveRuler, StraightRuler } from '../types/perspective';
+import { ResizeCanvasOptions } from '../types/settings';
+import { TileBuffer } from '../utils/tileEngine';
 import { documentStore } from '../utils/documentStore';
 import { uiStoreActions, useUiStore } from '../stores';
-
-const NICKNAME_KEY = 'sora_paint_nickname';
-const NICKNAME_CUSTOMIZED_KEY = 'ink_nickname_customized';
+import {
+  NICKNAME_CUSTOMIZED_STORAGE_KEY as NICKNAME_CUSTOMIZED_KEY,
+  NICKNAME_STORAGE_KEY as NICKNAME_KEY,
+} from '../types/settings';
 
 const PEER_COLORS = [
   '#f43f5e', // Rose
@@ -35,6 +64,25 @@ const PEER_COLORS = [
   '#ec4899', // Pink
   '#84cc16', // Lime
 ];
+
+export const RECONNECT_BASE_DELAY_MS = 1000;
+export const RECONNECT_MAX_DELAY_MS = 30000;
+export const RECONNECT_MAX_ATTEMPTS = 12;
+
+export function computeReconnectDelayMs(
+  attempt: number,
+  rng: () => number = Math.random
+): number {
+  const safeAttempt = Math.max(1, Math.floor(attempt));
+  const exp = Math.min(
+    RECONNECT_MAX_DELAY_MS,
+    RECONNECT_BASE_DELAY_MS * Math.pow(2, safeAttempt - 1)
+  );
+  const raw = rng();
+  const clampedRng = Math.max(0, Math.min(1, Number.isFinite(raw) ? raw : 0.5));
+  const jitterFactor = 0.8 + 0.4 * clampedRng; // +/- 20% jitter
+  return Math.min(RECONNECT_MAX_DELAY_MS, Math.round(exp * jitterFactor));
+}
 
 function getRandomColor(): string {
   return PEER_COLORS[Math.floor(Math.random() * PEER_COLORS.length)];
@@ -58,35 +106,56 @@ function getInitialPeerName(): string {
     if (!isTauriEnvironment()) {
       return 'Guest';
     }
-    // Desktop: will be replaced by OS username via get_os_username on mount
     return 'Artist';
   } catch {
     return isTauriEnvironment() ? 'Artist' : 'Guest';
   }
 }
 
+interface ActiveSessionParams {
+  wsUrl: string;
+  token?: string;
+  roomName: string;
+  host: string;
+  port: number;
+  isSecure: boolean;
+  isHost: boolean;
+}
+
 export interface UseMultiplayerProps {
   dimensions: CanvasDimensions;
   colorMode: CanvasColorMode;
   layers: LayerItem[];
-  layerCanvasesRef: React.MutableRefObject<Map<string, HTMLCanvasElement>>;
+  perspectiveRuler?: PerspectiveRuler | null;
+  straightRuler?: StraightRuler | null;
+  animationTimeline?: AnimationTimeline | null;
   onRemoteStrokeStart?: (msg: StrokeStartMessage) => void;
   onRemoteStrokeChunk?: (msg: StrokeChunkMessage) => void;
   onRemoteStrokeFinish?: (msg: StrokeFinishMessage) => void;
   onRemoteLayerAction?: (msg: MultiplayerMessage) => void;
+  onRemoteMaskData?: (msg: LayerMaskDataMessage) => void;
+  onRemotePerspectiveRuler?: (ruler: PerspectiveRuler | null) => void;
+  onRemoteStraightRuler?: (ruler: StraightRuler | null) => void;
+  onRemoteAnimationSync?: (timeline: AnimationTimeline | null) => void;
+  onRemoteCanvasResize?: (dimensions: CanvasDimensions, options: ResizeCanvasOptions) => void;
   onRemoteDocSync?: (
     dimensions: CanvasDimensions,
     colorMode: CanvasColorMode,
-    layers: LayerItem[],
-    dataUrls: Record<string, string>,
+    layers: WireLayerItem[],
     assignedLayerId?: string,
-    roomName?: string
+    roomName?: string,
+    perspectiveRuler?: PerspectiveRuler | null,
+    straightRuler?: StraightRuler | null,
+    animationTimeline?: AnimationTimeline | null,
+    isReconnect?: boolean
   ) => void;
   onRemoteJoinRequest?: (
     peer: CollabPeer
   ) => { assignedLayerId: string; updatedLayers: LayerItem[] } | void;
   onRemoteAssignedLayer?: (layerId: string) => void;
   onRemoteSelectiveUndo?: (strokeId: string, peerId: string | number) => void;
+  onRemoteTileApplied?: (layerId: string) => void;
+  onRemotePeerLeft?: (peerId: string | number) => void;
   showToast: (msg: string) => void;
 }
 
@@ -94,27 +163,45 @@ export function useMultiplayer({
   dimensions,
   colorMode,
   layers,
-  layerCanvasesRef,
+  perspectiveRuler = null,
+  straightRuler = null,
+  animationTimeline = null,
   onRemoteStrokeStart,
   onRemoteStrokeChunk,
   onRemoteStrokeFinish,
   onRemoteLayerAction,
+  onRemoteMaskData,
+  onRemotePerspectiveRuler,
+  onRemoteStraightRuler,
+  onRemoteAnimationSync,
+  onRemoteCanvasResize,
   onRemoteDocSync,
   onRemoteJoinRequest,
   onRemoteAssignedLayer,
   onRemoteSelectiveUndo,
+  onRemoteTileApplied,
+  onRemotePeerLeft,
   showToast,
 }: UseMultiplayerProps) {
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('disconnected');
   const [isConnected, setIsConnected] = useState(false);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [isHost, setIsHost] = useState(false);
+  const [myRole, setMyRole] = useState<CollabRole>('editor');
   const [hostInfo, setHostInfo] = useState<SessionHostInfo | null>(null);
   const [peers, setPeers] = useState<CollabPeer[]>([]);
+  const [bannedPeerIds, setBannedPeerIds] = useState<string[]>([]);
+
   const peersRef = useRef<CollabPeer[]>([]);
+  const myRoleRef = useRef<CollabRole>('editor');
+  const bannedPeerIdsRef = useRef<Set<string>>(new Set());
+  const peerRolesRef = useRef<Map<string, CollabRole>>(new Map());
 
   const [myPeer, setMyPeer] = useState<CollabPeer>(() => ({
     id: `peer-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
     name: getInitialPeerName(),
     color: getRandomColor(),
+    role: 'editor',
   }));
   const myPeerRef = useRef(myPeer);
 
@@ -130,41 +217,136 @@ export function useMultiplayer({
   // Web Landing modal for browser guests visiting via ?room=...
   const [webLandingInvite, setWebLandingInvite] = useState<ParsedInviteLink | null>(null);
 
+  // Auto-reconnect & seq/version tracking refs
+  const sessionParamsRef = useRef<ActiveSessionParams | null>(null);
+  const intentionalDisconnectRef = useRef(false);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const isReconnectingInFlightRef = useRef(false);
+  const pendingReconnectCatchUpRef = useRef(false);
+  const lastAppliedSeqRef = useRef(0);
+  const tileSeqMapRef = useRef<Map<string, number>>(new Map());
+  const tileVersionMapRef = useRef<Map<string, number>>(new Map());
+  const docFieldSeqRef = useRef({
+    layerTree: 0,
+    perspectiveRuler: 0,
+    straightRuler: 0,
+    animationTimeline: 0,
+    canvasResize: 0,
+  });
+
   // Synchronous refs for event handlers
   const dimensionsRef = useRef(dimensions);
   const colorModeRef = useRef(colorMode);
   const layersRef = useRef(layers);
+  const perspectiveRulerRef = useRef(perspectiveRuler);
+  const straightRulerRef = useRef(straightRuler);
+  const animationTimelineRef = useRef(animationTimeline);
   const isHostRef = useRef(isHost);
   const hostInfoRef = useRef(hostInfo);
 
   dimensionsRef.current = dimensions;
   colorModeRef.current = colorMode;
   layersRef.current = layers;
+  perspectiveRulerRef.current = perspectiveRuler;
+  straightRulerRef.current = straightRuler;
+  animationTimelineRef.current = animationTimeline;
   isHostRef.current = isHost;
   hostInfoRef.current = hostInfo;
   myPeerRef.current = myPeer;
   peersRef.current = peers;
+  myRoleRef.current = myRole;
 
   // Keep callback refs
   const onRemoteStrokeStartRef = useRef(onRemoteStrokeStart);
   const onRemoteStrokeChunkRef = useRef(onRemoteStrokeChunk);
   const onRemoteStrokeFinishRef = useRef(onRemoteStrokeFinish);
   const onRemoteLayerActionRef = useRef(onRemoteLayerAction);
+  const onRemoteMaskDataRef = useRef(onRemoteMaskData);
+  const onRemotePerspectiveRulerRef = useRef(onRemotePerspectiveRuler);
+  const onRemoteStraightRulerRef = useRef(onRemoteStraightRuler);
+  const onRemoteAnimationSyncRef = useRef(onRemoteAnimationSync);
+  const onRemoteCanvasResizeRef = useRef(onRemoteCanvasResize);
   const onRemoteDocSyncRef = useRef(onRemoteDocSync);
   const onRemoteJoinRequestRef = useRef(onRemoteJoinRequest);
   const onRemoteAssignedLayerRef = useRef(onRemoteAssignedLayer);
   const onRemoteSelectiveUndoRef = useRef(onRemoteSelectiveUndo);
+  const onRemoteTileAppliedRef = useRef(onRemoteTileApplied);
+  const onRemotePeerLeftRef = useRef(onRemotePeerLeft);
   const showToastRef = useRef(showToast);
 
   onRemoteStrokeStartRef.current = onRemoteStrokeStart;
   onRemoteStrokeChunkRef.current = onRemoteStrokeChunk;
   onRemoteStrokeFinishRef.current = onRemoteStrokeFinish;
   onRemoteLayerActionRef.current = onRemoteLayerAction;
+  onRemoteMaskDataRef.current = onRemoteMaskData;
+  onRemotePerspectiveRulerRef.current = onRemotePerspectiveRuler;
+  onRemoteStraightRulerRef.current = onRemoteStraightRuler;
+  onRemoteAnimationSyncRef.current = onRemoteAnimationSync;
+  onRemoteCanvasResizeRef.current = onRemoteCanvasResize;
   onRemoteDocSyncRef.current = onRemoteDocSync;
   onRemoteJoinRequestRef.current = onRemoteJoinRequest;
   onRemoteAssignedLayerRef.current = onRemoteAssignedLayer;
   onRemoteSelectiveUndoRef.current = onRemoteSelectiveUndo;
+  onRemoteTileAppliedRef.current = onRemoteTileApplied;
+  onRemotePeerLeftRef.current = onRemotePeerLeft;
   showToastRef.current = showToast;
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current !== null) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const applyLocalRole = useCallback((nextRole: CollabRole) => {
+    myRoleRef.current = nextRole;
+    setMyRole(nextRole);
+    multiplayerService.setLocalRole(nextRole);
+    setMyPeer((prev) => {
+      if (prev.role === nextRole && Boolean(prev.isHost) === (nextRole === 'host')) {
+        return prev;
+      }
+      const next: CollabPeer = {
+        ...prev,
+        role: nextRole,
+        isHost: nextRole === 'host',
+      };
+      myPeerRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const resetSessionState = useCallback(() => {
+    clearReconnectTimer();
+    isReconnectingInFlightRef.current = false;
+    pendingReconnectCatchUpRef.current = false;
+    reconnectAttemptRef.current = 0;
+    setReconnectAttempt(0);
+    sessionParamsRef.current = null;
+    setIsConnected(false);
+    setConnectionStatus('disconnected');
+    setIsHost(false);
+    isHostRef.current = false;
+    setHostInfo(null);
+    hostInfoRef.current = null;
+    setPeers([]);
+    peersRef.current = [];
+    bannedPeerIdsRef.current.clear();
+    setBannedPeerIds([]);
+    peerRolesRef.current.clear();
+    lastAppliedSeqRef.current = 0;
+    tileSeqMapRef.current.clear();
+    tileVersionMapRef.current.clear();
+    docFieldSeqRef.current = {
+      layerTree: 0,
+      perspectiveRuler: 0,
+      straightRuler: 0,
+      animationTimeline: 0,
+      canvasResize: 0,
+    };
+    applyLocalRole('editor');
+  }, [applyLocalRole, clearReconnectTimer]);
 
   // Desktop: resolve default peer name from OS account name unless explicitly customized
   useEffect(() => {
@@ -193,7 +375,7 @@ export function useMultiplayer({
             return next;
           });
           const curSettings = useUiStore.getState().appSettings;
-          if (!curSettings.userName || curSettings.userName === 'Sora') {
+          if (!curSettings.userName || curSettings.userName === 'Artist') {
             uiStoreActions.updateAppSettings({ ...curSettings, userName: trimmed });
           }
         }
@@ -259,56 +441,320 @@ export function useMultiplayer({
     pump();
   }, []);
 
-  // Handle incoming messages
+  // Auto-reconnect scheduler with exponential backoff and missed seq/tile catch-up
+  const scheduleReconnectRef = useRef<(immediate?: boolean) => void>(() => {});
+  const scheduleReconnect = useCallback(
+    (immediate = false) => {
+      if (intentionalDisconnectRef.current) return;
+      const params = sessionParamsRef.current;
+      if (!params) return;
+      if (multiplayerService.isConnected() || isReconnectingInFlightRef.current) return;
+
+      clearReconnectTimer();
+
+      const nextAttempt = reconnectAttemptRef.current + 1;
+      if (nextAttempt > RECONNECT_MAX_ATTEMPTS) {
+        resetSessionState();
+        showToastRef.current('Unable to reconnect to collaborative session');
+        return;
+      }
+
+      reconnectAttemptRef.current = nextAttempt;
+      setReconnectAttempt(nextAttempt);
+      setConnectionStatus('reconnecting');
+      setIsConnected(false);
+
+      const delay = immediate ? 150 : computeReconnectDelayMs(nextAttempt);
+
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null;
+        if (intentionalDisconnectRef.current || !sessionParamsRef.current) return;
+        if (multiplayerService.isConnected() || isReconnectingInFlightRef.current) return;
+
+        const targetParams = sessionParamsRef.current;
+        const sinceSeq = Math.max(
+          lastAppliedSeqRef.current,
+          multiplayerService.getLastServerSeq()
+        );
+        const reconnectPeer: CollabPeer = {
+          ...myPeerRef.current,
+          isHost: targetParams.isHost,
+          role: myRoleRef.current,
+        };
+
+        isReconnectingInFlightRef.current = true;
+        pendingReconnectCatchUpRef.current = true;
+
+        multiplayerService
+          .connect(targetParams.wsUrl, reconnectPeer, targetParams.token, {
+            isReconnect: true,
+            sinceSeq,
+          })
+          .then(() => {
+            isReconnectingInFlightRef.current = false;
+            if (intentionalDisconnectRef.current || !sessionParamsRef.current) {
+              multiplayerService.disconnect();
+              return;
+            }
+            reconnectAttemptRef.current = 0;
+            setReconnectAttempt(0);
+            setIsConnected(true);
+            setConnectionStatus('connected');
+            multiplayerService.clearSyncDedupeCaches();
+            showToastRef.current('Reconnected to collaborative session');
+          })
+          .catch(() => {
+            isReconnectingInFlightRef.current = false;
+            if (!intentionalDisconnectRef.current && sessionParamsRef.current) {
+              scheduleReconnectRef.current(false);
+            }
+          });
+      }, delay);
+    },
+    [clearReconnectTimer, resetSessionState]
+  );
+  scheduleReconnectRef.current = scheduleReconnect;
+
+  // Retry immediately if the browser reports network connectivity restored while reconnecting
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleOnline = () => {
+      if (
+        !intentionalDisconnectRef.current &&
+        sessionParamsRef.current &&
+        !multiplayerService.isConnected() &&
+        !isReconnectingInFlightRef.current
+      ) {
+        reconnectAttemptRef.current = Math.max(0, reconnectAttemptRef.current - 1);
+        scheduleReconnectRef.current(true);
+      }
+    };
+    window.addEventListener('online', handleOnline);
+    return () => window.removeEventListener('online', handleOnline);
+  }, []);
+
+  // Clean up timers on unmount
+  useEffect(() => {
+    return () => {
+      intentionalDisconnectRef.current = true;
+      clearReconnectTimer();
+    };
+  }, [clearReconnectTimer]);
+
+  // Handle incoming messages & unexpected close
   useEffect(() => {
     const unsubscribe = multiplayerService.onMessage((msg: MultiplayerMessage) => {
+      if (
+        msg.type !== 'CANVAS_PING' &&
+        msg.senderId !== undefined &&
+        peerIdEquals(msg.senderId, myPeerRef.current.id)
+      ) {
+        return;
+      }
+
+      // Track highest applied authoritative seq for reconnect catch-up
+      if (typeof msg.seq === 'number' && Number.isSafeInteger(msg.seq) && msg.seq > lastAppliedSeqRef.current) {
+        lastAppliedSeqRef.current = msg.seq;
+      }
+
+      // Defense-in-depth validation against rogue viewer / unauthorized layer mutations
+      const senderPeer =
+        msg.senderId !== undefined
+          ? peersRef.current.find((p) => peerIdEquals(p.id, msg.senderId))
+          : undefined;
+      const permCheck = validateIncomingRemoteMutation(msg, senderPeer, layersRef.current);
+      if (!permCheck.allowed) {
+        return;
+      }
+
       switch (msg.type) {
         case 'ROOM_INFO': {
+          // Do not leapfrog lastAppliedSeq before missed reconnect ops arrive
+          if (
+            typeof msg.serverSeq === 'number' &&
+            !pendingReconnectCatchUpRef.current &&
+            lastAppliedSeqRef.current === 0
+          ) {
+            lastAppliedSeqRef.current = msg.serverSeq;
+            multiplayerService.updateServerSeq(msg.serverSeq);
+          }
+          break;
+        }
+
+        case 'ACCESS_DENIED': {
+          const denied = msg as AccessDeniedMessage;
+          if (
+            denied.targetPeerId !== undefined &&
+            !peerIdEquals(denied.targetPeerId, myPeerRef.current.id)
+          ) {
+            return;
+          }
+          if (denied.code === 'BANNED' || denied.code === 'KICKED') {
+            intentionalDisconnectRef.current = true;
+            multiplayerService.disconnect();
+            resetSessionState();
+          }
+          showToastRef.current(denied.reason || 'Access denied');
+          break;
+        }
+
+        case 'PEER_ROLE_UPDATE': {
+          const roleMsg = msg as PeerRoleUpdateMessage;
+          const nextRole = normalizeRole(roleMsg.role, false);
+          if (nextRole === 'host') break; // Guests cannot be promoted to host via this event
+
+          peerRolesRef.current.set(String(roleMsg.targetPeerId), nextRole);
+
+          if (peerIdEquals(roleMsg.targetPeerId, myPeerRef.current.id)) {
+            if (!isHostRef.current) {
+              applyLocalRole(nextRole);
+              showToastRef.current(
+                nextRole === 'viewer'
+                  ? 'Your role was changed to Viewer (read-only)'
+                  : 'Your role was changed to Editor'
+              );
+            }
+          } else {
+            setPeers((prev) => {
+              const next = prev.map((p) =>
+                peerIdEquals(p.id, roleMsg.targetPeerId) ? { ...p, role: nextRole } : p
+              );
+              peersRef.current = next;
+              return next;
+            });
+          }
+          break;
+        }
+
+        case 'PEER_KICK':
+        case 'PEER_BAN': {
+          const modMsg = msg as PeerKickMessage | PeerBanMessage;
+          const isBan = modMsg.type === 'PEER_BAN';
+
+          if (peerIdEquals(modMsg.targetPeerId, myPeerRef.current.id)) {
+            intentionalDisconnectRef.current = true;
+            multiplayerService.disconnect();
+            resetSessionState();
+            showToastRef.current(
+              modMsg.reason ||
+                (isBan
+                  ? 'You have been banned from this room by the host'
+                  : 'You were removed from this room by the host')
+            );
+            break;
+          }
+
+          if (isBan && isHostRef.current) {
+            const key = String(modMsg.targetPeerId);
+            if (!bannedPeerIdsRef.current.has(key)) {
+              bannedPeerIdsRef.current.add(key);
+              setBannedPeerIds(Array.from(bannedPeerIdsRef.current));
+            }
+          }
+
+          onRemotePeerLeftRef.current?.(modMsg.targetPeerId);
+          setPeers((prev) => {
+            const target = prev.find((p) => peerIdEquals(p.id, modMsg.targetPeerId));
+            if (target) {
+              showToastRef.current(
+                isBan ? `${target.name} was banned` : `${target.name} was kicked`
+              );
+            }
+            const next = prev.filter((p) => !peerIdEquals(p.id, modMsg.targetPeerId));
+            peersRef.current = next;
+            return next;
+          });
+          break;
+        }
+
+        case 'PEER_UNBAN': {
+          const unbanMsg = msg as PeerUnbanMessage;
+          const key = String(unbanMsg.targetPeerId);
+          if (bannedPeerIdsRef.current.delete(key)) {
+            setBannedPeerIds(Array.from(bannedPeerIdsRef.current));
+          }
           break;
         }
 
         case 'JOIN_REQUEST': {
-          // Only the host processes join requests; other guests will receive PEER_JOINED
+          // Host fallback handler when server is a dumb relay (stateful Rust server handles this directly)
           if (msg.peer && isHostRef.current) {
-            const guestPeer = msg.peer;
+            const rawGuest = msg.peer;
+            const guestIdKey = String(rawGuest.id);
+
+            if (bannedPeerIdsRef.current.has(guestIdKey)) {
+              multiplayerService.sendAccessDenied(
+                'BANNED',
+                'You are banned from this room',
+                rawGuest.id
+              );
+              break;
+            }
+
+            const assignedRole: CollabRole =
+              peerRolesRef.current.get(guestIdKey) === 'viewer' ? 'viewer' : 'editor';
+            peerRolesRef.current.set(guestIdKey, assignedRole);
+
+            const guestPeer: CollabPeer = {
+              ...rawGuest,
+              isHost: false,
+              role: assignedRole,
+            };
 
             setPeers((prev) => {
-              const filtered = prev.filter((p) => p.id !== guestPeer.id);
+              const filtered = prev.filter((p) => !peerIdEquals(p.id, guestPeer.id));
               const next = [...filtered, guestPeer];
               peersRef.current = next;
               return next;
             });
 
-            showToastRef.current(`${guestPeer.name} joined the canvas`);
+            if (!msg.isReconnect) {
+              showToastRef.current(`${guestPeer.name} joined the canvas`);
+            }
 
             let assignedLayerId: string | undefined;
             let effectiveLayers = layersRef.current;
 
-            // Delegate layer creation to the host application
-            if (onRemoteJoinRequestRef.current) {
-              const res = onRemoteJoinRequestRef.current(guestPeer);
-              if (res) {
-                assignedLayerId = res.assignedLayerId;
-                effectiveLayers = res.updatedLayers;
+            if (assignedRole !== 'viewer' && onRemoteJoinRequestRef.current) {
+              const existingOwned = effectiveLayers.find(
+                (l) => l.id === `layer-${guestPeer.id}-1`
+              );
+              if (existingOwned) {
+                assignedLayerId = existingOwned.id;
+              } else {
+                const res = onRemoteJoinRequestRef.current(guestPeer);
+                if (res) {
+                  assignedLayerId = res.assignedLayerId;
+                  effectiveLayers = res.updatedLayers;
+                }
               }
             }
 
             const roomName = hostInfoRef.current?.roomName || 'Studio';
 
-            // Send JOIN_ACCEPTED to the joining guest
             const joinAcceptedMsg: JoinAcceptedMessage = {
               type: 'JOIN_ACCEPTED',
               targetPeerId: guestPeer.id,
               roomName,
-              peers: [...peersRef.current.filter((p) => p.id !== guestPeer.id), myPeerRef.current],
+              peers: [
+                ...peersRef.current.filter((p) => !peerIdEquals(p.id, guestPeer.id)),
+                { ...myPeerRef.current, isHost: true, role: 'host' },
+              ],
               hostId: myPeerRef.current.id,
               docDimensions: dimensionsRef.current,
               colorMode: colorModeRef.current,
               assignedLayerId,
+              assignedRole,
+              isReconnect: Boolean(msg.isReconnect),
             };
             multiplayerService.sendMessage(joinAcceptedMsg);
 
-            // Send document synchronization (carries assignedLayerId & roomName so there is no race)
+            multiplayerService.clearSyncDedupeCaches();
+
+            const wireLayers = effectiveLayers.map(serializeLayerForWire);
+            const wireAnim = animationTimelineRef.current
+              ? { ...animationTimelineRef.current, isPlaying: false }
+              : null;
             multiplayerService.sendMessage({
               type: 'DOC_SYNC_RESPONSE',
               targetPeerId: guestPeer.id,
@@ -316,14 +762,20 @@ export function useMultiplayer({
               assignedLayerId,
               dimensions: dimensionsRef.current,
               colorMode: colorModeRef.current,
-              layers: effectiveLayers,
-              layerDataUrls: {},
+              layers: wireLayers,
+              perspectiveRuler: perspectiveRulerRef.current,
+              straightRuler: straightRulerRef.current,
+              animationTimeline: wireAnim,
             });
 
-            // Progressive paced tile streaming from active document's sparse tile grid
             streamTilesPaced(effectiveLayers);
 
-            // Broadcast PEER_JOINED to other already connected peers
+            for (const layer of effectiveLayers) {
+              if (layer.maskCanvas) {
+                multiplayerService.sendLayerMaskData(layer.id, layer.maskCanvas);
+              }
+            }
+
             multiplayerService.sendMessage({
               type: 'PEER_JOINED',
               peer: guestPeer,
@@ -334,31 +786,55 @@ export function useMultiplayer({
 
         case 'JOIN_ACCEPTED': {
           const accMsg = msg as JoinAcceptedMessage;
-          if (accMsg.targetPeerId && accMsg.targetPeerId !== myPeerRef.current.id) {
+          if (accMsg.targetPeerId && !peerIdEquals(accMsg.targetPeerId, myPeerRef.current.id)) {
             return;
           }
 
-          // Store all peers (host + existing guests)
-          const allOtherPeers = (accMsg.peers || []).filter((p) => p.id !== myPeerRef.current.id);
+          const wasReconnect = Boolean(accMsg.isReconnect || pendingReconnectCatchUpRef.current);
+          pendingReconnectCatchUpRef.current = false;
+
+          if (accMsg.assignedRole && !isHostRef.current) {
+            applyLocalRole(normalizeRole(accMsg.assignedRole, false));
+          }
+
+          const allOtherPeers = (accMsg.peers || [])
+            .filter((p) => !peerIdEquals(p.id, myPeerRef.current.id))
+            .map((p) => ({
+              ...p,
+              role: normalizeRole(p.role, p.isHost),
+            }));
           setPeers(allOtherPeers);
           peersRef.current = allOtherPeers;
 
-          if (accMsg.assignedLayerId) {
+          if (accMsg.assignedLayerId && !wasReconnect) {
             onRemoteAssignedLayerRef.current?.(accMsg.assignedLayerId);
           }
 
-          showToastRef.current(`Connected to room "${accMsg.roomName}"`);
+          if (!wasReconnect) {
+            showToastRef.current(`Connected to room "${accMsg.roomName}"`);
+          }
           break;
         }
 
         case 'PEER_JOINED': {
-          if (msg.peer && msg.peer.id !== myPeerRef.current.id) {
+          if (msg.peer && !peerIdEquals(msg.peer.id, myPeerRef.current.id)) {
+            const normalizedPeer: CollabPeer = {
+              ...msg.peer,
+              role: normalizeRole(msg.peer.role, msg.peer.isHost),
+            };
+            multiplayerService.clearSyncDedupeCaches();
             setPeers((prev) => {
-              const next = [...prev.filter((p) => p.id !== msg.peer.id), msg.peer];
+              const existed = prev.some((p) => peerIdEquals(p.id, normalizedPeer.id));
+              const next = [
+                ...prev.filter((p) => !peerIdEquals(p.id, normalizedPeer.id)),
+                normalizedPeer,
+              ];
               peersRef.current = next;
+              if (!existed) {
+                showToastRef.current(`${normalizedPeer.name} joined the canvas`);
+              }
               return next;
             });
-            showToastRef.current(`${msg.peer.name} joined the canvas`);
           }
           break;
         }
@@ -367,12 +843,13 @@ export function useMultiplayer({
         case 'PEER_DISCONNECTED': {
           const id = (msg as any).peerId ?? (msg as any).clientId;
           if (id === undefined || id === null) break;
+          onRemotePeerLeftRef.current?.(id);
           setPeers((prev) => {
-            const leaving = prev.find((p) => String(p.id) === String(id));
+            const leaving = prev.find((p) => peerIdEquals(p.id, id));
             if (leaving) {
               showToastRef.current(`${leaving.name} left the canvas`);
             }
-            const next = prev.filter((p) => String(p.id) !== String(id));
+            const next = prev.filter((p) => !peerIdEquals(p.id, id));
             peersRef.current = next;
             return next;
           });
@@ -382,12 +859,13 @@ export function useMultiplayer({
         case 'CURSOR_MOVE': {
           const cMsg = msg as CursorMoveMessage;
           setPeers((prev) => {
-            const existing = prev.find((p) => p.id === cMsg.peerId);
+            const existing = prev.find((p) => peerIdEquals(p.id, cMsg.peerId));
             if (!existing) {
               const newPeer: CollabPeer = {
                 id: cMsg.peerId,
                 name: cMsg.peerName || 'Guest',
                 color: cMsg.peerColor || getRandomColor(),
+                role: 'editor',
                 x: cMsg.x,
                 y: cMsg.y,
                 isDrawing: cMsg.isDrawing,
@@ -400,7 +878,7 @@ export function useMultiplayer({
             }
 
             const next = prev.map((p) =>
-              p.id === cMsg.peerId
+              peerIdEquals(p.id, cMsg.peerId)
                 ? {
                     ...p,
                     name: cMsg.peerName || p.name,
@@ -422,11 +900,12 @@ export function useMultiplayer({
         case 'STROKE_START': {
           const sMsg = msg as StrokeStartMessage;
           setPeers((prev) => {
-            if (prev.some((p) => p.id === sMsg.peerId)) return prev;
+            if (prev.some((p) => peerIdEquals(p.id, sMsg.peerId))) return prev;
             const newPeer: CollabPeer = {
               id: sMsg.peerId,
               name: sMsg.peerName || 'Guest',
               color: sMsg.peerColor || getRandomColor(),
+              role: 'editor',
               isDrawing: true,
               tool: sMsg.tool,
               lastActive: Date.now(),
@@ -449,28 +928,115 @@ export function useMultiplayer({
           break;
         }
 
+        case 'BRUSH_ASSET_DATA': {
+          const aMsg = msg as BrushAssetDataMessage;
+          registerRemoteBrushAsset(aMsg.hash, aMsg.mime, aMsg.data);
+          break;
+        }
+
+        case 'BRUSH_ASSET_REQUEST': {
+          const rMsg = msg as BrushAssetRequestMessage;
+          if (
+            rMsg.targetPeerId !== undefined &&
+            !peerIdEquals(rMsg.targetPeerId, myPeerRef.current.id)
+          ) {
+            break;
+          }
+          const rec = getBrushAssetRecord(rMsg.hash);
+          if (rec) {
+            multiplayerService.sendBrushAssetData(rec.hash, rec.mime, rec.bytes);
+          }
+          break;
+        }
+
         case 'LAYER_ADD':
         case 'LAYER_DELETE':
         case 'LAYER_CLEAR':
         case 'LAYER_RENAME':
         case 'LAYER_VISIBILITY':
-        case 'LAYER_OPACITY': {
+        case 'LAYER_OPACITY':
+        case 'LAYER_UPDATE':
+        case 'LAYER_TREE_SYNC': {
+          if (msg.type === 'LAYER_TREE_SYNC' && typeof msg.seq === 'number') {
+            if (msg.seq < docFieldSeqRef.current.layerTree) break;
+            docFieldSeqRef.current.layerTree = msg.seq;
+          }
           onRemoteLayerActionRef.current?.(msg);
           break;
         }
 
+        case 'BINARY_MASK': {
+          onRemoteMaskDataRef.current?.(msg as LayerMaskDataMessage);
+          break;
+        }
+
+        case 'PERSPECTIVE_RULER_SYNC': {
+          if (typeof msg.seq === 'number') {
+            if (msg.seq < docFieldSeqRef.current.perspectiveRuler) break;
+            docFieldSeqRef.current.perspectiveRuler = msg.seq;
+          }
+          onRemotePerspectiveRulerRef.current?.(msg.perspectiveRuler ?? null);
+          break;
+        }
+
+        case 'STRAIGHT_RULER_SYNC': {
+          if (typeof msg.seq === 'number') {
+            if (msg.seq < docFieldSeqRef.current.straightRuler) break;
+            docFieldSeqRef.current.straightRuler = msg.seq;
+          }
+          onRemoteStraightRulerRef.current?.(msg.straightRuler ?? null);
+          break;
+        }
+
+        case 'ANIMATION_SYNC': {
+          if (typeof msg.seq === 'number') {
+            if (msg.seq < docFieldSeqRef.current.animationTimeline) break;
+            docFieldSeqRef.current.animationTimeline = msg.seq;
+          }
+          onRemoteAnimationSyncRef.current?.(msg.animationTimeline ?? null);
+          break;
+        }
+
+        case 'CANVAS_RESIZE': {
+          if (typeof msg.seq === 'number') {
+            if (msg.seq < docFieldSeqRef.current.canvasResize) break;
+            docFieldSeqRef.current.canvasResize = msg.seq;
+          }
+          onRemoteCanvasResizeRef.current?.(msg.dimensions, msg.options);
+          break;
+        }
+
         case 'DOC_SYNC_RESPONSE': {
-          if (msg.targetPeerId && msg.targetPeerId !== myPeerRef.current.id) {
+          if (msg.targetPeerId && !peerIdEquals(msg.targetPeerId, myPeerRef.current.id)) {
             return;
           }
+          const isReconnectSync = pendingReconnectCatchUpRef.current;
+          pendingReconnectCatchUpRef.current = false;
+
+          const snapSeq = typeof msg.seq === 'number' ? msg.seq : 0;
+          if (snapSeq > lastAppliedSeqRef.current) {
+            lastAppliedSeqRef.current = snapSeq;
+          }
+          tileSeqMapRef.current.clear();
+          tileVersionMapRef.current.clear();
+          docFieldSeqRef.current = {
+            layerTree: snapSeq,
+            perspectiveRuler: snapSeq,
+            straightRuler: snapSeq,
+            animationTimeline: snapSeq,
+            canvasResize: snapSeq,
+          };
           if (onRemoteDocSyncRef.current && msg.layers) {
             onRemoteDocSyncRef.current(
               msg.dimensions,
               msg.colorMode,
               msg.layers,
-              msg.layerDataUrls || {},
               msg.assignedLayerId,
-              msg.roomName
+              msg.roomName,
+              msg.perspectiveRuler ?? null,
+              msg.straightRuler ?? null,
+              msg.animationTimeline ?? null,
+              isReconnectSync
             );
           }
           break;
@@ -490,6 +1056,46 @@ export function useMultiplayer({
 
         case 'BINARY_TILE': {
           const tMsg = msg as TileStreamMessage;
+          const tileKey = `${tMsg.layerId}:${tMsg.tileX}:${tMsg.tileY}`;
+          if (typeof tMsg.seq === 'number') {
+            const prevSeq = tileSeqMapRef.current.get(tileKey);
+            if (prevSeq !== undefined && tMsg.seq < prevSeq) {
+              break;
+            }
+            if (prevSeq !== undefined && tMsg.seq === prevSeq) {
+              const prevVer = tileVersionMapRef.current.get(tileKey);
+              if (prevVer !== undefined && tMsg.version <= prevVer) {
+                break;
+              }
+            }
+            tileSeqMapRef.current.set(tileKey, tMsg.seq);
+            tileVersionMapRef.current.set(tileKey, tMsg.version);
+          } else {
+            const prevVer = tileVersionMapRef.current.get(tileKey);
+            if (
+              tMsg.data !== null &&
+              prevVer !== undefined &&
+              tMsg.version > 0 &&
+              tMsg.version <= prevVer
+            ) {
+              break;
+            }
+            if (tMsg.data === null) {
+              tileVersionMapRef.current.delete(tileKey);
+            } else if (tMsg.version > 0) {
+              tileVersionMapRef.current.set(tileKey, tMsg.version);
+            }
+          }
+
+          const activeGrid = documentStore.getActiveTileGrid();
+          activeGrid.markLayerIngested(tMsg.layerId);
+          if (tMsg.data === null) {
+            activeGrid.deleteTile(tMsg.layerId, tMsg.tileX, tMsg.tileY, 0);
+            activeGrid.bumpLayerVersion(tMsg.layerId);
+            activeGrid.notifyChange(true);
+            onRemoteTileAppliedRef.current?.(tMsg.layerId);
+            break;
+          }
           const tile: TileBuffer = {
             layerId: tMsg.layerId,
             tileX: tMsg.tileX,
@@ -502,18 +1108,9 @@ export function useMultiplayer({
             lastAccessTimestamp: typeof performance !== 'undefined' ? performance.now() : Date.now(),
             lod: 0,
           };
-          const activeGrid = documentStore.getActiveTileGrid();
           activeGrid.setTile(tMsg.layerId, tMsg.tileX, tMsg.tileY, tile);
-          const canvas = layerCanvasesRef.current.get(tMsg.layerId);
-          if (canvas) {
-            activeGrid.renderLayerToCanvas(tMsg.layerId, canvas, {
-              x: tMsg.tileX * TILE_SIZE,
-              y: tMsg.tileY * TILE_SIZE,
-              width: TILE_SIZE,
-              height: TILE_SIZE,
-            });
-          }
           activeGrid.notifyChange(true);
+          onRemoteTileAppliedRef.current?.(tMsg.layerId);
           break;
         }
 
@@ -525,24 +1122,31 @@ export function useMultiplayer({
       }
     });
 
+    // Unexpected close: keep session state & seq cursors, reconnect with exponential backoff
     const unsubClose = multiplayerService.onClose(() => {
+      if (intentionalDisconnectRef.current || !sessionParamsRef.current) {
+        resetSessionState();
+        return;
+      }
+
       setIsConnected(false);
-      setIsHost(false);
-      setPeers([]);
-      peersRef.current = [];
-      showToastRef.current('Disconnected from collaborative session');
+      setConnectionStatus('reconnecting');
+      if (reconnectAttemptRef.current === 0) {
+        showToastRef.current('Connection lost. Reconnecting...');
+      }
+      scheduleReconnectRef.current(false);
     });
 
     return () => {
       unsubscribe();
       unsubClose();
     };
-  }, [layerCanvasesRef, streamTilesPaced]);
+  }, [applyLocalRole, resetSessionState, streamTilesPaced]);
 
   // SMART CLIPBOARD INVITATION DETECTION
   useEffect(() => {
     const checkClipboardForInvite = async () => {
-      if (isConnected) return;
+      if (isConnected || connectionStatus === 'reconnecting') return;
 
       try {
         if (!navigator.clipboard || !navigator.clipboard.readText) return;
@@ -561,7 +1165,7 @@ export function useMultiplayer({
 
     window.addEventListener('focus', checkClipboardForInvite);
     return () => window.removeEventListener('focus', checkClipboardForInvite);
-  }, [isConnected]);
+  }, [isConnected, connectionStatus]);
 
   // Check URL query parameters on initial page load (for Web Browser joins)
   useEffect(() => {
@@ -582,6 +1186,12 @@ export function useMultiplayer({
       onStatus?: (status: string) => void
     ) => {
       try {
+        clearReconnectTimer();
+        intentionalDisconnectRef.current = false;
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        setConnectionStatus('connecting');
+
         let currentName = myPeerRef.current.name;
         if (hostNickname && hostNickname.trim()) {
           currentName = hostNickname.trim();
@@ -650,18 +1260,65 @@ export function useMultiplayer({
         isHostRef.current = true;
         hostInfoRef.current = normalizedServerInfo;
 
+        bannedPeerIdsRef.current.clear();
+        setBannedPeerIds([]);
+        peerRolesRef.current.clear();
+        lastAppliedSeqRef.current = 0;
+        tileSeqMapRef.current.clear();
+        tileVersionMapRef.current.clear();
+        pendingReconnectCatchUpRef.current = false;
+
         const hostPeer: CollabPeer = {
           ...myPeerRef.current,
           name: currentName,
           isHost: true,
+          role: 'host',
         };
         setMyPeer(hostPeer);
         myPeerRef.current = hostPeer;
+        myRoleRef.current = 'host';
+        setMyRole('host');
+        multiplayerService.setLocalRole('host');
 
         // Host connects locally via 127.0.0.1 with the room token
         const wsUrl = `ws://127.0.0.1:${resolvedPort}/ws`;
+        sessionParamsRef.current = {
+          wsUrl,
+          token: resolvedRoomToken || undefined,
+          roomName: resolvedRoomName,
+          host: '127.0.0.1',
+          port: resolvedPort,
+          isSecure: false,
+          isHost: true,
+        };
+
         await multiplayerService.connect(wsUrl, hostPeer, resolvedRoomToken || undefined);
         setIsConnected(true);
+        setConnectionStatus('connected');
+
+        // Seed the stateful server immediately so joining peers sync directly from the server
+        const initialLayers = layersRef.current;
+        const wireLayers = initialLayers.map(serializeLayerForWire);
+        const wireAnim = animationTimelineRef.current
+          ? { ...animationTimelineRef.current, isPlaying: false }
+          : null;
+        multiplayerService.sendMessage({
+          type: 'DOC_SYNC_RESPONSE',
+          targetPeerId: '__server__',
+          roomName: resolvedRoomName,
+          dimensions: dimensionsRef.current,
+          colorMode: colorModeRef.current,
+          layers: wireLayers,
+          perspectiveRuler: perspectiveRulerRef.current,
+          straightRuler: straightRulerRef.current,
+          animationTimeline: wireAnim,
+        });
+        streamTilesPaced(initialLayers);
+        for (const layer of initialLayers) {
+          if (layer.maskCanvas) {
+            multiplayerService.sendLayerMaskData(layer.id, layer.maskCanvas);
+          }
+        }
 
         // Auto-copy invite link
         try {
@@ -679,34 +1336,31 @@ export function useMultiplayer({
         return normalizedServerInfo;
       } catch (err: any) {
         console.error('Failed to start host session:', err);
+        resetSessionState();
         const errMsg = err?.message || (typeof err === 'string' ? err : 'Connection error');
         showToast(`Failed to start host: ${errMsg}`);
         throw err;
       }
     },
-    [showToast]
+    [clearReconnectTimer, resetSessionState, showToast, streamTilesPaced]
   );
 
   // STOP HOSTING
   const stopHosting = useCallback(async () => {
     try {
+      intentionalDisconnectRef.current = true;
+      clearReconnectTimer();
       multiplayerService.disconnect();
       if (isTauriEnvironment()) {
         const { invoke } = await import('@tauri-apps/api/core');
         await invoke('stop_collab_server');
       }
-      setIsConnected(false);
-      setIsHost(false);
-      isHostRef.current = false;
-      setHostInfo(null);
-      hostInfoRef.current = null;
-      setPeers([]);
-      peersRef.current = [];
+      resetSessionState();
       showToast('Collaborative session stopped');
     } catch (err) {
       console.error('Failed to stop collab server:', err);
     }
-  }, [showToast]);
+  }, [clearReconnectTimer, resetSessionState, showToast]);
 
   // JOIN ROOM
   const joinRoom = useCallback(
@@ -720,6 +1374,12 @@ export function useMultiplayer({
       persistName: boolean = false
     ): Promise<boolean> => {
       try {
+        clearReconnectTimer();
+        intentionalDisconnectRef.current = false;
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        setConnectionStatus('connecting');
+
         let currentName = myPeerRef.current.name;
         if (guestNickname && guestNickname.trim()) {
           currentName = guestNickname.trim();
@@ -742,14 +1402,35 @@ export function useMultiplayer({
           ...myPeerRef.current,
           name: currentName,
           isHost: false,
+          role: 'editor',
         };
         setMyPeer(guestPeer);
         myPeerRef.current = guestPeer;
+        myRoleRef.current = 'editor';
+        setMyRole('editor');
+        multiplayerService.setLocalRole('editor');
+
+        lastAppliedSeqRef.current = 0;
+        tileSeqMapRef.current.clear();
+        tileVersionMapRef.current.clear();
+        pendingReconnectCatchUpRef.current = false;
+
+        sessionParamsRef.current = {
+          wsUrl,
+          token,
+          roomName,
+          host,
+          port,
+          isSecure,
+          isHost: false,
+        };
 
         await multiplayerService.connect(wsUrl, guestPeer, token);
         setIsConnected(true);
+        setConnectionStatus('connected');
         setIsHost(false);
         isHostRef.current = false;
+
         const inviteProto = isSecure ? 'https' : 'http';
         const tokenQuery = token ? `&token=${encodeURIComponent(token)}` : '';
         const nextHostInfo: SessionHostInfo = {
@@ -768,11 +1449,12 @@ export function useMultiplayer({
         setWebLandingInvite(null);
         return true;
       } catch (err: any) {
+        resetSessionState();
         showToast(`Failed to connect: ${err?.message || err}`);
         return false;
       }
     },
-    [showToast]
+    [clearReconnectTimer, resetSessionState, showToast]
   );
 
   const joinByInviteUrl = useCallback(
@@ -796,16 +1478,98 @@ export function useMultiplayer({
   );
 
   const leaveRoom = useCallback(() => {
+    intentionalDisconnectRef.current = true;
+    clearReconnectTimer();
     multiplayerService.disconnect();
-    setIsConnected(false);
-    setIsHost(false);
-    isHostRef.current = false;
-    setHostInfo(null);
-    hostInfoRef.current = null;
-    setPeers([]);
-    peersRef.current = [];
+    resetSessionState();
     showToast('Left the collaborative session');
-  }, [showToast]);
+  }, [clearReconnectTimer, resetSessionState, showToast]);
+
+  // HOST MODERATION: ROLE CHANGE, KICK, BAN, UNBAN
+  const setPeerRole = useCallback(
+    (peerId: string | number, role: Exclude<CollabRole, 'host'>) => {
+      if (!isHostRef.current) {
+        showToast('Only the Host can change participant roles');
+        return;
+      }
+      if (peerIdEquals(peerId, myPeerRef.current.id)) return;
+
+      peerRolesRef.current.set(String(peerId), role);
+      setPeers((prev) => {
+        const next = prev.map((p) => (peerIdEquals(p.id, peerId) ? { ...p, role } : p));
+        peersRef.current = next;
+        return next;
+      });
+      multiplayerService.sendPeerRoleUpdate(peerId, role);
+    },
+    [showToast]
+  );
+
+  const kickPeer = useCallback(
+    (peerId: string | number, reason?: string) => {
+      if (!isHostRef.current) {
+        showToast('Only the Host can kick participants');
+        return;
+      }
+      if (peerIdEquals(peerId, myPeerRef.current.id)) return;
+
+      multiplayerService.sendPeerKick(peerId, reason);
+      onRemotePeerLeftRef.current?.(peerId);
+      setPeers((prev) => {
+        const target = prev.find((p) => peerIdEquals(p.id, peerId));
+        if (target) {
+          showToast(`Kicked ${target.name} from the room`);
+        }
+        const next = prev.filter((p) => !peerIdEquals(p.id, peerId));
+        peersRef.current = next;
+        return next;
+      });
+    },
+    [showToast]
+  );
+
+  const banPeer = useCallback(
+    (peerId: string | number, reason?: string) => {
+      if (!isHostRef.current) {
+        showToast('Only the Host can ban participants');
+        return;
+      }
+      if (peerIdEquals(peerId, myPeerRef.current.id)) return;
+
+      const key = String(peerId);
+      bannedPeerIdsRef.current.add(key);
+      setBannedPeerIds(Array.from(bannedPeerIdsRef.current));
+
+      multiplayerService.sendPeerBan(peerId, reason);
+      onRemotePeerLeftRef.current?.(peerId);
+      setPeers((prev) => {
+        const target = prev.find((p) => peerIdEquals(p.id, peerId));
+        if (target) {
+          showToast(`Banned ${target.name} from the room`);
+        }
+        const next = prev.filter((p) => !peerIdEquals(p.id, peerId));
+        peersRef.current = next;
+        return next;
+      });
+    },
+    [showToast]
+  );
+
+  const unbanPeer = useCallback(
+    (peerId: string | number) => {
+      if (!isHostRef.current) {
+        showToast('Only the Host can unban participants');
+        return;
+      }
+      const key = String(peerId);
+      if (bannedPeerIdsRef.current.delete(key)) {
+        setBannedPeerIds(Array.from(bannedPeerIdsRef.current));
+        multiplayerService.sendPeerUnban(peerId);
+        showToast(`Unbanned ${key}`);
+      }
+    },
+    [showToast]
+  );
 
   const updateMyName = useCallback((name: string, markCustomized: boolean = true) => {
     const fallback = isTauriEnvironment() ? 'Artist' : 'Guest';
@@ -839,9 +1603,14 @@ export function useMultiplayer({
 
   return {
     isConnected,
+    connectionStatus,
+    isReconnecting: connectionStatus === 'reconnecting',
+    reconnectAttempt,
     isHost,
+    myRole,
     hostInfo,
     peers,
+    bannedPeerIds,
     myPeer,
     activePings,
     clipboardInvite,
@@ -855,6 +1624,10 @@ export function useMultiplayer({
     joinRoom,
     joinByInviteUrl,
     leaveRoom,
+    setPeerRole,
+    kickPeer,
+    banPeer,
+    unbanPeer,
     updateMyName,
     updateMyColor,
     sendPing,

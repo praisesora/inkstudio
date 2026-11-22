@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { SessionHostInfo, CollabPeer } from '../types/multiplayer';
+import {
+  SessionHostInfo,
+  CollabPeer,
+  CollabRole,
+  ConnectionStatus,
+} from '../types/multiplayer';
 import {
   Users,
   Copy,
@@ -14,6 +19,9 @@ import {
   Link2,
   LogOut,
   AlertTriangle,
+  Ban,
+  UserX,
+  RefreshCw,
 } from 'lucide-react';
 
 interface HostModalProps {
@@ -21,8 +29,12 @@ interface HostModalProps {
   onClose: () => void;
   isHost: boolean;
   isConnected: boolean;
+  connectionStatus?: ConnectionStatus;
+  reconnectAttempt?: number;
+  myRole?: CollabRole;
   hostInfo: SessionHostInfo | null;
   peers: CollabPeer[];
+  bannedPeerIds?: string[];
   myPeer: CollabPeer;
   onUpdateMyName: (name: string) => void;
   onStartHosting: (
@@ -35,6 +47,10 @@ interface HostModalProps {
   onStopHosting: () => void;
   onJoinByInviteUrl: (rawUrl: string, nickname?: string, persistName?: boolean) => Promise<boolean>;
   onLeaveRoom: () => void;
+  onSetPeerRole?: (peerId: string | number, role: 'editor' | 'viewer') => void;
+  onKickPeer?: (peerId: string | number) => void;
+  onBanPeer?: (peerId: string | number) => void;
+  onUnbanPeer?: (peerId: string | number) => void;
   showToast: (msg: string) => void;
 }
 
@@ -48,14 +64,22 @@ export const HostModal: React.FC<HostModalProps> = ({
   onClose,
   isHost,
   isConnected,
+  connectionStatus = isConnected ? 'connected' : 'disconnected',
+  reconnectAttempt = 0,
+  myRole = isHost ? 'host' : 'editor',
   hostInfo,
   peers,
+  bannedPeerIds = [],
   myPeer,
   onUpdateMyName,
   onStartHosting,
   onStopHosting,
   onJoinByInviteUrl,
   onLeaveRoom,
+  onSetPeerRole,
+  onKickPeer,
+  onBanPeer,
+  onUnbanPeer,
   showToast,
 }) => {
   const [activeTab, setActiveTab] = useState<'host' | 'join'>('host');
@@ -175,11 +199,13 @@ export const HostModal: React.FC<HostModalProps> = ({
             <div>
               <h3 className="text-sm font-semibold text-white">Collaborative Drawing</h3>
               <p className="text-[11px] text-[#888888]">
-                {isConnected
-                  ? isHost
-                    ? 'Hosting active session'
-                    : 'Connected to remote canvas'
-                  : 'Host or join a live canvas session'}
+                {connectionStatus === 'reconnecting'
+                  ? `Reconnecting (attempt ${reconnectAttempt || 1})...`
+                  : isConnected
+                    ? isHost
+                      ? 'Hosting active session'
+                      : `Connected as ${myRole === 'viewer' ? 'Viewer (Read-Only)' : 'Editor'}`
+                    : 'Host or join a live canvas session'}
               </p>
             </div>
           </div>
@@ -193,7 +219,39 @@ export const HostModal: React.FC<HostModalProps> = ({
 
         {/* Content */}
         <div className="p-5 space-y-4">
-          {isConnected && isHost ? (
+          {connectionStatus === 'reconnecting' ? (
+            <div className="space-y-4">
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3.5 flex items-start space-x-3">
+                <RefreshCw className="w-5 h-5 text-amber-400 shrink-0 mt-0.5 animate-spin" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-semibold text-amber-300">
+                    Reconnecting to Session...
+                  </div>
+                  <div className="text-[11px] text-[#aaaaaa] mt-0.5 truncate">
+                    Room: <span className="text-white font-medium">{hostInfo?.roomName || 'Studio'}</span>{' '}
+                    (attempt {reconnectAttempt || 1})
+                  </div>
+                  <div className="text-[10px] text-[#888888] mt-1">
+                    Session state is preserved. Missed tiles and layer updates will catch up automatically.
+                  </div>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  if (isHost) {
+                    onStopHosting();
+                  } else {
+                    onLeaveRoom();
+                  }
+                  onClose();
+                }}
+                className="w-full flex items-center justify-center space-x-2 rounded border border-rose-500/30 bg-rose-500/10 hover:bg-rose-500/20 py-2 text-xs font-medium text-rose-400 transition-colors cursor-pointer"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>{isHost ? 'Stop Session' : 'Cancel & Leave'}</span>
+              </button>
+            </div>
+          ) : isConnected && isHost ? (
             // Active Host View
             <div className="space-y-4">
               {hostInfo?.isGlobal ? (
@@ -295,26 +353,94 @@ export const HostModal: React.FC<HostModalProps> = ({
                     </span>
                   </div>
 
-                  {peers.map((peer) => (
-                    <div
-                      key={peer.id}
-                      className="flex items-center justify-between px-3 py-2 text-xs"
-                    >
-                      <div className="flex items-center space-x-2">
-                        <div
-                          className="w-3 h-3 rounded-full shrink-0"
-                          style={{ backgroundColor: peer.color }}
-                        />
-                        <span className="text-[#dddddd]">{peer.name}</span>
+                  {peers.map((peer) => {
+                    const peerRole = peer.role === 'viewer' ? 'viewer' : 'editor';
+                    return (
+                      <div
+                        key={peer.id}
+                        className="flex items-center justify-between gap-2 px-3 py-2 text-xs"
+                      >
+                        <div className="flex items-center space-x-2 min-w-0">
+                          <div
+                            className="w-3 h-3 rounded-full shrink-0"
+                            style={{ backgroundColor: peer.color }}
+                          />
+                          <span className="text-[#dddddd] truncate">{peer.name}</span>
+                        </div>
+                        <div className="flex items-center space-x-1.5 shrink-0">
+                          {onSetPeerRole ? (
+                            <select
+                              aria-label={`Role for ${peer.name}`}
+                              value={peerRole}
+                              onChange={(e) =>
+                                onSetPeerRole(
+                                  peer.id,
+                                  e.target.value === 'viewer' ? 'viewer' : 'editor'
+                                )
+                              }
+                              className="rounded border border-[#3e3e3e] bg-[#252525] px-1.5 py-0.5 text-[10px] text-[#e0e0e0] focus:outline-hidden cursor-pointer"
+                            >
+                              <option value="editor">Editor</option>
+                              <option value="viewer">Viewer</option>
+                            </select>
+                          ) : (
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#2a2a2a] text-[#aaaaaa] capitalize">
+                              {peerRole}
+                            </span>
+                          )}
+                          {onKickPeer && (
+                            <button
+                              type="button"
+                              onClick={() => onKickPeer(peer.id)}
+                              title={`Kick ${peer.name}`}
+                              className="p-1 rounded text-[#999999] hover:text-amber-300 hover:bg-amber-500/15 transition-colors cursor-pointer"
+                            >
+                              <UserX className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {onBanPeer && (
+                            <button
+                              type="button"
+                              onClick={() => onBanPeer(peer.id)}
+                              title={`Ban ${peer.name}`}
+                              className="p-1 rounded text-[#999999] hover:text-rose-400 hover:bg-rose-500/15 transition-colors cursor-pointer"
+                            >
+                              <Ban className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
                       </div>
-                      <span className="text-[10px] text-emerald-400 flex items-center space-x-1">
-                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                        <span>Online</span>
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
+
+              {bannedPeerIds.length > 0 && (
+                <div>
+                  <div className="text-[11px] font-medium text-[#aaaaaa] mb-1.5">
+                    Banned Peers ({bannedPeerIds.length})
+                  </div>
+                  <div className="rounded border border-[#333333] bg-[#1a1a1a] max-h-24 overflow-y-auto divide-y divide-[#2a2a2a]">
+                    {bannedPeerIds.map((pid) => (
+                      <div
+                        key={pid}
+                        className="flex items-center justify-between px-3 py-1.5 text-[11px]"
+                      >
+                        <span className="font-mono text-[#aaaaaa] truncate">{pid}</span>
+                        {onUnbanPeer && (
+                          <button
+                            type="button"
+                            onClick={() => onUnbanPeer(pid)}
+                            className="text-[10px] text-sky-400 hover:text-sky-300 underline ml-2 shrink-0 cursor-pointer"
+                          >
+                            Unban
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Stop Button */}
               <div className="pt-2">
@@ -364,7 +490,15 @@ export const HostModal: React.FC<HostModalProps> = ({
                       />
                       <span className="font-medium text-white">{myPeer.name} (You)</span>
                     </div>
-                    <span className="text-[10px] text-emerald-400">Online</span>
+                    <span
+                      className={`text-[10px] font-mono px-1.5 py-0.5 rounded capitalize ${
+                        myRole === 'viewer'
+                          ? 'bg-slate-500/20 text-slate-300'
+                          : 'bg-emerald-500/20 text-emerald-300'
+                      }`}
+                    >
+                      {myRole}
+                    </span>
                   </div>
                   {peers.map((peer) => (
                     <div
@@ -378,8 +512,8 @@ export const HostModal: React.FC<HostModalProps> = ({
                         />
                         <span className="text-[#dddddd]">{peer.name}</span>
                       </div>
-                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#2a2a2a] text-[#aaaaaa]">
-                        {peer.isHost ? 'Host' : 'Peer'}
+                      <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-[#2a2a2a] text-[#aaaaaa] capitalize">
+                        {peer.isHost ? 'Host' : peer.role || 'Editor'}
                       </span>
                     </div>
                   ))}
