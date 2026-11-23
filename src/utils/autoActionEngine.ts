@@ -25,6 +25,7 @@ export type AutoActionCommandType =
   | 'fill-layer'
   | 'clear-layer'
   | 'merge-down'
+  | 'merge-folder'
   | 'rasterize-layer'
   | 'apply-filter'
   | 'apply-tonal-correction'
@@ -75,6 +76,7 @@ export interface AutoActionExecutionContext {
   fillLayer: (layerId: string, color: string) => void;
   clearLayer: (layerId: string) => void;
   mergeDown: () => void;
+  mergeFolder?: (folderId?: string) => void;
   rasterizeLayer?: (layerId: string) => void;
   applyFilter?: (type: FilterType, params?: Record<string, unknown>) => void;
   applyTonalCorrection?: (type: TonalCorrectionType, params?: Record<string, unknown>) => void;
@@ -112,6 +114,7 @@ const VALID_COMMAND_TYPES = new Set<AutoActionCommandType>([
   'fill-layer',
   'clear-layer',
   'merge-down',
+  'merge-folder',
   'rasterize-layer',
   'apply-filter',
   'apply-tonal-correction',
@@ -470,6 +473,9 @@ export async function executeAutoAction(
             break;
           case 'merge-down':
             ctx.mergeDown();
+            break;
+          case 'merge-folder':
+            ctx.mergeFolder?.(activeId);
             break;
           case 'rasterize-layer':
             if (activeId && ctx.rasterizeLayer) ctx.rasterizeLayer(activeId);

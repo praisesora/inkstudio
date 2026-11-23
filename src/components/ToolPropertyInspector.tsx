@@ -21,6 +21,7 @@ import {
   CspBrush,
   BrushDynamics,
   DEFAULT_BRUSH_DYNAMICS,
+  DEFAULT_NATURAL_PAINT_SETTINGS,
   LiquifyMode,
   CspAngleDynamicsMode,
   CspBlendTipsMode,
@@ -58,6 +59,8 @@ import {
   useUiStore,
   uiStoreActions,
 } from '../stores';
+import { Tool3DPropertyInspector } from './Tool3DPropertyInspector';
+import { PigmentBlendControl } from './PigmentBlendControl';
 
 interface CompactSliderProps {
   label: string;
@@ -306,7 +309,9 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
           taper: newSettings.taper ?? activeCustomBrush.taper,
           spray: newSettings.spray ?? activeCustomBrush.spray,
           colorMixing: newSettings.colorMixing ?? activeCustomBrush.colorMixing,
+          perceptualMixing: newSettings.perceptualMixing ?? activeCustomBrush.perceptualMixing,
           mixingMode: newSettings.mixingMode ?? activeCustomBrush.mixingMode,
+          naturalPaint: newSettings.naturalPaint ?? activeCustomBrush.naturalPaint,
           amountOfPaint: newSettings.amountOfPaint ?? activeCustomBrush.amountOfPaint,
           densityOfPaint: newSettings.densityOfPaint ?? activeCustomBrush.densityOfPaint,
           colorStretch: newSettings.colorStretch ?? activeCustomBrush.colorStretch,
@@ -346,6 +351,10 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
     };
 
     if (!isBrushOrEraser) {
+      if (currentTool === '3d') {
+        return <Tool3DPropertyInspector />;
+      }
+
       if (currentTool === 'fill') {
         const method = fillSettings.method ?? 'refer-all';
         return (
@@ -731,6 +740,17 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                   <option value="overlay">Overlay</option>
                 </select>
               </div>
+              <div className="pt-1 border-t border-[#2c2c2c]">
+                <PigmentBlendControl
+                  label="Color Blending"
+                  enabled={Boolean(gradientSettings.pigmentBlending)}
+                  onEnabledChange={(enabled) =>
+                    toolStoreActions.updateGradientSettings({ pigmentBlending: enabled })
+                  }
+                  primaryColor={primaryColor}
+                  secondaryColor={secondaryColor}
+                />
+              </div>
               <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
                 <span>Dither</span>
                 <input
@@ -824,19 +844,40 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
               />
             </label>
 
-            {retouchSettings.mode === 'smudge' && (
-              <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer pt-1 border-t border-[#2c2c2c]">
-                <span>Finger Painting</span>
-                <input
-                  type="checkbox"
-                  checked={retouchSettings.smudgeFingerPainting}
-                  onChange={(e) =>
+            {(retouchSettings.mode === 'smudge' || retouchSettings.mode === 'blur') && (
+              <div className="space-y-2.5 pt-2 border-t border-[#2c2c2c]">
+                <PigmentBlendControl
+                  label="Blending"
+                  strengthLabel="Pigment Strength"
+                  enabled={Boolean(retouchSettings.pigmentBlending)}
+                  onEnabledChange={(enabled) =>
+                    toolStoreActions.updateRetouchSettings({ pigmentBlending: enabled })
+                  }
+                  strength={(retouchSettings.pigmentStrength ?? 100) / 100}
+                  onStrengthChange={(s) =>
                     toolStoreActions.updateRetouchSettings({
-                      smudgeFingerPainting: e.target.checked,
+                      pigmentStrength: Math.round(s * 100),
                     })
                   }
+                  primaryColor={primaryColor}
+                  secondaryColor={secondaryColor}
                 />
-              </label>
+
+                {retouchSettings.mode === 'smudge' && (
+                  <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer pt-1.5 border-t border-[#2c2c2c]/70">
+                    <span>Finger Painting</span>
+                    <input
+                      type="checkbox"
+                      checked={retouchSettings.smudgeFingerPainting}
+                      onChange={(e) =>
+                        toolStoreActions.updateRetouchSettings({
+                          smudgeFingerPainting: e.target.checked,
+                        })
+                      }
+                    />
+                  </label>
+                )}
+              </div>
             )}
 
             {(retouchSettings.mode === 'dodge' || retouchSettings.mode === 'burn') && (
@@ -2410,19 +2451,32 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             )}
           </div>
 
-          {/* 4. Color Mixing & Watercolor Edge */}
+          {/* 4. Color Mixing & Blending */}
           <div className="bg-[#202020]">
             <button
               type="button"
               onClick={() => toggleAccordion('mixing')}
               className="w-full px-2 py-1.5 flex items-center justify-between text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 transition-colors cursor-pointer"
             >
-              <span>Color Mixing &amp; Edge</span>
-              {openAccordion === 'mixing' ? (
-                <ChevronDown className="w-3 h-3" />
-              ) : (
-                <ChevronRight className="w-3 h-3" />
-              )}
+              <span>Blending &amp; Mixing</span>
+              <div className="flex items-center gap-1">
+                {brushSettings.colorMixing && (
+                  <span
+                    className={`px-1.5 py-[1px] rounded-full text-[9px] font-medium border ${
+                      (brushSettings.perceptualMixing ?? true)
+                        ? 'bg-emerald-500/12 text-emerald-300 border-emerald-400/25'
+                        : 'bg-white/[0.04] text-[#8a8a8a] border-white/[0.08]'
+                    }`}
+                  >
+                    {(brushSettings.perceptualMixing ?? true) ? 'Pigment' : 'Regular'}
+                  </span>
+                )}
+                {openAccordion === 'mixing' ? (
+                  <ChevronDown className="w-3 h-3" />
+                ) : (
+                  <ChevronRight className="w-3 h-3" />
+                )}
+              </div>
             </button>
 
             {openAccordion === 'mixing' && (
@@ -2473,16 +2527,29 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                         </button>
                       ))}
                     </div>
-                    <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
-                      <span>Perceptual (OKLab)</span>
-                      <input
-                        type="checkbox"
-                        checked={brushSettings.perceptualMixing ?? true}
-                        onChange={(e) =>
-                          handleUpdateBrushSettings({ perceptualMixing: e.target.checked })
-                        }
-                      />
-                    </label>
+                    <PigmentBlendControl
+                      label="Color Blending"
+                      strengthLabel="Pigment Strength"
+                      enabled={brushSettings.perceptualMixing ?? true}
+                      onEnabledChange={(enabled) =>
+                        handleUpdateBrushSettings({
+                          perceptualMixing: enabled,
+                        })
+                      }
+                      strength={brushSettings.naturalPaint?.pigmentMixingStrength ?? 1.0}
+                      onStrengthChange={(s) =>
+                        handleUpdateBrushSettings({
+                          perceptualMixing: true,
+                          naturalPaint: {
+                            ...DEFAULT_NATURAL_PAINT_SETTINGS,
+                            ...(brushSettings.naturalPaint || {}),
+                            pigmentMixingStrength: s,
+                          },
+                        })
+                      }
+                      primaryColor={primaryColor}
+                      secondaryColor={secondaryColor}
+                    />
                     <CompactSlider
                       label="Amount of Paint"
                       valueLabel={`${Math.round((brushSettings.amountOfPaint ?? brushSettings.naturalPaint?.paintLoad ?? 0.7) * 100)}%`}

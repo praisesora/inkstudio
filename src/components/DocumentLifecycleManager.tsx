@@ -69,10 +69,13 @@ function hasMeaningfulLayerEdit(prev: LayerItem[], next: LayerItem[]): boolean {
       a.clipped !== b.clipped ||
       a.parentId !== b.parentId ||
       a.isReference !== b.isReference ||
+      a.isToneLayer !== b.isToneLayer ||
       a.toneEnabled !== b.toneEnabled ||
       a.toneFrequency !== b.toneFrequency ||
       a.toneAngle !== b.toneAngle ||
+      a.toneDotShape !== b.toneDotShape ||
       a.toneDensity !== b.toneDensity ||
+      a.toneDensityType !== b.toneDensityType ||
       a.layerColorEnabled !== b.layerColorEnabled ||
       a.layerColor !== b.layerColor ||
       a.expressionColor !== b.expressionColor ||
@@ -211,6 +214,7 @@ export interface UseDocumentLifecycleParams {
     layerId?: string;
     layerName?: string;
     tileDeltas?: import('../types/editor').TileDelta[];
+    layerTreeDelta?: import('../types/editor').LayerTreeDelta;
   }>;
   onDeselectAfterPaste?: () => void;
   deleteLayer: (id: string) => void;
@@ -348,7 +352,7 @@ export function useDocumentLifecycle({
   const handlePasteSelectedLayer = useCallback(async () => {
     const res = await pasteLayer();
     if (res.success && res.layerName) {
-      if (res.layerId && res.tileDeltas && res.tileDeltas.length > 0) {
+      if (res.layerId && ((res.tileDeltas && res.tileDeltas.length > 0) || res.layerTreeDelta)) {
         pushHistoryStep(
           'selection-move',
           `Paste "${res.layerName}"`,
@@ -356,7 +360,12 @@ export function useDocumentLifecycle({
           null,
           res.layerId,
           undefined,
-          res.tileDeltas
+          res.tileDeltas,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          res.layerTreeDelta
         );
       }
       onDeselectAfterPaste?.();
@@ -411,8 +420,9 @@ export function useDocumentLifecycle({
     (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (file) {
+        toolStoreActions.selectTool('3d');
         uiStoreActions.set3DLayerOpen(true, file);
-        showToast(`Importing 3D model "${file.name}" into local ghost layer...`);
+        showToast(`Importing 3D model "${file.name}" into 3D stage...`);
         if (import3DFileInputRef.current) {
           import3DFileInputRef.current.value = '';
         }
@@ -489,6 +499,16 @@ export function useDocumentLifecycle({
 
   const handleProcessFile = useCallback(
     async (file: File, options?: ProcessFileOptions) => {
+      const lowerName = file.name.toLowerCase();
+      if (
+        (lowerName.endsWith('.glb') || lowerName.endsWith('.gltf') || lowerName.endsWith('.obj')) &&
+        useDocumentStore.getState().documents.length > 0
+      ) {
+        toolStoreActions.selectTool('3d');
+        uiStoreActions.set3DLayerOpen(true, file);
+        showToast(`Importing 3D model "${file.name}" into 3D stage...`);
+        return;
+      }
       if (isSupportedBrushFileName(file.name)) {
         try {
           uiStoreActions.setLoading(true, `Importing Brush: ${file.name}...`);

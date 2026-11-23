@@ -45,7 +45,8 @@ export type ToolType =
   | 'balloon'
   | 'object'
   | 'vector-edit'
-  | 'liquify';
+  | 'liquify'
+  | '3d';
 
 export interface Point {
   x: number;
@@ -571,7 +572,8 @@ export type HistoryActionType =
   | 'retouch'
   | 'pen'
   | 'filter'
-  | 'auto-action';
+  | 'auto-action'
+  | 'layer';
 
 export type LiquifyMode =
   | 'push'
@@ -879,6 +881,11 @@ export interface LayerTreeDelta {
   insertBeforeLayerId?: string | null;
   insertIndex?: number;
   updatedLayers?: LayerTreeDeltaUpdate[];
+  /** Full layer list snapshots before/after for general layer tree mutations (add, delete, reorder, merge, properties, masks, etc.). */
+  beforeLayers?: LayerItem[];
+  afterLayers?: LayerItem[];
+  /** Optional key to coalesce rapid continuous slider edits (e.g. opacity, tone frequency) into a single undo step. */
+  coalesceKey?: string;
   beforeActiveLayerId?: string;
   afterActiveLayerId?: string;
 }
@@ -1009,12 +1016,13 @@ export interface LayerItem {
   thumbnailUrl?: string; // live layer thumbnail data URL
   isReference?: boolean; // Clip Studio Paint Reference Layer toggle
   // Screentone (CSP Tone Effect)
+  isToneLayer?: boolean; // True for dedicated screentone fill layers with flat editable density; false/undefined for regular layers whose tone adapts to image tones
   toneEnabled?: boolean;
   toneFrequency?: number; // Lines / LPI (20 to 85, default: 60)
   toneAngle?: number; // Angle in degrees (0 to 90, default: 45)
   toneDotShape?: 'circle' | 'euclidean' | 'line' | 'diamond'; // Default: circle
-  toneDensity?: number; // Density percentage (1 to 100, default: 40)
-  toneDensityType?: 'specified' | 'image'; // 'specified' ("Use specified density") or 'image' ("Use image brightness")
+  toneDensity?: number; // Density percentage (1 to 100, default: 40; editable on dedicated tone layers)
+  toneDensityType?: 'specified' | 'image'; // 'specified' (dedicated tone layer) or 'image' (existing layer tones)
   // Clip Studio Paint Style Layer Color (Tint Effect)
   layerColorEnabled?: boolean;
   layerColor?: string; // Primary tint color (default: '#1c73c2')
@@ -1053,6 +1061,31 @@ export interface LayerItem {
 
 export function isFolderLikeLayer(layer: Pick<LayerItem, 'type'> | null | undefined): boolean {
   return layer?.type === 'folder' || layer?.type === 'frame-folder';
+}
+
+/**
+ * Returns true if the layer is a dedicated Screen Tone layer (flat tone sheet
+ * whose density is directly editable, like Clip Studio Paint's Tone layer).
+ * Regular layers with the Screentone effect enabled return false so their
+ * halftone dots adapt to the layer's own brightness and opacity tones.
+ */
+export function isDedicatedToneLayer(
+  layer: Pick<LayerItem, 'isToneLayer' | 'toneDensityType'> | null | undefined
+): boolean {
+  if (!layer) return false;
+  if (typeof layer.isToneLayer === 'boolean') return layer.isToneLayer;
+  return layer.toneDensityType === 'specified';
+}
+
+/**
+ * Resolves the effective screentone density mode for rendering:
+ * dedicated tone layers use their specified flat density, while existing
+ * layers adapt dynamically to their image luminance and alpha.
+ */
+export function resolveToneDensityType(
+  layer: Pick<LayerItem, 'isToneLayer' | 'toneDensityType'> | null | undefined
+): 'specified' | 'image' {
+  return isDedicatedToneLayer(layer) ? 'specified' : 'image';
 }
 
 export function hasTileBackedLayer(layer: Pick<LayerItem, 'type'> | null | undefined): boolean {

@@ -61,6 +61,7 @@ const CLEARABLE_FIELDS_SET = new Set<LayerClearableField>([
   'alphaLocked',
   'clipped',
   'isReference',
+  'isToneLayer',
   'toneEnabled',
   'toneFrequency',
   'toneAngle',
@@ -103,6 +104,7 @@ const SYNCED_LAYER_KEYS: ReadonlyArray<keyof WireLayerItem> = [
   'clipped',
   'parentId',
   'isReference',
+  'isToneLayer',
   'toneEnabled',
   'toneFrequency',
   'toneAngle',
@@ -286,6 +288,7 @@ export function sanitizeWireLayerPatch(raw: unknown): Partial<WireLayerItem> {
   if (typeof src.isReference === 'boolean') out.isReference = src.isReference;
 
   // Screentone
+  if (typeof src.isToneLayer === 'boolean') out.isToneLayer = src.isToneLayer;
   if (typeof src.toneEnabled === 'boolean') out.toneEnabled = src.toneEnabled;
   if (typeof src.toneFrequency === 'number' && Number.isFinite(src.toneFrequency)) {
     out.toneFrequency = Math.round(clampFinite(src.toneFrequency, 20, 85, 60));

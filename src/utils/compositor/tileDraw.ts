@@ -38,8 +38,11 @@ export function drawTilesFallback2D(
   );
   gl.uniform2f(state.uTileSizeLoc, lodTileDocSize, lodTileDocSize);
 
+  const forceCrispNearest =
+    (Boolean(layer.toneEnabled) || layer.expressionColor === 'monochrome') && state.currentZoom >= 0.99;
+
   for (const tile of visibleTiles) {
-    const tex = getTileTexture(state, tile, grid);
+    const tex = getTileTexture(state, tile, grid, forceCrispNearest);
     if (!tex) continue;
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -85,16 +88,20 @@ export function drawVisibleTiles(
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.tileArrayTexture);
 
+    const forceCrispNearest =
+      (Boolean(layer.toneEnabled) || layer.expressionColor === 'monochrome') && state.currentZoom >= 0.99;
     const desiredTier =
-      state.filteringQuality === 'smooth'
-        ? 1
-        : state.filteringQuality === 'pixelated'
-          ? 2
-          : state.currentZoom < 0.99
-            ? 0
-            : state.currentZoom < 2.0
-              ? 1
-              : 2;
+      forceCrispNearest
+        ? 2
+        : state.filteringQuality === 'smooth'
+          ? 1
+          : state.filteringQuality === 'pixelated'
+            ? 2
+            : state.currentZoom < 0.99
+              ? 0
+              : state.currentZoom < 2.0
+                ? 1
+                : 2;
     if (state.arrayPoolFilterTier !== desiredTier) {
       const filter = desiredTier <= 1 ? gl.LINEAR : gl.NEAREST;
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, filter);

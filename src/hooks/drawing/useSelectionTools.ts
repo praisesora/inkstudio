@@ -6,6 +6,7 @@ import {
   CanvasSelection,
   DirtyRect,
   LayerItem,
+  LayerTreeDelta,
   TileDelta,
   TransformSession,
 } from '../../types/editor';
@@ -42,8 +43,10 @@ import {
   createDefaultMeshPoints,
   computeMeshSubdivisions,
   getMeshSurfaceBounds,
+  resolveTransformTargetLayers,
+  getTransformPreviewLayerState,
 } from '../../utils/transformEngine';
-import { get2DContext } from '../../utils/canvasUtils';
+import { get2DContext, getCanvasCompositeOperation } from '../../utils/canvasUtils';
 import { useToolStore, toolStoreActions } from '../../stores';
 import { PushHistoryStepFn } from './types';
 
@@ -211,7 +214,7 @@ export interface UseSelectionToolsParams {
     blendMode?: BlendMode,
     opacity?: number,
     layerOverrides?: Partial<LayerItem>
-  ) => { id: string; name: string; tileDeltas: TileDelta[] };
+  ) => { id: string; name: string; tileDeltas: TileDelta[]; layerTreeDelta?: LayerTreeDelta };
 }
 
 export interface UseSelectionToolsResult {
@@ -242,7 +245,7 @@ export interface UseSelectionToolsResult {
     pt: { x: number; y: number }
   ) => boolean;
   handleSelectionPointerMove: (pt: { x: number; y: number }) => boolean;
-  handleSelectionPointerUp: (pt: { x: number; y: number }) => boolean;
+  handleSelectionPointerUp: (pt: { x: number; y: number }, e?: React.PointerEvent<HTMLElement>) => boolean;
 }
 
 export function useSelectionTools({
@@ -288,6 +291,7 @@ export function useSelectionTools({
     lastPt: { x: number; y: number };
     maskCanvas: HTMLCanvasElement;
     ctx: CanvasRenderingContext2D;
+    lastPreviewTs: number;
   } | null>(null);
 
   const selectionDragRef = useRef<{
@@ -635,7 +639,7 @@ export function useSelectionTools({
     );
 
     const combinedDeltas = [...srcDeltas, ...created.tileDeltas];
-    if (combinedDeltas.length > 0) {
+    if (combinedDeltas.length > 0 || created.layerTreeDelta) {
       pushHistoryStep(
         'selection-move',
         'Move Selection to New Layer',
@@ -643,7 +647,12 @@ export function useSelectionTools({
         null,
         created.id,
         dirtyRect,
-        combinedDeltas
+        combinedDeltas,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        created.layerTreeDelta
       );
     }
 
@@ -700,7 +709,7 @@ export function useSelectionTools({
       overrides
     );
 
-    if (created.tileDeltas.length > 0) {
+    if (created.tileDeltas.length > 0 || created.layerTreeDelta) {
       pushHistoryStep(
         'selection-move',
         'Copy Selection to New Layer',
@@ -708,7 +717,12 @@ export function useSelectionTools({
         null,
         created.id,
         snapshot.bounds,
-        created.tileDeltas
+        created.tileDeltas,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        created.layerTreeDelta
       );
     }
 
@@ -733,9 +747,54 @@ export function useSelectionTools({
 
   const handleFillSelectionColor = useCallback(() => {
     if (!selection) return;
+    if (selection.floating) {
+      handleCommitFloatingSelection();
+    }
+    if (!activeLayer || !activeLayerId) {
+      showToast('Select a raster layer to fill');
+      return;
+    }
+    if (activeLayer.type === 'frame-folder') {
+      showToast('Select a child layer inside the Frame Border Folder to fill');
+      return;
+    }
+    if (activeLayer.type !== 'raster') {
+      showToast('Select a raster layer to fill');
+      return;
+    }
+    if (activeLayer.locked) {
+      showToast('Active layer is locked');
+      return;
+    }
+    // Check effective visibility (including ancestor folders)
+    let effectivelyVisible = activeLayer.visible;
+    let pId = activeLayer.parentId;
+    let guard = 0;
+    while (effectivelyVisible && pId && guard < 32) {
+      const parent = layers.find((l) => l.id === pId);
+      if (!parent) break;
+      if (!parent.visible) effectivelyVisible = false;
+      pId = parent.parentId;
+      guard++;
+    }
+    if (!effectivelyVisible) {
+      showToast('Active layer is hidden');
+      return;
+    }
+
+    const { primaryColor, isTransparentColor } = useToolStore.getState();
+    if (isTransparentColor) {
+      handleClearSelection();
+      return;
+    }
+
     flushPendingHistoryTasks?.();
     const grid = getGrid();
-    const primaryColor = useToolStore.getState().primaryColor;
+    if (activeLayer.alphaLocked && !grid.hasLayerTiles(activeLayerId)) {
+      showToast('Alpha Lock is enabled on an empty layer');
+      return;
+    }
+
     const targetFormat = resolveLayerFormat(activeLayerId);
 
     const { dirtyRect, tileDeltas } = fillSelectionInTileGrid({
@@ -745,7 +804,7 @@ export function useSelectionTools({
       selection,
       colorCss: primaryColor,
       targetFormat,
-      alphaLocked: Boolean(activeLayer?.alphaLocked),
+      alphaLocked: Boolean(activeLayer.alphaLocked),
     });
 
     if (tileDeltas.length > 0) {
@@ -762,14 +821,18 @@ export function useSelectionTools({
     updateLayerThumbnail(activeLayerId, true);
   }, [
     selection,
+    handleCommitFloatingSelection,
+    handleClearSelection,
     flushPendingHistoryTasks,
     getGrid,
+    layers,
     activeLayerId,
     activeLayer,
     dimensions,
     resolveLayerFormat,
     updateLayerThumbnail,
     pushHistoryStep,
+    showToast,
   ]);
 
   const handleExpandSelection = useCallback(
@@ -893,40 +956,23 @@ export function useSelectionTools({
 
   const handleStartTransform = useCallback(() => {
     if (transformSession?.active) return;
-    if (activeLayer?.locked || (activeLayer && activeLayer.type !== 'raster')) {
-      showToast('Select an unlocked raster layer to transform');
-      return;
-    }
 
     flushPendingHistoryTasks?.();
     const grid = getGrid();
 
-    if (selection) {
-      let floatCanvas = selection.floating?.canvas;
-      const targetLayerId = selection.floating?.layerId || activeLayerId;
-      const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
-      const targetFormat = resolveLayerFormat(targetLayerId);
-
-      let floatX = selection.floating?.x ?? selection.bounds.x;
-      let floatY = selection.floating?.y ?? selection.bounds.y;
-      let beforeTileSnapshot = selection.floating?.beforeTileSnapshot;
-
-      if (!floatCanvas) {
-        const lifted = liftSelectionFromTileGrid({
-          grid,
-          layerId: targetLayerId,
-          dimensions,
-          selection,
-          isBackground: isBg,
-          targetFormat,
-        });
-        if (!lifted) return;
-        floatCanvas = lifted.floatingCanvas;
-        floatX = lifted.bounds.x;
-        floatY = lifted.bounds.y;
-        beforeTileSnapshot = lifted.beforeTileSnapshot;
-        updateLayerThumbnail(targetLayerId, true);
+    // If there is already a floating selection canvas lifted from a specific layer, transform it directly
+    if (selection?.floating?.canvas) {
+      const targetLayerId = selection.floating.layerId || activeLayerId;
+      const floatingTarget = layers.find((l) => l.id === targetLayerId);
+      if (floatingTarget && (floatingTarget.locked || floatingTarget.type !== 'raster')) {
+        showToast('Select an unlocked raster layer or folder to transform');
+        return;
       }
+
+      const floatCanvas = selection.floating.canvas;
+      const floatX = selection.floating.x;
+      const floatY = selection.floating.y;
+      const beforeTileSnapshot = selection.floating.beforeTileSnapshot;
 
       const quad = createDefaultPerspectiveQuad(
         floatX,
@@ -956,121 +1002,301 @@ export function useSelectionTools({
         meshPoints: createDefaultMeshPoints(quad, 4, 4),
       });
       setSelection(null);
-    } else {
-      const isMultiLayer = selectedLayerIds && selectedLayerIds.length > 1;
-      const multiTargetLayers = isMultiLayer
-        ? layers.filter((l) => selectedLayerIds.includes(l.id) && l.type === 'raster' && !l.locked)
-        : [];
+      toolStoreActions.setToolRaw('transform');
+      return;
+    }
 
-      if (isMultiLayer && multiTargetLayers.length > 1) {
-        let minX = Infinity;
-        let minY = Infinity;
-        let maxX = -Infinity;
-        let maxY = -Infinity;
+    const resolved = resolveTransformTargetLayers(layers, activeLayer, selectedLayerIds);
+    if (resolved.targetLayers.length === 0) {
+      if (resolved.blockedReason === 'locked') {
+        showToast(
+          resolved.includesFolder
+            ? 'Unlock the selected folder to transform'
+            : 'Select an unlocked raster layer or folder to transform'
+        );
+      } else if (resolved.blockedReason === 'empty-folder') {
+        showToast('Selected folder has no unlocked raster layers to transform');
+      } else {
+        showToast('Select an unlocked raster layer or folder to transform');
+      }
+      return;
+    }
 
-        for (const lyr of multiTargetLayers) {
-          const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
-          const cb = grid.getLayerContentBounds(lyr.id, dimensions, isLayerBg);
-          if (cb) {
-            minX = Math.min(minX, cb.x);
-            minY = Math.min(minY, cb.y);
-            maxX = Math.max(maxX, cb.x + cb.width);
-            maxY = Math.max(maxY, cb.y + cb.height);
-          }
-        }
+    const { targetLayers, includesFolder } = resolved;
+    const layerMap = new Map(layers.map((l) => [l.id, l]));
+    const selectedRootIds = new Set(
+      selectedLayerIds && selectedLayerIds.length > 0
+        ? selectedLayerIds
+        : activeLayer
+          ? [activeLayer.id]
+          : []
+    );
 
-        if (!isFinite(minX) || !isFinite(minY) || maxX <= minX || maxY <= minY) {
-          showToast('Selected layers are empty');
-          return;
-        }
-
-        const b: DirtyRect = {
-          x: Math.max(0, minX),
-          y: Math.max(0, minY),
-          width: Math.max(1, maxX - minX),
-          height: Math.max(1, maxY - minY),
-        };
-
+    if (selection) {
+      if (targetLayers.length > 1) {
         const layerBeforeSnapshots = new Map<string, Map<string, TileSnapshotEntry>>();
         const layerSourceCanvases = new Map<string, HTMLCanvasElement>();
+        const orderedLayers = targetLayers.slice().reverse();
 
-        const compositeCanvas = document.createElement('canvas');
-        compositeCanvas.width = b.width;
-        compositeCanvas.height = b.height;
-        const compCtx = get2DContext(compositeCanvas);
+        let liftBounds: DirtyRect | null = null;
+        let compositeCanvas: HTMLCanvasElement | null = null;
+        let compCtx: CanvasRenderingContext2D | null = null;
 
-        const orderedLayers = multiTargetLayers.slice().reverse();
         for (const lyr of orderedLayers) {
-          const sCanvas = grid.createRegionCanvas(lyr.id, b);
-          if (!sCanvas) continue;
-          layerSourceCanvases.set(lyr.id, sCanvas);
+          if (!grid.hasLayerTiles(lyr.id)) continue;
+          const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
+          const targetFormat = resolveLayerFormat(lyr.id);
+          const lifted = liftSelectionFromTileGrid({
+            grid,
+            layerId: lyr.id,
+            dimensions,
+            selection,
+            isBackground: isLayerBg,
+            targetFormat,
+          });
+          if (!lifted) continue;
 
-          if (compCtx) {
+          if (!liftBounds) {
+            liftBounds = lifted.bounds;
+            compositeCanvas = document.createElement('canvas');
+            compositeCanvas.width = lifted.floatingCanvas.width;
+            compositeCanvas.height = lifted.floatingCanvas.height;
+            compCtx = get2DContext(compositeCanvas);
+          }
+
+          layerSourceCanvases.set(lyr.id, lifted.floatingCanvas);
+          layerBeforeSnapshots.set(lyr.id, lifted.beforeTileSnapshot);
+
+          const previewState = getTransformPreviewLayerState(lyr, layerMap, selectedRootIds);
+          if (compCtx && previewState.visible && previewState.opacity > 0.001) {
             compCtx.save();
-            compCtx.globalAlpha = lyr.opacity;
-            compCtx.drawImage(sCanvas, 0, 0);
+            compCtx.globalAlpha = previewState.opacity;
+            compCtx.globalCompositeOperation = getCanvasCompositeOperation(lyr.blendMode);
+            compCtx.drawImage(lifted.floatingCanvas, 0, 0);
             compCtx.restore();
           }
 
-          const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
-          const beforeSnap = new Map<string, TileSnapshotEntry>();
-          grid.clearRectInLayer(lyr.id, b, isLayerBg, beforeSnap, true);
-          layerBeforeSnapshots.set(lyr.id, beforeSnap);
           updateLayerThumbnail(lyr.id, true);
         }
-        grid.notifyChange(true);
 
-        const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
+        const liftedLayerIds = targetLayers
+          .filter((l) => layerSourceCanvases.has(l.id))
+          .map((l) => l.id);
+        if (!liftBounds || !compositeCanvas || liftedLayerIds.length === 0) {
+          if (compositeCanvas) releaseTemporaryCanvas(compositeCanvas);
+          showToast(includesFolder ? 'Selected folder is empty' : 'Selected layers are empty');
+          return;
+        }
+
+        grid.notifyChange(true);
+        const primaryLayerId = liftedLayerIds[0];
+        const quad = createDefaultPerspectiveQuad(
+          liftBounds.x,
+          liftBounds.y,
+          compositeCanvas.width,
+          compositeCanvas.height,
+          0
+        );
         setTransformSession({
           active: true,
-          layerId: activeLayerId,
-          layerIds: multiTargetLayers.map((l) => l.id),
+          layerId: primaryLayerId,
+          layerIds: liftedLayerIds,
           layerSourceCanvases,
           layerBeforeSnapshots,
           sourceCanvas: compositeCanvas,
-          beforeTileSnapshot: layerBeforeSnapshots.get(activeLayerId),
-          bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
-          x: b.x,
-          y: b.y,
-          width: b.width,
-          height: b.height,
+          beforeTileSnapshot: layerBeforeSnapshots.get(primaryLayerId),
+          bounds: {
+            x: liftBounds.x,
+            y: liftBounds.y,
+            width: compositeCanvas.width,
+            height: compositeCanvas.height,
+          },
+          x: liftBounds.x,
+          y: liftBounds.y,
+          width: compositeCanvas.width,
+          height: compositeCanvas.height,
           rotation: 0,
           flipH: false,
           flipV: false,
-          isSelection: false,
+          isSelection: true,
           mode: 'affine',
           perspectiveQuad: quad,
           meshCols: 4,
           meshRows: 4,
           meshPoints: createDefaultMeshPoints(quad, 4, 4),
         });
+        setSelection(null);
         toolStoreActions.setToolRaw('transform');
         return;
       }
 
-      const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
-      const contentBounds = grid.getLayerContentBounds(activeLayerId, dimensions, isBg);
+      const targetLayerId = targetLayers[0].id;
+      const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
+      const targetFormat = resolveLayerFormat(targetLayerId);
+      const lifted = liftSelectionFromTileGrid({
+        grid,
+        layerId: targetLayerId,
+        dimensions,
+        selection,
+        isBackground: isBg,
+        targetFormat,
+      });
+      if (!lifted) return;
+
+      const floatCanvas = lifted.floatingCanvas;
+      const floatX = lifted.bounds.x;
+      const floatY = lifted.bounds.y;
+      const beforeTileSnapshot = lifted.beforeTileSnapshot;
+      updateLayerThumbnail(targetLayerId, true);
+
+      const quad = createDefaultPerspectiveQuad(
+        floatX,
+        floatY,
+        floatCanvas.width,
+        floatCanvas.height,
+        0
+      );
+      setTransformSession({
+        active: true,
+        layerId: targetLayerId,
+        sourceCanvas: floatCanvas,
+        beforeTileSnapshot,
+        bounds: { x: floatX, y: floatY, width: floatCanvas.width, height: floatCanvas.height },
+        x: floatX,
+        y: floatY,
+        width: floatCanvas.width,
+        height: floatCanvas.height,
+        rotation: 0,
+        flipH: false,
+        flipV: false,
+        isSelection: true,
+        mode: 'affine',
+        perspectiveQuad: quad,
+        meshCols: 4,
+        meshRows: 4,
+        meshPoints: createDefaultMeshPoints(quad, 4, 4),
+      });
+      setSelection(null);
+    } else if (targetLayers.length > 1) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+
+      for (const lyr of targetLayers) {
+        const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
+        const cb = grid.getLayerContentBounds(lyr.id, dimensions, isLayerBg);
+        if (cb) {
+          minX = Math.min(minX, cb.x);
+          minY = Math.min(minY, cb.y);
+          maxX = Math.max(maxX, cb.x + cb.width);
+          maxY = Math.max(maxY, cb.y + cb.height);
+        }
+      }
+
+      if (!isFinite(minX) || !isFinite(minY) || maxX <= minX || maxY <= minY) {
+        showToast(includesFolder ? 'Selected folder is empty' : 'Selected layers are empty');
+        return;
+      }
+
+      const b: DirtyRect = {
+        x: Math.max(0, minX),
+        y: Math.max(0, minY),
+        width: Math.max(1, maxX - minX),
+        height: Math.max(1, maxY - minY),
+      };
+
+      const layerBeforeSnapshots = new Map<string, Map<string, TileSnapshotEntry>>();
+      const layerSourceCanvases = new Map<string, HTMLCanvasElement>();
+
+      const compositeCanvas = document.createElement('canvas');
+      compositeCanvas.width = b.width;
+      compositeCanvas.height = b.height;
+      const compCtx = get2DContext(compositeCanvas);
+
+      const orderedLayers = targetLayers.slice().reverse();
+      for (const lyr of orderedLayers) {
+        if (!grid.hasLayerTiles(lyr.id)) continue;
+        const sCanvas = grid.createRegionCanvas(lyr.id, b);
+        if (!sCanvas) continue;
+        layerSourceCanvases.set(lyr.id, sCanvas);
+
+        const previewState = getTransformPreviewLayerState(lyr, layerMap, selectedRootIds);
+        if (compCtx && previewState.visible && previewState.opacity > 0.001) {
+          compCtx.save();
+          compCtx.globalAlpha = previewState.opacity;
+          compCtx.globalCompositeOperation = getCanvasCompositeOperation(lyr.blendMode);
+          compCtx.drawImage(sCanvas, 0, 0);
+          compCtx.restore();
+        }
+
+        const isLayerBg = lyr.id === 'layer-bg' || lyr.id.startsWith('layer-bg');
+        const beforeSnap = new Map<string, TileSnapshotEntry>();
+        grid.clearRectInLayer(lyr.id, b, isLayerBg, beforeSnap, true);
+        layerBeforeSnapshots.set(lyr.id, beforeSnap);
+        updateLayerThumbnail(lyr.id, true);
+      }
+      grid.notifyChange(true);
+
+      const liftedLayerIds = targetLayers
+        .filter((l) => layerSourceCanvases.has(l.id))
+        .map((l) => l.id);
+      if (liftedLayerIds.length === 0) {
+        releaseTemporaryCanvas(compositeCanvas);
+        showToast(includesFolder ? 'Selected folder is empty' : 'Selected layers are empty');
+        return;
+      }
+
+      const primaryLayerId = liftedLayerIds[0];
+      const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
+      setTransformSession({
+        active: true,
+        layerId: primaryLayerId,
+        layerIds: liftedLayerIds,
+        layerSourceCanvases,
+        layerBeforeSnapshots,
+        sourceCanvas: compositeCanvas,
+        beforeTileSnapshot: layerBeforeSnapshots.get(primaryLayerId),
+        bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
+        x: b.x,
+        y: b.y,
+        width: b.width,
+        height: b.height,
+        rotation: 0,
+        flipH: false,
+        flipV: false,
+        isSelection: false,
+        mode: 'affine',
+        perspectiveQuad: quad,
+        meshCols: 4,
+        meshRows: 4,
+        meshPoints: createDefaultMeshPoints(quad, 4, 4),
+      });
+    } else {
+      const targetLayerId = targetLayers[0].id;
+      const isBg = targetLayerId === 'layer-bg' || targetLayerId.startsWith('layer-bg');
+      const contentBounds = grid.getLayerContentBounds(targetLayerId, dimensions, isBg);
       let b = contentBounds;
       if (!b) {
         if (isBg) {
           b = { x: 0, y: 0, width: dimensions.width, height: dimensions.height };
         } else {
-          showToast('Active layer is empty');
+          showToast(includesFolder ? 'Selected folder is empty' : 'Active layer is empty');
           return;
         }
       }
 
-      const sourceCanvas = grid.createRegionCanvas(activeLayerId, b);
+      const sourceCanvas = grid.createRegionCanvas(targetLayerId, b);
       if (!sourceCanvas) return;
 
       const beforeTileSnapshot = new Map<string, TileSnapshotEntry>();
-      grid.clearRectInLayer(activeLayerId, b, isBg, beforeTileSnapshot, false);
-      updateLayerThumbnail(activeLayerId, true);
+      grid.clearRectInLayer(targetLayerId, b, isBg, beforeTileSnapshot, false);
+      updateLayerThumbnail(targetLayerId, true);
 
       const quad = createDefaultPerspectiveQuad(b.x, b.y, b.width, b.height, 0);
       setTransformSession({
         active: true,
-        layerId: activeLayerId,
+        layerId: targetLayerId,
         sourceCanvas,
         beforeTileSnapshot,
         bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
@@ -1111,9 +1337,12 @@ export function useSelectionTools({
 
     if (
       transformSession.layerIds &&
-      transformSession.layerIds.length > 1 &&
+      transformSession.layerIds.length > 0 &&
       transformSession.layerSourceCanvases
     ) {
+      const allTileDeltas: TileDelta[] = [];
+      let combinedDestRect: DirtyRect | null = null;
+
       for (const lId of transformSession.layerIds) {
         const sCanvas = transformSession.layerSourceCanvases.get(lId);
         if (!sCanvas) continue;
@@ -1132,20 +1361,42 @@ export function useSelectionTools({
           beforeSnap
         );
 
+        if (destRect) {
+          if (!combinedDestRect) {
+            combinedDestRect = { ...destRect };
+          } else {
+            const minX = Math.min(combinedDestRect.x, destRect.x);
+            const minY = Math.min(combinedDestRect.y, destRect.y);
+            const maxX = Math.max(
+              combinedDestRect.x + combinedDestRect.width,
+              destRect.x + destRect.width
+            );
+            const maxY = Math.max(
+              combinedDestRect.y + combinedDestRect.height,
+              destRect.y + destRect.height
+            );
+            combinedDestRect = { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
+          }
+        }
+
         const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnap, lId);
-        if (tileDeltas.length > 0) {
-          pushHistoryStep(
-            'transform',
-            'Batch Free Transform',
-            null,
-            null,
-            lId,
-            destRect ?? undefined,
-            tileDeltas
-          );
+        for (const d of tileDeltas) {
+          allTileDeltas.push(d);
         }
         releaseTemporaryCanvas(sCanvas);
         updateLayerThumbnail(lId, true);
+      }
+
+      if (allTileDeltas.length > 0) {
+        pushHistoryStep(
+          'transform',
+          `Free Transform (${transformSession.layerIds.length} layers)`,
+          null,
+          null,
+          transformSession.layerIds[0],
+          combinedDestRect ?? undefined,
+          allTileDeltas
+        );
       }
 
       releaseTemporaryCanvas(transformSession.sourceCanvas);
@@ -1326,12 +1577,19 @@ export function useSelectionTools({
         mCtx.fill();
         mCtx.restore();
 
+        try {
+          (e.currentTarget as HTMLElement)?.setPointerCapture?.(e.pointerId);
+        } catch {
+          // Ignore capture errors in synthetic events
+        }
+
         isSelectionPenDrawingRef.current = true;
         selectionPenDrawingRef.current = {
           isDrawing: true,
           lastPt: pt,
           maskCanvas,
           ctx: mCtx,
+          lastPreviewTs: Date.now(),
         };
 
         const mImgData = mCtx.getImageData(0, 0, w, h);
@@ -1417,12 +1675,22 @@ export function useSelectionTools({
         }
 
         if (tool === 'select-rect') {
+          try {
+            (e.currentTarget as HTMLElement)?.setPointerCapture?.(e.pointerId);
+          } catch {
+            // Ignore capture errors in synthetic events
+          }
           selectRectStartRef.current = pt;
           setSelection({
             type: 'rect',
             bounds: { x: pt.x, y: pt.y, width: 0, height: 0 },
           });
         } else {
+          try {
+            (e.currentTarget as HTMLElement)?.setPointerCapture?.(e.pointerId);
+          } catch {
+            // Ignore capture errors in synthetic events
+          }
           lassoPointsRef.current = [pt];
           setSelection({
             type: 'lasso',
@@ -1473,10 +1741,43 @@ export function useSelectionTools({
       mCtx.restore();
 
       selectionPenDrawingRef.current.lastPt = pt;
+
+      // Throttle live marching-ants preview while painting with Selection Pen / Eraser
+      const nowTs = Date.now();
+      if (nowTs - selectionPenDrawingRef.current.lastPreviewTs >= 60) {
+        selectionPenDrawingRef.current.lastPreviewTs = nowTs;
+        const w = dimensions.width;
+        const h = dimensions.height;
+        if (w * h <= 4096 * 4096) {
+          const mImgData = mCtx.getImageData(0, 0, w, h);
+          const newMask = new Uint8Array(w * h);
+          for (let i = 0; i < newMask.length; i++) {
+            newMask[i] = mImgData.data[i * 4 + 3] > 0 ? 255 : 0;
+          }
+          const b = maskToBounds(newMask, w, h);
+          if (b) {
+            const svg = maskToSvgPath(newMask, w, h);
+            setSelection({
+              type: 'mask',
+              bounds: b,
+              mask: newMask,
+              maskWidth: w,
+              maskHeight: h,
+              svgPath: svg,
+            });
+          } else {
+            setSelection(null);
+          }
+        }
+      }
       return true;
     }
 
     if (selectionDragRef.current?.isDragging) {
+      if (tool !== 'select-rect' && tool !== 'select-lasso') {
+        selectionDragRef.current = null;
+        return false;
+      }
       const drag = selectionDragRef.current;
       const dx = pt.x - drag.startX;
       const dy = pt.y - drag.startY;
@@ -1507,6 +1808,10 @@ export function useSelectionTools({
     }
 
     if (selectRectStartRef.current) {
+      if (tool !== 'select-rect') {
+        selectRectStartRef.current = null;
+        return false;
+      }
       const s = selectRectStartRef.current;
       const x0 = Math.max(0, Math.min(dimensions.width, Math.floor(Math.min(s.x, pt.x))));
       const y0 = Math.max(0, Math.min(dimensions.height, Math.floor(Math.min(s.y, pt.y))));
@@ -1520,6 +1825,10 @@ export function useSelectionTools({
     }
 
     if (lassoPointsRef.current.length > 0) {
+      if (tool !== 'select-lasso') {
+        lassoPointsRef.current = [];
+        return false;
+      }
       const pts = lassoPointsRef.current;
       const last = pts[pts.length - 1];
       if (Math.hypot(pt.x - last.x, pt.y - last.y) >= 2) {
@@ -1538,13 +1847,22 @@ export function useSelectionTools({
   }, [dimensions.height, dimensions.width]);
 
   const handleSelectionPointerUp = useCallback(
-    (pt: { x: number; y: number }): boolean => {
+    (pt: { x: number; y: number }, e?: React.PointerEvent<HTMLElement>): boolean => {
       const { tool } = useToolStore.getState();
+      const releaseCapture = () => {
+        if (!e) return;
+        try {
+          (e.currentTarget as HTMLElement)?.releasePointerCapture?.(e.pointerId);
+        } catch {
+          // Ignore release errors
+        }
+      };
 
       if (
         (tool === 'select-pen' || tool === 'select-eraser') &&
         selectionPenDrawingRef.current?.isDrawing
       ) {
+        releaseCapture();
         const { ctx: mCtx } = selectionPenDrawingRef.current;
         selectionPenDrawingRef.current = null;
         isSelectionPenDrawingRef.current = false;
@@ -1578,6 +1896,7 @@ export function useSelectionTools({
       }
 
       if (selectRectStartRef.current) {
+        releaseCapture();
         const s = selectRectStartRef.current;
         selectRectStartRef.current = null;
         const x0 = Math.max(0, Math.min(dimensions.width, Math.floor(Math.min(s.x, pt.x))));
@@ -1598,6 +1917,7 @@ export function useSelectionTools({
       }
 
       if (lassoPointsRef.current.length > 0) {
+        releaseCapture();
         if (lassoPointsRef.current.length < 3) {
           setSelection(null);
         } else {

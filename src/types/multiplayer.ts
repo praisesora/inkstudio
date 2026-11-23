@@ -90,6 +90,7 @@ export type LayerClearableField =
   | 'alphaLocked'
   | 'clipped'
   | 'isReference'
+  | 'isToneLayer'
   | 'toneEnabled'
   | 'toneFrequency'
   | 'toneAngle'

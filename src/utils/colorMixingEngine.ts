@@ -147,73 +147,286 @@ export function oklabToLinearRgb(L: number, a: number, b: number): { r: number; 
 import { SparseTileGrid, TILE_SIZE, globalTileGrid } from './tileEngine';
 import type { BristleProfilePreset, BristleSettings, NaturalMixingMode, NaturalPaintSettings } from '../types/editor';
 
+// -------------------------------------------------------------
+// 7-Band Spectral Kubelka-Munk Pigment Engine (420–660nm, CIE 1931 D65)
+// Closed-form physical pigment reflectance decomposition + Kubelka-Munk K/S
+// absorption/scattering blending + OKLab perceptual lightness/chroma polish.
+// Guarantees:
+// - Blue + Yellow -> vibrant emerald/leaf green (no gray mud)
+// - Green + Magenta -> warm golden-amber / coral (no dead olive-gray)
+// - Red + Blue -> rich royal violet; Red + Yellow -> luminous orange
+// - Exact self-mix invariance: mix(c, c, t) === c
+// - Exact neutral-gray invariance: Black + White stays pure neutral gray
+// -------------------------------------------------------------
+
+const KM_LO = 0.025;
+const KM_SPAN = 0.97;
+const KM_INV_SPAN = 1.0 / KM_SPAN;
+const KM_EXP = 0.72;
+const KM_INV_EXP = 1.0 / KM_EXP;
+
+// Normalized CIE 1931 D65 band-to-Linear-sRGB weights (columns sum to 1.0)
+const SPEC_W_R = new Float32Array([0.140, 0.030, -0.145, -0.080, 0.365, 0.465, 0.225]);
+const SPEC_W_G = new Float32Array([-0.050, 0.045, 0.250, 0.500, 0.300, -0.018, -0.027]);
+const SPEC_W_B = new Float32Array([0.340, 0.550, 0.145, -0.028, -0.007, 0.000, 0.000]);
+{
+  let sr = 0;
+  let sg = 0;
+  let sb = 0;
+  for (let i = 0; i < 7; i++) {
+    sr += SPEC_W_R[i];
+    sg += SPEC_W_G[i];
+    sb += SPEC_W_B[i];
+  }
+  for (let i = 0; i < 7; i++) {
+    SPEC_W_R[i] /= sr;
+    SPEC_W_G[i] /= sg;
+    SPEC_W_B[i] /= sb;
+  }
+}
+
+// Calibrated physical artist-pigment reflectance curves across 7 bands (420..660nm)
+const BASIS_R = new Float32Array([0.025, 0.018, 0.020, 0.035, 0.360, 0.965, 0.990]);
+const BASIS_G = new Float32Array([0.020, 0.040, 0.420, 0.980, 0.900, 0.420, 0.060]);
+const BASIS_B = new Float32Array([0.880, 0.990, 0.780, 0.340, 0.025, 0.020, 0.055]);
+const BASIS_C = new Float32Array([0.720, 0.980, 0.990, 0.840, 0.140, 0.025, 0.025]);
+const BASIS_M = new Float32Array([0.780, 0.500, 0.055, 0.025, 0.640, 0.975, 0.990]);
+const BASIS_Y = new Float32Array([0.018, 0.022, 0.280, 0.930, 0.995, 0.990, 0.980]);
+
+// Module-level scratch buffers for zero-allocation hot-loop pigment mixing
+const _kmSp1 = new Float32Array(7);
+const _kmSp2 = new Float32Array(7);
+const _kmSpM = new Float32Array(7);
+
+function linearRgbToReflectance(r: number, g: number, b: number, out: Float32Array): void {
+  const rr = KM_LO + r * KM_SPAN;
+  const gg = KM_LO + g * KM_SPAN;
+  const bb = KM_LO + b * KM_SPAN;
+
+  if (rr <= gg && rr <= bb) {
+    const w = rr;
+    if (gg <= bb) {
+      const c = gg - rr;
+      const p = bb - gg;
+      for (let i = 0; i < 7; i++) out[i] = w + c * BASIS_C[i] + p * BASIS_B[i];
+    } else {
+      const c = bb - rr;
+      const p = gg - bb;
+      for (let i = 0; i < 7; i++) out[i] = w + c * BASIS_C[i] + p * BASIS_G[i];
+    }
+  } else if (gg <= rr && gg <= bb) {
+    const w = gg;
+    if (rr <= bb) {
+      const c = rr - gg;
+      const p = bb - rr;
+      for (let i = 0; i < 7; i++) out[i] = w + c * BASIS_M[i] + p * BASIS_B[i];
+    } else {
+      const c = bb - gg;
+      const p = rr - bb;
+      for (let i = 0; i < 7; i++) out[i] = w + c * BASIS_M[i] + p * BASIS_R[i];
+    }
+  } else {
+    const w = bb;
+    if (rr <= gg) {
+      const c = rr - bb;
+      const p = gg - rr;
+      for (let i = 0; i < 7; i++) out[i] = w + c * BASIS_Y[i] + p * BASIS_G[i];
+    } else {
+      const c = gg - bb;
+      const p = rr - gg;
+      for (let i = 0; i < 7; i++) out[i] = w + c * BASIS_Y[i] + p * BASIS_R[i];
+    }
+  }
+}
+
 /**
- * Subtractive Pigment Mixing (Physical Paint Simulation — CSP Perceptual / Krita Kubelka-Munk).
- * Simulates real-world physical absorption and spectral overlap where Blue + Yellow = vibrant Green,
- * Red + Blue = Purple/Violet, Red + Yellow = Orange, and colors don't collapse into muddy RGB grays!
+ * Encodes an sRGB color [0..255] into 7-band compressed Kubelka-Munk K/S + 3 linear residual channels
+ * (10 floats written starting at `offset`). Useful for fast separable spectral convolution (Pigment Blur).
  */
-export function mixSubtractivePigments(
-  c1: RgbColor,
-  c2: RgbColor,
-  weight2: number // 0.0 = 100% c1, 1.0 = 100% c2
+export function encodeSrgbToSpectralKS(
+  r: number,
+  g: number,
+  b: number,
+  out: Float32Array,
+  offset: number
+): void {
+  const lr = srgbToLinear(r);
+  const lg = srgbToLinear(g);
+  const lb = srgbToLinear(b);
+  linearRgbToReflectance(lr, lg, lb, _kmSp1);
+
+  let br = 0;
+  let bg = 0;
+  let bb = 0;
+  for (let i = 0; i < 7; i++) {
+    const sp = _kmSp1[i];
+    br += sp * SPEC_W_R[i];
+    bg += sp * SPEC_W_G[i];
+    bb += sp * SPEC_W_B[i];
+    const rc = sp < 0.02 ? 0.02 : sp > 0.998 ? 0.998 : sp;
+    const ks = ((1 - rc) * (1 - rc)) / (2 * rc);
+    out[offset + i] = Math.pow(ks, KM_EXP);
+  }
+  out[offset + 7] = lr - (br - KM_LO) * KM_INV_SPAN;
+  out[offset + 8] = lg - (bg - KM_LO) * KM_INV_SPAN;
+  out[offset + 9] = lb - (bb - KM_LO) * KM_INV_SPAN;
+}
+
+/**
+ * Decodes 7-band compressed Kubelka-Munk K/S + 3 linear residual channels back to sRGB [0..255].
+ */
+export function decodeSpectralKSToSrgb(
+  buf: Float32Array,
+  offset: number,
+  out: RgbColor
 ): RgbColor {
-  const w2 = Math.max(0, Math.min(1, weight2));
-  if (w2 <= 0.0001) return { r: c1.r, g: c1.g, b: c1.b };
-  if (w2 >= 0.9999) return { r: c2.r, g: c2.g, b: c2.b };
-  const w1 = 1 - w2;
+  let mr = 0;
+  let mg = 0;
+  let mb = 0;
+  for (let i = 0; i < 7; i++) {
+    const cks = buf[offset + i];
+    const ks = cks > 0 ? Math.pow(cks, KM_INV_EXP) : 0;
+    const ref = 1 + ks - Math.sqrt(ks * ks + 2 * ks);
+    mr += ref * SPEC_W_R[i];
+    mg += ref * SPEC_W_G[i];
+    mb += ref * SPEC_W_B[i];
+  }
+  const lr = (mr - KM_LO) * KM_INV_SPAN + buf[offset + 7];
+  const lg = (mg - KM_LO) * KM_INV_SPAN + buf[offset + 8];
+  const lb = (mb - KM_LO) * KM_INV_SPAN + buf[offset + 9];
+  out.r = linearToSrgbFloat(lr);
+  out.g = linearToSrgbFloat(lg);
+  out.b = linearToSrgbFloat(lb);
+  return out;
+}
 
-  // Convert to linear reflectance
-  const r1 = srgbToLinear(c1.r);
-  const g1 = srgbToLinear(c1.g);
-  const b1 = srgbToLinear(c1.b);
-
-  const r2 = srgbToLinear(c2.r);
-  const g2 = srgbToLinear(c2.g);
-  const b2 = srgbToLinear(c2.b);
-
-  // 1. Subtractive absorption coefficients (Kubelka-Munk K/S approximation)
-  const absR1 = 1 - Math.sqrt(r1);
-  const absG1 = 1 - Math.sqrt(g1);
-  const absB1 = 1 - Math.sqrt(b1);
-
-  const absR2 = 1 - Math.sqrt(r2);
-  const absG2 = 1 - Math.sqrt(g2);
-  const absB2 = 1 - Math.sqrt(b2);
-
-  const mixAbsR = absR1 * w1 + absR2 * w2;
-  const mixAbsG = absG1 * w1 + absG2 * w2;
-  const mixAbsB = absB1 * w1 + absB2 * w2;
-
-  let subR = Math.pow(Math.max(0, 1 - mixAbsR), 2);
-  let subG = Math.pow(Math.max(0, 1 - mixAbsG), 2);
-  let subB = Math.pow(Math.max(0, 1 - mixAbsB), 2);
-
-  // 2. Spectral Yellow + Blue -> Green pigment transmittance coupling
-  // In RGB, pure blue has R=0, G=0, B=1, which falsely implies infinite green absorption.
-  // Physical blue/cyan pigments transmit 490-540nm (green) wavelengths that overlap with yellow's passband.
-  const yellow1 = Math.max(0, Math.min(r1, g1) - b1);
-  const yellow2 = Math.max(0, Math.min(r2, g2) - b2);
-  const blue1 = Math.max(0, b1 - r1);
-  const blue2 = Math.max(0, b2 - r2);
-
-  const ybCross = (yellow1 * blue2 + yellow2 * blue1) * 4.0 * w1 * w2;
-  if (ybCross > 0.001) {
-    subG = Math.min(1.0, subG + ybCross * 0.55);
-    subR = Math.max(0.0, subR * (1.0 - ybCross * 0.45));
-    subB = Math.max(0.0, subB * (1.0 - ybCross * 0.45));
+/**
+ * Zero-allocation 7-Band Spectral Kubelka-Munk pigment mixer writing directly into `out`.
+ * `pigmentStrength` in [0..1]: 0.0 = regular sRGB blend, 1.0 = full physical Kubelka-Munk pigment blend.
+ */
+export function mixPigmentRgbOut(
+  r1In: number,
+  g1In: number,
+  b1In: number,
+  r2In: number,
+  g2In: number,
+  b2In: number,
+  weight2: number,
+  pigmentStrength: number,
+  out: RgbColor
+): RgbColor {
+  const t = weight2 <= 0 ? 0 : weight2 >= 1 ? 1 : weight2;
+  if (t <= 0.0001) {
+    out.r = r1In;
+    out.g = g1In;
+    out.b = b1In;
+    return out;
+  }
+  if (t >= 0.9999) {
+    out.r = r2In;
+    out.g = g2In;
+    out.b = b2In;
+    return out;
   }
 
-  // 3. Perceptual Lightness & Chroma preservation via OKLab with hue-safe gamut clamping
+  const strength = pigmentStrength <= 0 ? 0 : pigmentStrength >= 1 ? 1 : pigmentStrength;
+  if (strength <= 0.005) {
+    out.r = r1In + (r2In - r1In) * t;
+    out.g = g1In + (g2In - g1In) * t;
+    out.b = b1In + (b2In - b1In) * t;
+    return out;
+  }
+
+  const invT = 1 - t;
+  const r1 = srgbToLinear(r1In);
+  const g1 = srgbToLinear(g1In);
+  const b1 = srgbToLinear(b1In);
+
+  const r2 = srgbToLinear(r2In);
+  const g2 = srgbToLinear(g2In);
+  const b2 = srgbToLinear(b2In);
+
+  // 1. Decompose into 7-band physical reflectance spectra + exact linear RGB residuals
+  linearRgbToReflectance(r1, g1, b1, _kmSp1);
+  linearRgbToReflectance(r2, g2, b2, _kmSp2);
+
+  let b1r = 0;
+  let b1g = 0;
+  let b1b = 0;
+  let b2r = 0;
+  let b2g = 0;
+  let b2b = 0;
+  for (let i = 0; i < 7; i++) {
+    const s1 = _kmSp1[i];
+    const s2 = _kmSp2[i];
+    const wr = SPEC_W_R[i];
+    const wg = SPEC_W_G[i];
+    const wb = SPEC_W_B[i];
+    b1r += s1 * wr;
+    b1g += s1 * wg;
+    b1b += s1 * wb;
+    b2r += s2 * wr;
+    b2g += s2 * wg;
+    b2b += s2 * wb;
+  }
+  const res1r = r1 - (b1r - KM_LO) * KM_INV_SPAN;
+  const res1g = g1 - (b1g - KM_LO) * KM_INV_SPAN;
+  const res1b = b1 - (b1b - KM_LO) * KM_INV_SPAN;
+  const res2r = r2 - (b2r - KM_LO) * KM_INV_SPAN;
+  const res2g = g2 - (b2g - KM_LO) * KM_INV_SPAN;
+  const res2b = b2 - (b2b - KM_LO) * KM_INV_SPAN;
+
+  // 2. Perceptual luminance concentration (physical tinting strength balance)
+  const Y1 = 0.2126 * r1 + 0.7152 * g1 + 0.0722 * b1;
+  const Y2 = 0.2126 * r2 + 0.7152 * g2 + 0.0722 * b2;
+  const conc1 = Math.pow(0.06 + Y1, 0.36);
+  const conc2 = Math.pow(0.06 + Y2, 0.36);
+  const w1Raw = invT * conc1;
+  const w1 = w1Raw / (w1Raw + t * conc2);
+  const w2 = 1 - w1;
+
+  // 3. Mix in Kubelka-Munk K/S absorption-scattering space and reconstruct Linear RGB
+  let mr = 0;
+  let mg = 0;
+  let mb = 0;
+  for (let i = 0; i < 7; i++) {
+    const a = _kmSp1[i] < 0.02 ? 0.02 : _kmSp1[i] > 0.998 ? 0.998 : _kmSp1[i];
+    const b = _kmSp2[i] < 0.02 ? 0.02 : _kmSp2[i] > 0.998 ? 0.998 : _kmSp2[i];
+    const ks1 = Math.pow(((1 - a) * (1 - a)) / (2 * a), KM_EXP);
+    const ks2 = Math.pow(((1 - b) * (1 - b)) / (2 * b), KM_EXP);
+    const ks = Math.pow(ks1 * w1 + ks2 * w2, KM_INV_EXP);
+    const ref = 1 + ks - Math.sqrt(ks * ks + 2 * ks);
+    _kmSpM[i] = ref;
+    mr += ref * SPEC_W_R[i];
+    mg += ref * SPEC_W_G[i];
+    mb += ref * SPEC_W_B[i];
+  }
+
+  const mixR = Math.max(0, (mr - KM_LO) * KM_INV_SPAN + res1r * invT + res2r * t);
+  const mixG = Math.max(0, (mg - KM_LO) * KM_INV_SPAN + res1g * invT + res2g * t);
+  const mixB = Math.max(0, (mb - KM_LO) * KM_INV_SPAN + res1b * invT + res2b * t);
+
+  // 4. OKLab perceptual lightness & chroma polish with hue-safe gamut clamping
   const lab1 = linearRgbToOklab(r1, g1, b1);
   const lab2 = linearRgbToOklab(r2, g2, b2);
-  const targetLightness = lab1.L * w1 + lab2.L * w2;
+  const labM = linearRgbToOklab(mixR, mixG, mixB);
 
-  const subLab = linearRgbToOklab(subR, subG, subB);
-  const tunedL = Math.max(0, Math.min(1, targetLightness * 0.68 + subLab.L * 0.32));
-  let finalLinear = oklabToLinearRgb(tunedL, subLab.a, subLab.b);
+  const targetL = lab1.L * invT + lab2.L * t;
+  const tunedL = Math.max(0, Math.min(1, labM.L * 0.40 + targetL * 0.60));
 
-  // If boosting lightness pushed chroma slightly outside sRGB gamut, scale chroma back smoothly
-  // instead of hard-clipping individual channels (which twists hues during wet transitions).
+  const c1Chroma = Math.hypot(lab1.a, lab1.b);
+  const c2Chroma = Math.hypot(lab2.a, lab2.b);
+  const mChroma = Math.hypot(labM.a, labM.b);
+  const linChroma = c1Chroma * invT + c2Chroma * t;
+  let chromaBoost = 1.0;
+  if (mChroma > 0.008 && linChroma > mChroma) {
+    const targetC = mChroma + (linChroma - mChroma) * 0.50;
+    chromaBoost = Math.min(1.65, targetC / mChroma);
+  }
+  const aM = labM.a * chromaBoost;
+  const bM = labM.b * chromaBoost;
+
+  let finalLinear = oklabToLinearRgb(tunedL, aM, bM);
   const minCh = Math.min(finalLinear.r, finalLinear.g, finalLinear.b);
   const maxCh = Math.max(finalLinear.r, finalLinear.g, finalLinear.b);
   if (minCh < 0 || maxCh > 1) {
@@ -226,19 +439,46 @@ export function mixSubtractivePigments(
       scale = Math.min(scale, (1 - lGray) / (maxCh - lGray));
     }
     scale = Math.max(0, Math.min(1, scale));
-    finalLinear = oklabToLinearRgb(tunedL, subLab.a * scale, subLab.b * scale);
+    finalLinear = oklabToLinearRgb(tunedL, aM * scale, bM * scale);
   }
 
-  return {
-    r: linearToSrgbFloat(finalLinear.r),
-    g: linearToSrgbFloat(finalLinear.g),
-    b: linearToSrgbFloat(finalLinear.b),
-  };
+  const subR = linearToSrgbFloat(finalLinear.r);
+  const subG = linearToSrgbFloat(finalLinear.g);
+  const subB = linearToSrgbFloat(finalLinear.b);
+
+  if (strength >= 0.995) {
+    out.r = subR;
+    out.g = subG;
+    out.b = subB;
+    return out;
+  }
+
+  const linR = r1In + (r2In - r1In) * t;
+  const linG = g1In + (g2In - g1In) * t;
+  const linB = b1In + (b2In - b1In) * t;
+  out.r = linR + (subR - linR) * strength;
+  out.g = linG + (subG - linG) * strength;
+  out.b = linB + (subB - linB) * strength;
+  return out;
+}
+
+/**
+ * Subtractive Pigment Mixing (Physical Paint Simulation — 7-Band Spectral Kubelka-Munk + OKLab).
+ * Simulates real-world physical absorption and spectral overlap where Blue + Yellow = vibrant Green,
+ * Green + Magenta = warm golden-amber/coral, Red + Blue = Violet, Red + Yellow = Orange.
+ */
+export function mixSubtractivePigments(
+  c1: RgbColor,
+  c2: RgbColor,
+  weight2: number // 0.0 = 100% c1, 1.0 = 100% c2
+): RgbColor {
+  const out: RgbColor = { r: c1.r, g: c1.g, b: c1.b };
+  return mixPigmentRgbOut(c1.r, c1.g, c1.b, c2.r, c2.g, c2.b, weight2, 1.0, out);
 }
 
 /**
  * Blends two colors with configurable subtractive pigment mixing strength [0..1].
- * 0.0 = standard linear RGB interpolation; 1.0 = full Kubelka-Munk + OKLab subtractive mixing.
+ * 0.0 = standard linear RGB interpolation; 1.0 = full 7-band Kubelka-Munk + OKLab pigment mixing.
  */
 export function mixPigmentsWithStrength(
   c1: RgbColor,
@@ -246,28 +486,8 @@ export function mixPigmentsWithStrength(
   weight2: number,
   pigmentStrength: number = 1.0
 ): RgbColor {
-  const w2 = Math.max(0, Math.min(1, weight2));
-  if (w2 <= 0.0001) return { r: c1.r, g: c1.g, b: c1.b };
-  if (w2 >= 0.9999) return { r: c2.r, g: c2.g, b: c2.b };
-
-  const s = Math.max(0, Math.min(1, pigmentStrength));
-  if (s <= 0.01) {
-    return {
-      r: c1.r + (c2.r - c1.r) * w2,
-      g: c1.g + (c2.g - c1.g) * w2,
-      b: c1.b + (c2.b - c1.b) * w2,
-    };
-  }
-  const sub = mixSubtractivePigments(c1, c2, w2);
-  if (s >= 0.99) return sub;
-  const linR = c1.r + (c2.r - c1.r) * w2;
-  const linG = c1.g + (c2.g - c1.g) * w2;
-  const linB = c1.b + (c2.b - c1.b) * w2;
-  return {
-    r: linR + (sub.r - linR) * s,
-    g: linG + (sub.g - linG) * s,
-    b: linB + (sub.b - linB) * s,
-  };
+  const out: RgbColor = { r: c1.r, g: c1.g, b: c1.b };
+  return mixPigmentRgbOut(c1.r, c1.g, c1.b, c2.r, c2.g, c2.b, weight2, pigmentStrength, out);
 }
 
 // -------------------------------------------------------------
@@ -950,7 +1170,8 @@ export class PaintReservoir {
     flow: number = 0.85,
     stepDist: number = 0,
     perceptualMixing: boolean = true,
-    pressureAlreadyAppliedToFlow: boolean = false
+    pressureAlreadyAppliedToFlow: boolean = false,
+    pigmentStrength: number = 1.0
   ): { r: number; g: number; b: number; alpha: number; colorHex: string } {
     this.cumulativeDistance += stepDist;
 
@@ -959,10 +1180,11 @@ export class PaintReservoir {
     const isPureSmudge = clampedAmount <= 0.005 || mixingMode === 'smear';
     const isFullFresh = !isPureSmudge && clampedAmount >= 0.995;
     const canvasAlpha = sampledColor.a;
+    const effPigmentStrength = perceptualMixing ? Math.max(0, Math.min(1, pigmentStrength)) : 0;
 
     const mixFn = (c1: RgbColor, c2: RgbColor, w2: number): RgbColor => {
-      if (perceptualMixing) {
-        return mixSubtractivePigments(c1, c2, w2);
+      if (effPigmentStrength > 0.005) {
+        return mixPigmentsWithStrength(c1, c2, w2, effPigmentStrength);
       }
       const w = Math.max(0, Math.min(1, w2));
       return {
@@ -1589,6 +1811,7 @@ export interface SpatialTipStampParams {
   colorStretch: number;
   mixingMode: NaturalMixingMode;
   perceptualMixing: boolean;
+  pigmentMixingStrength?: number;
   tipImage?: HTMLImageElement;
   sampler?: LayerPixelSampler;
   grainDensity?: number;
@@ -1659,7 +1882,6 @@ export class SpatialTipMixer {
 
   private readonly sampleScratch: RgbaColor = { r: 0, g: 0, b: 0, a: 0 };
   private readonly c1Scratch: RgbColor = { r: 0, g: 0, b: 0 };
-  private readonly c2Scratch: RgbColor = { r: 0, g: 0, b: 0 };
 
   constructor(initialColor: string) {
     const rgb = parseColorToRgb(initialColor);
@@ -1783,6 +2005,10 @@ export class SpatialTipMixer {
 
     const smudgeDecay = carryDecay;
 
+    const effPigmentStrength = p.perceptualMixing
+      ? Math.max(0, Math.min(1, p.pigmentMixingStrength ?? 1.0))
+      : 0;
+
     const mixColorInto = (
       r1: number,
       g1: number,
@@ -1805,14 +2031,8 @@ export class SpatialTipMixer {
         this.c1Scratch.b = b2;
         return this.c1Scratch;
       }
-      if (p.perceptualMixing) {
-        this.c1Scratch.r = r1;
-        this.c1Scratch.g = g1;
-        this.c1Scratch.b = b1;
-        this.c2Scratch.r = r2;
-        this.c2Scratch.g = g2;
-        this.c2Scratch.b = b2;
-        return mixSubtractivePigments(this.c1Scratch, this.c2Scratch, w);
+      if (effPigmentStrength > 0.005) {
+        return mixPigmentRgbOut(r1, g1, b1, r2, g2, b2, w, effPigmentStrength, this.c1Scratch);
       }
       this.c1Scratch.r = r1 + (r2 - r1) * w;
       this.c1Scratch.g = g1 + (g2 - g1) * w;

@@ -13,6 +13,7 @@ export interface Bake3DOptions {
   layerName?: string;
   opacity?: number;
   blendMode?: BlendMode;
+  disposeOnComplete?: boolean;
   onInsertLayer?: (layer: LayerItem, canvas: HTMLCanvasElement) => void;
   onBroadcastLayer?: (layer: LayerItem, dataUrl: string) => void;
 }
@@ -236,6 +237,7 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
     layerName = '3D Layer',
     opacity = 1,
     blendMode = 'normal',
+    disposeOnComplete = true,
     onInsertLayer,
     onBroadcastLayer,
   } = options;
@@ -277,6 +279,14 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
   offscreenRenderer.setSize(renderWidth, renderHeight, false);
   offscreenRenderer.setPixelRatio(1);
   offscreenRenderer.setClearColor(0x000000, 0);
+  if (activeRenderer && 'toneMapping' in activeRenderer && 'toneMapping' in offscreenRenderer) {
+    offscreenRenderer.toneMapping = activeRenderer.toneMapping;
+    offscreenRenderer.toneMappingExposure = activeRenderer.toneMappingExposure;
+  }
+  if (offscreenRenderer.shadowMap && activeRenderer?.shadowMap) {
+    offscreenRenderer.shadowMap.enabled = activeRenderer.shadowMap.enabled;
+    offscreenRenderer.shadowMap.type = activeRenderer.shadowMap.type;
+  }
 
   // Synchronize camera projection aspect ratio with document geometry
   const renderCamera = camera.clone();
@@ -296,17 +306,27 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
 
   const ctx = rasterCanvas.getContext('2d', { willReadFrequently: false });
   if (!ctx) {
-    disposeThreeResources(null, offscreenRenderer);
+    if (!reusedActiveRenderer) {
+      disposeThreeResources(null, offscreenRenderer);
+    }
     throw new Error('Unable to create 2D canvas context for 3D rasterization');
   }
 
   ctx.drawImage(offscreenRenderer.domElement, 0, 0, targetWidth, targetHeight);
   const dataUrl = rasterCanvas.toDataURL('image/png');
 
-  // 3. Immediate Memory Cleanup: Free WebGL contexts, VRAM buffers, and scene graph
-  disposeThreeResources(scene, offscreenRenderer);
-  if (activeRenderer && !reusedActiveRenderer) {
-    disposeThreeResources(null, activeRenderer);
+  // 3. Memory Cleanup: Free offscreen WebGL context; preserve live scene if disposeOnComplete=false
+  if (disposeOnComplete) {
+    disposeThreeResources(scene, offscreenRenderer);
+    if (activeRenderer && !reusedActiveRenderer) {
+      disposeThreeResources(null, activeRenderer);
+    }
+  } else if (reusedActiveRenderer) {
+    if (savedActiveSize.x > 0 && savedActiveSize.y > 0) {
+      offscreenRenderer.setSize(savedActiveSize.x, savedActiveSize.y, false);
+    }
+  } else {
+    disposeThreeResources(null, offscreenRenderer);
   }
 
   // 4. Construct standard document raster layer
@@ -343,20 +363,22 @@ export async function bake3DToRasterLayer(options: Bake3DOptions): Promise<Bake3
 export interface Bake3DLTOptions {
   scene: THREE.Scene;
   camera: THREE.Camera;
-  dimensions: { width: number; height: number };
+  dimensions: { width: number; height: number; dpi?: number };
+  dpi?: number;
   activeRenderer?: THREE.WebGLRenderer | null;
   modelName?: string;
   targetFolderName?: string;
   baseLayerName?: string;
   lineWidth?: number; // 1 to 5 (default: 1)
   lineThreshold?: number; // 0.05 to 0.8 (default: 0.28)
-  toneCount?: number; // 1 to 4 tone layers (default: 2)
+  toneCount?: number; // 0 to 4 tone layers (default: 2; 0 = outline only)
   toneBands?: 2 | 3; // Backward-compatibility alias for toneCount
   toneFrequencies?: number[]; // Lines per inch [light, deep, ...] (default: 60)
-  toneAngles?: number[]; // Halftone grid angles (default: [45, 60, ...])
+  toneAngles?: number[]; // Halftone grid angles (default: 45° for all tiers)
   toneDensities?: number[]; // Density normalized [0-1] (e.g. [0.20, 0.45])
-  antiAliasing?: boolean;
+  antiAliasing?: boolean; // default: false for crisp 1-bit CSP manga lineart
   disposeOnComplete?: boolean;
+  previewOnly?: boolean;
   onInsertLayers?: (layers: LayerItem[], canvases: HTMLCanvasElement[]) => void;
   onBroadcastLayer?: (layer: LayerItem, dataUrl: string) => void;
 }
@@ -407,70 +429,73 @@ const sobelFragmentShader = `
     return z;
   }
 
+  float evaluateEdgeAt(vec2 uv, vec2 px) {
+    vec4 centerNorm = texture2D(tNormal, uv);
+    if (centerNorm.a < 0.5) {
+      return 0.0;
+    }
+
+    vec2 uvL = uv + vec2(-px.x, 0.0);
+    vec2 uvR = uv + vec2(px.x, 0.0);
+    vec2 uvT = uv + vec2(0.0, px.y);
+    vec2 uvB = uv + vec2(0.0, -px.y);
+
+    vec4 sL = texture2D(tNormal, uvL);
+    vec4 sR = texture2D(tNormal, uvR);
+    vec4 sT = texture2D(tNormal, uvT);
+    vec4 sB = texture2D(tNormal, uvB);
+
+    // Crisp outer silhouette against transparent background
+    if (sL.a < 0.5 || sR.a < 0.5 || sT.a < 0.5 || sB.a < 0.5) {
+      return 10.0;
+    }
+
+    // Angular normal crease detection (eliminates blurry smudging on smooth curved surfaces)
+    vec3 nC = normalize(centerNorm.rgb * 2.0 - 1.0);
+    vec3 nL = normalize(sL.rgb * 2.0 - 1.0);
+    vec3 nR = normalize(sR.rgb * 2.0 - 1.0);
+    vec3 nT = normalize(sT.rgb * 2.0 - 1.0);
+    vec3 nB = normalize(sB.rgb * 2.0 - 1.0);
+
+    float creaseH = max(1.0 - clamp(dot(nC, nL), -1.0, 1.0), 1.0 - clamp(dot(nC, nR), -1.0, 1.0));
+    float creaseV = max(1.0 - clamp(dot(nC, nT), -1.0, 1.0), 1.0 - clamp(dot(nC, nB), -1.0, 1.0));
+    float normalEdge = max(creaseH, creaseV);
+
+    // Second-order depth Laplacian: zero on tilted flat planes, sharp spike on true occlusion steps
+    float dC = readDepth(uv);
+    float dL = readDepth(uvL);
+    float dR = readDepth(uvR);
+    float dT = readDepth(uvT);
+    float dB = readDepth(uvB);
+    float depthLap = abs(dL + dR - 2.0 * dC) + abs(dT + dB - 2.0 * dC);
+    float depthEdge = depthLap * 90.0;
+
+    return normalEdge * 1.15 + depthEdge;
+  }
+
   void main() {
-    vec2 texel = (max(1.0, uLineWidth) / uResolution);
+    vec2 px = 1.0 / max(vec2(1.0), uResolution);
+    float maxEdge = evaluateEdgeAt(vUv, px);
 
-    vec4 centerNorm = texture2D(tNormal, vUv);
-    if (centerNorm.a < 0.05) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
-      return;
+    // Crisp morphological dilation for lineWidth > 1 (solid stroke, zero hollow/double-edge artifacts)
+    if (uLineWidth > 1.5 && maxEdge <= uThreshold) {
+      float radius = min(2.5, uLineWidth * 0.5);
+      for (int dy = -2; dy <= 2; dy++) {
+        for (int dx = -2; dx <= 2; dx++) {
+          if (dx == 0 && dy == 0) continue;
+          vec2 off = vec2(float(dx), float(dy));
+          if (length(off) <= radius) {
+            float e = evaluateEdgeAt(vUv + off * px, px);
+            if (e > maxEdge) maxEdge = e;
+          }
+        }
+      }
     }
 
-    // Outer silhouette check against 4-neighborhood background
-    float aL = texture2D(tNormal, vUv + vec2(-texel.x, 0.0)).a;
-    float aR = texture2D(tNormal, vUv + vec2(texel.x, 0.0)).a;
-    float aT = texture2D(tNormal, vUv + vec2(0.0, texel.y)).a;
-    float aB = texture2D(tNormal, vUv + vec2(0.0, -texel.y)).a;
-
-    if (aL < 0.5 || aR < 0.5 || aT < 0.5 || aB < 0.5) {
-      gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-      return;
-    }
-
-    // 3x3 Sobel sample coordinates
-    vec2 uv00 = vUv + vec2(-texel.x, -texel.y);
-    vec2 uv10 = vUv + vec2(0.0, -texel.y);
-    vec2 uv20 = vUv + vec2(texel.x, -texel.y);
-    vec2 uv01 = vUv + vec2(-texel.x, 0.0);
-    vec2 uv21 = vUv + vec2(texel.x, 0.0);
-    vec2 uv02 = vUv + vec2(-texel.x, texel.y);
-    vec2 uv12 = vUv + vec2(0.0, texel.y);
-    vec2 uv22 = vUv + vec2(texel.x, texel.y);
-
-    // Normal discontinuity Sobel filter (crease detection)
-    vec3 n00 = texture2D(tNormal, uv00).rgb * 2.0 - 1.0;
-    vec3 n10 = texture2D(tNormal, uv10).rgb * 2.0 - 1.0;
-    vec3 n20 = texture2D(tNormal, uv20).rgb * 2.0 - 1.0;
-    vec3 n01 = texture2D(tNormal, uv01).rgb * 2.0 - 1.0;
-    vec3 n21 = texture2D(tNormal, uv21).rgb * 2.0 - 1.0;
-    vec3 n02 = texture2D(tNormal, uv02).rgb * 2.0 - 1.0;
-    vec3 n12 = texture2D(tNormal, uv12).rgb * 2.0 - 1.0;
-    vec3 n22 = texture2D(tNormal, uv22).rgb * 2.0 - 1.0;
-
-    vec3 gx_n = -n00 + n20 - 2.0 * n01 + 2.0 * n21 - n02 + n22;
-    vec3 gy_n = -n00 - 2.0 * n10 - n20 + n02 + 2.0 * n12 + n22;
-    float normalEdge = length(gx_n) + length(gy_n);
-
-    // Depth discontinuity Sobel filter (depth step/silhouette detection)
-    float d00 = readDepth(uv00);
-    float d10 = readDepth(uv10);
-    float d20 = readDepth(uv20);
-    float d01 = readDepth(uv01);
-    float d21 = readDepth(uv21);
-    float d02 = readDepth(uv02);
-    float d12 = readDepth(uv12);
-    float d22 = readDepth(uv22);
-
-    float gx_d = -d00 + d20 - 2.0 * d01 + 2.0 * d21 - d02 + d22;
-    float gy_d = -d00 - 2.0 * d10 - d20 + d02 + 2.0 * d12 + d22;
-    float depthEdge = sqrt(gx_d * gx_d + gy_d * gy_d) * 160.0;
-
-    float totalEdge = normalEdge * 0.45 + depthEdge * 0.55;
-
-    if (totalEdge > uThreshold) {
+    if (maxEdge > uThreshold) {
       if (uAntiAliasing == 1) {
-        float alpha = clamp((totalEdge - uThreshold) / max(0.01, uThreshold * 0.25), 0.0, 1.0);
-        gl_FragColor = vec4(0.0, 0.0, 0.0, alpha);
+        float alpha = smoothstep(uThreshold, uThreshold + 0.08, maxEdge);
+        gl_FragColor = alpha >= 0.15 ? vec4(0.0, 0.0, 0.0, alpha) : vec4(0.0, 0.0, 0.0, 0.0);
       } else {
         gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
       }
@@ -511,6 +536,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     scene,
     camera,
     dimensions,
+    dpi,
     activeRenderer,
     modelName,
     targetFolderName,
@@ -522,15 +548,18 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     toneFrequencies,
     toneAngles,
     toneDensities,
-    antiAliasing = true,
+    antiAliasing = false,
     disposeOnComplete = true,
+    previewOnly = false,
     onInsertLayers,
     onBroadcastLayer,
   } = options;
 
+  const effectiveDisposeOnComplete = previewOnly ? false : disposeOnComplete;
   const targetWidth = Math.max(1, Math.round(dimensions.width));
   const targetHeight = Math.max(1, Math.round(dimensions.height));
-  const resolvedToneCount = Math.max(1, Math.min(4, Math.round(explicitToneCount ?? toneBands ?? 2)));
+  const resolvedDpi = Math.max(1, dpi ?? dimensions.dpi ?? 600);
+  const resolvedToneCount = Math.max(0, Math.min(4, Math.round(explicitToneCount ?? toneBands ?? 2)));
 
   let offscreenRenderer: THREE.WebGLRenderer;
   let reusedActiveRenderer = false;
@@ -564,6 +593,14 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   offscreenRenderer.setSize(renderWidth, renderHeight, false);
   offscreenRenderer.setPixelRatio(1);
   offscreenRenderer.setClearColor(0x000000, 0);
+  if (activeRenderer && 'toneMapping' in activeRenderer && 'toneMapping' in offscreenRenderer) {
+    offscreenRenderer.toneMapping = activeRenderer.toneMapping;
+    offscreenRenderer.toneMappingExposure = activeRenderer.toneMappingExposure;
+  }
+  if (offscreenRenderer.shadowMap && activeRenderer?.shadowMap) {
+    offscreenRenderer.shadowMap.enabled = activeRenderer.shadowMap.enabled;
+    offscreenRenderer.shadowMap.type = activeRenderer.shadowMap.type;
+  }
 
   const renderCamera = camera.clone();
   let isPerspective = 1;
@@ -585,11 +622,17 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     isPerspective = 0;
   }
 
-  // Preserve original materials for restoring after normal pass
+  // Preserve original materials for restoring after normal pass (skipping helpers/hidden meshes)
   const savedMaterials = new Map<THREE.Mesh, THREE.Material | THREE.Material[]>();
+  const hiddenHelpers: THREE.Object3D[] = [];
   scene.traverse((obj) => {
+    if (obj.userData?.is3DHelper && obj.visible) {
+      hiddenHelpers.push(obj);
+      obj.visible = false;
+      return;
+    }
     const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh) {
+    if (mesh.isMesh && !mesh.userData?.is3DHelper) {
       savedMaterials.set(mesh, mesh.material);
     }
   });
@@ -604,35 +647,38 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   });
 
   const normalMat = new THREE.MeshNormalMaterial();
-  scene.traverse((obj) => {
-    const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh) {
-      mesh.material = normalMat;
-    }
-  });
-
-  offscreenRenderer.setRenderTarget(targetA);
-  offscreenRenderer.clear();
-  offscreenRenderer.render(scene, renderCamera);
-
-  // 2. Offscreen Render Target B: Diffuse Lighting Buffer
   const targetB = new THREE.WebGLRenderTarget(renderWidth, renderHeight, {
-    minFilter: THREE.LinearFilter,
-    magFilter: THREE.LinearFilter,
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
     format: THREE.RGBAFormat,
     type: THREE.UnsignedByteType,
   });
 
-  scene.traverse((obj) => {
-    const mesh = obj as THREE.Mesh;
-    if (mesh.isMesh && savedMaterials.has(mesh)) {
-      mesh.material = savedMaterials.get(mesh)!;
+  try {
+    for (const mesh of savedMaterials.keys()) {
+      mesh.material = normalMat;
     }
-  });
 
-  offscreenRenderer.setRenderTarget(targetB);
-  offscreenRenderer.clear();
-  offscreenRenderer.render(scene, renderCamera);
+    offscreenRenderer.setRenderTarget(targetA);
+    offscreenRenderer.clear();
+    offscreenRenderer.render(scene, renderCamera);
+
+    // 2. Offscreen Render Target B: Diffuse Lighting Buffer
+    for (const [mesh, origMat] of savedMaterials.entries()) {
+      mesh.material = origMat;
+    }
+
+    offscreenRenderer.setRenderTarget(targetB);
+    offscreenRenderer.clear();
+    offscreenRenderer.render(scene, renderCamera);
+  } finally {
+    for (const [mesh, origMat] of savedMaterials.entries()) {
+      mesh.material = origMat;
+    }
+    for (const helper of hiddenHelpers) {
+      helper.visible = true;
+    }
+  }
 
   // 3. GLSL Fragment Sobel Edge Detection Pass over Target A (Normals + Depth)
   const lineTarget = new THREE.WebGLRenderTarget(renderWidth, renderHeight, {
@@ -691,16 +737,8 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   offscreenRenderer.setRenderTarget(null);
   offscreenRenderer.clear();
   offscreenRenderer.render(postScene, postCamera);
+  lineCtx.imageSmoothingEnabled = false;
   lineCtx.drawImage(offscreenRenderer.domElement, 0, 0, targetWidth, targetHeight);
-
-  // Extract binary line pixel map to ensure screentone shading doesn't bleed into outline
-  const renderLineCanvas = document.createElement('canvas');
-  renderLineCanvas.width = renderWidth;
-  renderLineCanvas.height = renderHeight;
-  const renderLineCtx = renderLineCanvas.getContext('2d', { willReadFrequently: true })!;
-  renderLineCtx.drawImage(offscreenRenderer.domElement, 0, 0, renderWidth, renderHeight);
-  const linePixels = renderLineCtx.getImageData(0, 0, renderWidth, renderHeight);
-  const lineData32 = new Uint32Array(linePixels.data.buffer);
 
   // 4. Capture Diffuse Lighting Buffer for Shadow Tier Posterization
   displayMaterial.uniforms.tSource.value = targetB.texture;
@@ -712,6 +750,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   diffuseCanvas.width = renderWidth;
   diffuseCanvas.height = renderHeight;
   const diffCtx = diffuseCanvas.getContext('2d', { willReadFrequently: true })!;
+  diffCtx.imageSmoothingEnabled = false;
   diffCtx.drawImage(offscreenRenderer.domElement, 0, 0, renderWidth, renderHeight);
   const diffImageData = diffCtx.getImageData(0, 0, renderWidth, renderHeight);
   const diffData = diffImageData.data;
@@ -722,12 +761,12 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   const folderName = targetFolderName?.trim() || `3D Extraction [${cleanModelName}]`;
   const folderId = `folder-lt-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
 
-  // 5. Posterize Diffuse Lighting into 1 to 4 Manga Screentone Shadow Tiers
-  // Default Tier Configurations:
-  // Tier 1 (Light shadow): 60 LPI, 20% density
-  // Tier 2 (Deep shadow): 60 LPI, 45% density
+  // 5. Posterize Diffuse Lighting into 1 to 4 Mutually Exclusive Manga Screentone Shadow Tiers
+  // Each pixel belongs to at most ONE shadow band at uniform 45° angle (Clip Studio Paint style),
+  // eliminating overlapping-band moiré and preserving exact requested tone densities.
   type ToneTierDef = {
-    threshold: number;
+    minLum: number;
+    maxLum: number;
     density: number;
     frequency: number;
     angle: number;
@@ -735,9 +774,12 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   };
 
   const tierConfigs: ToneTierDef[] = [];
-  if (resolvedToneCount === 1) {
+  if (resolvedToneCount === 0) {
+    // Lineart-only extraction
+  } else if (resolvedToneCount === 1) {
     tierConfigs.push({
-      threshold: 0.45,
+      minLum: -1.0,
+      maxLum: 0.45,
       density: toneDensities?.[0] ?? 0.45,
       frequency: toneFrequencies?.[0] ?? 60,
       angle: toneAngles?.[0] ?? 45,
@@ -746,38 +788,43 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   } else if (resolvedToneCount === 2) {
     tierConfigs.push(
       {
-        threshold: 0.65,
+        minLum: 0.35,
+        maxLum: 0.65,
         density: toneDensities?.[0] ?? 0.20,
         frequency: toneFrequencies?.[0] ?? 60,
         angle: toneAngles?.[0] ?? 45,
         name: '3D Tone 1 (Light)',
       },
       {
-        threshold: 0.35,
+        minLum: -1.0,
+        maxLum: 0.35,
         density: toneDensities?.[1] ?? 0.45,
         frequency: toneFrequencies?.[1] ?? 60,
-        angle: toneAngles?.[1] ?? 60,
+        angle: toneAngles?.[1] ?? 45,
         name: '3D Tone 2 (Deep)',
       }
     );
   } else if (resolvedToneCount === 3) {
     tierConfigs.push(
       {
-        threshold: 0.70,
+        minLum: 0.45,
+        maxLum: 0.70,
         density: toneDensities?.[0] ?? 0.15,
         frequency: toneFrequencies?.[0] ?? 60,
         angle: toneAngles?.[0] ?? 45,
         name: '3D Tone 1 (Light)',
       },
       {
-        threshold: 0.45,
+        minLum: 0.25,
+        maxLum: 0.45,
         density: toneDensities?.[1] ?? 0.30,
         frequency: toneFrequencies?.[1] ?? 60,
-        angle: toneAngles?.[1] ?? 60,
+        angle: toneAngles?.[1] ?? 45,
         name: '3D Tone 2 (Mid)',
       },
       {
-        threshold: 0.25,
+        minLum: -1.0,
+        maxLum: 0.25,
         density: toneDensities?.[2] ?? 0.50,
         frequency: toneFrequencies?.[2] ?? 60,
         angle: toneAngles?.[2] ?? 45,
@@ -788,31 +835,35 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     // 4 Tone Layers
     tierConfigs.push(
       {
-        threshold: 0.75,
+        minLum: 0.55,
+        maxLum: 0.75,
         density: toneDensities?.[0] ?? 0.10,
         frequency: toneFrequencies?.[0] ?? 60,
         angle: toneAngles?.[0] ?? 45,
         name: '3D Tone 1 (Light)',
       },
       {
-        threshold: 0.55,
+        minLum: 0.35,
+        maxLum: 0.55,
         density: toneDensities?.[1] ?? 0.25,
         frequency: toneFrequencies?.[1] ?? 60,
-        angle: toneAngles?.[1] ?? 60,
+        angle: toneAngles?.[1] ?? 45,
         name: '3D Tone 2 (Mid-Light)',
       },
       {
-        threshold: 0.35,
+        minLum: 0.18,
+        maxLum: 0.35,
         density: toneDensities?.[2] ?? 0.40,
         frequency: toneFrequencies?.[2] ?? 60,
         angle: toneAngles?.[2] ?? 45,
         name: '3D Tone 3 (Mid-Deep)',
       },
       {
-        threshold: 0.18,
+        minLum: -1.0,
+        maxLum: 0.18,
         density: toneDensities?.[3] ?? 0.55,
         frequency: toneFrequencies?.[3] ?? 60,
-        angle: toneAngles?.[3] ?? 60,
+        angle: toneAngles?.[3] ?? 45,
         name: '3D Tone 4 (Deep)',
       }
     );
@@ -833,42 +884,54 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     for (let i = 0; i < renderWidth * renderHeight; i++) {
       const pIdx = i * 4;
       const alpha = diffData[pIdx + 3];
-      // Skip background pixels and lineart contours
-      if (alpha === 0 || (lineData32[i] & SOLID_BLACK_U32) !== 0) continue;
+      // Threshold alpha cleanly at 128 to prevent darkened transparent silhouette fringes.
+      // Do NOT cut out outline pixels: "3D Outline" sits above tone layers, so keeping solid
+      // tone masks underneath prevents white/gray halos around lines.
+      if (alpha < 128) continue;
 
       const r = diffData[pIdx];
       const g = diffData[pIdx + 1];
       const b = diffData[pIdx + 2];
       const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255.0;
 
-      if (lum < tier.threshold) {
+      if (lum >= tier.minLum && lum < tier.maxLum) {
         maskData32[i] = SOLID_BLACK_U32;
       }
     }
 
     maskCtx.putImageData(maskImageData, 0, 0);
 
-    const toneRenderCanvas = document.createElement('canvas');
-    toneRenderCanvas.width = renderWidth;
-    toneRenderCanvas.height = renderHeight;
-
-    applyScreentoneCPU(maskCanvas, toneRenderCanvas, {
-      frequency: tier.frequency,
-      angle: tier.angle,
-      specifiedDensity: tier.density,
-      densityType: 'specified',
-      dpi: 600,
-      antiAliasing: true,
-    });
-
     const finalToneCanvas = document.createElement('canvas');
     finalToneCanvas.width = targetWidth;
     finalToneCanvas.height = targetHeight;
     const finalToneCtx = finalToneCanvas.getContext('2d')!;
-    finalToneCtx.drawImage(toneRenderCanvas, 0, 0, targetWidth, targetHeight);
+    finalToneCtx.imageSmoothingEnabled = false;
+
+    if (previewOnly) {
+      // Live 2D modal preview composites toneCanvases directly without the WebGL compositor,
+      // so render crisp 1-bit binary screentone dots at preview resolution.
+      const toneRenderCanvas = document.createElement('canvas');
+      toneRenderCanvas.width = renderWidth;
+      toneRenderCanvas.height = renderHeight;
+      applyScreentoneCPU(maskCanvas, toneRenderCanvas, {
+        frequency: tier.frequency,
+        angle: tier.angle,
+        dotShape: 'circle',
+        specifiedDensity: tier.density,
+        densityType: 'specified',
+        dpi: resolvedDpi,
+        antiAliasing: false,
+      });
+      finalToneCtx.drawImage(toneRenderCanvas, 0, 0, targetWidth, targetHeight);
+    } else {
+      // Extracted tone layers are non-destructive Clip Studio Paint tone layers (toneEnabled: true):
+      // store the crisp solid-black shadow mask so the compositor renders the 1-bit halftone dots
+      // ONCE at exact document DPI (eliminating double-screentoning blur & moiré artifacts).
+      finalToneCtx.drawImage(maskCanvas, 0, 0, targetWidth, targetHeight);
+    }
     toneCanvases.push(finalToneCanvas);
 
-    const toneDataUrl = finalToneCanvas.toDataURL('image/png');
+    const toneDataUrl = previewOnly ? '' : finalToneCanvas.toDataURL('image/png');
     const toneLayer: LayerItem = {
       id: `raster-lt-tone-${t + 1}-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       name: tier.name,
@@ -880,9 +943,11 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
       collapsed: false,
       parentId: folderId,
       thumbnailUrl: toneDataUrl,
+      isToneLayer: true,
       toneEnabled: true,
       toneFrequency: tier.frequency,
       toneAngle: tier.angle,
+      toneDotShape: 'circle',
       toneDensity: Math.round(tier.density * 100),
       toneDensityType: 'specified',
     };
@@ -890,7 +955,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   }
 
   // 6. Outline Layer ("3D Outline")
-  const lineDataUrl = lineCanvas.toDataURL('image/png');
+  const lineDataUrl = previewOnly ? '' : lineCanvas.toDataURL('image/png');
   const lineLayer: LayerItem = {
     id: `raster-lt-line-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
     name: '3D Outline',
@@ -902,6 +967,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
     collapsed: false,
     parentId: folderId,
     thumbnailUrl: lineDataUrl,
+    expressionColor: antiAliasing ? 'gray' : 'monochrome',
   };
 
   // 7. Folder Group Layer: "3D Extraction [Model Name]"
@@ -930,7 +996,7 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   lineTarget.texture.dispose();
   lineTarget.dispose();
 
-  if (disposeOnComplete) {
+  if (effectiveDisposeOnComplete) {
     disposeThreeResources(scene, offscreenRenderer);
     if (activeRenderer && !reusedActiveRenderer) {
       disposeThreeResources(null, activeRenderer);
@@ -963,23 +1029,25 @@ export async function bake3DToLineAndTone(options: Bake3DLTOptions): Promise<Bak
   const allLayers: LayerItem[] = [folderLayer, lineLayer, ...toneLayersStackOrder];
   const allCanvases: HTMLCanvasElement[] = [folderCanvas, lineCanvas, ...toneCanvasesStackOrder];
 
-  if (onInsertLayers) {
+  if (!previewOnly && onInsertLayers) {
     onInsertLayers(allLayers, allCanvases);
   }
 
-  if (onBroadcastLayer) {
-    onBroadcastLayer(folderLayer, '');
-    onBroadcastLayer(lineLayer, lineDataUrl);
-    toneLayersStackOrder.forEach((l, i) => onBroadcastLayer(l, toneCanvasesStackOrder[i].toDataURL('image/png')));
-  } else if (multiplayerService.isConnected()) {
-    const activeGrid = documentStore.getActiveTileGrid();
-    multiplayerService.sendLayerAdd(folderLayer);
-    multiplayerService.sendLayerAdd(lineLayer);
-    multiplayerService.streamLayerTiles(lineLayer.id, activeGrid);
-    toneLayersStackOrder.forEach((l) => {
-      multiplayerService.sendLayerAdd(l);
-      multiplayerService.streamLayerTiles(l.id, activeGrid);
-    });
+  if (!previewOnly) {
+    if (onBroadcastLayer) {
+      onBroadcastLayer(folderLayer, '');
+      onBroadcastLayer(lineLayer, lineDataUrl);
+      toneLayersStackOrder.forEach((l, i) => onBroadcastLayer(l, toneCanvasesStackOrder[i].toDataURL('image/png')));
+    } else if (multiplayerService.isConnected()) {
+      const activeGrid = documentStore.getActiveTileGrid();
+      multiplayerService.sendLayerAdd(folderLayer);
+      multiplayerService.sendLayerAdd(lineLayer);
+      multiplayerService.streamLayerTiles(lineLayer.id, activeGrid);
+      toneLayersStackOrder.forEach((l) => {
+        multiplayerService.sendLayerAdd(l);
+        multiplayerService.streamLayerTiles(l.id, activeGrid);
+      });
+    }
   }
 
   return {

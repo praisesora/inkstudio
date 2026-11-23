@@ -47,11 +47,22 @@ export function fillLayerSolidColor(
       g = parseInt(hex.slice(2, 4), 16) || 0;
       b = parseInt(hex.slice(4, 6), 16) || 0;
       if (hex.length === 8) {
-        a = parseInt(hex.slice(6, 8), 16) || 255;
+        const parsedA = parseInt(hex.slice(6, 8), 16);
+        a = Number.isNaN(parsedA) ? 255 : parsedA;
       }
     }
   } else if (lower === 'black') {
     r = 0; g = 0; b = 0;
+  } else {
+    const rgbaMatch = lower.match(/^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)$/);
+    if (rgbaMatch) {
+      r = Math.max(0, Math.min(255, parseInt(rgbaMatch[1], 10)));
+      g = Math.max(0, Math.min(255, parseInt(rgbaMatch[2], 10)));
+      b = Math.max(0, Math.min(255, parseInt(rgbaMatch[3], 10)));
+      a = rgbaMatch[4] !== undefined
+        ? Math.max(0, Math.min(255, Math.round(parseFloat(rgbaMatch[4]) * 255)))
+        : 255;
+    }
   }
 
   host.clearLayer(layerId);

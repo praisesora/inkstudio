@@ -1,6 +1,7 @@
-import { CanvasDimensions, LayerItem, isFolderLikeLayer } from '../../types/editor';
+import { CanvasDimensions, LayerItem, isFolderLikeLayer, resolveToneDensityType } from '../../types/editor';
 import { getCanvasCompositeOperation } from '../canvasUtils';
 import { applyMultiFrameClip, renderFrameBorder } from '../frameEngine';
+import { applyScreentoneCPU } from '../screentoneEngine';
 import { SparseTileGrid, TILE_SIZE, TileBuffer } from '../tileEngine';
 import { applyAdjustment } from '../tonalEngine';
 import { calculateVisibleDocumentBounds } from './bounds';
@@ -93,7 +94,17 @@ export function render2DSingleLayer(
   frustum?: DocumentBounds | null
 ): void {
   targetCtx.save();
-  targetCtx.globalAlpha = Math.max(0, Math.min(1, layer.opacity * opacityMultiplier));
+  const effectiveOpacity = Math.max(0, Math.min(1, layer.opacity * opacityMultiplier));
+  const toneEnabled = Boolean(layer.toneEnabled);
+  const toneDensityType = resolveToneDensityType(layer);
+  const toneDpi = state.currentOptions?.dimensions?.dpi ?? 600;
+  const toneSpecifiedDensity = Math.max(0, Math.min(1, (layer.toneDensity ?? 40) / 100));
+
+  if ((toneEnabled || layer.expressionColor === 'monochrome') && state.currentZoom >= 0.99) {
+    targetCtx.imageSmoothingEnabled = false;
+  }
+
+  targetCtx.globalAlpha = effectiveOpacity;
   targetCtx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
 
   const { tiles, lodTileDocSize } = collectVisible2DTiles(
@@ -110,6 +121,16 @@ export function render2DSingleLayer(
     if (!tileCtx || !state.fallbackTileCanvas) return;
     const imgData = getReusableTileImageData(state, tileCtx);
     const scaleRatio = lodTileDocSize / TILE_SIZE;
+    const renderCrispTone = toneEnabled && scaleRatio === 1;
+    const prevAlpha = ctx.globalAlpha;
+    if (toneEnabled) {
+      ctx.globalAlpha = renderCrispTone
+        ? 1.0
+        : toneDensityType === 'specified'
+          ? Math.max(0, Math.min(1, effectiveOpacity * toneSpecifiedDensity))
+          : effectiveOpacity;
+    }
+
     for (const tile of tiles) {
       const rgba = grid.getTileAsRGBA(tile);
       imgData.data.set(rgba);
@@ -125,7 +146,29 @@ export function render2DSingleLayer(
         }
       }
 
+      if (renderCrispTone && toneDensityType === 'image' && effectiveOpacity < 0.999) {
+        const d = imgData.data;
+        for (let i = 3; i < d.length; i += 4) {
+          if (d[i] > 0) d[i] = Math.round(d[i] * effectiveOpacity);
+        }
+      }
+
       tileCtx.putImageData(imgData, 0, 0);
+
+      if (renderCrispTone) {
+        applyScreentoneCPU(state.fallbackTileCanvas, state.fallbackTileCanvas, {
+          frequency: layer.toneFrequency ?? 60,
+          angle: layer.toneAngle ?? 45,
+          dotShape: layer.toneDotShape ?? 'circle',
+          dpi: toneDpi,
+          densityType: toneDensityType,
+          specifiedDensity: toneSpecifiedDensity * effectiveOpacity,
+          antiAliasing: false,
+          docOriginX: tile.tileX * TILE_SIZE,
+          docOriginY: tile.tileY * TILE_SIZE,
+        });
+      }
+
       if (scaleRatio === 1) {
         ctx.drawImage(state.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
       } else {
@@ -137,6 +180,10 @@ export function render2DSingleLayer(
           lodTileDocSize
         );
       }
+    }
+
+    if (toneEnabled) {
+      ctx.globalAlpha = prevAlpha;
     }
   };
 

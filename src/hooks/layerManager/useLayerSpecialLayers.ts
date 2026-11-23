@@ -18,6 +18,7 @@ import {
   applyLayerTreeDelta as applyLayerTreeDeltaPure,
   cloneComicFrames,
   cloneLayerItemForHistory,
+  createLayerTreeSnapshotDelta,
 } from './layerTreeOps';
 import { LayerManagerContext } from './types';
 
@@ -52,6 +53,8 @@ export function useLayerSpecialLayers(
     layersRef,
     setActiveLayerId,
     activeLayerIdRef,
+    suppressHistoryDepthRef,
+    recordLayerHistory,
   } = ctx;
 
   // Create or update a non-destructive Vector Text Layer (re-renders crisply into tileGrid)
@@ -60,41 +63,96 @@ export function useLayerSpecialLayers(
       const grid = activeTileGridRef.current;
       const dims = dimensionsRef.current;
       const snippet = textData.text.trim().replace(/\s+/g, ' ').slice(0, 22) || 'Text';
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
 
       if (editingLayerId) {
-        const existing = layersRef.current.find((l) => l.id === editingLayerId);
+        const existing = beforeLayers.find((l) => l.id === editingLayerId);
         if (existing && existing.type === 'text') {
+          const beforeTileSnap = grid.snapshotLayerTiles(editingLayerId);
           const updated: LayerItem = {
             ...existing,
             name: snippet,
             textData: { ...textData },
           };
-          setLayers((prev) => {
-            const next = prev.map((l) => (l.id === editingLayerId ? updated : l));
-            layersRef.current = next;
-            return next;
-          });
+          const nextLayers = beforeLayers.map((l) => (l.id === editingLayerId ? updated : l));
+          layersRef.current = nextLayers;
+          setLayers(nextLayers);
           syncVectorObjectLayerToGrid(updated, dims, grid);
+          const tileDeltas = grid.computeDeltasFromSnapshot(beforeTileSnap, editingLayerId, {
+            x: 0,
+            y: 0,
+            width: dims.width,
+            height: dims.height,
+          });
+          for (const t of grid.getLayerTiles(editingLayerId, 0)) {
+            const key = getTileKey(editingLayerId, t.tileX, t.tileY, 0);
+            if (t.data && !beforeTileSnap.has(key) && !tileDeltas.some((d) => d.key === key)) {
+              tileDeltas.push({ key, format: t.format, beforeData: null, afterData: new Uint8Array(t.data) });
+            }
+          }
           updateLayerThumbnail(editingLayerId, true);
+          recordLayerHistory(
+            'Edit Text Layer',
+            editingLayerId,
+            createLayerTreeSnapshotDelta(
+              beforeLayers,
+              layersRef.current,
+              beforeActiveLayerId,
+              activeLayerIdRef.current
+            ),
+            tileDeltas,
+            'text'
+          );
           return updated;
         }
       }
 
-      const created = addLayer('text', undefined, snippet, undefined, true);
+      suppressHistoryDepthRef.current += 1;
+      let created: LayerItem;
+      try {
+        created = addLayer('text', undefined, snippet, undefined, true);
+      } finally {
+        suppressHistoryDepthRef.current = Math.max(0, suppressHistoryDepthRef.current - 1);
+      }
       const withData: LayerItem = {
         ...created,
         textData: { ...textData },
       };
-      setLayers((prev) => {
-        const next = prev.map((l) => (l.id === created.id ? { ...l, textData: { ...textData } } : l));
-        layersRef.current = next;
-        return next;
-      });
+      const nextLayers = layersRef.current.map((l) =>
+        l.id === created.id ? { ...l, textData: { ...textData } } : l
+      );
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
+      const beforeTileSnap = grid.snapshotLayerTiles(created.id);
       syncVectorObjectLayerToGrid(withData, dims, grid);
+      const tileDeltas = grid.computeDeltasFromSnapshot(beforeTileSnap, created.id, {
+        x: 0,
+        y: 0,
+        width: dims.width,
+        height: dims.height,
+      });
       updateLayerThumbnail(created.id, true);
+      recordLayerHistory(
+        'Add Text Layer',
+        created.id,
+        createLayerTreeSnapshotDelta(beforeLayers, layersRef.current, beforeActiveLayerId, created.id),
+        tileDeltas,
+        'text'
+      );
       return withData;
     },
-    [activeTileGridRef, addLayer, dimensionsRef, layersRef, setLayers, updateLayerThumbnail]
+    [
+      activeLayerIdRef,
+      activeTileGridRef,
+      addLayer,
+      dimensionsRef,
+      layersRef,
+      recordLayerHistory,
+      setLayers,
+      suppressHistoryDepthRef,
+      updateLayerThumbnail,
+    ]
   );
 
   // Create or update a non-destructive Speech Balloon Layer (re-renders crisply into tileGrid)
@@ -105,41 +163,96 @@ export function useLayerSpecialLayers(
       const clonedBalloon: SpeechBalloon = JSON.parse(JSON.stringify(balloonData));
       const snippet = clonedBalloon.text.trim().replace(/\s+/g, ' ').slice(0, 18);
       const label = snippet ? `Balloon: ${snippet}` : undefined;
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
 
       if (editingLayerId) {
-        const existing = layersRef.current.find((l) => l.id === editingLayerId);
+        const existing = beforeLayers.find((l) => l.id === editingLayerId);
         if (existing && existing.type === 'balloon') {
+          const beforeTileSnap = grid.snapshotLayerTiles(editingLayerId);
           const updated: LayerItem = {
             ...existing,
             name: label || existing.name,
             balloonData: clonedBalloon,
           };
-          setLayers((prev) => {
-            const next = prev.map((l) => (l.id === editingLayerId ? updated : l));
-            layersRef.current = next;
-            return next;
-          });
+          const nextLayers = beforeLayers.map((l) => (l.id === editingLayerId ? updated : l));
+          layersRef.current = nextLayers;
+          setLayers(nextLayers);
           syncVectorObjectLayerToGrid(updated, dims, grid);
+          const tileDeltas = grid.computeDeltasFromSnapshot(beforeTileSnap, editingLayerId, {
+            x: 0,
+            y: 0,
+            width: dims.width,
+            height: dims.height,
+          });
+          for (const t of grid.getLayerTiles(editingLayerId, 0)) {
+            const key = getTileKey(editingLayerId, t.tileX, t.tileY, 0);
+            if (t.data && !beforeTileSnap.has(key) && !tileDeltas.some((d) => d.key === key)) {
+              tileDeltas.push({ key, format: t.format, beforeData: null, afterData: new Uint8Array(t.data) });
+            }
+          }
           updateLayerThumbnail(editingLayerId, true);
+          recordLayerHistory(
+            'Edit Speech Balloon',
+            editingLayerId,
+            createLayerTreeSnapshotDelta(
+              beforeLayers,
+              layersRef.current,
+              beforeActiveLayerId,
+              activeLayerIdRef.current
+            ),
+            tileDeltas,
+            'balloon'
+          );
           return updated;
         }
       }
 
-      const created = addLayer('balloon', undefined, label, undefined, true);
+      suppressHistoryDepthRef.current += 1;
+      let created: LayerItem;
+      try {
+        created = addLayer('balloon', undefined, label, undefined, true);
+      } finally {
+        suppressHistoryDepthRef.current = Math.max(0, suppressHistoryDepthRef.current - 1);
+      }
       const withData: LayerItem = {
         ...created,
         balloonData: clonedBalloon,
       };
-      setLayers((prev) => {
-        const next = prev.map((l) => (l.id === created.id ? { ...l, balloonData: clonedBalloon } : l));
-        layersRef.current = next;
-        return next;
-      });
+      const nextLayers = layersRef.current.map((l) =>
+        l.id === created.id ? { ...l, balloonData: clonedBalloon } : l
+      );
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
+      const beforeTileSnap = grid.snapshotLayerTiles(created.id);
       syncVectorObjectLayerToGrid(withData, dims, grid);
+      const tileDeltas = grid.computeDeltasFromSnapshot(beforeTileSnap, created.id, {
+        x: 0,
+        y: 0,
+        width: dims.width,
+        height: dims.height,
+      });
       updateLayerThumbnail(created.id, true);
+      recordLayerHistory(
+        'Add Speech Balloon',
+        created.id,
+        createLayerTreeSnapshotDelta(beforeLayers, layersRef.current, beforeActiveLayerId, created.id),
+        tileDeltas,
+        'balloon'
+      );
       return withData;
     },
-    [activeTileGridRef, addLayer, dimensionsRef, layersRef, setLayers, updateLayerThumbnail]
+    [
+      activeLayerIdRef,
+      activeTileGridRef,
+      addLayer,
+      dimensionsRef,
+      layersRef,
+      recordLayerHistory,
+      setLayers,
+      suppressHistoryDepthRef,
+      updateLayerThumbnail,
+    ]
   );
 
   // Create a true Manga Frame Border Folder with auto-clipping & initial child raster layer
@@ -247,7 +360,7 @@ export function useLayerSpecialLayers(
       grid.notifyChange(true);
 
       const layerTreeDelta: LayerTreeDelta = {
-        addedLayers: addedLayers.map(cloneLayerItemForHistory),
+        addedLayers: addedLayers.map((l) => cloneLayerItemForHistory(l)),
         insertBeforeLayerId,
         insertIndex,
         beforeActiveLayerId,
@@ -375,7 +488,7 @@ export function useLayerSpecialLayers(
       return {
         divided: true,
         layerTreeDelta: {
-          addedLayers: addedLayers.map(cloneLayerItemForHistory),
+          addedLayers: addedLayers.map((l) => cloneLayerItemForHistory(l)),
           insertBeforeLayerId: folder.id,
           insertIndex: folderIdx,
           updatedLayers: [
@@ -412,22 +525,20 @@ export function useLayerSpecialLayers(
         return nextRes.nextLayers;
       });
 
-      if (direction === 'undo') {
-        for (const delId of syncResult.removedLayerIds) {
-          const timer = thumbDebounceTimersRef.current.get(delId);
-          if (timer) {
-            clearTimeout(timer);
-            thumbDebounceTimersRef.current.delete(delId);
-          }
-          grid.clearLayer(delId);
+      for (const delId of syncResult.removedLayerIds) {
+        const timer = thumbDebounceTimersRef.current.get(delId);
+        if (timer) {
+          clearTimeout(timer);
+          thumbDebounceTimersRef.current.delete(delId);
         }
-      } else {
-        for (const added of syncResult.addedLayers) {
-          if (hasTileBackedLayer(added)) {
-            const isMono = added.expressionColor === 'monochrome';
-            grid.setLayerFormat(added.id, isMono ? 'monochrome-1bit' : 'color-32bit');
-            grid.markLayerIngested(added.id);
-          }
+        grid.clearLayer(delId);
+      }
+
+      for (const added of syncResult.addedLayers) {
+        if (hasTileBackedLayer(added)) {
+          const isMono = added.expressionColor === 'monochrome';
+          grid.setLayerFormat(added.id, isMono ? 'monochrome-1bit' : 'color-32bit');
+          grid.markLayerIngested(added.id);
         }
       }
 
@@ -435,6 +546,7 @@ export function useLayerSpecialLayers(
         setActiveLayerId(syncResult.nextActiveLayerId);
       }
 
+      grid.notifyChange(true);
       return syncResult;
     },
     [activeLayerIdRef, activeTileGridRef, layersRef, setActiveLayerId, setLayers, thumbDebounceTimersRef]
@@ -443,7 +555,9 @@ export function useLayerSpecialLayers(
   // Rasterize a non-destructive text, balloon, or vector layer into a standard raster layer
   const rasterizeLayer = useCallback(
     (id: string): boolean => {
-      const target = layersRef.current.find((l) => l.id === id);
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
+      const target = beforeLayers.find((l) => l.id === id);
       if (!target) return false;
       if (target.type !== 'text' && target.type !== 'balloon' && target.type !== 'vector') {
         return false;
@@ -451,29 +565,48 @@ export function useLayerSpecialLayers(
 
       const grid = activeTileGridRef.current;
       const dims = dimensionsRef.current;
+      const beforeTileSnap = grid.snapshotLayerTiles(id);
 
       if (target.type === 'text' || target.type === 'balloon') {
         syncVectorObjectLayerToGrid(target, dims, grid);
       }
 
-      setLayers((prev) => {
-        const next = prev.map((l) => {
-          if (l.id !== id) return l;
-          const { textData: _td, balloonData: _bd, vectorStrokes: _vs, ...rest } = l;
-          return {
-            ...rest,
-            type: 'raster' as const,
-          };
-        });
-        layersRef.current = next;
-        return next;
+      const nextLayers = beforeLayers.map((l) => {
+        if (l.id !== id) return l;
+        const { textData: _td, balloonData: _bd, vectorStrokes: _vs, ...rest } = l;
+        return {
+          ...rest,
+          type: 'raster' as const,
+        };
       });
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
+
+      const tileDeltas = grid.computeDeltasFromSnapshot(beforeTileSnap, id, {
+        x: 0,
+        y: 0,
+        width: dims.width,
+        height: dims.height,
+      });
+      for (const t of grid.getLayerTiles(id, 0)) {
+        const key = getTileKey(id, t.tileX, t.tileY, 0);
+        if (t.data && !beforeTileSnap.has(key) && !tileDeltas.some((d) => d.key === key)) {
+          tileDeltas.push({ key, format: t.format, beforeData: null, afterData: new Uint8Array(t.data) });
+        }
+      }
 
       updateLayerThumbnail(id, true);
       grid.notifyChange(true);
+      recordLayerHistory(
+        'Rasterize Layer',
+        id,
+        createLayerTreeSnapshotDelta(beforeLayers, nextLayers, beforeActiveLayerId, activeLayerIdRef.current),
+        tileDeltas,
+        'layer-convert'
+      );
       return true;
     },
-    [activeTileGridRef, dimensionsRef, layersRef, setLayers, updateLayerThumbnail]
+    [activeLayerIdRef, activeTileGridRef, dimensionsRef, layersRef, recordLayerHistory, setLayers, updateLayerThumbnail]
   );
 
   return {

@@ -203,6 +203,15 @@ export const DEFAULT_COMMANDS: readonly CommandDefinition[] = [
     springLoaded: true,
   },
   {
+    id: 'tool.3d',
+    label: '3D Object & Camera Tool',
+    description: 'Manipulate 3D models, lighting, camera, and poses on the canvas',
+    category: 'Tools',
+    defaultShortcut: 'K',
+    toolId: '3d',
+    springLoaded: false,
+  },
+  {
     id: 'tool.brushSizeDown',
     label: 'Decrease Brush Size',
     description: 'Step brush diameter down',

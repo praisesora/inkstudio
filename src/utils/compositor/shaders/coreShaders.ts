@@ -1,4 +1,5 @@
 import { buildBlendModeGlsl } from './blendModesGlsl';
+import { buildScreentoneGlsl } from './screentoneGlsl';
 
 // Document-Space Solid Polygon Shaders for Frame Border Folder Stencil Clipping & Borders
 export const FRAME_POLY_VERTEX_SHADER = `#version 300 es
@@ -176,70 +177,9 @@ uniform int u_monoExpressWhite;
 
 out vec4 fragColor;
 
-float fractVal(float x) {
-  return x - floor(x);
-}
-
 ${buildBlendModeGlsl()}
 
-vec4 evaluateScreentone(vec4 srcColor, vec2 docCoord) {
-  if (srcColor.a < 0.0039) {
-    return vec4(0.0);
-  }
-
-  float density;
-  if (u_toneDensityType == 0) {
-    // Specified density
-    density = clamp(u_toneDensity * srcColor.a, 0.0, 1.0);
-  } else {
-    // Luminance
-    float lum = dot(srcColor.rgb, vec3(0.299, 0.587, 0.114));
-    density = clamp((1.0 - lum) * srcColor.a, 0.0, 1.0);
-  }
-
-  if (density <= 0.001) return vec4(0.0);
-  if (density >= 0.999) return vec4(0.0, 0.0, 0.0, 1.0);
-
-  float cellSize = max(3.5, u_toneDpi / max(1.0, u_toneFrequency));
-  float cosA = cos(u_toneAngleRad);
-  float sinA = sin(u_toneAngleRad);
-
-  float xr = docCoord.x * cosA - docCoord.y * sinA;
-  float yr = docCoord.x * sinA + docCoord.y * cosA;
-
-  float u = fractVal(xr / cellSize) - 0.5;
-  float v = fractVal(yr / cellSize) - 0.5;
-
-  float spot;
-  if (u_toneDotShape == 2) {
-    // Line
-    spot = 1.0 - 2.0 * abs(u);
-  } else if (u_toneDotShape == 3) {
-    // Diamond
-    spot = 1.0 - (abs(u) + abs(v));
-  } else {
-    // Euclidean circle
-    float absU = abs(u);
-    float absV = abs(v);
-    if (absU + absV <= 0.5) {
-      spot = 1.0 - 2.0 * (u * u + v * v);
-    } else {
-      float uc = absU - 0.5;
-      float vc = absV - 0.5;
-      spot = 2.0 * (uc * uc + vc * vc);
-    }
-  }
-
-  float diff = spot - (1.0 - density);
-  float halfSpan = min(0.25, 0.75 / cellSize);
-  float coverage = clamp(diff / (2.0 * halfSpan) + 0.5, 0.0, 1.0);
-  vec4 halftoneColor = vec4(0.0, 0.0, 0.0, coverage);
-
-  // Anti-moiré smoothstep crossfading
-  float moireBlend = smoothstep(0.35, 0.95, u_zoom);
-  vec4 contColor = vec4(0.0, 0.0, 0.0, density);
-  return mix(contColor, halftoneColor, moireBlend);
-}
+${buildScreentoneGlsl()}
 
 vec4 applyLayerTint(vec4 color) {
   if (u_layerColorEnabled == 0) return color;
@@ -311,21 +251,31 @@ void main() {
   }
 
   if (u_toneEnabled == 1) {
+    if (u_maskEnabled == 1) {
+      vec2 maskCoord = clamp(v_docCoord / u_docDimensions, 0.0, 1.0);
+      vec4 maskPixel = texture(u_maskTexture, maskCoord);
+      float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
+      finalColor.a *= maskLum;
+    }
+    finalColor.a *= u_layerOpacity;
     finalColor = evaluateScreentone(finalColor, v_docCoord);
-  }
+    if (u_layerColorEnabled == 1) {
+      finalColor = applyLayerTint(finalColor);
+    }
+  } else {
+    if (u_layerColorEnabled == 1) {
+      finalColor = applyLayerTint(finalColor);
+    }
 
-  if (u_layerColorEnabled == 1) {
-    finalColor = applyLayerTint(finalColor);
-  }
+    if (u_maskEnabled == 1) {
+      vec2 maskCoord = clamp(v_docCoord / u_docDimensions, 0.0, 1.0);
+      vec4 maskPixel = texture(u_maskTexture, maskCoord);
+      float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
+      finalColor.a *= maskLum;
+    }
 
-  if (u_maskEnabled == 1) {
-    vec2 maskCoord = clamp(v_docCoord / u_docDimensions, 0.0, 1.0);
-    vec4 maskPixel = texture(u_maskTexture, maskCoord);
-    float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
-    finalColor.a *= maskLum;
+    finalColor.a *= u_layerOpacity;
   }
-
-  finalColor.a *= u_layerOpacity;
 
   if (finalColor.a < 0.002) {
     discard;

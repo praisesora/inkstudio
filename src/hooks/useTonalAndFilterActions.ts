@@ -8,6 +8,7 @@ import {
   FilterType,
   LayerItem,
   LayerStyles,
+  LayerTreeDelta,
   TileDelta,
 } from '../types/editor';
 import { documentStore } from '../utils/documentStore';
@@ -100,18 +101,18 @@ export interface UseTonalAndFilterActionsParams {
     angle: number,
     dotShape: HalftoneDotShape,
     densityType: 'specified' | 'image'
-  ) => { id: string; tileDeltas: TileDelta[] };
+  ) => { id: string; tileDeltas: TileDelta[]; layerTreeDelta?: LayerTreeDelta };
   applyExpressionColorOfPreview: (
     layerId: string
   ) => { tileDeltas: TileDelta[] } | null | undefined;
   applyLayerColorPermanently: (
     layerId: string
-  ) => { tileDeltas: TileDelta[] } | null | undefined;
+  ) => { tileDeltas: TileDelta[]; layerTreeDelta?: LayerTreeDelta } | null | undefined;
   convertLayer: (
     layerId: string,
     targetMode: ExpressionColor,
     options?: { threshold?: number; expressBlack?: boolean; expressWhite?: boolean }
-  ) => { tileDeltas: TileDelta[] } | null | undefined;
+  ) => { tileDeltas: TileDelta[]; layerTreeDelta?: LayerTreeDelta } | null | undefined;
   showToast: (msg: string) => void;
 }
 
@@ -636,7 +637,10 @@ export function useTonalAndFilterActions({
   const handleConfirmTone = useCallback(
     (settings: SimpleToneSettings) => {
       uiStoreActions.setToneModalOpen(false);
-      const { id, tileDeltas } = fillScreentoneSelection(
+      if (selection?.floating) {
+        handleCommitFloatingSelection();
+      }
+      const { id, tileDeltas, layerTreeDelta } = fillScreentoneSelection(
         selection,
         settings.density,
         settings.frequency,
@@ -644,7 +648,7 @@ export function useTonalAndFilterActions({
         settings.dotShape,
         settings.densityType
       );
-      if (tileDeltas.length > 0) {
+      if (tileDeltas.length > 0 || layerTreeDelta) {
         pushHistoryStepRef.current?.(
           'screentone',
           `Screentone (${settings.density}%)`,
@@ -652,12 +656,17 @@ export function useTonalAndFilterActions({
           null,
           id,
           selection?.bounds,
-          tileDeltas
+          tileDeltas,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          layerTreeDelta
         );
       }
       showToast(`Created Screentone Layer (${settings.density}%)`);
     },
-    [selection, fillScreentoneSelection, pushHistoryStepRef, showToast]
+    [selection, handleCommitFloatingSelection, fillScreentoneSelection, pushHistoryStepRef, showToast]
   );
 
   const handleApplyExpressionColor = useCallback(
@@ -682,7 +691,7 @@ export function useTonalAndFilterActions({
   const handleApplyLayerColor = useCallback(
     (layerId: string) => {
       const result = applyLayerColorPermanently(layerId);
-      if (result && result.tileDeltas.length > 0) {
+      if (result && (result.tileDeltas.length > 0 || result.layerTreeDelta)) {
         pushHistoryStepRef.current?.(
           'layer-color',
           'Apply Layer Color Tint',
@@ -690,7 +699,12 @@ export function useTonalAndFilterActions({
           null,
           layerId,
           undefined,
-          result.tileDeltas
+          result.tileDeltas,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          result.layerTreeDelta
         );
         showToast('Applied tint to layer permanently');
       }
@@ -705,7 +719,7 @@ export function useTonalAndFilterActions({
       options?: { threshold?: number; expressBlack?: boolean; expressWhite?: boolean }
     ) => {
       const result = convertLayer(layerId, targetMode, options);
-      if (result && result.tileDeltas.length > 0) {
+      if (result && (result.tileDeltas.length > 0 || result.layerTreeDelta)) {
         pushHistoryStepRef.current?.(
           'layer-convert',
           `Convert to ${targetMode.toUpperCase()}`,
@@ -713,7 +727,12 @@ export function useTonalAndFilterActions({
           null,
           layerId,
           undefined,
-          result.tileDeltas
+          result.tileDeltas,
+          undefined,
+          undefined,
+          undefined,
+          false,
+          result.layerTreeDelta
         );
         showToast(`Converted layer to ${targetMode}`);
       }

@@ -124,6 +124,7 @@ export function renderSingleLayer(
     gl.clear(gl.COLOR_BUFFER_BIT);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
+    const tonePreAppliesOpacity = Boolean(layer.toneEnabled) && draftOp === 'destination-out';
     if (visibleTiles.length > 0) {
       drawVisibleTiles(
         state,
@@ -133,7 +134,7 @@ export function renderSingleLayer(
         layer,
         dimensions,
         lodTileDocSize,
-        1.0,
+        tonePreAppliesOpacity ? effectiveOpacity : 1.0,
         0,
         null,
         maskTex
@@ -171,7 +172,7 @@ export function renderSingleLayer(
       gl,
       state.layerTexture,
       layer.blendMode,
-      effectiveOpacity,
+      tonePreAppliesOpacity ? 1.0 : effectiveOpacity,
       fs.viewportW,
       fs.viewportH,
       target,

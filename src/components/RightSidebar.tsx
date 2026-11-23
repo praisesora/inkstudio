@@ -22,6 +22,8 @@ import {
   Type,
   MessageSquare,
   Shield,
+  Layers,
+  Scaling,
 } from 'lucide-react';
 import {
   HistoryItemMeta,
@@ -31,7 +33,9 @@ import {
   CanvasColorMode,
   ExpressionColor,
   isFolderLikeLayer,
+  isDedicatedToneLayer,
 } from '../types/editor';
+import { HalftoneDotShape } from '../utils/screentoneEngine';
 import { BLEND_MODES } from '../utils/canvasUtils';
 import { ColorPanel } from './ColorPanel';
 import { useToolStore, toolStoreActions } from '../stores';
@@ -151,14 +155,17 @@ export interface RightSidebarProps {
   onOpenLayerStylesModal?: (layerId: string) => void;
   onEditVectorLayer?: (layer: LayerItem) => void;
   onRasterizeLayer?: (layerId: string) => void;
+  onMergeFolder?: (folderId: string) => void;
+  onTransformLayer?: () => void;
   onReorderLayers?: (draggedId: string, targetId: string, position: 'above' | 'below' | 'inside') => void;
   onToggleReferenceLayer?: (id: string) => void;
   onToggleTone?: (id: string) => void;
   onSetToneFrequency?: (id: string, frequency: number) => void;
   onSetToneAngle?: (id: string, angle: number) => void;
-  onSetToneDotShape?: (id: string, dotShape: 'circle' | 'euclidean') => void;
+  onSetToneDotShape?: (id: string, dotShape: HalftoneDotShape) => void;
   onSetToneDensity?: (id: string, density: number) => void;
   onSetToneDensityType?: (id: string, densityType: 'specified' | 'image') => void;
+  onCreateToneLayer?: () => void;
   onToggleLayerColor?: (id: string) => void;
   onSetLayerColor?: (id: string, color: string) => void;
   onSetLayerSubColor?: (id: string, color: string) => void;
@@ -249,13 +256,15 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
   onOpenLayerStylesModal,
   onEditVectorLayer,
   onRasterizeLayer,
+  onMergeFolder,
+  onTransformLayer,
   onToggleReferenceLayer,
   onToggleTone,
   onSetToneFrequency,
   onSetToneAngle,
   onSetToneDotShape,
   onSetToneDensity,
-  onSetToneDensityType,
+  onCreateToneLayer,
   onToggleLayerColor,
   onSetLayerColor,
   onSetLayerSubColor,
@@ -826,6 +835,44 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                               fx
                             </button>
                           )}
+                        {isFolderLikeLayer(activeLayer) && onMergeFolder && (
+                          <button
+                            type="button"
+                            disabled={activeLayer.locked}
+                            onClick={() => onMergeFolder(activeLayer.id)}
+                            title={
+                              activeLayer.locked
+                                ? 'Unlock folder to merge'
+                                : 'Merge Folder into Single Layer'
+                            }
+                            className={`w-5 h-5 rounded flex items-center justify-center transition-colors ${
+                              activeLayer.locked
+                                ? 'text-[#8a8a8a]/30 cursor-not-allowed'
+                                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
+                            }`}
+                          >
+                            <Layers className="w-3 h-3" />
+                          </button>
+                        )}
+                        {isFolderLikeLayer(activeLayer) && onTransformLayer && (
+                          <button
+                            type="button"
+                            disabled={activeLayer.locked}
+                            onClick={() => onTransformLayer()}
+                            title={
+                              activeLayer.locked
+                                ? 'Unlock folder to transform'
+                                : 'Transform Folder (Ctrl+T)'
+                            }
+                            className={`w-5 h-5 rounded flex items-center justify-center transition-colors ${
+                              activeLayer.locked
+                                ? 'text-[#8a8a8a]/30 cursor-not-allowed'
+                                : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] cursor-pointer'
+                            }`}
+                          >
+                            <Scaling className="w-3 h-3" />
+                          </button>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -1319,97 +1366,102 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                               onChange={() => onToggleTone?.(activeLayer.id)}
                             />
                           </label>
+                          {onCreateToneLayer && (
+                            <button
+                              type="button"
+                              onClick={onCreateToneLayer}
+                              className="w-full h-6 px-2 rounded bg-[#2a2a2a] hover:bg-[#333333] text-[10px] text-[#d4d4d4] border border-white/[0.06] transition-colors cursor-pointer"
+                            >
+                              New Screentone Layer...
+                            </button>
+                          )}
 
-                          {activeLayer.toneEnabled && (
-                            <div className="space-y-2">
-                              <select
-                                value={activeLayer.toneDensityType ?? 'specified'}
-                                onChange={(e) =>
-                                  onSetToneDensityType?.(
-                                    activeLayer.id,
-                                    e.target.value as 'specified' | 'image'
-                                  )
-                                }
-                                className="w-full h-6 px-1.5 text-[10px]"
-                              >
-                                <option value="specified">Specified Density</option>
-                                <option value="image">Image Brightness</option>
-                              </select>
+                          {activeLayer.toneEnabled && (() => {
+                            const isToneLayer = isDedicatedToneLayer(activeLayer);
+                            return (
+                              <div className="space-y-2">
+                                {isToneLayer ? (
+                                  <div className="space-y-1">
+                                    <div className="flex justify-between text-[10px]">
+                                      <span className="text-[#8a8a8a]">Density</span>
+                                      <span className="font-mono text-[#e5e5e5]">
+                                        {activeLayer.toneDensity ?? 40}%
+                                      </span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min="1"
+                                      max="100"
+                                      value={activeLayer.toneDensity ?? 40}
+                                      onChange={(e) =>
+                                        onSetToneDensity?.(activeLayer.id, parseInt(e.target.value, 10))
+                                      }
+                                      className="w-full"
+                                    />
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between text-[10px] text-[#8a8a8a]">
+                                    <span>Density</span>
+                                    <span className="font-mono text-[#a3a3a3]">Layer tones</span>
+                                  </div>
+                                )}
 
-                              {(activeLayer.toneDensityType ?? 'specified') === 'specified' && (
                                 <div className="space-y-1">
                                   <div className="flex justify-between text-[10px]">
-                                    <span className="text-[#8a8a8a]">Density</span>
+                                    <span className="text-[#8a8a8a]">Frequency</span>
                                     <span className="font-mono text-[#e5e5e5]">
-                                      {activeLayer.toneDensity ?? 40}%
+                                      {activeLayer.toneFrequency ?? 60} LPI
                                     </span>
                                   </div>
                                   <input
                                     type="range"
-                                    min="1"
-                                    max="100"
-                                    value={activeLayer.toneDensity ?? 40}
+                                    min="20"
+                                    max="85"
+                                    value={activeLayer.toneFrequency ?? 60}
                                     onChange={(e) =>
-                                      onSetToneDensity?.(activeLayer.id, parseInt(e.target.value, 10))
+                                      onSetToneFrequency?.(activeLayer.id, parseInt(e.target.value, 10))
                                     }
                                     className="w-full"
                                   />
                                 </div>
-                              )}
 
-                              <div className="space-y-1">
-                                <div className="flex justify-between text-[10px]">
-                                  <span className="text-[#8a8a8a]">Frequency</span>
-                                  <span className="font-mono text-[#e5e5e5]">
-                                    {activeLayer.toneFrequency ?? 60} LPI
-                                  </span>
+                                <div className="space-y-1">
+                                  <div className="flex justify-between text-[10px]">
+                                    <span className="text-[#8a8a8a]">Angle</span>
+                                    <span className="font-mono text-[#e5e5e5]">
+                                      {activeLayer.toneAngle ?? 45}°
+                                    </span>
+                                  </div>
+                                  <input
+                                    type="range"
+                                    min="0"
+                                    max="90"
+                                    value={activeLayer.toneAngle ?? 45}
+                                    onChange={(e) =>
+                                      onSetToneAngle?.(activeLayer.id, parseInt(e.target.value, 10))
+                                    }
+                                    className="w-full"
+                                  />
                                 </div>
-                                <input
-                                  type="range"
-                                  min="20"
-                                  max="85"
-                                  value={activeLayer.toneFrequency ?? 60}
-                                  onChange={(e) =>
-                                    onSetToneFrequency?.(activeLayer.id, parseInt(e.target.value, 10))
-                                  }
-                                  className="w-full"
-                                />
-                              </div>
 
-                              <div className="space-y-1">
-                                <div className="flex justify-between text-[10px]">
-                                  <span className="text-[#8a8a8a]">Angle</span>
-                                  <span className="font-mono text-[#e5e5e5]">
-                                    {activeLayer.toneAngle ?? 45}°
-                                  </span>
-                                </div>
-                                <input
-                                  type="range"
-                                  min="0"
-                                  max="90"
-                                  value={activeLayer.toneAngle ?? 45}
+                                <select
+                                  value={activeLayer.toneDotShape ?? 'circle'}
                                   onChange={(e) =>
-                                    onSetToneAngle?.(activeLayer.id, parseInt(e.target.value, 10))
+                                    onSetToneDotShape?.(
+                                      activeLayer.id,
+                                      e.target.value as HalftoneDotShape
+                                    )
                                   }
-                                  className="w-full"
-                                />
+                                  className="w-full h-6 px-1.5 text-[10px]"
+                                >
+                                  <option value="circle">Circle Dot</option>
+                                  <option value="euclidean">Euclidean Dot</option>
+                                  <option value="line">Line (Hatching)</option>
+                                  <option value="diamond">Diamond</option>
+                                </select>
                               </div>
-
-                              <select
-                                value={activeLayer.toneDotShape ?? 'circle'}
-                                onChange={(e) =>
-                                  onSetToneDotShape?.(
-                                    activeLayer.id,
-                                    e.target.value as 'circle' | 'euclidean'
-                                  )
-                                }
-                                className="w-full h-6 px-1.5 text-[10px]"
-                              >
-                                <option value="circle">Circle Dot</option>
-                                <option value="euclidean">Euclidean Dot</option>
-                              </select>
-                            </div>
-                          )}
+                            );
+                          })()}
 
                           <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
                             <span>Layer Tint</span>
@@ -1595,6 +1647,22 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                 </button>
               )}
 
+              {onCreateToneLayer && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onCreateToneLayer();
+                      setContextMenu(null);
+                    }}
+                    className="w-full text-left px-2.5 py-1 rounded hover:bg-[#2c2c2c] cursor-pointer"
+                  >
+                    New Screentone Layer...
+                  </button>
+                  <div className="my-0.5 h-px bg-[#2c2c2c]" />
+                </>
+              )}
+
               {onOpenAdjustmentModal && (
                 <>
                   {(['curves', 'levels', 'gradient-map', 'color-balance'] as const).map((adjType) => (
@@ -1657,6 +1725,46 @@ export const RightSidebar: React.FC<RightSidebarProps> = React.memo(({
                     Layer Styles...
                   </button>
                 )}
+
+              {isFolderLikeLayer(targetLayer) && (onMergeFolder || onTransformLayer) && (
+                <>
+                  {onMergeFolder && (
+                    <button
+                      type="button"
+                      disabled={targetLayer.locked}
+                      onClick={() => {
+                        onMergeFolder(targetLayer.id);
+                        setContextMenu(null);
+                      }}
+                      className={`w-full text-left px-2.5 py-1 rounded ${
+                        targetLayer.locked
+                          ? 'text-[#8a8a8a]/40 cursor-not-allowed'
+                          : 'hover:bg-[#2c2c2c] cursor-pointer'
+                      }`}
+                    >
+                      Merge Folder
+                    </button>
+                  )}
+                  {onTransformLayer && (
+                    <button
+                      type="button"
+                      disabled={targetLayer.locked}
+                      onClick={() => {
+                        onTransformLayer();
+                        setContextMenu(null);
+                      }}
+                      className={`w-full text-left px-2.5 py-1 rounded ${
+                        targetLayer.locked
+                          ? 'text-[#8a8a8a]/40 cursor-not-allowed'
+                          : 'hover:bg-[#2c2c2c] cursor-pointer'
+                      }`}
+                    >
+                      Transform Folder (Ctrl+T)
+                    </button>
+                  )}
+                  <div className="my-0.5 h-px bg-[#2c2c2c]" />
+                </>
+              )}
 
               {onGroupSelectedLayers && (
                 <button

@@ -145,6 +145,97 @@ export function computeBatchDeleteLayers(
 }
 
 // Pure group selected layers helper
+export function getFolderDescendantIds(layers: LayerItem[], folderId: string): string[] {
+  const descendants: string[] = [];
+  const collect = (parentId: string) => {
+    for (const l of layers) {
+      if (l.parentId === parentId) {
+        descendants.push(l.id);
+        if (isFolderLikeLayer(l)) {
+          collect(l.id);
+        }
+      }
+    }
+  };
+  collect(folderId);
+  return descendants;
+}
+
+export interface ComputeMergeFolderResult {
+  folder: LayerItem;
+  descendantLayers: LayerItem[];
+  descendantIds: string[];
+  mergedLayer: LayerItem;
+  nextLayers: LayerItem[];
+}
+
+// Pure folder-to-single-layer merge tree computation
+export function computeMergeFolderLayers(
+  layers: LayerItem[],
+  folderId: string,
+  customMergedId?: string
+): ComputeMergeFolderResult | null {
+  const folderIdx = layers.findIndex((l) => l.id === folderId);
+  if (folderIdx < 0) return null;
+
+  const folder = layers[folderIdx];
+  if (!folder || !isFolderLikeLayer(folder) || folder.locked) {
+    return null;
+  }
+
+  const descendantIds = getFolderDescendantIds(layers, folder.id);
+  const descendantIdSet = new Set(descendantIds);
+  // Preserve stack order (top-to-bottom) for descendants
+  const descendantLayers = layers.filter((l) => descendantIdSet.has(l.id));
+
+  const mergedId =
+    customMergedId || `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+
+  const mergedLayer: LayerItem = {
+    id: mergedId,
+    name: folder.name,
+    type: 'raster',
+    visible: folder.visible,
+    opacity: folder.opacity,
+    blendMode: folder.blendMode === 'pass-through' ? 'normal' : folder.blendMode,
+    locked: false,
+    clipped: folder.clipped,
+    parentId: folder.parentId,
+    thumbnailUrl: '',
+    isReference: folder.isReference,
+    expressionColor: folder.expressionColor ?? 'color',
+    monoThreshold: folder.monoThreshold ?? 128,
+    monoExpressBlack: folder.monoExpressBlack ?? true,
+    monoExpressWhite: folder.monoExpressWhite ?? true,
+    ...(folder.maskCanvas
+      ? {
+          maskCanvas: folder.maskCanvas,
+          maskEnabled: folder.maskEnabled,
+          maskLinked: folder.maskLinked,
+          maskThumbnailUrl: folder.maskThumbnailUrl,
+          maskVersion: folder.maskVersion,
+        }
+      : {}),
+  };
+
+  const nextLayers: LayerItem[] = [];
+  for (const l of layers) {
+    if (l.id === folder.id) {
+      nextLayers.push(mergedLayer);
+    } else if (!descendantIdSet.has(l.id)) {
+      nextLayers.push(l);
+    }
+  }
+
+  return {
+    folder,
+    descendantLayers,
+    descendantIds,
+    mergedLayer,
+    nextLayers,
+  };
+}
+
 export function computeGroupLayers(
   layers: LayerItem[],
   selectedIds: string[],
@@ -338,9 +429,27 @@ export function cloneComicFrames(frames: ComicFrame[]): ComicFrame[] {
   }));
 }
 
-export function cloneLayerItemForHistory(layer: LayerItem): LayerItem {
+export function cloneMaskCanvasForHistory(
+  canvas: HTMLCanvasElement | undefined
+): HTMLCanvasElement | undefined {
+  if (!canvas || typeof document === 'undefined') return canvas;
+  const copy = document.createElement('canvas');
+  copy.width = canvas.width;
+  copy.height = canvas.height;
+  const ctx = copy.getContext('2d');
+  if (ctx) {
+    ctx.drawImage(canvas, 0, 0);
+  }
+  return copy;
+}
+
+export function cloneLayerItemForHistory(
+  layer: LayerItem,
+  cloneMask: boolean = false
+): LayerItem {
   return {
     ...layer,
+    maskCanvas: cloneMask && layer.maskCanvas ? cloneMaskCanvasForHistory(layer.maskCanvas) : layer.maskCanvas,
     comicFrames: layer.comicFrames ? cloneComicFrames(layer.comicFrames) : undefined,
     vectorStrokes: layer.vectorStrokes ? JSON.parse(JSON.stringify(layer.vectorStrokes)) : undefined,
     textData: layer.textData ? JSON.parse(JSON.stringify(layer.textData)) : undefined,
@@ -351,6 +460,23 @@ export function cloneLayerItemForHistory(layer: LayerItem): LayerItem {
   };
 }
 
+export function createLayerTreeSnapshotDelta(
+  beforeLayers: LayerItem[],
+  afterLayers: LayerItem[],
+  beforeActiveLayerId: string,
+  afterActiveLayerId: string,
+  options?: { cloneMasks?: boolean; coalesceKey?: string }
+): LayerTreeDelta {
+  const cloneMasks = Boolean(options?.cloneMasks);
+  return {
+    beforeLayers: beforeLayers.map((l) => cloneLayerItemForHistory(l, cloneMasks)),
+    afterLayers: afterLayers.map((l) => cloneLayerItemForHistory(l, cloneMasks)),
+    beforeActiveLayerId,
+    afterActiveLayerId,
+    coalesceKey: options?.coalesceKey,
+  };
+}
+
 export interface ApplyLayerTreeDeltaResult {
   nextLayers: LayerItem[];
   nextActiveLayerId: string | null;
@@ -358,13 +484,45 @@ export interface ApplyLayerTreeDeltaResult {
   addedLayers: LayerItem[];
 }
 
-// Pure undo/redo application of a targeted LayerTreeDelta (e.g. create/divide frame border folder)
+// Pure undo/redo application of a LayerTreeDelta (both targeted frame deltas and full tree snapshots)
 export function applyLayerTreeDelta(
   layers: LayerItem[],
   currentActiveLayerId: string,
   delta: LayerTreeDelta,
   direction: 'undo' | 'redo'
 ): ApplyLayerTreeDeltaResult {
+  // Full snapshot path: handles arbitrary add, delete, duplicate, group, merge, reorder, property & mask changes
+  if (delta.beforeLayers && delta.afterLayers) {
+    const targetSnapshot = direction === 'undo' ? delta.beforeLayers : delta.afterLayers;
+    const prevIdSet = new Set(layers.map((l) => l.id));
+    const targetIdSet = new Set(targetSnapshot.map((l) => l.id));
+
+    const removedLayerIds: string[] = [];
+    for (const l of layers) {
+      if (!targetIdSet.has(l.id)) {
+        removedLayerIds.push(l.id);
+      }
+    }
+
+    const nextLayers = targetSnapshot.map((l) => cloneLayerItemForHistory(l));
+    const addedLayers = nextLayers.filter((l) => !prevIdSet.has(l.id));
+
+    const desiredActiveId =
+      direction === 'undo' ? delta.beforeActiveLayerId : delta.afterActiveLayerId;
+    let nextActiveLayerId: string | null = null;
+    if (desiredActiveId && nextLayers.some((l) => l.id === desiredActiveId)) {
+      nextActiveLayerId = desiredActiveId;
+    } else if (
+      removedLayerIds.includes(currentActiveLayerId) ||
+      (currentActiveLayerId && !nextLayers.some((l) => l.id === currentActiveLayerId))
+    ) {
+      const fallback = nextLayers.find((l) => l.type === 'raster') || nextLayers[0];
+      nextActiveLayerId = fallback ? fallback.id : '';
+    }
+
+    return { nextLayers, nextActiveLayerId, removedLayerIds, addedLayers };
+  }
+
   let nextLayers = [...layers];
   const removedLayerIds: string[] = [];
   const addedLayers: LayerItem[] = [];
@@ -428,7 +586,7 @@ export function applyLayerTreeDelta(
     const existingIds = new Set(nextLayers.map((l) => l.id));
     const toAdd = delta.addedLayers
       .filter((al) => !existingIds.has(al.id))
-      .map(cloneLayerItemForHistory);
+      .map((al) => cloneLayerItemForHistory(al));
 
     if (toAdd.length > 0) {
       let insertIdx: number;

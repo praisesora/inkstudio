@@ -59,6 +59,40 @@ export interface FloodFillOptions {
   antiAlias?: boolean;
   /** Optional active selection mask (1/255 = inside selection, 0 = outside) */
   selectionMask?: Uint8Array | null;
+  /** When true, only modifies pixels with existing non-zero alpha on the target layer */
+  alphaLocked?: boolean;
+}
+
+function isLayerEffectivelyVisibleInList(layer: LayerItem, layers: LayerItem[]): boolean {
+  if (!layer.visible) return false;
+  let parentId = layer.parentId;
+  let guard = 0;
+  while (parentId && guard < 32) {
+    const parent = layers.find((l) => l.id === parentId);
+    if (!parent) break;
+    if (!parent.visible) return false;
+    parentId = parent.parentId;
+    guard++;
+  }
+  return true;
+}
+
+function pointInPolygonFlood(
+  px: number,
+  py: number,
+  polygon: Array<{ x: number; y: number }>
+): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
 }
 
 /**
@@ -719,13 +753,32 @@ export function executeFloodFillOnTileGrid(params: {
     return { dirtyRect: null, modified: false, tileDeltas: [] };
   }
 
-  // Determine reference layers for lazy tile compositing
+  // Determine reference layers for lazy tile compositing (respecting ancestor folder visibility)
   let refLayers: LayerItem[] | null = null;
   if (referMode === 'refer-reference') {
-    const refs = layers.filter((l) => l.visible && l.isReference && l.type !== 'folder' && l.type !== 'frame-folder');
-    refLayers = refs.length > 0 ? refs : layers.filter((l) => l.visible && l.type !== 'folder' && l.type !== 'frame-folder');
+    const refs = layers.filter(
+      (l) =>
+        isLayerEffectivelyVisibleInList(l, layers) &&
+        l.isReference &&
+        l.type !== 'folder' &&
+        l.type !== 'frame-folder'
+    );
+    refLayers =
+      refs.length > 0
+        ? refs
+        : layers.filter(
+            (l) =>
+              isLayerEffectivelyVisibleInList(l, layers) &&
+              l.type !== 'folder' &&
+              l.type !== 'frame-folder'
+          );
   } else if (referMode === 'refer-all') {
-    refLayers = layers.filter((l) => l.visible && l.type !== 'folder' && l.type !== 'frame-folder');
+    refLayers = layers.filter(
+      (l) =>
+        isLayerEffectivelyVisibleInList(l, layers) &&
+        l.type !== 'folder' &&
+        l.type !== 'frame-folder'
+    );
   }
 
   const refTileCache = new Map<number, Uint8ClampedArray | null>();
@@ -1019,6 +1072,7 @@ export function executeFloodFillOnTileGrid(params: {
   const maxTx = pixelToTileCoord(maxX, 0);
   const maxTy = pixelToTileCoord(maxY, 0);
 
+  const alphaLocked = Boolean(options?.alphaLocked);
   const workBuf = new Uint8ClampedArray(BYTES_32BIT);
 
   for (let ty = minTy; ty <= maxTy; ty++) {
@@ -1034,6 +1088,9 @@ export function executeFloodFillOnTileGrid(params: {
       if (!tileVisited && !antiAlias) continue;
 
       const existingTile = grid.getTile(targetLayerId, tx, ty, 0);
+      if (alphaLocked && (!existingTile || !existingTile.data)) {
+        continue;
+      }
       if (existingTile && existingTile.data) {
         workBuf.set(grid.getTileAsRGBA(existingTile));
       } else {
@@ -1053,11 +1110,22 @@ export function executeFloodFillOnTileGrid(params: {
           const filled = tileVisited ? tileVisited[rowOff + lx] !== 0 : false;
           if (filled) {
             const off = (rowOff + lx) << 2;
-            workBuf[off] = fillR;
-            workBuf[off + 1] = fillG;
-            workBuf[off + 2] = fillB;
-            workBuf[off + 3] = fillA;
-            tileChanged = true;
+            if (alphaLocked) {
+              const dstAlpha = workBuf[off + 3];
+              if (dstAlpha === 0) continue;
+              const srcA = fillA / 255;
+              const invSrcA = 1 - srcA;
+              workBuf[off] = Math.round(fillR * srcA + workBuf[off] * invSrcA);
+              workBuf[off + 1] = Math.round(fillG * srcA + workBuf[off + 1] * invSrcA);
+              workBuf[off + 2] = Math.round(fillB * srcA + workBuf[off + 2] * invSrcA);
+              tileChanged = true;
+            } else {
+              workBuf[off] = fillR;
+              workBuf[off + 1] = fillG;
+              workBuf[off + 2] = fillB;
+              workBuf[off + 3] = fillA;
+              tileChanged = true;
+            }
           } else if (antiAlias) {
             let filledNeighbors = 0;
             if (gx > 0 && isVisited(gx - 1, gy)) filledNeighbors++;
@@ -1066,14 +1134,22 @@ export function executeFloodFillOnTileGrid(params: {
             if (gy < height - 1 && isVisited(gx, gy + 1)) filledNeighbors++;
             if (filledNeighbors >= 2) {
               const off = (rowOff + lx) << 2;
+              if (alphaLocked && workBuf[off + 3] === 0) continue;
               const blendAlpha = (filledNeighbors / 4) * (fillA / 255) * 0.5;
               const dstA = workBuf[off + 3] / 255;
-              const outA = blendAlpha + dstA * (1 - blendAlpha);
+              const outA = alphaLocked ? dstA : blendAlpha + dstA * (1 - blendAlpha);
               if (outA > 0) {
-                workBuf[off] = Math.round((fillR * blendAlpha + workBuf[off] * dstA * (1 - blendAlpha)) / outA);
-                workBuf[off + 1] = Math.round((fillG * blendAlpha + workBuf[off + 1] * dstA * (1 - blendAlpha)) / outA);
-                workBuf[off + 2] = Math.round((fillB * blendAlpha + workBuf[off + 2] * dstA * (1 - blendAlpha)) / outA);
-                workBuf[off + 3] = Math.round(outA * 255);
+                if (alphaLocked) {
+                  const inv = 1 - blendAlpha;
+                  workBuf[off] = Math.round(fillR * blendAlpha + workBuf[off] * inv);
+                  workBuf[off + 1] = Math.round(fillG * blendAlpha + workBuf[off + 1] * inv);
+                  workBuf[off + 2] = Math.round(fillB * blendAlpha + workBuf[off + 2] * inv);
+                } else {
+                  workBuf[off] = Math.round((fillR * blendAlpha + workBuf[off] * dstA * (1 - blendAlpha)) / outA);
+                  workBuf[off + 1] = Math.round((fillG * blendAlpha + workBuf[off + 1] * dstA * (1 - blendAlpha)) / outA);
+                  workBuf[off + 2] = Math.round((fillB * blendAlpha + workBuf[off + 2] * dstA * (1 - blendAlpha)) / outA);
+                  workBuf[off + 3] = Math.round(outA * 255);
+                }
                 tileChanged = true;
               }
             }
@@ -1118,9 +1194,18 @@ export function executeLassoFillOnTileGrid(params: {
   fillColorHex: string;
   targetFormat?: TileFormat;
   alphaLocked?: boolean;
+  selectionMask?: Uint8Array | null;
 }): { dirtyRect: DirtyRect | null; modified: boolean; tileDeltas: TileDelta[] } {
-  const { grid, targetLayerId, dimensions, polygon, fillColorHex, alphaLocked = false } = params;
-  if (polygon.length < 3 || typeof document === 'undefined') {
+  const {
+    grid,
+    targetLayerId,
+    dimensions,
+    polygon,
+    fillColorHex,
+    alphaLocked = false,
+    selectionMask = null,
+  } = params;
+  if (polygon.length < 3) {
     return { dirtyRect: null, modified: false, tileDeltas: [] };
   }
 
@@ -1146,44 +1231,78 @@ export function executeLassoFillOnTileGrid(params: {
   const targetFormat = params.targetFormat ?? grid.getLayerFormat(targetLayerId);
   const beforeSnapshot = new Map<string, TileSnapshotEntry>();
   const CHUNK = 512;
-  const chunkCanvas = document.createElement('canvas');
-  chunkCanvas.width = Math.min(CHUNK, rw);
-  chunkCanvas.height = Math.min(CHUNK, rh);
-  const cCtx = chunkCanvas.getContext('2d', { willReadFrequently: true });
-  if (!cCtx) {
-    releaseTemporaryCanvas(chunkCanvas);
-    return { dirtyRect: null, modified: false, tileDeltas: [] };
-  }
+  const chunkCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+  const cCtx = chunkCanvas ? chunkCanvas.getContext('2d', { willReadFrequently: true }) : null;
+  const [fillR, fillG, fillB, fillA] = parseColorToRgba(fillColorHex);
+  const isEraseFill = fillA === 0;
+  const hasSelectionMask = Boolean(
+    selectionMask && selectionMask.length === dimensions.width * dimensions.height
+  );
 
   try {
     for (let cy = ry; cy < ry1; cy += CHUNK) {
       const ch = Math.min(CHUNK, ry1 - cy);
       for (let cx = rx; cx < rx1; cx += CHUNK) {
         const cw = Math.min(CHUNK, rx1 - cx);
-        if (chunkCanvas.width !== cw) chunkCanvas.width = cw;
-        if (chunkCanvas.height !== ch) chunkCanvas.height = ch;
+        let chunkData: Uint8ClampedArray;
 
-        cCtx.clearRect(0, 0, cw, ch);
-        cCtx.save();
-        cCtx.translate(-cx, -cy);
-        cCtx.fillStyle = fillColorHex;
-        cCtx.beginPath();
-        cCtx.moveTo(polygon[0].x, polygon[0].y);
-        for (let i = 1; i < polygon.length; i++) {
-          cCtx.lineTo(polygon[i].x, polygon[i].y);
+        if (chunkCanvas && cCtx) {
+          if (chunkCanvas.width !== cw) chunkCanvas.width = cw;
+          if (chunkCanvas.height !== ch) chunkCanvas.height = ch;
+
+          cCtx.clearRect(0, 0, cw, ch);
+          cCtx.save();
+          cCtx.translate(-cx, -cy);
+          cCtx.fillStyle = isEraseFill ? '#000000' : fillColorHex;
+          cCtx.beginPath();
+          cCtx.moveTo(polygon[0].x, polygon[0].y);
+          for (let i = 1; i < polygon.length; i++) {
+            cCtx.lineTo(polygon[i].x, polygon[i].y);
+          }
+          cCtx.closePath();
+          cCtx.fill();
+          cCtx.restore();
+          chunkData = cCtx.getImageData(0, 0, cw, ch).data;
+        } else {
+          chunkData = new Uint8ClampedArray(cw * ch * 4);
+          for (let ly = 0; ly < ch; ly++) {
+            const gy = cy + ly + 0.5;
+            const row = ly * cw * 4;
+            for (let lx = 0; lx < cw; lx++) {
+              if (pointInPolygonFlood(cx + lx + 0.5, gy, polygon)) {
+                const off = row + lx * 4;
+                chunkData[off] = fillR;
+                chunkData[off + 1] = fillG;
+                chunkData[off + 2] = fillB;
+                chunkData[off + 3] = isEraseFill ? 255 : fillA;
+              }
+            }
+          }
         }
-        cCtx.closePath();
-        cCtx.fill();
-        cCtx.restore();
 
-        const img = cCtx.getImageData(0, 0, cw, ch);
+        if (hasSelectionMask && selectionMask) {
+          for (let ly = 0; ly < ch; ly++) {
+            const selRow = (cy + ly) * dimensions.width + cx;
+            const dRow = ly * cw * 4;
+            for (let lx = 0; lx < cw; lx++) {
+              if (selectionMask[selRow + lx] === 0) {
+                chunkData[dRow + lx * 4 + 3] = 0;
+              }
+            }
+          }
+        }
+
         grid.compositeStrokeToTiles({
           layerId: targetLayerId,
-          strokeData: img,
+          strokeData: { data: chunkData, width: cw, height: ch },
           destX: cx,
           destY: cy,
           format: targetFormat,
-          compositeOp: alphaLocked ? 'source-atop' : 'source-over',
+          compositeOp: isEraseFill
+            ? 'destination-out'
+            : alphaLocked
+              ? 'source-atop'
+              : 'source-over',
           opacity: 1.0,
           snapshotOut: beforeSnapshot,
           suppressNotify: true,
@@ -1191,7 +1310,7 @@ export function executeLassoFillOnTileGrid(params: {
       }
     }
   } finally {
-    releaseTemporaryCanvas(chunkCanvas);
+    if (chunkCanvas) releaseTemporaryCanvas(chunkCanvas);
   }
 
   const dirtyRect: DirtyRect = { x: rx, y: ry, width: rw, height: rh };
@@ -1218,7 +1337,7 @@ export async function executeFloodFillOnTileGridAsync(params: {
   targetFormat?: TileFormat;
   options?: FloodFillOptions;
 }): Promise<{ dirtyRect: DirtyRect | null; modified: boolean; tileDeltas: TileDelta[] }> {
-  if (!isNativeRustAvailable()) {
+  if (!isNativeRustAvailable() || params.options?.alphaLocked) {
     return executeFloodFillOnTileGrid(params);
   }
 
@@ -1257,13 +1376,27 @@ export async function executeFloodFillOnTileGridAsync(params: {
       referMode === 'refer-reference'
         ? (() => {
             const r = layers.filter(
-              (l) => l.visible && l.isReference && l.type !== 'folder' && l.type !== 'frame-folder'
+              (l) =>
+                isLayerEffectivelyVisibleInList(l, layers) &&
+                l.isReference &&
+                l.type !== 'folder' &&
+                l.type !== 'frame-folder'
             );
             return r.length > 0
               ? r
-              : layers.filter((l) => l.visible && l.type !== 'folder' && l.type !== 'frame-folder');
+              : layers.filter(
+                  (l) =>
+                    isLayerEffectivelyVisibleInList(l, layers) &&
+                    l.type !== 'folder' &&
+                    l.type !== 'frame-folder'
+                );
           })()
-        : layers.filter((l) => l.visible && l.type !== 'folder' && l.type !== 'frame-folder');
+        : layers.filter(
+            (l) =>
+              isLayerEffectivelyVisibleInList(l, layers) &&
+              l.type !== 'folder' &&
+              l.type !== 'frame-folder'
+          );
 
     const comp = new Uint8ClampedArray(width * height * 4);
     const tilesX = Math.ceil(width / TILE_SIZE);
@@ -1287,20 +1420,26 @@ export async function executeFloodFillOnTileGridAsync(params: {
     refRgba = comp;
   }
 
-  const res = await floodFillNative({
-    refRgba,
-    targetRgba: referMode === 'active' ? null : targetRgba,
-    selectionMask: options?.selectionMask ?? null,
-    width,
-    height,
-    startX: px,
-    startY: py,
-    fillRgba: parseColorToRgba(fillColorHex),
-    tolerance,
-    closeGap: Math.max(0, Math.min(20, Math.round(options?.closeGap ?? 0))),
-    areaScale: Math.max(-20, Math.min(20, Math.round(options?.areaScale ?? 0))),
-    antiAlias: options?.antiAlias ?? false,
-  });
+  let res: Awaited<ReturnType<typeof floodFillNative>>;
+  try {
+    res = await floodFillNative({
+      refRgba,
+      targetRgba: referMode === 'active' ? null : targetRgba,
+      selectionMask: options?.selectionMask ?? null,
+      width,
+      height,
+      startX: px,
+      startY: py,
+      fillRgba: parseColorToRgba(fillColorHex),
+      tolerance,
+      closeGap: Math.max(0, Math.min(20, Math.round(options?.closeGap ?? 0))),
+      areaScale: Math.max(-20, Math.min(20, Math.round(options?.areaScale ?? 0))),
+      antiAlias: options?.antiAlias ?? false,
+    });
+  } catch (err) {
+    console.warn('Native flood fill failed, falling back to JS tile flood fill:', err);
+    return executeFloodFillOnTileGrid(params);
+  }
 
   if (!res.modified || !res.dirtyRect || !res.dirtyRgba) {
     return { dirtyRect: null, modified: false, tileDeltas: [] };

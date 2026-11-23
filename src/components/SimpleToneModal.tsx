@@ -34,14 +34,12 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
   initialDensity = 40,
   initialAngle = 45,
   initialDotShape = 'circle',
-  initialDensityType = 'specified',
   dpi = 600,
 }) => {
   const [frequency, setFrequency] = useState(initialFrequency);
   const [density, setDensity] = useState(initialDensity);
   const [angle, setAngle] = useState(initialAngle);
   const [dotShape, setDotShape] = useState<HalftoneDotShape>(initialDotShape);
-  const [densityType, setDensityType] = useState<'specified' | 'image'>(initialDensityType);
 
   const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -52,9 +50,8 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
       setDensity(initialDensity);
       setAngle(initialAngle);
       setDotShape(initialDotShape);
-      setDensityType(initialDensityType);
     }
-  }, [isOpen, initialFrequency, initialDensity, initialAngle, initialDotShape, initialDensityType]);
+  }, [isOpen, initialFrequency, initialDensity, initialAngle, initialDotShape]);
 
   // Live Swatch Preview renderer
   useEffect(() => {
@@ -74,25 +71,19 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
     const sCtx = src.getContext('2d');
     if (!sCtx) return;
 
-    if (densityType === 'specified') {
-      sCtx.fillStyle = '#000000';
-      sCtx.fillRect(0, 0, w, h);
-    } else {
-      const g = Math.round(255 * (1 - density / 100));
-      sCtx.fillStyle = `rgb(${g},${g},${g})`;
-      sCtx.fillRect(0, 0, w, h);
-    }
+    sCtx.fillStyle = '#000000';
+    sCtx.fillRect(0, 0, w, h);
 
     applyScreentoneCPU(src, canvas, {
       frequency,
       angle,
       dotShape,
       dpi,
-      densityType,
+      densityType: 'specified',
       specifiedDensity: density / 100,
-      antiAliasing: true,
+      antiAliasing: false,
     });
-  }, [isOpen, frequency, density, angle, dotShape, densityType, dpi]);
+  }, [isOpen, frequency, density, angle, dotShape, dpi]);
 
   // Keyboard navigation (Enter = Confirm, Escape = Close)
   useEffect(() => {
@@ -108,13 +99,13 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
           density,
           angle,
           dotShape,
-          densityType,
+          densityType: 'specified',
         });
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isOpen, onClose, onConfirm, frequency, density, angle, dotShape, densityType]);
+  }, [isOpen, onClose, onConfirm, frequency, density, angle, dotShape]);
 
   if (!isOpen) return null;
 
@@ -144,10 +135,10 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
             <div className="flex flex-col items-center">
               <span className="text-[10px] text-[#8a8a8a] mb-1">Preview</span>
               <div className="w-[120px] h-[120px] rounded border border-white/[0.08] bg-white overflow-hidden flex items-center justify-center">
-                <canvas ref={previewCanvasRef} className="w-full h-full" />
+                <canvas ref={previewCanvasRef} className="w-full h-full" style={{ imageRendering: 'pixelated' }} />
               </div>
               <span className="text-[9px] text-[#8a8a8a] font-mono mt-1">
-                {frequency}L · {densityType === 'specified' ? `${density}%` : 'Lum'}
+                {frequency}L · {density}%
               </span>
             </div>
 
@@ -164,19 +155,7 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                   <option value="circle">Circle (Standard)</option>
                   <option value="euclidean">Euclidean (Halftone)</option>
                   <option value="line">Line (Hatching)</option>
-                </select>
-              </div>
-
-              {/* Density Mode */}
-              <div>
-                <label className="text-[10px] text-[#8a8a8a] block mb-1">Density Mode</label>
-                <select
-                  value={densityType}
-                  onChange={(e) => setDensityType(e.target.value as 'specified' | 'image')}
-                  className="w-full bg-[#161616] border border-white/[0.08] text-[#e5e5e5] text-xs rounded px-2 py-1 cursor-pointer"
-                >
-                  <option value="specified">Use specified density</option>
-                  <option value="image">Use image brightness</option>
+                  <option value="diamond">Diamond</option>
                 </select>
               </div>
 
@@ -213,51 +192,49 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
             </div>
           </div>
 
-          {/* Density Slider & Presets (when specified) */}
-          {densityType === 'specified' && (
-            <div className="p-2.5 bg-[#161616] rounded border border-white/[0.06]">
-              <div className="flex items-center justify-between text-xs mb-1.5">
-                <span className="text-[#cccccc]">Density</span>
-                <div className="flex items-center space-x-1">
-                  <input
-                    type="number"
-                    min="1"
-                    max="100"
-                    value={density}
-                    onChange={(e) => {
-                      const v = parseInt(e.target.value, 10);
-                      if (!isNaN(v)) setDensity(Math.max(1, Math.min(100, v)));
-                    }}
-                    className="w-12 bg-[#202020] border border-white/[0.08] text-[#e5e5e5] font-mono text-xs rounded px-1.5 py-0.5 text-right"
-                  />
-                  <span className="text-xs text-[#8a8a8a] font-mono">%</span>
-                </div>
-              </div>
-              <input
-                type="range"
-                min="1"
-                max="100"
-                step="1"
-                value={density}
-                onChange={(e) => setDensity(parseInt(e.target.value, 10))}
-                className="w-full mb-1.5"
-              />
-              <div className="flex items-center justify-between text-[9px] text-[#8a8a8a] font-mono">
-                {DENSITY_PRESETS.map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => setDensity(p)}
-                    className={`hover:text-[#e5e5e5] px-1 py-0.5 rounded transition-colors cursor-pointer ${
-                      density === p ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-semibold' : ''
-                    }`}
-                  >
-                    {p}%
-                  </button>
-                ))}
+          {/* Density Slider & Presets */}
+          <div className="p-2.5 bg-[#161616] rounded border border-white/[0.06]">
+            <div className="flex items-center justify-between text-xs mb-1.5">
+              <span className="text-[#cccccc]">Density</span>
+              <div className="flex items-center space-x-1">
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  value={density}
+                  onChange={(e) => {
+                    const v = parseInt(e.target.value, 10);
+                    if (!isNaN(v)) setDensity(Math.max(1, Math.min(100, v)));
+                  }}
+                  className="w-12 bg-[#202020] border border-white/[0.08] text-[#e5e5e5] font-mono text-xs rounded px-1.5 py-0.5 text-right"
+                />
+                <span className="text-xs text-[#8a8a8a] font-mono">%</span>
               </div>
             </div>
-          )}
+            <input
+              type="range"
+              min="1"
+              max="100"
+              step="1"
+              value={density}
+              onChange={(e) => setDensity(parseInt(e.target.value, 10))}
+              className="w-full mb-1.5"
+            />
+            <div className="flex items-center justify-between text-[9px] text-[#8a8a8a] font-mono">
+              {DENSITY_PRESETS.map((p) => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => setDensity(p)}
+                  className={`hover:text-[#e5e5e5] px-1 py-0.5 rounded transition-colors cursor-pointer ${
+                    density === p ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-semibold' : ''
+                  }`}
+                >
+                  {p}%
+                </button>
+              ))}
+            </div>
+          </div>
 
           {/* Frequency (Lines / LPI) */}
           <div className="p-2.5 bg-[#161616] rounded border border-white/[0.06]">
@@ -322,7 +299,7 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
                 density,
                 angle,
                 dotShape,
-                densityType,
+                densityType: 'specified',
               })
             }
             className="px-4 py-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium transition-opacity cursor-pointer text-xs"

@@ -16,6 +16,9 @@ import type {
   TileDelta,
 } from '../types/editor';
 import { createSelectionMask } from './tonalEngine';
+import { RgbColor, mixPigmentRgbOut } from './colorMixingEngine';
+
+const _gradMixOut: RgbColor = { r: 0, g: 0, b: 0 };
 import {
   BYTES_32BIT,
   SparseTileGrid,
@@ -61,6 +64,7 @@ export interface GradientSettings {
   blendMode: GradientBlendMode;
   repeat: GradientRepeatMode;
   dither: boolean;
+  pigmentBlending?: boolean;
   reverse: boolean;
   meshCols: number; // 2..6
   meshRows: number; // 2..6
@@ -158,6 +162,7 @@ export const DEFAULT_GRADIENT_SETTINGS: GradientSettings = {
   blendMode: 'normal',
   repeat: 'clamp',
   dither: true,
+  pigmentBlending: false,
   reverse: false,
   meshCols: 3,
   meshRows: 3,
@@ -249,7 +254,8 @@ export function sampleGradientStops(
   t: number,
   repeat: GradientRepeatMode,
   reverse: boolean,
-  out: [number, number, number, number]
+  out: [number, number, number, number],
+  pigmentBlending: boolean = false
 ): void {
   if (stops.length === 0) {
     out[0] = 0;
@@ -284,9 +290,16 @@ export function sampleGradientStops(
   const s1 = stops[hi];
   const span = s1.offset - s0.offset;
   const f = span > 1e-6 ? (u - s0.offset) / span : 0;
-  out[0] = s0.r + (s1.r - s0.r) * f;
-  out[1] = s0.g + (s1.g - s0.g) * f;
-  out[2] = s0.b + (s1.b - s0.b) * f;
+  if (pigmentBlending) {
+    mixPigmentRgbOut(s0.r, s0.g, s0.b, s1.r, s1.g, s1.b, f, 1.0, _gradMixOut);
+    out[0] = _gradMixOut.r;
+    out[1] = _gradMixOut.g;
+    out[2] = _gradMixOut.b;
+  } else {
+    out[0] = s0.r + (s1.r - s0.r) * f;
+    out[1] = s0.g + (s1.g - s0.g) * f;
+    out[2] = s0.b + (s1.b - s0.b) * f;
+  }
   out[3] = s0.a + (s1.a - s0.a) * f;
 }
 
@@ -841,7 +854,14 @@ export function renderGradientToTileGrid(params: RenderGradientParams): RenderGr
             } else {
               t = invRad > 0 ? Math.hypot(gx - start.x, gy - start.y) * invRad : 0;
             }
-            sampleGradientStops(stops, t, settings.repeat, settings.reverse, sampleOut);
+            sampleGradientStops(
+              stops,
+              t,
+              settings.repeat,
+              settings.reverse,
+              sampleOut,
+              Boolean(settings.pigmentBlending)
+            );
             const effAlpha = (sampleOut[3] / 255) * opacity * maskWeight;
             if (effAlpha <= 0) continue;
             compositePixelInPlace(

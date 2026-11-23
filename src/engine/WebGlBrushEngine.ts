@@ -131,6 +131,7 @@ uniform vec2 u_paperTexSize;
 
 uniform bool u_colorMixing;
 uniform bool u_perceptualMixing;
+uniform float u_pigmentStrength;
 uniform bool u_hasCanvasTexture;
 uniform sampler2D u_canvasTexture;
 uniform vec2 u_canvasResolution;
@@ -187,28 +188,142 @@ float samplePaperTooth(vec2 worldPos) {
   return clamp(g, 0.0, 1.0);
 }
 
-vec3 mixPigmentsGpu(vec3 c1, vec3 c2, float w2) {
-  float w1 = 1.0 - w2;
+// 7-band Spectral Kubelka-Munk + OKLab Pigment Mixing (WebGL1-safe unrolled bands)
+float kmReflectanceBand(vec3 c, float bR, float bG, float bB, float bC, float bM, float bY) {
+  float rr = 0.025 + c.r * 0.97;
+  float gg = 0.025 + c.g * 0.97;
+  float bb = 0.025 + c.b * 0.97;
+  if (rr <= gg && rr <= bb) {
+    if (gg <= bb) {
+      return rr + (gg - rr) * bC + (bb - gg) * bB;
+    }
+    return rr + (bb - rr) * bC + (gg - bb) * bG;
+  } else if (gg <= rr && gg <= bb) {
+    if (rr <= bb) {
+      return gg + (rr - gg) * bM + (bb - rr) * bB;
+    }
+    return gg + (bb - gg) * bM + (rr - bb) * bR;
+  } else {
+    if (rr <= gg) {
+      return bb + (rr - bb) * bY + (gg - rr) * bG;
+    }
+    return bb + (gg - bb) * bY + (rr - gg) * bR;
+  }
+}
+
+float kmMixBand(float s1, float s2, float w1, float w2) {
+  float a = clamp(s1, 0.02, 0.998);
+  float b = clamp(s2, 0.02, 0.998);
+  float ks1 = pow(((1.0 - a) * (1.0 - a)) / (2.0 * a), 0.72);
+  float ks2 = pow(((1.0 - b) * (1.0 - b)) / (2.0 * b), 0.72);
+  float ks = pow(max(0.0, ks1 * w1 + ks2 * w2), 1.3888889);
+  return 1.0 + ks - sqrt(ks * ks + 2.0 * ks);
+}
+
+vec3 linRgbToOklabGpu(vec3 c) {
+  float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+  float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+  float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+  float l_ = pow(max(0.0, l), 0.33333333);
+  float m_ = pow(max(0.0, m), 0.33333333);
+  float s_ = pow(max(0.0, s), 0.33333333);
+  return vec3(
+    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+  );
+}
+
+vec3 oklabToLinRgbGpu(vec3 lab) {
+  float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
+  float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
+  float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
+  float l = l_ * l_ * l_;
+  float m = m_ * m_ * m_;
+  float s = s_ * s_ * s_;
+  return vec3(
+     4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
+  );
+}
+
+vec3 mixPigmentsGpu(vec3 c1, vec3 c2, float t) {
+  float invT = 1.0 - t;
   vec3 l1 = pow(max(c1, vec3(0.0)), vec3(2.2));
   vec3 l2 = pow(max(c2, vec3(0.0)), vec3(2.2));
 
-  vec3 abs1 = vec3(1.0) - sqrt(l1);
-  vec3 abs2 = vec3(1.0) - sqrt(l2);
-  vec3 mixAbs = abs1 * w1 + abs2 * w2;
-  vec3 sub = pow(max(vec3(0.0), vec3(1.0) - mixAbs), vec3(2.0));
+  float Y1 = dot(l1, vec3(0.2126, 0.7152, 0.0722));
+  float Y2 = dot(l2, vec3(0.2126, 0.7152, 0.0722));
+  float conc1 = pow(0.06 + Y1, 0.36);
+  float conc2 = pow(0.06 + Y2, 0.36);
+  float w1 = (invT * conc1) / max(1e-5, invT * conc1 + t * conc2);
+  float w2 = 1.0 - w1;
 
-  float y1 = max(0.0, min(l1.r, l1.g) - l1.b);
-  float y2 = max(0.0, min(l2.r, l2.g) - l2.b);
-  float b1 = max(0.0, l1.b - l1.r);
-  float b2 = max(0.0, l2.b - l2.r);
-  float ybCross = (y1 * b2 + y2 * b1) * 4.0 * w1 * w2;
-  if (ybCross > 0.001) {
-    sub.g = min(1.0, sub.g + ybCross * 0.55);
-    sub.r = max(0.0, sub.r * (1.0 - ybCross * 0.45));
-    sub.b = max(0.0, sub.b * (1.0 - ybCross * 0.45));
-  }
+  vec3 b1 = vec3(0.0);
+  vec3 b2 = vec3(0.0);
+  vec3 mBase = vec3(0.0);
 
-  return clamp(pow(max(sub, vec3(0.0)), vec3(1.0 / 2.2)), 0.0, 1.0);
+  // Band 0 (420nm)
+  float s1 = kmReflectanceBand(l1, 0.025, 0.020, 0.880, 0.720, 0.780, 0.018);
+  float s2 = kmReflectanceBand(l2, 0.025, 0.020, 0.880, 0.720, 0.780, 0.018);
+  vec3 wv = vec3(0.140, -0.050, 0.340);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  // Band 1 (460nm)
+  s1 = kmReflectanceBand(l1, 0.018, 0.040, 0.990, 0.980, 0.500, 0.022);
+  s2 = kmReflectanceBand(l2, 0.018, 0.040, 0.990, 0.980, 0.500, 0.022);
+  wv = vec3(0.030, 0.045, 0.550);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  // Band 2 (500nm)
+  s1 = kmReflectanceBand(l1, 0.020, 0.420, 0.780, 0.990, 0.055, 0.280);
+  s2 = kmReflectanceBand(l2, 0.020, 0.420, 0.780, 0.990, 0.055, 0.280);
+  wv = vec3(-0.145, 0.250, 0.145);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  // Band 3 (540nm)
+  s1 = kmReflectanceBand(l1, 0.035, 0.980, 0.340, 0.840, 0.025, 0.930);
+  s2 = kmReflectanceBand(l2, 0.035, 0.980, 0.340, 0.840, 0.025, 0.930);
+  wv = vec3(-0.080, 0.500, -0.028);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  // Band 4 (580nm)
+  s1 = kmReflectanceBand(l1, 0.360, 0.900, 0.025, 0.140, 0.640, 0.995);
+  s2 = kmReflectanceBand(l2, 0.360, 0.900, 0.025, 0.140, 0.640, 0.995);
+  wv = vec3(0.365, 0.300, -0.007);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  // Band 5 (620nm)
+  s1 = kmReflectanceBand(l1, 0.965, 0.420, 0.020, 0.025, 0.975, 0.990);
+  s2 = kmReflectanceBand(l2, 0.965, 0.420, 0.020, 0.025, 0.975, 0.990);
+  wv = vec3(0.465, -0.018, 0.000);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  // Band 6 (660nm)
+  s1 = kmReflectanceBand(l1, 0.990, 0.060, 0.055, 0.025, 0.990, 0.980);
+  s2 = kmReflectanceBand(l2, 0.990, 0.060, 0.055, 0.025, 0.990, 0.980);
+  wv = vec3(0.225, -0.027, 0.000);
+  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
+
+  vec3 res1 = l1 - (b1 - vec3(0.025)) * 1.0309278;
+  vec3 res2 = l2 - (b2 - vec3(0.025)) * 1.0309278;
+  vec3 mixLin = max(vec3(0.0), (mBase - vec3(0.025)) * 1.0309278 + res1 * invT + res2 * t);
+
+  vec3 lab1 = linRgbToOklabGpu(l1);
+  vec3 lab2 = linRgbToOklabGpu(l2);
+  vec3 labM = linRgbToOklabGpu(mixLin);
+
+  float tunedL = clamp(labM.x * 0.40 + (lab1.x * invT + lab2.x * t) * 0.60, 0.0, 1.0);
+  float c1Ch = length(lab1.yz);
+  float c2Ch = length(lab2.yz);
+  float mCh = length(labM.yz);
+  float linCh = c1Ch * invT + c2Ch * t;
+  float boost = (mCh > 0.008 && linCh > mCh) ? min(1.65, (mCh + (linCh - mCh) * 0.50) / mCh) : 1.0;
+  vec2 ab = labM.yz * boost;
+
+  vec3 fin = oklabToLinRgbGpu(vec3(tunedL, ab));
+  return clamp(pow(max(fin, vec3(0.0)), vec3(1.0 / 2.2)), 0.0, 1.0);
 }
 
 void main() {
@@ -332,8 +447,10 @@ void main() {
       float effectiveAmount = u_amountOfPaint >= 0.995
         ? 1.0
         : clamp(mix(u_amountOfPaint, 1.0, (1.0 - stretchDecay) * 0.35), 0.02, 1.0);
-      if (u_perceptualMixing) {
-        rgb = mixPigmentsGpu(canvasColor.rgb, rgb, effectiveAmount);
+      if (u_perceptualMixing && u_pigmentStrength > 0.005) {
+        vec3 pig = mixPigmentsGpu(canvasColor.rgb, rgb, effectiveAmount);
+        vec3 lin = mix(canvasColor.rgb, rgb, effectiveAmount);
+        rgb = mix(lin, pig, clamp(u_pigmentStrength, 0.0, 1.0));
       } else {
         rgb = mix(canvasColor.rgb, rgb, effectiveAmount);
       }
@@ -581,6 +698,7 @@ export class WebGlBrushEngine {
   private uPaperTexSizeLoc: WebGLUniformLocation | null = null;
   private uColorMixingLoc: WebGLUniformLocation | null = null;
   private uPerceptualMixingLoc: WebGLUniformLocation | null = null;
+  private uPigmentStrengthLoc: WebGLUniformLocation | null = null;
   private uHasCanvasTextureLoc: WebGLUniformLocation | null = null;
   private uCanvasTextureLoc: WebGLUniformLocation | null = null;
   private uAmountOfPaintLoc: WebGLUniformLocation | null = null;
@@ -874,6 +992,7 @@ export class WebGlBrushEngine {
             this.uPaperTexSizeLoc = gl.getUniformLocation(program, 'u_paperTexSize');
             this.uColorMixingLoc = gl.getUniformLocation(program, 'u_colorMixing');
             this.uPerceptualMixingLoc = gl.getUniformLocation(program, 'u_perceptualMixing');
+            this.uPigmentStrengthLoc = gl.getUniformLocation(program, 'u_pigmentStrength');
             this.uHasCanvasTextureLoc = gl.getUniformLocation(program, 'u_hasCanvasTexture');
             this.uCanvasTextureLoc = gl.getUniformLocation(program, 'u_canvasTexture');
             this.uAmountOfPaintLoc = gl.getUniformLocation(program, 'u_amountOfPaint');
@@ -1809,6 +1928,10 @@ export class WebGlBrushEngine {
     const enableColorMix = Boolean(settings.colorMixing) && underlyingCanvas !== undefined;
     gl.uniform1i(this.uColorMixingLoc, enableColorMix ? 1 : 0);
     gl.uniform1i(this.uPerceptualMixingLoc, settings.perceptualMixing !== false ? 1 : 0);
+    if (this.uPigmentStrengthLoc) {
+      const pStr = settings.perceptualMixing === false ? 0.0 : (settings.naturalPaint?.pigmentMixingStrength ?? 1.0);
+      gl.uniform1f(this.uPigmentStrengthLoc, Math.max(0, Math.min(1, pStr)));
+    }
 
     if (enableColorMix && underlyingCanvas) {
       const canvasTex = this.uploadCanvasTexture(underlyingCanvas, {

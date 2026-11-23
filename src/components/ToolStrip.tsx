@@ -22,6 +22,7 @@ import {
   Blend,
   Droplets,
   Feather,
+  Box,
 } from 'lucide-react';
 import { ToolType } from '../types/editor';
 import { LiquifyIcon } from './LiquifyIcon';
@@ -119,6 +120,15 @@ export const ToolStrip: React.FC<ToolStripProps> = React.memo(
       { id: 'frame', label: 'Frame Border (F)', icon: <Frame className="w-3.5 h-3.5" /> },
       { id: 'balloon', label: 'Speech Balloon', icon: <MessageSquare className="w-3.5 h-3.5" /> },
       { id: 'vector-edit', label: 'Correct Line', icon: <Spline className="w-3.5 h-3.5" /> },
+      {
+        id: '3d',
+        label: '3D Object & Camera Tool (K)',
+        icon: <Box className="w-3.5 h-3.5" />,
+        onClick: () => {
+          toolStoreActions.selectTool('3d');
+          if (isHidden) uiStoreActions.toggleLeftPanelHidden();
+        },
+      },
     ];
 
     return (

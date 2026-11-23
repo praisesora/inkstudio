@@ -94,12 +94,23 @@ export function extractBristleStrokeConfig(
     bs.colorMixing === false
       ? false
       : bs.naturalPaint?.spatialMixing ?? DEFAULT_NATURAL_PAINT_SETTINGS.spatialMixing;
+  const resolvedPigmentStrength =
+    bs.perceptualMixing === false
+      ? 0
+      : Math.max(
+          0,
+          Math.min(
+            1,
+            bs.naturalPaint?.pigmentMixingStrength ?? DEFAULT_NATURAL_PAINT_SETTINGS.pigmentMixingStrength
+          )
+        );
   const naturalPaint: NaturalPaintSettings = {
     ...DEFAULT_NATURAL_PAINT_SETTINGS,
     ...(bs.naturalPaint || {}),
     enabled: bs.naturalPaint?.enabled ?? (bs.renderMode === 'bristle-ribbon' || bs.renderMode === 'bristle-hybrid'),
     paintLoad: resolvedPaintLoad,
     spatialMixing: resolvedSpatialMixing,
+    pigmentMixingStrength: resolvedPigmentStrength,
   };
   return {
     color: strokeColor,

@@ -195,10 +195,12 @@ export const uiStoreActions = {
   },
 
   set3DLayerOpen(open: boolean, initialFile: File | null = null): void {
-    useUiStore.setState({
+    useUiStore.setState((prev) => ({
       is3DLayerOpen: open,
-      initial3DFile: open ? initialFile : null,
-    });
+      initial3DFile: open
+        ? (initialFile ?? (prev.is3DLayerOpen ? prev.initial3DFile : null))
+        : null,
+    }));
   },
 
   updateAppSettings(newSettings: AppSettings): void {

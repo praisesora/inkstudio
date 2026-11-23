@@ -64,6 +64,7 @@ export interface UseShapeAndFillToolsParams {
   activeLayerId: string;
   selectedLayerIds?: string[];
   selection: CanvasSelection | null;
+  onCommitFloatingSelection?: () => void;
   flushPendingHistoryTasks?: () => void;
   isLayerEffectivelyVisible: (layer: LayerItem) => boolean;
   getEffectiveOpacity: (layer: LayerItem) => number;
@@ -149,6 +150,7 @@ export function useShapeAndFillTools({
   activeLayerId,
   selectedLayerIds = [],
   selection,
+  onCommitFloatingSelection,
   flushPendingHistoryTasks,
   isLayerEffectivelyVisible,
   getEffectiveOpacity,
@@ -346,16 +348,9 @@ export function useShapeAndFillTools({
       x: textSession.x,
       y: textSession.y,
     };
-    const savedLayer = upsertTextLayer(textData, textSession.editingLayerId);
-    pushHistoryStep(
-      'text',
-      textSession.editingLayerId ? 'Edit Text Layer' : 'Create Text Layer',
-      null,
-      null,
-      savedLayer.id
-    );
+    upsertTextLayer(textData, textSession.editingLayerId);
     setTextSession(null);
-  }, [textSession, upsertTextLayer, pushHistoryStep]);
+  }, [textSession, upsertTextLayer]);
 
   const handleCancelText = useCallback(() => {
     setTextSession(null);
@@ -363,17 +358,10 @@ export function useShapeAndFillTools({
 
   const handleConfirmBalloon = useCallback(() => {
     if (!activeBalloon) return;
-    const savedLayer = upsertBalloonLayer(activeBalloon, editingBalloonLayerId);
-    pushHistoryStep(
-      'balloon',
-      editingBalloonLayerId ? 'Edit Speech Balloon' : 'Create Speech Balloon',
-      null,
-      null,
-      savedLayer.id
-    );
+    upsertBalloonLayer(activeBalloon, editingBalloonLayerId);
     setActiveBalloon(null);
     setEditingBalloonLayerId(null);
-  }, [activeBalloon, editingBalloonLayerId, upsertBalloonLayer, pushHistoryStep]);
+  }, [activeBalloon, editingBalloonLayerId, upsertBalloonLayer]);
 
   const handleDeleteBalloon = useCallback(() => {
     if (editingBalloonLayerId && deleteLayer) {
@@ -632,7 +620,36 @@ export function useShapeAndFillTools({
 
       if (tool === 'fill') {
         e.preventDefault();
+        if (selection?.floating) {
+          onCommitFloatingSelection?.();
+        }
+        if (!activeLayerId || !activeLayer) {
+          showToast?.('Select a raster layer to use the Fill tool');
+          return true;
+        }
+        if (activeLayer.type === 'frame-folder') {
+          showToast?.('Select a child layer inside the Frame Border Folder to fill');
+          return true;
+        }
+        if (activeLayer.type !== 'raster') {
+          showToast?.('Select a raster layer to use the Fill tool');
+          return true;
+        }
+        if (activeLayer.locked) {
+          showToast?.('Active layer is locked');
+          return true;
+        }
+        if (!isLayerEffectivelyVisible(activeLayer)) {
+          showToast?.('Active layer is hidden');
+          return true;
+        }
+
         if (fillSettings.method === 'lasso') {
+          try {
+            (e.currentTarget as HTMLElement)?.setPointerCapture?.(e.pointerId);
+          } catch {
+            // Ignore capture errors in synthetic events
+          }
           lassoFillPointsRef.current = [pt];
           return true;
         }
@@ -642,18 +659,16 @@ export function useShapeAndFillTools({
         if (px < 0 || px >= dimensions.width || py < 0 || py >= dimensions.height) return true;
 
         flushPendingHistoryTasks?.();
-        if (
-          !activeLayerId ||
-          activeLayer?.locked ||
-          (activeLayer && !isLayerEffectivelyVisible(activeLayer))
-        ) {
+
+        const grid = documentStore.getActiveTileGrid();
+        if (activeLayer.alphaLocked && !grid.hasLayerTiles(activeLayerId)) {
+          showToast?.('Alpha Lock is enabled on an empty layer');
           return true;
         }
 
-        const grid = documentStore.getActiveTileGrid();
         const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
         const isMono =
-          !isBg && (colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome');
+          !isBg && (colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome');
         const targetFormat: TileFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
         const referMode =
           fillSettings.method === 'refer-all'
@@ -665,7 +680,13 @@ export function useShapeAndFillTools({
         const selMask = selection
           ? createSelectionMask(selection, dimensions.width, dimensions.height)
           : null;
+        if (selMask && selMask[py * dimensions.width + px] === 0) {
+          showToast?.('Click inside the active selection to fill');
+          return true;
+        }
 
+        const isTransparentInk = useToolStore.getState().isTransparentColor;
+        const effectiveFillColor = isTransparentInk ? 'rgba(0,0,0,0)' : primaryColor;
         const targetLayerId = activeLayerId;
         void executeFloodFillOnTileGridAsync({
           grid,
@@ -674,7 +695,7 @@ export function useShapeAndFillTools({
           dimensions,
           startX: px,
           startY: py,
-          fillColorHex: primaryColor,
+          fillColorHex: effectiveFillColor,
           tolerance: fillSettings.tolerance,
           referMode,
           targetFormat,
@@ -683,21 +704,27 @@ export function useShapeAndFillTools({
             areaScale: fillSettings.areaScale ?? 0,
             antiAlias: fillSettings.antiAlias ?? true,
             selectionMask: selMask,
+            alphaLocked: Boolean(activeLayer.alphaLocked),
           },
-        }).then((fillRes) => {
-          if (fillRes.modified && fillRes.tileDeltas.length > 0) {
-            pushHistoryStep(
-              'fill',
-              'Bucket Fill',
-              null,
-              null,
-              targetLayerId,
-              fillRes.dirtyRect ?? undefined,
-              fillRes.tileDeltas
-            );
-            updateLayerThumbnail(targetLayerId, true);
-          }
-        });
+        })
+          .then((fillRes) => {
+            if (fillRes.modified && fillRes.tileDeltas.length > 0) {
+              pushHistoryStep(
+                'fill',
+                isTransparentInk ? 'Erase Fill' : 'Bucket Fill',
+                null,
+                null,
+                targetLayerId,
+                fillRes.dirtyRect ?? undefined,
+                fillRes.tileDeltas
+              );
+              updateLayerThumbnail(targetLayerId, true);
+            }
+          })
+          .catch((err) => {
+            console.warn('Flood fill failed:', err);
+            showToast?.('Fill failed');
+          });
         return true;
       }
 
@@ -775,6 +802,7 @@ export function useShapeAndFillTools({
       isLayerEffectivelyVisible,
       flushPendingHistoryTasks,
       selection,
+      onCommitFloatingSelection,
       dimensions,
       colorMode,
       startLiquifyLoop,
@@ -1068,31 +1096,50 @@ export function useShapeAndFillTools({
         fillSettings.method === 'lasso' &&
         lassoFillPointsRef.current.length >= 3
       ) {
+        try {
+          (e.currentTarget as HTMLElement)?.releasePointerCapture?.(e.pointerId);
+        } catch {
+          // Ignore release errors
+        }
         const pts = [...lassoFillPointsRef.current];
         lassoFillPointsRef.current = [];
         flushPendingHistoryTasks?.();
-        if (!activeLayerId || activeLayer?.locked) return true;
+        if (
+          !activeLayerId ||
+          !activeLayer ||
+          activeLayer.type !== 'raster' ||
+          activeLayer.locked ||
+          !isLayerEffectivelyVisible(activeLayer)
+        ) {
+          return true;
+        }
 
         const grid = documentStore.getActiveTileGrid();
         const isBg = activeLayerId === 'layer-bg' || activeLayerId.startsWith('layer-bg');
         const isMono =
-          !isBg && (colorMode === 'monochrome' || activeLayer?.expressionColor === 'monochrome');
+          !isBg && (colorMode === 'monochrome' || activeLayer.expressionColor === 'monochrome');
         const targetFormat: TileFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+        const selMask = selection
+          ? createSelectionMask(selection, dimensions.width, dimensions.height)
+          : null;
+        const isTransparentInk = useToolStore.getState().isTransparentColor;
+        const effectiveFillColor = isTransparentInk ? 'rgba(0,0,0,0)' : primaryColor;
 
         const res = executeLassoFillOnTileGrid({
           grid,
           targetLayerId: activeLayerId,
           dimensions,
           polygon: pts,
-          fillColorHex: primaryColor,
+          fillColorHex: effectiveFillColor,
           targetFormat,
-          alphaLocked: Boolean(activeLayer?.alphaLocked),
+          alphaLocked: Boolean(activeLayer.alphaLocked),
+          selectionMask: selMask,
         });
 
         if (res.modified && res.tileDeltas.length > 0) {
           pushHistoryStep(
             'fill',
-            'Lasso Fill',
+            isTransparentInk ? 'Lasso Erase' : 'Lasso Fill',
             null,
             null,
             activeLayerId,

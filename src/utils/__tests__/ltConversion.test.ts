@@ -2,28 +2,74 @@ import { describe, it, expect, vi } from 'vitest';
 import * as THREE from 'three';
 
 function createMockCanvas(width = 64, height = 64) {
+  let pixels = new Uint8ClampedArray(width * height * 4);
   const canvas: any = {
-    width,
-    height,
+    get width() {
+      return width;
+    },
+    set width(v: number) {
+      width = v;
+      pixels = new Uint8ClampedArray(width * height * 4);
+    },
+    get height() {
+      return height;
+    },
+    set height(v: number) {
+      height = v;
+      pixels = new Uint8ClampedArray(width * height * 4);
+    },
+    getData: () => pixels,
     getContext: () => ({
+      imageSmoothingEnabled: true,
       createImageData: (w: number, h: number) => ({
         width: w,
         height: h,
         data: new Uint8ClampedArray(w * h * 4),
       }),
-      getImageData: (_x: number, _y: number, w: number, h: number) => {
-        const data = new Uint8ClampedArray(w * h * 4);
-        // Fill diffuse buffer with mid-gray (lum ~ 0.5) so tone layers trigger
-        for (let i = 0; i < data.length; i += 4) {
-          data[i] = 100;
-          data[i + 1] = 100;
-          data[i + 2] = 100;
-          data[i + 3] = 255;
+      getImageData: (x: number, y: number, w: number, h: number) => {
+        const out = new Uint8ClampedArray(w * h * 4);
+        let hasAny = false;
+        for (let i = 3; i < pixels.length; i += 4) {
+          if (pixels[i] !== 0) {
+            hasAny = true;
+            break;
+          }
         }
-        return { width: w, height: h, data };
+        if (!hasAny) {
+          // Default diffuse buffer with two shadow bands: left half mid-gray (lum ~ 0.47), right half deep shadow (lum ~ 0.20)
+          for (let row = 0; row < h; row++) {
+            for (let col = 0; col < w; col++) {
+              const i = (row * w + col) * 4;
+              const v = col < w / 2 ? 120 : 50;
+              out[i] = v;
+              out[i + 1] = v;
+              out[i + 2] = v;
+              out[i + 3] = 255;
+            }
+          }
+          return { width: w, height: h, data: out };
+        }
+        for (let row = 0; row < h; row++) {
+          const srcStart = ((y + row) * width + x) * 4;
+          out.set(pixels.subarray(srcStart, srcStart + w * 4), row * w * 4);
+        }
+        return { width: w, height: h, data: out };
       },
-      putImageData: () => {},
-      drawImage: () => {},
+      putImageData: (img: ImageData, x: number, y: number) => {
+        for (let row = 0; row < img.height; row++) {
+          const dstStart = ((y + row) * width + x) * 4;
+          const srcStart = row * img.width * 4;
+          pixels.set(img.data.subarray(srcStart, srcStart + img.width * 4), dstStart);
+        }
+      },
+      drawImage: (src: any) => {
+        if (src && typeof src.getData === 'function') {
+          const srcData: Uint8ClampedArray = src.getData();
+          if (srcData.length === pixels.length) {
+            pixels.set(srcData);
+          }
+        }
+      },
       fillRect: () => {},
       clearRect: () => {},
     }),
@@ -139,5 +185,100 @@ describe('3D LT Conversion Service', () => {
     expect(result.toneLayers[0].toneDensity).toBe(15);
     expect(result.toneLayers[1].toneDensity).toBe(30);
     expect(result.toneLayers[2].toneDensity).toBe(50);
+  });
+
+  it('supports non-destructive previewOnly mode and outline-only extraction (toneCount = 0)', async () => {
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial());
+    scene.add(mesh);
+
+    const onInsertLayers = vi.fn();
+
+    const previewRes = await bake3DToLineAndTone({
+      scene,
+      camera,
+      dimensions: { width: 32, height: 32 },
+      modelName: 'PreviewModel',
+      toneCount: 0,
+      previewOnly: true,
+      onInsertLayers,
+    });
+
+    expect(onInsertLayers).not.toHaveBeenCalled();
+    expect(previewRes.lineCanvas).toBeDefined();
+    expect(previewRes.toneLayers.length).toBe(0);
+    expect(previewRes.toneCanvases.length).toBe(0);
+    // Scene graph must remain intact after previewOnly render
+    expect(scene.children.length).toBe(1);
+  });
+
+  it('prevents double-screentoning, overlapping band moiré, and AA blur in extracted 3D LT layers', async () => {
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial());
+    scene.add(mesh);
+
+    const extracted = await bake3DToLineAndTone({
+      scene,
+      camera,
+      dimensions: { width: 64, height: 64, dpi: 600 },
+      modelName: 'CrispModel',
+      toneCount: 2,
+    });
+
+    // Outline defaults to crisp monochrome (no AA gray smudges)
+    expect(extracted.lineLayer.expressionColor).toBe('monochrome');
+
+    // All tone tiers default to uniform 45° angle (no 45° vs 60° moiré interference)
+    expect(extracted.toneLayers[0].toneAngle).toBe(45);
+    expect(extracted.toneLayers[1].toneAngle).toBe(45);
+    expect(extracted.toneLayers[0].toneDotShape).toBe('circle');
+    expect(extracted.toneLayers[1].toneDotShape).toBe('circle');
+
+    // Extracted tone layers store mutually exclusive solid masks (no pre-baked dots on toneEnabled layers!)
+    const lightData: Uint8ClampedArray = (extracted.toneCanvases[0] as any).getData();
+    const deepData: Uint8ClampedArray = (extracted.toneCanvases[1] as any).getData();
+
+    let lightSolid = 0;
+    let deepSolid = 0;
+    let overlapCount = 0;
+    for (let i = 0; i < 64 * 64; i++) {
+      const aL = lightData[i * 4 + 3];
+      const aD = deepData[i * 4 + 3];
+      // Strictly binary solid mask pixels (0 or 255)
+      expect(aL === 0 || aL === 255).toBe(true);
+      expect(aD === 0 || aD === 255).toBe(true);
+      if (aL === 255) lightSolid++;
+      if (aD === 255) deepSolid++;
+      if (aL === 255 && aD === 255) overlapCount++;
+    }
+    // Left half (32*64 = 2048 px) is light shadow, right half (2048 px) is deep shadow -> zero overlap!
+    expect(lightSolid).toBe(32 * 64);
+    expect(deepSolid).toBe(32 * 64);
+    expect(overlapCount).toBe(0);
+
+    // previewOnly renders crisp 1-bit binary halftone dots (strictly 0 or 255 alpha, no gray blur)
+    const preview = await bake3DToLineAndTone({
+      scene,
+      camera,
+      dimensions: { width: 64, height: 64, dpi: 600 },
+      modelName: 'CrispModel',
+      toneCount: 2,
+      previewOnly: true,
+    });
+    const prevDeep: Uint8ClampedArray = (preview.toneCanvases[1] as any).getData();
+    let prevBlack = 0;
+    let prevEmptyInDeepRegion = 0;
+    for (let y = 0; y < 64; y++) {
+      for (let x = 32; x < 64; x++) {
+        const a = prevDeep[(y * 64 + x) * 4 + 3];
+        expect(a === 0 || a === 255).toBe(true);
+        if (a === 255) prevBlack++;
+        else prevEmptyInDeepRegion++;
+      }
+    }
+    expect(prevBlack).toBeGreaterThan(0);
+    expect(prevEmptyInDeepRegion).toBeGreaterThan(0);
   });
 });

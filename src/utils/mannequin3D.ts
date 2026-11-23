@@ -354,8 +354,28 @@ export function findHumanoidBones(root: THREE.Object3D): HumanoidBones {
 }
 
 /**
+ * Applies a world-space delta rotation to a bone's local quaternion,
+ * accounting for any rotation on the bone's ancestors/root.
+ */
+function applyWorldRotationDeltaToBone(
+  bone: THREE.Bone,
+  worldRotDelta: THREE.Quaternion
+): void {
+  const parentWorldQuat = new THREE.Quaternion();
+  if (bone.parent) {
+    bone.parent.updateMatrixWorld(true);
+    bone.parent.getWorldQuaternion(parentWorldQuat);
+  }
+  const invParent = parentWorldQuat.clone().invert();
+  const localDelta = invParent.multiply(worldRotDelta).multiply(parentWorldQuat);
+  bone.quaternion.premultiply(localDelta).normalize();
+  bone.updateMatrixWorld(true);
+}
+
+/**
  * Closed-form analytic 2-bone Inverse Kinematics (IK) with pole target constraint.
- * Solves root (shoulder/hip) and mid (elbow/knee) joint rotations in real time.
+ * Solves root (shoulder/hip) and mid (elbow/knee) joint rotations in real time,
+ * properly converting world-space rotations into each bone's parent-local space.
  */
 export function solveTwoBoneIK(
   rootBone: THREE.Bone,
@@ -364,6 +384,10 @@ export function solveTwoBoneIK(
   targetWorldPos: THREE.Vector3,
   poleWorldPos: THREE.Vector3
 ): void {
+  rootBone.updateMatrixWorld(true);
+  midBone.updateMatrixWorld(true);
+  endBone.updateMatrixWorld(true);
+
   const rootWorldPos = new THREE.Vector3();
   const midWorldPos = new THREE.Vector3();
   const endWorldPos = new THREE.Vector3();
@@ -379,11 +403,15 @@ export function solveTwoBoneIK(
   if (l1 <= 1e-4 || l2 <= 1e-4) return;
 
   const toTarget = new THREE.Vector3().subVectors(targetWorldPos, rootWorldPos);
-  const targetDist = Math.max(0.001, Math.min(totalLength - 1e-4, toTarget.length()));
-  const targetDir = toTarget.clone().normalize();
+  const rawDist = toTarget.length();
+  if (rawDist <= 1e-5) return;
 
-  // Law of Cosines for limb angles
-  // cos(alpha): angle at root joint
+  const minReach = Math.abs(l1 - l2) + 1e-3;
+  const maxReach = totalLength - 1e-4;
+  const targetDist = Math.max(minReach, Math.min(maxReach, rawDist));
+  const targetDir = toTarget.clone().divideScalar(rawDist);
+
+  // Law of Cosines for angle at root joint
   const cosAlpha = Math.max(
     -1.0,
     Math.min(1.0, (l1 * l1 + targetDist * targetDist - l2 * l2) / (2.0 * l1 * targetDist))
@@ -391,10 +419,17 @@ export function solveTwoBoneIK(
   const alpha = Math.acos(cosAlpha);
 
   // Compute bend plane normal from pole vector
-  const toPole = new THREE.Vector3().subVectors(poleWorldPos, rootWorldPos).normalize();
+  const toPole = new THREE.Vector3().subVectors(poleWorldPos, rootWorldPos);
+  if (toPole.lengthSq() > 1e-6) {
+    toPole.normalize();
+  } else {
+    toPole.set(0, 0, 1);
+  }
   let bendNormal = new THREE.Vector3().crossVectors(targetDir, toPole);
   if (bendNormal.lengthSq() < 1e-4) {
-    bendNormal = new THREE.Vector3(0, 0, 1).applyQuaternion(rootBone.quaternion);
+    const worldQuat = new THREE.Quaternion();
+    rootBone.getWorldQuaternion(worldQuat);
+    bendNormal = new THREE.Vector3(0, 0, 1).applyQuaternion(worldQuat).normalize();
   } else {
     bendNormal.normalize();
   }
@@ -406,24 +441,53 @@ export function solveTwoBoneIK(
     .normalize();
   const solvedMidWorldPos = rootWorldPos.clone().addScaledVector(midDir, l1);
 
-  // Orient Root Bone towards solved mid position
-  const rootParent = rootBone.parent;
-  if (rootParent) {
-    const currentLimbDir = new THREE.Vector3().subVectors(midWorldPos, rootWorldPos).normalize();
-    const targetLimbDir = new THREE.Vector3().subVectors(solvedMidWorldPos, rootWorldPos).normalize();
+  // 1. Orient Root Bone towards solved mid position (in parent-local space)
+  const currentLimbDir = new THREE.Vector3().subVectors(midWorldPos, rootWorldPos).normalize();
+  const targetLimbDir = new THREE.Vector3().subVectors(solvedMidWorldPos, rootWorldPos).normalize();
+  if (currentLimbDir.lengthSq() > 1e-6 && targetLimbDir.lengthSq() > 1e-6) {
     const rotDelta = new THREE.Quaternion().setFromUnitVectors(currentLimbDir, targetLimbDir);
-    rootBone.quaternion.premultiply(rotDelta);
-    rootBone.updateMatrixWorld(true);
+    applyWorldRotationDeltaToBone(rootBone, rotDelta);
   }
 
-  // Orient Mid Bone towards target position
-  const midParent = midBone.parent;
-  if (midParent) {
-    const currentEndDir = new THREE.Vector3().subVectors(endWorldPos, midWorldPos).normalize();
-    const targetEndDir = new THREE.Vector3().subVectors(targetWorldPos, solvedMidWorldPos).normalize();
+  // 2. Re-read updated world positions after root bone rotated, then orient Mid Bone towards target
+  midBone.getWorldPosition(midWorldPos);
+  endBone.getWorldPosition(endWorldPos);
+
+  const currentEndDir = new THREE.Vector3().subVectors(endWorldPos, midWorldPos).normalize();
+  const targetEndDir = new THREE.Vector3().subVectors(targetWorldPos, midWorldPos).normalize();
+  if (currentEndDir.lengthSq() > 1e-6 && targetEndDir.lengthSq() > 1e-6) {
     const rotDelta = new THREE.Quaternion().setFromUnitVectors(currentEndDir, targetEndDir);
-    midBone.quaternion.premultiply(rotDelta);
-    midBone.updateMatrixWorld(true);
+    applyWorldRotationDeltaToBone(midBone, rotDelta);
+  }
+}
+
+/**
+ * Synchronizes IK handle meshes to the live world positions of their corresponding bones.
+ */
+export function syncIKHandlesToBones(
+  bones: HumanoidBones | null,
+  handles: Record<string, THREE.Mesh> | null
+): void {
+  if (!bones || !handles) return;
+  const wp = new THREE.Vector3();
+  const pairs: Array<[string, THREE.Bone | undefined]> = [
+    ['head', bones.head],
+    ['leftHand', bones.leftHand],
+    ['rightHand', bones.rightHand],
+    ['leftFoot', bones.leftFoot],
+    ['rightFoot', bones.rightFoot],
+  ];
+  for (const [name, bone] of pairs) {
+    const handle = handles[name];
+    if (!handle) continue;
+    if (bone) {
+      bone.updateMatrixWorld(true);
+      bone.getWorldPosition(wp);
+      handle.position.copy(wp);
+      handle.visible = true;
+    } else {
+      handle.visible = false;
+    }
   }
 }
 
@@ -436,6 +500,7 @@ export function createIKHandles(): {
 } {
   const container = new THREE.Group();
   container.name = 'IKHandles';
+  container.userData.is3DHelper = true;
 
   const handles: Record<string, THREE.Mesh> = {};
 
@@ -456,13 +521,31 @@ export function createIKHandles(): {
     const geom = new THREE.SphereGeometry(def.size, 16, 16);
     const mat = new THREE.MeshBasicMaterial({
       color: def.color,
-      wireframe: true,
+      transparent: true,
+      opacity: 0.55,
+      wireframe: false,
       depthTest: false,
     });
     const mesh = new THREE.Mesh(geom, mat);
     mesh.name = `IKHandle_${def.name}`;
+    mesh.userData.is3DHelper = true;
+    mesh.userData.ikHandleName = def.name;
     mesh.position.set(...def.initialPos);
     mesh.renderOrder = 999;
+
+    // Crisp outer ring wireframe for clear hit-target readability
+    const wireGeom = new THREE.SphereGeometry(def.size * 1.15, 12, 12);
+    const wireMat = new THREE.MeshBasicMaterial({
+      color: def.color,
+      wireframe: true,
+      depthTest: false,
+    });
+    const wire = new THREE.Mesh(wireGeom, wireMat);
+    wire.userData.is3DHelper = true;
+    wire.userData.ikHandleName = def.name;
+    wire.renderOrder = 1000;
+    mesh.add(wire);
+
     container.add(mesh);
     handles[def.name] = mesh;
   }

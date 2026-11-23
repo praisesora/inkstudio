@@ -15,7 +15,9 @@ import {
   DEFAULT_NATURAL_PAINT_SETTINGS,
 } from '../../types/editor';
 import { cleanDirtyBrush } from '../../utils/colorMixingEngine';
+import { useToolStore } from '../../stores';
 import { LightSourceWidget } from '../LightSourceWidget';
+import { PigmentBlendControl } from '../PigmentBlendControl';
 import { PressureCurveEditor } from '../PressureCurveEditor';
 import {
   StudioSegmented,
@@ -25,6 +27,8 @@ import {
 import type { BrushStudioTabProps } from './BrushStudioTabsPrimary';
 
 export const NaturalPaintMixingTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => {
+  const primaryColor = useToolStore((s) => s.primaryColor);
+  const secondaryColor = useToolStore((s) => s.secondaryColor);
   const np: NaturalPaintSettings = {
     ...DEFAULT_NATURAL_PAINT_SETTINGS,
     ...(bs.naturalPaint || {}),
@@ -75,13 +79,21 @@ export const NaturalPaintMixingTab: React.FC<BrushStudioTabProps> = ({ bs, onPat
 
       <div className="p-2.5 rounded bg-[#181818] border border-white/[0.06] space-y-2.5">
         <div className="text-[11px] font-medium text-[#e5e5e5]">Pigment & Reservoir Physics</div>
-        <StudioSlider
-          label="Kubelka-Munk Pigment Strength"
-          value={Math.round(np.pigmentMixingStrength * 100)}
-          min={0}
-          max={100}
-          valueLabel={`${Math.round(np.pigmentMixingStrength * 100)}%`}
-          onChange={(v) => patchNp({ pigmentMixingStrength: v / 100 })}
+        <PigmentBlendControl
+          variant="studio"
+          label="Color Blending"
+          strengthLabel="Kubelka-Munk Pigment Strength"
+          enabled={bs.perceptualMixing !== false}
+          onEnabledChange={(enabled) => onPatch({ perceptualMixing: enabled })}
+          strength={np.pigmentMixingStrength}
+          onStrengthChange={(s) =>
+            onPatch({
+              perceptualMixing: true,
+              naturalPaint: { ...np, pigmentMixingStrength: s },
+            })
+          }
+          primaryColor={primaryColor}
+          secondaryColor={secondaryColor}
         />
         <StudioSlider
           label="Paint Load (0% = Pure Blender)"

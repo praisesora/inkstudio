@@ -28,11 +28,14 @@ import { CanvasNavigationHandle } from '../hooks/useCanvasNavigation';
 import { TextPlacementSession, FrameDragPreview } from '../hooks/drawing/useShapeAndFillTools';
 import { AutoAction } from '../utils/autoActionEngine';
 import { ExternalFileDropTarget } from '../utils/fileDropImport';
+import { HalftoneDotShape } from '../utils/screentoneEngine';
 import {
   documentStoreActions,
   selectHasOpenDocument,
+  store3DActions,
   toolStoreActions,
   uiStoreActions,
+  use3DStore,
   useDocumentStore,
   useToolStore,
   useUiStore,
@@ -169,6 +172,11 @@ const CanvasAreaContainer: React.FC<CanvasAreaContainerProps> = React.memo((prop
 
   const handleClose3DLayer = useCallback(() => {
     uiStoreActions.set3DLayerOpen(false, null);
+    const prevTool = use3DStore.getState().previousToolBefore3D;
+    store3DActions.resetSceneMeta();
+    if (useToolStore.getState().tool === '3d') {
+      toolStoreActions.selectTool((prevTool as import('../types/editor').ToolType) || 'brush');
+    }
   }, []);
 
   const handleToggleWebtoon = useCallback(() => {
@@ -441,7 +449,7 @@ export interface AppShellProps {
   toggleTone: (id: string) => void;
   setToneFrequency: (id: string, frequency: number) => void;
   setToneAngle: (id: string, angle: number) => void;
-  setToneDotShape: (id: string, dotShape: 'circle' | 'euclidean') => void;
+  setToneDotShape: (id: string, dotShape: HalftoneDotShape) => void;
   setToneDensity: (id: string, density: number) => void;
   setToneDensityType: (id: string, densityType: 'specified' | 'image') => void;
   toggleLayerColor: (id: string) => void;
@@ -463,6 +471,7 @@ export interface AppShellProps {
   handleOpenLayerStylesModal: (layerId?: string) => void;
   onEditVectorLayer?: (layer: LayerItem) => void;
   onRasterizeLayer?: (layerId: string) => void;
+  onMergeFolder?: (folderId: string) => void;
   onPlayAutoAction?: (action: AutoAction) => void;
   externalFileDropTarget?: ExternalFileDropTarget | null;
   children?: React.ReactNode;
@@ -555,6 +564,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     handleOpenLayerStylesModal,
     onEditVectorLayer,
     onRasterizeLayer,
+    onMergeFolder,
     onPlayAutoAction,
     externalFileDropTarget = null,
     children,
@@ -632,6 +642,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
     }, []);
 
     const handleOpen3DLayer = useCallback(() => {
+      toolStoreActions.selectTool('3d');
       uiStoreActions.set3DLayerOpen(true);
     }, []);
 
@@ -813,6 +824,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         onSetToneDotShape: setToneDotShape,
         onSetToneDensity: setToneDensity,
         onSetToneDensityType: setToneDensityType,
+        onCreateToneLayer: canvasProps.onFillScreentone,
         onToggleLayerColor: toggleLayerColor,
         onSetLayerColor: setLayerColor,
         onSetLayerSubColor: setLayerSubColor,
@@ -831,6 +843,8 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         onOpenLayerStylesModal: handleOpenLayerStylesModal,
         onEditVectorLayer,
         onRasterizeLayer,
+        onMergeFolder,
+        onTransformLayer: canvasProps.onTransformSelection,
         externalFileDropIndicator:
           externalFileDropTarget?.zone === 'layers'
             ? {
@@ -884,6 +898,7 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         setToneDotShape,
         setToneDensity,
         setToneDensityType,
+        canvasProps.onFillScreentone,
         toggleLayerColor,
         setLayerColor,
         setLayerSubColor,
@@ -901,6 +916,8 @@ export const AppShell: React.FC<AppShellProps> = React.memo(
         handleOpenLayerStylesModal,
         onEditVectorLayer,
         onRasterizeLayer,
+        onMergeFolder,
+        canvasProps.onTransformSelection,
         externalFileDropTarget,
       ]
     );

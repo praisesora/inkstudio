@@ -1,4 +1,4 @@
-import { CanvasDimensions, LayerItem, isFolderLikeLayer } from '../../types/editor';
+import { CanvasDimensions, LayerItem, isFolderLikeLayer, resolveToneDensityType } from '../../types/editor';
 import { getCanvasCompositeOperation } from '../canvasUtils';
 import { applyMultiFrameClip, renderFrameBorder } from '../frameEngine';
 import { SparseTileGrid, TILE_SIZE, globalTileGrid } from '../tileEngine';
@@ -76,7 +76,11 @@ export function renderLowResPreview(
     opacityMul: number,
     compositeOverride?: GlobalCompositeOperation
   ) => {
-    const alpha = Math.max(0, Math.min(1, layer.opacity * opacityMul));
+    const toneDensityMul =
+      layer.toneEnabled && resolveToneDensityType(layer) === 'specified'
+        ? Math.max(0, Math.min(1, (layer.toneDensity ?? 40) / 100))
+        : 1.0;
+    const alpha = Math.max(0, Math.min(1, layer.opacity * opacityMul * toneDensityMul));
     if (alpha <= 0.001) return;
 
     const tiles = grid.getOrBuildLodTiles(layer.id, targetLod);

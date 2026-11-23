@@ -3,6 +3,7 @@ import {
   BlendMode,
   CanvasSelection,
   LayerItem,
+  LayerTreeDelta,
   isFolderLikeLayer,
 } from '../../types/editor';
 import { createCanvasThumbnail } from '../../utils/canvasUtils';
@@ -22,6 +23,7 @@ import {
   unpack1BitToRGBA,
   unpack8BitToRGBA,
 } from '../../utils/tileEngine';
+import { createLayerTreeSnapshotDelta } from './layerTreeOps';
 import { LayerManagerContext } from './types';
 
 export function useLayerClipboard(ctx: LayerManagerContext) {
@@ -36,6 +38,7 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     activeLayerId,
     setActiveLayerId,
     activeLayerIdRef,
+    recordLayerHistory,
   } = ctx;
 
   // Internal Layer Clipboard (tile-backed; zero full-doc HTMLCanvasElement allocation)
@@ -61,82 +64,82 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       thumb: string,
       layerOverrides?: Partial<LayerItem>,
       insertTarget?: LayerInsertTarget
-    ) => {
-      setLayers((prev) => {
-        const getSubtreeEndIndex = (list: LayerItem[], folderIndex: number): number => {
-          const folderId = list[folderIndex].id;
-          const subtreeIds = new Set<string>([folderId]);
-          let endIdx = folderIndex + 1;
-          while (endIdx < list.length) {
-            const item = list[endIdx];
-            if (item.parentId && subtreeIds.has(item.parentId)) {
-              subtreeIds.add(item.id);
-              endIdx++;
-            } else {
-              break;
-            }
-          }
-          return endIdx;
-        };
-
-        let insertIdx = 0;
-        let resolvedParentId: string | null = null;
-        let expandFolderId: string | null = null;
-
-        const targetIdx = insertTarget?.targetLayerId
-          ? prev.findIndex((l) => l.id === insertTarget.targetLayerId)
-          : -1;
-
-        if (targetIdx >= 0) {
-          const targetItem = prev[targetIdx];
-          const pos = insertTarget?.position || (isFolderLikeLayer(targetItem) ? 'inside' : 'above');
-          if (pos === 'inside' && isFolderLikeLayer(targetItem)) {
-            resolvedParentId = targetItem.id;
-            insertIdx = targetIdx + 1;
-            if (targetItem.collapsed) expandFolderId = targetItem.id;
-          } else if (pos === 'below') {
-            resolvedParentId = targetItem.parentId;
-            insertIdx = isFolderLikeLayer(targetItem)
-              ? getSubtreeEndIndex(prev, targetIdx)
-              : targetIdx + 1;
+    ): LayerItem[] => {
+      const prev = layersRef.current;
+      const getSubtreeEndIndex = (list: LayerItem[], folderIndex: number): number => {
+        const folderId = list[folderIndex].id;
+        const subtreeIds = new Set<string>([folderId]);
+        let endIdx = folderIndex + 1;
+        while (endIdx < list.length) {
+          const item = list[endIdx];
+          if (item.parentId && subtreeIds.has(item.parentId)) {
+            subtreeIds.add(item.id);
+            endIdx++;
           } else {
-            resolvedParentId = targetItem.parentId;
-            insertIdx = targetIdx;
-          }
-        } else {
-          const activeIdx = prev.findIndex((l) => l.id === activeLayerIdRef.current);
-          const activeItem = activeIdx >= 0 ? prev[activeIdx] : undefined;
-          if (activeItem && isFolderLikeLayer(activeItem)) {
-            resolvedParentId = activeItem.id;
-            insertIdx = activeIdx + 1;
-            if (activeItem.collapsed) expandFolderId = activeItem.id;
-          } else {
-            resolvedParentId = activeItem?.parentId || null;
-            insertIdx = activeIdx >= 0 ? activeIdx : 0;
+            break;
           }
         }
+        return endIdx;
+      };
 
-        const newLayer: LayerItem = {
-          id: newId,
-          name: layerName,
-          type: layerOverrides?.type || 'raster',
-          visible: true,
-          opacity,
-          blendMode,
-          locked: false,
-          collapsed: false,
-          parentId: layerOverrides?.parentId !== undefined ? layerOverrides.parentId : resolvedParentId,
-          thumbnailUrl: thumb,
-          ...layerOverrides,
-        };
+      let insertIdx = 0;
+      let resolvedParentId: string | null = null;
+      let expandFolderId: string | null = null;
 
-        const nextLayers = expandFolderId
-          ? prev.map((l) => (l.id === expandFolderId ? { ...l, collapsed: false } : l))
-          : [...prev];
-        nextLayers.splice(insertIdx, 0, newLayer);
-        layersRef.current = nextLayers;
-        return nextLayers;
-      });
+      const targetIdx = insertTarget?.targetLayerId
+        ? prev.findIndex((l) => l.id === insertTarget.targetLayerId)
+        : -1;
+
+      if (targetIdx >= 0) {
+        const targetItem = prev[targetIdx];
+        const pos = insertTarget?.position || (isFolderLikeLayer(targetItem) ? 'inside' : 'above');
+        if (pos === 'inside' && isFolderLikeLayer(targetItem)) {
+          resolvedParentId = targetItem.id;
+          insertIdx = targetIdx + 1;
+          if (targetItem.collapsed) expandFolderId = targetItem.id;
+        } else if (pos === 'below') {
+          resolvedParentId = targetItem.parentId;
+          insertIdx = isFolderLikeLayer(targetItem)
+            ? getSubtreeEndIndex(prev, targetIdx)
+            : targetIdx + 1;
+        } else {
+          resolvedParentId = targetItem.parentId;
+          insertIdx = targetIdx;
+        }
+      } else {
+        const activeIdx = prev.findIndex((l) => l.id === activeLayerIdRef.current);
+        const activeItem = activeIdx >= 0 ? prev[activeIdx] : undefined;
+        if (activeItem && isFolderLikeLayer(activeItem)) {
+          resolvedParentId = activeItem.id;
+          insertIdx = activeIdx + 1;
+          if (activeItem.collapsed) expandFolderId = activeItem.id;
+        } else {
+          resolvedParentId = activeItem?.parentId || null;
+          insertIdx = activeIdx >= 0 ? activeIdx : 0;
+        }
+      }
+
+      const newLayer: LayerItem = {
+        id: newId,
+        name: layerName,
+        type: layerOverrides?.type || 'raster',
+        visible: true,
+        opacity,
+        blendMode,
+        locked: false,
+        collapsed: false,
+        parentId: layerOverrides?.parentId !== undefined ? layerOverrides.parentId : resolvedParentId,
+        thumbnailUrl: thumb,
+        ...layerOverrides,
+      };
+
+      const nextLayers = expandFolderId
+        ? prev.map((l) => (l.id === expandFolderId ? { ...l, collapsed: false } : l))
+        : [...prev];
+      nextLayers.splice(insertIdx, 0, newLayer);
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
+      return nextLayers;
     },
     [activeLayerIdRef, layersRef, setLayers]
   );
@@ -152,6 +155,8 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       layerOverrides?: Partial<LayerItem>,
       insertTarget?: LayerInsertTarget
     ) => {
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
       const newId = customId || `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const grid = activeTileGridRef.current;
       const isMono = layerOverrides?.expressionColor === 'monochrome';
@@ -159,12 +164,25 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       grid.notifyChange(true);
 
       const dims = dimensionsRef.current;
+      const tileDeltas = grid.computeDeltasFromSnapshot(new Map(), newId, {
+        x: 0,
+        y: 0,
+        width: Math.max(dims.width, sourceCanvas.width),
+        height: Math.max(dims.height, sourceCanvas.height),
+      });
       const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions: dims }, true);
-      insertNewLayerItem(newId, layerName, blendMode, opacity, thumb, layerOverrides, insertTarget);
+      const nextLayers = insertNewLayerItem(newId, layerName, blendMode, opacity, thumb, layerOverrides, insertTarget);
       setActiveLayerId(newId);
+      recordLayerHistory(
+        `Paste Layer (${layerName})`,
+        newId,
+        createLayerTreeSnapshotDelta(beforeLayers, nextLayers, beforeActiveLayerId, newId),
+        tileDeltas,
+        'layer'
+      );
       return newId;
     },
-    [activeTileGridRef, dimensionsRef, insertNewLayerItem, setActiveLayerId]
+    [activeLayerIdRef, activeTileGridRef, dimensionsRef, insertNewLayerItem, layersRef, recordLayerHistory, setActiveLayerId]
   );
 
   // Fill selection with non-destructive screentone layer directly in SparseTileGrid (GPU renders dots)
@@ -176,11 +194,14 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       angle: number = 45,
       dotShape: HalftoneDotShape = 'circle',
       densityType: 'specified' | 'image' = 'specified'
-    ): { id: string; tileDeltas: TileDelta[] } => {
+    ): { id: string; tileDeltas: TileDelta[]; layerTreeDelta: LayerTreeDelta } => {
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
       const resolvedFreq = frequency || defaultToneFrequencyRef.current || 60;
       const resolvedDensity = Math.max(1, Math.min(100, Math.round(density <= 1.0 && density > 0 ? density * 100 : density)));
       const newId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
 
       // Continuous source value: black ink in 'specified' mode, grayscale value in 'image' mode
       const grayVal = densityType === 'specified' ? 0 : Math.round(255 * (1 - resolvedDensity / 100));
@@ -191,7 +212,7 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
         const res = fillSelectionInTileGrid({
           grid,
           layerId: newId,
-          dimensions,
+          dimensions: dims,
           selection,
           colorCss: fillCss,
           targetFormat: 'color-32bit',
@@ -199,22 +220,49 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
         tileDeltas = res.tileDeltas;
       } else {
         const beforeSnapshot = grid.snapshotLayerTiles(newId);
-        grid.fillLayerSolidColor(newId, dimensions.width, dimensions.height, fillCss, 'color-32bit');
-        tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, newId);
+        grid.fillLayerSolidColor(newId, dims.width, dims.height, fillCss, 'color-32bit');
+        tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, newId, {
+          x: 0,
+          y: 0,
+          width: dims.width,
+          height: dims.height,
+        });
       }
 
-      const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions }, true);
+      const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions: dims }, true);
+      const activeIdx = beforeLayers.findIndex((l) => l.id === beforeActiveLayerId);
+      const activeItem = activeIdx >= 0 ? beforeLayers[activeIdx] : undefined;
+      const isActiveFolderLike = Boolean(activeItem && isFolderLikeLayer(activeItem));
+      const parentId = isActiveFolderLike ? activeItem!.id : (activeItem?.parentId || null);
+
+      let name = 'Screen Tone';
+      let count = 1;
+      beforeLayers.forEach((l) => {
+        if (l.name.startsWith('Screen Tone')) {
+          const num = parseInt(l.name.replace('Screen Tone', '').trim(), 10);
+          if (!isNaN(num) && num >= count) {
+            count = num + 1;
+          } else if (num === 1 || count === 1) {
+            count = Math.max(count, 2);
+          }
+        }
+      });
+      if (count > 1) {
+        name = `Screen Tone ${count}`;
+      }
+
       const newLayer: LayerItem = {
         id: newId,
-        name: 'Screen Tone',
+        name,
         type: 'raster',
         visible: true,
         opacity: 1,
         blendMode: 'normal',
         locked: false,
         collapsed: false,
-        parentId: null,
+        parentId,
         thumbnailUrl: thumb,
+        isToneLayer: densityType === 'specified',
         toneEnabled: true,
         toneFrequency: resolvedFreq,
         toneAngle: angle,
@@ -223,60 +271,53 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
         toneDensityType: densityType,
       };
 
-      setLayers((prev) => {
-        const activeIdx = prev.findIndex((l) => l.id === activeLayerId);
-        const activeItem = prev[activeIdx];
-        const parentId = activeItem?.type === 'folder' ? activeItem.id : (activeItem?.parentId || null);
-        newLayer.parentId = parentId;
+      const insertIdx = isActiveFolderLike ? activeIdx + 1 : (activeIdx >= 0 ? activeIdx : 0);
+      let nextLayers =
+        isActiveFolderLike && activeItem?.collapsed
+          ? beforeLayers.map((l) => (l.id === activeItem.id ? { ...l, collapsed: false } : l))
+          : [...beforeLayers];
+      nextLayers.splice(insertIdx, 0, newLayer);
 
-        let name = 'Screen Tone';
-        let count = 1;
-        prev.forEach((l) => {
-          if (l.name.startsWith('Screen Tone')) {
-            const num = parseInt(l.name.replace('Screen Tone', '').trim(), 10);
-            if (!isNaN(num) && num >= count) {
-              count = num + 1;
-            } else if (num === 1 || count === 1) {
-              count = Math.max(count, 2);
-            }
-          }
+      const hasBg = beforeLayers.some((l) => l.id.startsWith('layer-bg') || l.name.toLowerCase() === 'background');
+      if (!hasBg) {
+        const bgId = `layer-bg-${Date.now()}`;
+        grid.fillLayerSolidWhite(bgId, dims.width, dims.height, 'color-32bit');
+        const bgDeltas = grid.computeDeltasFromSnapshot(new Map(), bgId, {
+          x: 0,
+          y: 0,
+          width: dims.width,
+          height: dims.height,
         });
-        if (count > 1) {
-          name = `Screen Tone ${count}`;
-        }
-        newLayer.name = name;
+        tileDeltas = [...tileDeltas, ...bgDeltas];
+        const bgThumb = createCanvasThumbnail({ grid, layerId: bgId, dimensions: dims }, false);
+        const bgLayer: LayerItem = {
+          id: bgId,
+          name: 'Background',
+          type: 'raster',
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal',
+          locked: true,
+          parentId: null,
+          thumbnailUrl: bgThumb,
+        };
+        nextLayers = [...nextLayers, bgLayer];
+      }
 
-        const insertIdx = activeIdx >= 0 ? activeIdx : 0;
-        let nextLayers = [...prev];
-        nextLayers.splice(insertIdx, 0, newLayer);
-
-        const hasBg = prev.some((l) => l.id.startsWith('layer-bg') || l.name.toLowerCase() === 'background');
-        if (!hasBg) {
-          const bgId = `layer-bg-${Date.now()}`;
-          grid.fillLayerSolidWhite(bgId, dimensions.width, dimensions.height, 'color-32bit');
-          const bgThumb = createCanvasThumbnail({ grid, layerId: bgId, dimensions }, false);
-          const bgLayer: LayerItem = {
-            id: bgId,
-            name: 'Background',
-            type: 'raster',
-            visible: true,
-            opacity: 1,
-            blendMode: 'normal',
-            locked: true,
-            parentId: null,
-            thumbnailUrl: bgThumb,
-          };
-          nextLayers = [...nextLayers, bgLayer];
-        }
-
-        return nextLayers;
-      });
-
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
       grid.notifyChange(true);
       setActiveLayerId(newId);
-      return { id: newId, tileDeltas };
+
+      const layerTreeDelta = createLayerTreeSnapshotDelta(
+        beforeLayers,
+        nextLayers,
+        beforeActiveLayerId,
+        newId
+      );
+      return { id: newId, tileDeltas, layerTreeDelta };
     },
-    [activeLayerId, activeTileGridRef, defaultToneFrequencyRef, dimensions, setActiveLayerId, setLayers]
+    [activeLayerIdRef, activeTileGridRef, defaultToneFrequencyRef, dimensionsRef, layersRef, setActiveLayerId, setLayers]
   );
 
   // Create a new raster layer directly from a sparse tile snapshot (zero full-doc canvas)
@@ -291,7 +332,9 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       opacity: number = 1,
       layerOverrides?: Partial<LayerItem>,
       insertTarget?: LayerInsertTarget
-    ): { id: string; name: string; tileDeltas: TileDelta[] } => {
+    ): { id: string; name: string; tileDeltas: TileDelta[]; layerTreeDelta: LayerTreeDelta } => {
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
       const newId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const grid = activeTileGridRef.current;
       grid.pasteLayerTilesSnapshot(newId, tileSnapshot);
@@ -306,11 +349,17 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
         ...(tileSnapshot.format === 'monochrome-1bit' ? { expressionColor: 'monochrome' as const } : {}),
         ...layerOverrides,
       };
-      insertNewLayerItem(newId, layerName, blendMode, opacity, thumb, resolvedOverrides, insertTarget);
+      const nextLayers = insertNewLayerItem(newId, layerName, blendMode, opacity, thumb, resolvedOverrides, insertTarget);
       setActiveLayerId(newId);
-      return { id: newId, name: layerName, tileDeltas };
+      const layerTreeDelta = createLayerTreeSnapshotDelta(
+        beforeLayers,
+        nextLayers,
+        beforeActiveLayerId,
+        newId
+      );
+      return { id: newId, name: layerName, tileDeltas, layerTreeDelta };
     },
-    [activeTileGridRef, dimensionsRef, insertNewLayerItem, setActiveLayerId]
+    [activeLayerIdRef, activeTileGridRef, dimensionsRef, insertNewLayerItem, layersRef, setActiveLayerId]
   );
 
   // Copy ONLY the selected pixels from a single layer into the sparse tile clipboard
@@ -465,6 +514,7 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     layerId?: string;
     layerName?: string;
     tileDeltas?: TileDelta[];
+    layerTreeDelta?: LayerTreeDelta;
   }> => {
     // 1. Check internal tile-backed clipboard (zero full-doc canvas)
     if (layerClipboardRef.current) {
@@ -478,7 +528,13 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
         data.opacity,
         overrides
       );
-      return { success: true, layerId: created.id, layerName: created.name, tileDeltas: created.tileDeltas };
+      return {
+        success: true,
+        layerId: created.id,
+        layerName: created.name,
+        tileDeltas: created.tileDeltas,
+        layerTreeDelta: created.layerTreeDelta,
+      };
     }
 
     // 2. Check system clipboard
@@ -497,6 +553,8 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
               img.src = url;
             });
 
+            const beforeLayers = layersRef.current;
+            const beforeActiveLayerId = activeLayerIdRef.current;
             const scale = Math.min(1, Math.min(dimensions.width / img.naturalWidth, dimensions.height / img.naturalHeight));
             const dw = Math.max(1, Math.round(img.naturalWidth * scale));
             const dh = Math.max(1, Math.round(img.naturalHeight * scale));
@@ -525,10 +583,16 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
             });
             const newName = 'Pasted Image';
             const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions }, true);
-            insertNewLayerItem(newId, newName, 'normal', 1, thumb);
+            const nextLayers = insertNewLayerItem(newId, newName, 'normal', 1, thumb);
             setActiveLayerId(newId);
             grid.notifyChange(true);
-            return { success: true, layerId: newId, layerName: newName, tileDeltas };
+            const layerTreeDelta = createLayerTreeSnapshotDelta(
+              beforeLayers,
+              nextLayers,
+              beforeActiveLayerId,
+              newId
+            );
+            return { success: true, layerId: newId, layerName: newName, tileDeltas, layerTreeDelta };
           }
         }
       }
@@ -537,7 +601,7 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
     }
 
     return { success: false };
-  }, [activeTileGridRef, createLayerFromTileSnapshot, dimensions, insertNewLayerItem, setActiveLayerId]);
+  }, [activeLayerIdRef, activeTileGridRef, createLayerFromTileSnapshot, dimensions, insertNewLayerItem, layersRef, setActiveLayerId]);
 
   // Import an image file directly as a centered/fitted raster layer (tight-sized canvas -> tiles)
   const importImageFileAsLayer = useCallback(
@@ -585,6 +649,8 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       const dx = Math.round((dims.width - dw) / 2);
       const dy = Math.round((dims.height - dh) / 2);
 
+      const beforeLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
       const newId = `raster-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const grid = activeTileGridRef.current;
       const tight = document.createElement('canvas');
@@ -600,14 +666,27 @@ export function useLayerClipboard(ctx: LayerManagerContext) {
       }
       releaseTemporaryCanvas(tight);
 
+      const tileDeltas = grid.computeDeltasFromSnapshot(new Map(), newId, {
+        x: dx,
+        y: dy,
+        width: dw,
+        height: dh,
+      });
       const layerName = sanitizeImportedLayerName(file.name);
       const thumb = createCanvasThumbnail({ grid, layerId: newId, dimensions: dims }, true);
-      insertNewLayerItem(newId, layerName, 'normal', 1, thumb, undefined, insertTarget);
+      const nextLayers = insertNewLayerItem(newId, layerName, 'normal', 1, thumb, undefined, insertTarget);
       setActiveLayerId(newId);
       grid.notifyChange(true);
+      recordLayerHistory(
+        `Import Image (${layerName})`,
+        newId,
+        createLayerTreeSnapshotDelta(beforeLayers, nextLayers, beforeActiveLayerId, newId),
+        tileDeltas,
+        'layer'
+      );
       return { id: newId, name: layerName };
     },
-    [activeTileGridRef, dimensionsRef, insertNewLayerItem, setActiveLayerId]
+    [activeLayerIdRef, activeTileGridRef, dimensionsRef, insertNewLayerItem, layersRef, recordLayerHistory, setActiveLayerId]
   );
 
   // Paste a photo from file

@@ -1,4 +1,4 @@
-import { Point2D } from '../types/editor';
+import { LayerItem, Point2D, isFolderLikeLayer } from '../types/editor';
 
 /**
  * Computes the 3x3 projective transformation (homography) parameters
@@ -949,5 +949,159 @@ export function getMeshSurfaceBounds(
     maxY: maxYC,
     width: Math.max(1, maxXC - minXF),
     height: Math.max(1, maxYC - minYF),
+  };
+}
+
+export interface ResolveTransformTargetsResult {
+  targetLayers: LayerItem[];
+  includesFolder: boolean;
+  blockedReason?: 'locked' | 'unsupported' | 'empty-folder';
+}
+
+export function isLayerOrAncestorLocked(
+  layer: LayerItem,
+  layerMap: Map<string, LayerItem>
+): boolean {
+  let curr: LayerItem | undefined = layer;
+  const visited = new Set<string>();
+  while (curr && !visited.has(curr.id)) {
+    if (curr.locked) return true;
+    visited.add(curr.id);
+    curr = curr.parentId ? layerMap.get(curr.parentId) : undefined;
+  }
+  return false;
+}
+
+function isDescendantOfAnyFolder(
+  layer: LayerItem,
+  folderIds: Set<string>,
+  layerMap: Map<string, LayerItem>
+): boolean {
+  let parentId = layer.parentId;
+  const visited = new Set<string>();
+  while (parentId && !visited.has(parentId)) {
+    if (folderIds.has(parentId)) return true;
+    visited.add(parentId);
+    parentId = layerMap.get(parentId)?.parentId ?? null;
+  }
+  return false;
+}
+
+/**
+ * Resolves all unlocked raster layers targeted by a Free Transform operation.
+ * Selecting a folder (or frame-folder) recursively includes all unlocked raster layers
+ * within that folder (including nested subfolders). Multi-selection expands any selected
+ * folders alongside directly selected raster layers in stack order without duplicates.
+ */
+export function resolveTransformTargetLayers(
+  layers: LayerItem[],
+  activeLayer: LayerItem | undefined,
+  selectedLayerIds: string[]
+): ResolveTransformTargetsResult {
+  const layerMap = new Map<string, LayerItem>();
+  for (const l of layers) {
+    layerMap.set(l.id, l);
+  }
+
+  const effectiveSelectedIds =
+    selectedLayerIds && selectedLayerIds.length > 0
+      ? selectedLayerIds
+      : activeLayer
+        ? [activeLayer.id]
+        : [];
+
+  const selectedItems = effectiveSelectedIds
+    .map((id) => layerMap.get(id))
+    .filter((l): l is LayerItem => Boolean(l));
+
+  if (selectedItems.length === 0) {
+    return { targetLayers: [], includesFolder: false, blockedReason: 'unsupported' };
+  }
+
+  if (selectedItems.length === 1) {
+    const single = selectedItems[0];
+    if (isFolderLikeLayer(single)) {
+      if (isLayerOrAncestorLocked(single, layerMap)) {
+        return { targetLayers: [], includesFolder: true, blockedReason: 'locked' };
+      }
+      const folderSet = new Set([single.id]);
+      const targets = layers.filter(
+        (l) =>
+          l.type === 'raster' &&
+          !isLayerOrAncestorLocked(l, layerMap) &&
+          isDescendantOfAnyFolder(l, folderSet, layerMap)
+      );
+      if (targets.length === 0) {
+        return { targetLayers: [], includesFolder: true, blockedReason: 'empty-folder' };
+      }
+      return { targetLayers: targets, includesFolder: true };
+    }
+
+    if (single.type !== 'raster') {
+      return { targetLayers: [], includesFolder: false, blockedReason: 'unsupported' };
+    }
+    if (isLayerOrAncestorLocked(single, layerMap)) {
+      return { targetLayers: [], includesFolder: false, blockedReason: 'locked' };
+    }
+    return { targetLayers: [single], includesFolder: false };
+  }
+
+  const selectedIdSet = new Set(selectedItems.map((l) => l.id));
+  const includesFolder = selectedItems.some((l) => isFolderLikeLayer(l));
+  const selectedUnlockedFolders = new Set(
+    selectedItems
+      .filter((l) => isFolderLikeLayer(l) && !isLayerOrAncestorLocked(l, layerMap))
+      .map((l) => l.id)
+  );
+
+  const targetLayers = layers.filter(
+    (l) =>
+      l.type === 'raster' &&
+      !isLayerOrAncestorLocked(l, layerMap) &&
+      (selectedIdSet.has(l.id) ||
+        (selectedUnlockedFolders.size > 0 &&
+          isDescendantOfAnyFolder(l, selectedUnlockedFolders, layerMap)))
+  );
+
+  if (targetLayers.length === 0) {
+    const allLocked = selectedItems.every((l) => isLayerOrAncestorLocked(l, layerMap));
+    return {
+      targetLayers: [],
+      includesFolder,
+      blockedReason: allLocked ? 'locked' : includesFolder ? 'empty-folder' : 'unsupported',
+    };
+  }
+
+  return { targetLayers, includesFolder };
+}
+
+/**
+ * Computes preview visibility and effective opacity for a target layer during a
+ * folder / multi-layer transform preview.
+ */
+export function getTransformPreviewLayerState(
+  layer: LayerItem,
+  layerMap: Map<string, LayerItem>,
+  selectedRootIds: Set<string>
+): { visible: boolean; opacity: number } {
+  let visible = layer.visible;
+  let opacity = layer.opacity;
+  let currParentId = layer.parentId;
+  const visited = new Set<string>([layer.id]);
+
+  while (currParentId && !visited.has(currParentId)) {
+    visited.add(currParentId);
+    const parent = layerMap.get(currParentId);
+    if (!parent) break;
+    opacity *= parent.opacity;
+    if (!selectedRootIds.has(parent.id) && !parent.visible) {
+      visible = false;
+    }
+    currParentId = parent.parentId;
+  }
+
+  return {
+    visible,
+    opacity: Math.max(0, Math.min(1, opacity)),
   };
 }

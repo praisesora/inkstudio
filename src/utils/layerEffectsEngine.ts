@@ -1,4 +1,4 @@
-import { LayerItem, DirtyRect } from '../types/editor';
+import { LayerItem, DirtyRect, resolveToneDensityType } from '../types/editor';
 import { parseRgba } from './colorUtils';
 import { applyScreentone } from './screentoneEngine';
 
@@ -209,7 +209,7 @@ export function applyLayerEffects(
         angle: layer.toneAngle ?? 45,
         dotShape: layer.toneDotShape ?? 'circle',
         dpi,
-        densityType: layer.toneDensityType ?? 'specified',
+        densityType: resolveToneDensityType(layer),
         specifiedDensity: Math.max(0, Math.min(1, (layer.toneDensity ?? 40) / 100)),
         renderBackend: 'auto',
       },

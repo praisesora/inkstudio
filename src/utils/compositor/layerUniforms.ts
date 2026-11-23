@@ -1,4 +1,4 @@
-import { CanvasDimensions, LayerItem } from '../../types/editor';
+import { CanvasDimensions, LayerItem, resolveToneDensityType } from '../../types/editor';
 import { parseHexColor } from './bounds';
 import { CompositorState, LayerUniformLocs } from './types';
 
@@ -93,8 +93,8 @@ export function applyLayerUniforms(
   const toneEnabled = Boolean(layer.toneEnabled);
   gl.uniform1i(locs.uToneEnabled, toneEnabled ? 1 : 0);
   if (toneEnabled) {
-    gl.uniform1f(locs.uToneFrequency, layer.toneFrequency || 60);
-    gl.uniform1f(locs.uToneAngleRad, ((layer.toneAngle || 45) * Math.PI) / 180);
+    gl.uniform1f(locs.uToneFrequency, layer.toneFrequency ?? 60);
+    gl.uniform1f(locs.uToneAngleRad, ((layer.toneAngle ?? 45) * Math.PI) / 180);
     gl.uniform1f(locs.uToneDpi, dimensions.dpi || 600);
     const dotShapeCode =
       layer.toneDotShape === 'line'
@@ -106,7 +106,7 @@ export function applyLayerUniforms(
         : 0;
     gl.uniform1i(locs.uToneDotShape, dotShapeCode);
     gl.uniform1f(locs.uToneDensity, (layer.toneDensity ?? 40) / 100);
-    gl.uniform1i(locs.uToneDensityType, layer.toneDensityType === 'image' ? 1 : 0);
+    gl.uniform1i(locs.uToneDensityType, resolveToneDensityType(layer) === 'image' ? 1 : 0);
   }
 
   // Layer Tint Uniforms

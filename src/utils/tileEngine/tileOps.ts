@@ -518,8 +518,24 @@ export function mergeLayersInGrid(
   const srcTiles = host.getLayerTiles(srcLayerId, 0);
   const dstFormat = options.dstFormat ?? host.getLayerFormat(dstLayerId);
 
-  if (typeof document === 'undefined') {
-    // Headless fallback: straight alpha-over per tile
+  const srcTileCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+  if (srcTileCanvas) {
+    srcTileCanvas.width = TILE_SIZE;
+    srcTileCanvas.height = TILE_SIZE;
+  }
+  const sCtx = srcTileCanvas ? srcTileCanvas.getContext('2d', { willReadFrequently: true }) : null;
+
+  const dstTileCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+  if (dstTileCanvas) {
+    dstTileCanvas.width = TILE_SIZE;
+    dstTileCanvas.height = TILE_SIZE;
+  }
+  const dCtx = dstTileCanvas ? dstTileCanvas.getContext('2d', { willReadFrequently: true }) : null;
+
+  if (!sCtx || !dCtx || !srcTileCanvas || !dstTileCanvas) {
+    if (srcTileCanvas) releaseTemporaryCanvas(srcTileCanvas);
+    if (dstTileCanvas) releaseTemporaryCanvas(dstTileCanvas);
+    // Headless / no-2D-context fallback: straight alpha-over per tile
     for (const srcTile of srcTiles) {
       if (!srcTile.data) continue;
       const srcRgba = new Uint8ClampedArray(host.getTileAsRGBA(srcTile));
@@ -551,22 +567,11 @@ export function mergeLayersInGrid(
     return;
   }
 
-  const srcTileCanvas = document.createElement('canvas');
-  srcTileCanvas.width = TILE_SIZE;
-  srcTileCanvas.height = TILE_SIZE;
-  const sCtx = srcTileCanvas.getContext('2d', { willReadFrequently: true });
-
-  const dstTileCanvas = document.createElement('canvas');
-  dstTileCanvas.width = TILE_SIZE;
-  dstTileCanvas.height = TILE_SIZE;
-  const dCtx = dstTileCanvas.getContext('2d', { willReadFrequently: true });
-
   const hasMask = Boolean(maskCanvas && maskEnabled !== false);
   const maskCtx = hasMask && maskCanvas ? maskCanvas.getContext('2d', { willReadFrequently: true }) : null;
   const compositeOp = getCanvasCompositeOperation(blendMode);
 
   try {
-    if (!sCtx || !dCtx) return;
 
     for (const srcTile of srcTiles) {
       if (!srcTile.data) continue;

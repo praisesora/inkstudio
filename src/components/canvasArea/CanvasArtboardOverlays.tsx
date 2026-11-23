@@ -44,8 +44,6 @@ export const CanvasArtboardOverlays: React.FC<CanvasArtboardOverlaysProps> = ({
     interactionRef,
     dimensions,
     zoom,
-    pan,
-    rotation,
     peers = [],
     activePings = [],
     remoteDraftCanvasesRef,
@@ -461,13 +459,19 @@ export const CanvasArtboardOverlays: React.FC<CanvasArtboardOverlaysProps> = ({
         />
       )}
 
-      {/* Local-Only 3D Viewport Ghost Layer (Strictly Client-Side Isolated State) */}
+      {/* Local-Only 3D Viewport Reference Stage (Interactive with 3D Tool, Pass-Through with 2D Tools) */}
       {is3DLayerOpen && onClose3DLayer && onInsertRasterLayer && (
         <Local3DContainer
           dimensions={dimensions}
-          zoom={zoom}
-          pan={pan}
-          rotation={rotation}
+          viewportRef={canvasProps.viewportRef}
+          navigation={canvasProps.navigation}
+          zoom={liveZoom}
+          pan={livePan}
+          rotation={liveRotation}
+          flipX={liveFlipX}
+          flipY={liveFlipY}
+          activeTool={tool}
+          isSpaceDown={canvasProps.isSpaceDown}
           isOpen={is3DLayerOpen}
           initialFile={initial3DFile}
           onClose={onClose3DLayer}

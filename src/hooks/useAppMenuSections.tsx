@@ -89,6 +89,8 @@ export interface UseAppMenuSectionsParams {
   handleContractSelection: (pixels?: number) => void;
   handleFeatherSelection: (radius?: number) => void;
   handleAddLayer: (type?: 'raster' | 'folder') => void;
+  handleFillScreentone?: () => void;
+  toggleTone?: (layerId: string) => void;
   handleOpenAdjustmentModal: (
     layerId?: string,
     initialType?: 'curves' | 'gradient-map' | 'levels' | 'color-balance'
@@ -99,6 +101,7 @@ export interface UseAppMenuSectionsParams {
   toggleMaskLinked: (layerId: string) => void;
   duplicateLayer: (layerId: string) => void;
   handleMergeDown: () => void;
+  handleMergeFolder?: (folderId?: string) => void;
   handleOpenLayerStylesModal: (layerId?: string) => void;
   toggleLayerColor: (layerId: string) => void;
   handleConvertLayer: (layerId: string, mode: ExpressionColor) => void;
@@ -166,6 +169,8 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
     handleContractSelection,
     handleFeatherSelection,
     handleAddLayer,
+    handleFillScreentone,
+    toggleTone,
     handleOpenAdjustmentModal,
     addLayerMask,
     removeLayerMask,
@@ -173,6 +178,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
     toggleMaskLinked,
     duplicateLayer,
     handleMergeDown,
+    handleMergeFolder,
     handleOpenLayerStylesModal,
     toggleLayerColor,
     handleConvertLayer,
@@ -619,10 +625,19 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             onClick: () => handleAddLayer('folder'),
           },
           {
+            id: 'layer-new-screentone',
+            label: 'New Screentone Layer...',
+            disabled: !hasOpenDocument || !handleFillScreentone,
+            onClick: () => handleFillScreentone?.(),
+          },
+          {
             id: 'layer-new-3d',
             label: 'New 3D Reference Layer...',
             disabled: !hasOpenDocument,
-            onClick: () => uiStoreActions.set3DLayerOpen(true),
+            onClick: () => {
+              toolStoreActions.selectTool('3d');
+              uiStoreActions.set3DLayerOpen(true);
+            },
           },
           {
             id: 'layer-new-adjustment',
@@ -719,6 +734,17 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             disabled: !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || layers.length <= 1,
             onClick: handleMergeDown,
           },
+          {
+            id: 'layer-merge-folder',
+            label: 'Merge Folder',
+            disabled:
+              !hasOpenDocument ||
+              !activeLayer ||
+              !isFolderLikeLayer(activeLayer) ||
+              activeLayer.locked ||
+              !handleMergeFolder,
+            onClick: () => activeLayer && handleMergeFolder?.(activeLayer.id),
+          },
           { id: 'layer-div-effects', label: '', divider: true },
           {
             id: 'layer-styles',
@@ -729,6 +755,14 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
               isFolderLikeLayer(activeLayer) ||
               activeLayer.type === 'adjustment',
             onClick: () => handleOpenLayerStylesModal(activeLayerId),
+          },
+          {
+            id: 'layer-toggle-tone',
+            label: activeLayer?.toneEnabled
+              ? 'Disable Screentone'
+              : 'Enable Screentone',
+            disabled: !hasOpenDocument || !activeLayer || isFolderLikeLayer(activeLayer) || !toggleTone,
+            onClick: () => toggleTone?.(activeLayerId),
           },
           {
             id: 'layer-toggle-tint',
@@ -1446,9 +1480,11 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       handleExpandSelection,
       handleExportImage,
       handleFeatherSelection,
+      handleFillScreentone,
       handleFillSelectionColor,
       handleInvertSelection,
       handleMergeDown,
+      handleMergeFolder,
       handleMoveSelectionToNewLayer,
       handleOpenAdjustmentModal,
       handleOpenLayerStylesModal,
@@ -1490,6 +1526,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       toggleLayerColor,
       toggleLayerMask,
       toggleMaskLinked,
+      toggleTone,
       visiblePanels,
       zoomIn,
       zoomOut,

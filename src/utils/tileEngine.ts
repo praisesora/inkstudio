@@ -258,7 +258,27 @@ export class SparseTileGrid {
       this.memoryManager?.notifyTileFreed(tile);
       this.tiles.delete(key);
       if (lod === 0) {
-        this.markLodAncestorsDirty(layerId, tileX, tileY);
+        let ax = tileX;
+        let ay = tileY;
+        for (let ancestorLod = 1; ancestorLod <= 3; ancestorLod++) {
+          ax = ax >> 1;
+          ay = ay >> 1;
+          const ancestorKey = getTileKey(layerId, ax, ay, ancestorLod);
+          if (!this.hasPopulatedLodTile(layerId, ax, ay, ancestorLod)) {
+            const stale = this.tiles.get(ancestorKey);
+            if (stale) {
+              this.memoryManager?.notifyTileFreed(stale);
+              this.tiles.delete(ancestorKey);
+            }
+            this.dirtyLodTiles.delete(ancestorKey);
+          } else {
+            this.dirtyLodTiles.add(ancestorKey);
+            const existing = this.tiles.get(ancestorKey);
+            if (existing) {
+              existing.dirty = true;
+            }
+          }
+        }
         this.bumpLayerVersion(layerId);
       }
     }

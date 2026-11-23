@@ -42,3 +42,15 @@ export type { AutoActionStoreState } from './useAutoActionStore';
 
 export { useUpdaterStore, updaterStoreActions } from './useUpdaterStore';
 export type { UpdaterStoreState, UpdaterStatus } from './useUpdaterStore';
+
+export {
+  use3DStore,
+  store3DActions,
+  scene3DBridge,
+  INITIAL_MODEL_3D_TRANSFORM,
+} from './use3DStore';
+export type {
+  Scene3DStoreState,
+  Model3DTransformState,
+  Scene3DCommandBridge,
+} from './use3DStore';

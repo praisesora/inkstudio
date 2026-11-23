@@ -85,7 +85,7 @@ export interface UseCanvasDrawingProps {
   activeLayerLocked?: boolean;
   activeLayerVisible?: boolean;
   layers?: LayerItem[];
-  onUpdateLayerThumbnail: (layerId: string) => void;
+  onUpdateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   onApplyLayerTreeDelta?: ApplyLayerTreeDeltaFn;
   isMaskMode?: boolean;
   onUpdateMaskThumbnail?: (layerId: string) => void;

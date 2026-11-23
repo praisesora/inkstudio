@@ -24,7 +24,7 @@ import {
   useVectorDrawing,
 } from './hooks/drawing';
 import { useCanvasNavigation } from './hooks/useCanvasNavigation';
-import { useLayerManager } from './hooks/useLayerManager';
+import { createLayerTreeSnapshotDelta, useLayerManager } from './hooks/useLayerManager';
 import { useCollabSync } from './hooks/useCollabSync';
 import { useTonalAndFilterActions } from './hooks/useTonalAndFilterActions';
 import { useAppMenuSections } from './hooks/useAppMenuSections';
@@ -32,8 +32,10 @@ import { useExternalFileDrop } from './hooks/useExternalFileDrop';
 import {
   autoActionStoreActions,
   documentStoreActions,
+  scene3DBridge,
   selectHasOpenDocument,
   uiStoreActions,
+  use3DStore,
   useDocumentStore,
   useToolStore,
   useUiStore,
@@ -58,6 +60,9 @@ export function App() {
   const activeEditTarget = useDocumentStore((s) => s.activeEditTarget);
   const animationTimeline = useDocumentStore((s) => s.animationTimeline);
   const isWebtoonMode = useUiStore((s) => s.isWebtoonMode);
+  const is3DLayerOpen = useUiStore((s) => s.is3DLayerOpen);
+  const canUndo3D = use3DStore((s) => s.canUndo3D);
+  const canRedo3D = use3DStore((s) => s.canRedo3D);
   const appView = useUiStore((s) => s.appView);
 
   // Delayed silent startup check for desktop Tauri updates (never blocks startup or crash recovery)
@@ -86,6 +91,7 @@ export function App() {
     dimensions,
     activeSessionId: activeDocumentId,
     tileGrid: activeTileGrid,
+    pushHistoryStepRef,
   });
 
   const activeDoc = documents.find((d) => d.id === activeDocumentId);
@@ -108,6 +114,8 @@ export function App() {
 
   const handleAddAnimationCel = useCallback(
     (frameIndex: number) => {
+      const beforeLayers = layerMgr.layers;
+      const beforeActiveLayerId = layerMgr.activeLayerId;
       const newLayerId = `layer-cel-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
       const newCelLayer: LayerItem = {
         id: newLayerId,
@@ -123,8 +131,23 @@ export function App() {
       activeTileGrid.setLayerFormat(newLayerId, 'color-32bit');
       activeTileGrid.markLayerIngested(newLayerId);
 
-      layerMgr.setLayers((prev) => [newCelLayer, ...prev]);
+      const nextLayers = [newCelLayer, ...beforeLayers];
+      layerMgr.setLayers(nextLayers);
       layerMgr.setActiveLayerId(newLayerId);
+      pushHistoryStepRef.current?.(
+        'layer',
+        `Add Cel Frame ${frameIndex + 1}`,
+        null,
+        null,
+        newLayerId,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        createLayerTreeSnapshotDelta(beforeLayers, nextLayers, beforeActiveLayerId, newLayerId)
+      );
 
       const currentTl = activeAnimationTimeline || createDefaultAnimationTimeline(layerMgr.layers);
       handleUpdateAnimationTimeline(setFrameCel(currentTl, frameIndex, newLayerId));
@@ -316,6 +339,15 @@ export function App() {
   flushPendingHistoryTasksRef.current = drawing.flushPendingHistoryTasks;
 
   const handleUndo = useCallback(() => {
+    if (
+      useUiStore.getState().is3DLayerOpen &&
+      useToolStore.getState().tool === '3d' &&
+      scene3DBridge.canUndo?.()
+    ) {
+      if (scene3DBridge.undo?.()) {
+        return;
+      }
+    }
     if (selectionTools.transformSession?.active) {
       selectionTools.handleCancelTransform();
       return;
@@ -335,6 +367,19 @@ export function App() {
       drawing.undo();
     }
   }, [collab.isConnected, collab.myPeer.id, drawing, selectionTools]);
+
+  const handleRedo = useCallback(() => {
+    if (
+      useUiStore.getState().is3DLayerOpen &&
+      useToolStore.getState().tool === '3d' &&
+      scene3DBridge.canRedo?.()
+    ) {
+      if (scene3DBridge.redo?.()) {
+        return;
+      }
+    }
+    drawing.redo();
+  }, [drawing]);
 
   const getCanvasCoords = useCallback(
     (e: React.PointerEvent<HTMLElement> | PointerEvent) => {
@@ -364,6 +409,7 @@ export function App() {
     activeLayerId: layerMgr.activeLayerId,
     selectedLayerIds: layerMgr.selectedLayerIds,
     selection: selectionTools.selection,
+    onCommitFloatingSelection: selectionTools.handleCommitFloatingSelection,
     flushPendingHistoryTasks: drawing.flushPendingHistoryTasks,
     isLayerEffectivelyVisible: layerMgr.isLayerEffectivelyVisible,
     getEffectiveOpacity: layerMgr.getEffectiveOpacity,
@@ -492,12 +538,38 @@ export function App() {
 
   const handleToggleReferenceLayer = useCallback(
     (layerId: string) => {
-      layerMgr.setLayers((prev) =>
-        prev.map((l) => (l.id === layerId ? { ...l, isReference: !l.isReference } : l))
+      const beforeLayers = layerMgr.layers;
+      const nextLayers = beforeLayers.map((l) =>
+        l.id === layerId ? { ...l, isReference: !l.isReference } : l
+      );
+      layerMgr.setLayers(nextLayers);
+      pushHistoryStepRef.current?.(
+        'layer',
+        'Toggle Reference Layer',
+        null,
+        null,
+        layerId,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        createLayerTreeSnapshotDelta(beforeLayers, nextLayers, layerMgr.activeLayerId, layerMgr.activeLayerId)
       );
       documentStoreActions.markDocumentDirty(activeDocumentId, true);
     },
-    [activeDocumentId, layerMgr.setLayers]
+    [activeDocumentId, layerMgr]
+  );
+
+  const handleToggleTone = useCallback(
+    (layerId: string) => {
+      if (selectionTools.selection?.floating) {
+        selectionTools.handleCommitFloatingSelection();
+      }
+      layerMgr.toggleTone(layerId, selectionTools.selection);
+    },
+    [layerMgr.toggleTone, selectionTools]
   );
 
   const handleMergeDown = useCallback(() => {
@@ -510,6 +582,26 @@ export function App() {
       showToast('Cannot merge down: need an unlocked raster layer below');
     }
   }, [layerMgr.mergeDown, activeDocumentId, showToast]);
+
+  const handleMergeFolder = useCallback(
+    (folderId?: string) => {
+      if (selectionTools.selection?.floating) {
+        selectionTools.handleCommitFloatingSelection();
+      }
+      if (selectionTools.transformSession?.active) {
+        selectionTools.handleApplyTransform();
+      }
+      const res = layerMgr.mergeFolder(folderId);
+      if (res) {
+        documentStoreActions.markDocumentDirty(activeDocumentId, true);
+        autoActionStoreActions.recordStep('merge-folder', 'Merge Folder');
+        showToast('Merged folder into layer');
+      } else {
+        showToast('Cannot merge folder: select an unlocked folder');
+      }
+    },
+    [layerMgr.mergeFolder, activeDocumentId, selectionTools, showToast]
+  );
 
   const handleAddDefaultFrameFolder = useCallback(() => {
     drawing.flushPendingHistoryTasks();
@@ -538,14 +630,13 @@ export function App() {
     (layerId: string) => {
       const ok = layerMgr.rasterizeLayer(layerId);
       if (ok) {
-        drawing.pushHistoryStep('layer-convert', 'Rasterize Layer', null, null, layerId);
         autoActionStoreActions.recordStep('rasterize-layer', 'Rasterize Layer');
         showToast('Layer rasterized');
       } else {
         showToast('Only Text, Speech Balloon, or Vector layers can be rasterized');
       }
     },
-    [layerMgr.rasterizeLayer, drawing.pushHistoryStep, showToast]
+    [layerMgr.rasterizeLayer, showToast]
   );
 
   // Auto-Action Recording Wrappers for common layer/filter commands
@@ -617,6 +708,8 @@ export function App() {
     async (action: AutoAction) => {
       if (!hasOpenDocument) return;
       autoActionStoreActions.setIsPlaying(true);
+      const beforeAutoLayers = layerMgr.layers;
+      const beforeAutoActiveId = layerMgr.activeLayerId;
       let currentLayerId = layerMgr.activeLayerId;
       let groupStartSnapshot: Map<string, TileSnapshotEntry> | null = null;
       let groupTargetLayerId = currentLayerId;
@@ -625,12 +718,16 @@ export function App() {
       const ctx: AutoActionExecutionContext = {
         getActiveLayerId: () => currentLayerId,
         createLayer: (name, type = 'raster') => {
-          const created = layerMgr.addLayer(type, undefined, name, undefined, true);
+          const created = layerMgr.runWithoutLayerHistory(() =>
+            layerMgr.addLayer(type, undefined, name, undefined, true)
+          );
           currentLayerId = created.id;
           return created.id;
         },
         createFolder: (name) => {
-          const created = layerMgr.addLayer('folder', undefined, name, undefined, true);
+          const created = layerMgr.runWithoutLayerHistory(() =>
+            layerMgr.addLayer('folder', undefined, name, undefined, true)
+          );
           currentLayerId = created.id;
           return created.id;
         },
@@ -656,35 +753,45 @@ export function App() {
           currentLayerId = folder.id;
           return folder.id;
         },
-        duplicateLayer: (id) => layerMgr.duplicateLayer(id),
-        deleteLayer: (id) => collab.handleDeleteLayer(id),
-        renameLayer: (id, name) => layerMgr.renameLayer(id, name),
-        setBlendMode: (id, blendMode) => layerMgr.setBlendMode(id, blendMode),
-        setOpacity: (id, opacity) => layerMgr.setOpacity(id, opacity),
-        setVisibility: (id) => layerMgr.toggleVisibility(id),
+        duplicateLayer: (id) => layerMgr.runWithoutLayerHistory(() => layerMgr.duplicateLayer(id)),
+        deleteLayer: (id) => layerMgr.runWithoutLayerHistory(() => collab.handleDeleteLayer(id)),
+        renameLayer: (id, name) => layerMgr.runWithoutLayerHistory(() => layerMgr.renameLayer(id, name)),
+        setBlendMode: (id, blendMode) =>
+          layerMgr.runWithoutLayerHistory(() => layerMgr.setBlendMode(id, blendMode)),
+        setOpacity: (id, opacity) =>
+          layerMgr.runWithoutLayerHistory(() => layerMgr.setOpacity(id, opacity)),
+        setVisibility: (id) => layerMgr.runWithoutLayerHistory(() => layerMgr.toggleVisibility(id)),
         setClipping: (id, clipped) => {
           const existing = layerMgr.layers.find((l) => l.id === id);
           if (clipped === undefined || Boolean(existing?.clipped) !== clipped) {
-            layerMgr.toggleClipping(id);
+            layerMgr.runWithoutLayerHistory(() => layerMgr.toggleClipping(id));
           }
         },
-        setAlphaLock: (id) => layerMgr.toggleAlphaLock(id),
-        setExpressionColor: (id, mode) => layerMgr.setLayerExpressionColor(id, mode),
+        setAlphaLock: (id) => layerMgr.runWithoutLayerHistory(() => layerMgr.toggleAlphaLock(id)),
+        setExpressionColor: (id, mode) =>
+          layerMgr.runWithoutLayerHistory(() => layerMgr.setLayerExpressionColor(id, mode)),
         setLayerColor: (id, enabled, color) => {
-          if (color) layerMgr.setLayerColor(id, color);
-          const existing = layerMgr.layers.find((l) => l.id === id);
-          if (Boolean(existing?.layerColorEnabled) !== enabled) {
-            layerMgr.toggleLayerColor(id);
-          }
+          layerMgr.runWithoutLayerHistory(() => {
+            if (color) layerMgr.setLayerColor(id, color);
+            const existing = layerMgr.layers.find((l) => l.id === id);
+            if (Boolean(existing?.layerColorEnabled) !== enabled) {
+              layerMgr.toggleLayerColor(id);
+            }
+          });
         },
         setTone: (id, enabled, opts) => {
-          const existing = layerMgr.layers.find((l) => l.id === id);
-          if (Boolean(existing?.toneEnabled) !== enabled) {
-            layerMgr.toggleTone(id);
-          }
-          if (opts?.frequency !== undefined) layerMgr.setToneFrequency(id, opts.frequency);
-          if (opts?.density !== undefined) layerMgr.setToneDensity(id, opts.density);
-          if (opts?.angle !== undefined) layerMgr.setToneAngle(id, opts.angle);
+          layerMgr.runWithoutLayerHistory(() => {
+            const existing = layerMgr.layers.find((l) => l.id === id);
+            if (Boolean(existing?.toneEnabled) !== enabled) {
+              layerMgr.toggleTone(id);
+            }
+            if (opts?.frequency !== undefined) layerMgr.setToneFrequency(id, opts.frequency);
+            if (opts?.density !== undefined) {
+              layerMgr.setToneDensityType(id, 'specified');
+              layerMgr.setToneDensity(id, opts.density);
+            }
+            if (opts?.angle !== undefined) layerMgr.setToneAngle(id, opts.angle);
+          });
         },
         fillLayer: (id, color) => {
           if (!groupStartSnapshot) {
@@ -705,10 +812,13 @@ export function App() {
           layerMgr.updateLayerThumbnail(id, true);
         },
         mergeDown: () => {
-          layerMgr.mergeDown();
+          layerMgr.runWithoutLayerHistory(() => layerMgr.mergeDown());
+        },
+        mergeFolder: (folderId) => {
+          layerMgr.runWithoutLayerHistory(() => layerMgr.mergeFolder(folderId));
         },
         rasterizeLayer: (id) => {
-          layerMgr.rasterizeLayer(id);
+          layerMgr.runWithoutLayerHistory(() => layerMgr.rasterizeLayer(id));
         },
         applyFilter: (type, params) => {
           tonalActions.handleApplyFilter(
@@ -722,8 +832,21 @@ export function App() {
         endHistoryGroup: (label) => {
           const targetId = groupTargetLayerId || currentLayerId;
           const tileDeltas = groupStartSnapshot
-            ? activeTileGrid.computeDeltasFromSnapshot(groupStartSnapshot, targetId)
+            ? activeTileGrid.computeDeltasFromSnapshot(groupStartSnapshot, targetId, {
+                x: 0,
+                y: 0,
+                width: dimensions.width,
+                height: dimensions.height,
+              })
             : undefined;
+          const finalTreeDelta =
+            groupLayerTreeDelta ??
+            createLayerTreeSnapshotDelta(
+              beforeAutoLayers,
+              layerMgr.layers,
+              beforeAutoActiveId,
+              currentLayerId
+            );
           drawing.pushHistoryStep(
             'auto-action',
             label,
@@ -736,7 +859,7 @@ export function App() {
             undefined,
             undefined,
             undefined,
-            groupLayerTreeDelta
+            finalTreeDelta
           );
         },
       };
@@ -959,7 +1082,7 @@ export function App() {
         penTools.handlePenPointerUp(e);
         return;
       }
-      if (selectionTools.handleSelectionPointerUp(pt)) return;
+      if (selectionTools.handleSelectionPointerUp(pt, e)) return;
       shapeFillTools.handleShapeFillPointerUp(e, pt);
     },
     [drawing, vectorTools, gradientTools, retouchTools, penTools, getCanvasCoords, selectionTools, shapeFillTools]
@@ -973,8 +1096,8 @@ export function App() {
     activeLayer: layerMgr.activeLayer,
     activeLayerId: layerMgr.activeLayerId,
     selection: selectionTools.selection,
-    canUndo: drawing.canUndo,
-    canRedo: drawing.canRedo,
+    canUndo: drawing.canUndo || (is3DLayerOpen && canUndo3D),
+    canRedo: drawing.canRedo || (is3DLayerOpen && canRedo3D),
     flipX: nav.flipX,
     flipY: nav.flipY,
     isWebtoonMode,
@@ -984,7 +1107,7 @@ export function App() {
     activeAnimationTimeline,
     clearCanvas: drawing.clearCanvas,
     handleUndo,
-    redo: drawing.redo,
+    redo: handleRedo,
     handleTriggerOpenFile: docLifecycle.handleTriggerOpenFile,
     handleTriggerImport3DFile: docLifecycle.handleTriggerImport3DFile,
     handleSave: docLifecycle.handleSave,
@@ -1011,6 +1134,8 @@ export function App() {
     handleContractSelection: selectionTools.handleContractSelection,
     handleFeatherSelection: selectionTools.handleFeatherSelection,
     handleAddLayer: handleRecordedAddLayer,
+    handleFillScreentone: tonalActions.handleFillScreentone,
+    toggleTone: handleToggleTone,
     handleOpenAdjustmentModal: tonalActions.handleOpenAdjustmentModal,
     addLayerMask: layerMgr.addLayerMask,
     removeLayerMask: layerMgr.removeLayerMask,
@@ -1018,6 +1143,7 @@ export function App() {
     toggleMaskLinked: layerMgr.toggleMaskLinked,
     duplicateLayer: handleRecordedDuplicateLayer,
     handleMergeDown,
+    handleMergeFolder,
     handleOpenLayerStylesModal: tonalActions.handleOpenLayerStylesModal,
     toggleLayerColor: layerMgr.toggleLayerColor,
     handleConvertLayer: tonalActions.handleConvertLayer,
@@ -1065,7 +1191,7 @@ export function App() {
       startZoomDrag: nav.startZoomDrag,
       onSampleColor: shapeFillTools.handleSampleColor,
       onUndo: handleUndo,
-      onRedo: drawing.redo,
+      onRedo: handleRedo,
       onFlipHorizontal: nav.toggleFlipHorizontal,
       isHovering: drawing.isHovering,
       cursorPos: drawing.cursorPos,
@@ -1175,7 +1301,7 @@ export function App() {
       penTools.handleCancelPenPath,
       penTools.handleClosePenPath,
       handleUndo,
-      drawing.redo,
+      handleRedo,
       activeAnimationTimeline,
       handleUpdateAnimationTimeline,
       handleAddAnimationCel,
@@ -1202,10 +1328,10 @@ export function App() {
       handleFileInputChange={docLifecycle.handleFileInputChange}
       handlePasteFileInputChange={docLifecycle.handlePasteFileInputChange}
       handleImport3DFileInputChange={docLifecycle.handleImport3DFileInputChange}
-      canUndo={drawing.canUndo}
-      canRedo={drawing.canRedo}
+      canUndo={drawing.canUndo || (is3DLayerOpen && canUndo3D)}
+      canRedo={drawing.canRedo || (is3DLayerOpen && canRedo3D)}
       handleUndo={handleUndo}
-      redo={drawing.redo}
+      redo={handleRedo}
       zoom={nav.zoom}
       zoomIn={nav.zoomIn}
       zoomOut={nav.zoomOut}
@@ -1259,7 +1385,7 @@ export function App() {
       moveLayerToFolder={layerMgr.moveLayerToFolder}
       reorderLayers={layerMgr.reorderLayers}
       handleToggleReferenceLayer={handleToggleReferenceLayer}
-      toggleTone={layerMgr.toggleTone}
+      toggleTone={handleToggleTone}
       setToneFrequency={layerMgr.setToneFrequency}
       setToneAngle={layerMgr.setToneAngle}
       setToneDotShape={layerMgr.setToneDotShape}
@@ -1281,6 +1407,7 @@ export function App() {
       handleOpenLayerStylesModal={tonalActions.handleOpenLayerStylesModal}
       onEditVectorLayer={shapeFillTools.openLayerForEditing}
       onRasterizeLayer={handleRasterizeLayer}
+      onMergeFolder={handleMergeFolder}
       onPlayAutoAction={handlePlayAutoAction}
       externalFileDropTarget={externalFileDrop.activeDropTarget}
     >
@@ -1311,7 +1438,7 @@ export function App() {
         isSelectionPenDrawingRef={selectionTools.isSelectionPenDrawingRef}
         isPipetteSamplingRef={shapeFillTools.isPipetteSamplingRef}
         handleUndo={handleUndo}
-        redo={drawing.redo}
+        redo={handleRedo}
         handleAddLayer={collab.handleAddLayer}
         handleTriggerOpenFile={docLifecycle.handleTriggerOpenFile}
         handleSave={docLifecycle.handleSave}

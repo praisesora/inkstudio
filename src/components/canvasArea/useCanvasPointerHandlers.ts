@@ -190,7 +190,9 @@ export function useCanvasPointerHandlers({
           allowDrawingPassThrough &&
           e.button === 0 &&
           e.altKey &&
-          ((tool === 'retouch' && retouchSettings?.mode === 'clone-stamp') || tool === 'pen')
+          ((tool === 'retouch' && retouchSettings?.mode === 'clone-stamp') ||
+            tool === 'pen' ||
+            tool === '3d')
         ) {
           return false;
         }

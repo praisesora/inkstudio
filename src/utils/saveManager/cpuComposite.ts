@@ -1,10 +1,11 @@
-import { CanvasDimensions, LayerItem, isFolderLikeLayer } from '../../types/editor';
+import { CanvasDimensions, LayerItem, isFolderLikeLayer, resolveToneDensityType } from '../../types/editor';
 import { getCanvasCompositeOperation } from '../canvasUtils';
 import {
   buildLayerTree,
   groupTreeNodesForCompositing,
   LayerTreeNode,
 } from '../compositor';
+import { applyScreentoneCPU } from '../screentoneEngine';
 import { applyAdjustment } from '../tonalEngine';
 import { applyMultiFrameClip, renderFrameBorder } from '../frameEngine';
 import { SparseTileGrid, releaseTemporaryCanvas } from '../tileEngine';
@@ -60,6 +61,39 @@ export function compositeCanvasCpuFallback(
     }
     mCtx.putImageData(imgData, 0, 0);
     return { canvas: masked, isTemporary: true };
+  };
+
+  const getPreparedLayerCanvas = (
+    layer: LayerItem,
+    srcCanvas: HTMLCanvasElement,
+    effectiveOpacity: number
+  ): { canvas: HTMLCanvasElement; isTemporary: boolean; opacityBaked: boolean } => {
+    const masked = getMaskedLayerCanvas(layer, srcCanvas);
+    if (!layer.toneEnabled) {
+      return { ...masked, opacityBaked: false };
+    }
+    const toneCanvas = document.createElement('canvas');
+    toneCanvas.width = dimensions.width;
+    toneCanvas.height = dimensions.height;
+    const toneType = resolveToneDensityType(layer);
+    const specDensity = Math.max(0, Math.min(1, (layer.toneDensity ?? 40) / 100));
+    applyScreentoneCPU(masked.canvas, toneCanvas, {
+      frequency: layer.toneFrequency ?? 60,
+      angle: layer.toneAngle ?? 45,
+      dotShape: layer.toneDotShape ?? 'circle',
+      dpi: dimensions.dpi ?? 600,
+      densityType: toneType,
+      specifiedDensity: toneType === 'specified' ? specDensity * effectiveOpacity : specDensity,
+      antiAliasing: false,
+    });
+    if (masked.isTemporary) {
+      releaseTemporaryCanvas(masked.canvas);
+    }
+    return {
+      canvas: toneCanvas,
+      isTemporary: true,
+      opacityBaked: toneType === 'specified',
+    };
   };
 
   const renderTreeNodes = (
@@ -160,7 +194,8 @@ export function compositeCanvasCpuFallback(
 
       const baseAcq = acquireLayerExportCanvas(baseLayer, dimensions, layerCanvasesMap, tileGrid);
       if (!baseAcq.canvas) continue;
-      const maskedBase = getMaskedLayerCanvas(baseLayer, baseAcq.canvas);
+      const baseEffOpacity = Math.max(0, Math.min(1, baseLayer.opacity * opacityMul));
+      const maskedBase = getPreparedLayerCanvas(baseLayer, baseAcq.canvas, baseEffOpacity);
 
       const activeClipped = group.clippedNodes
         .map((n) => n.layer)
@@ -168,7 +203,7 @@ export function compositeCanvasCpuFallback(
 
       if (activeClipped.length === 0) {
         targetCtx.save();
-        targetCtx.globalAlpha = Math.max(0, Math.min(1, baseLayer.opacity * opacityMul));
+        targetCtx.globalAlpha = maskedBase.opacityBaked ? 1.0 : baseEffOpacity;
         targetCtx.globalCompositeOperation = getCanvasCompositeOperation(baseLayer.blendMode);
         targetCtx.drawImage(maskedBase.canvas, 0, 0);
         targetCtx.restore();
@@ -179,17 +214,18 @@ export function compositeCanvasCpuFallback(
         const gCtx = groupCanvas.getContext('2d');
         if (gCtx) {
           gCtx.save();
-          gCtx.globalAlpha = Math.max(0, Math.min(1, baseLayer.opacity * opacityMul));
+          gCtx.globalAlpha = maskedBase.opacityBaked ? 1.0 : baseEffOpacity;
           gCtx.drawImage(maskedBase.canvas, 0, 0);
           gCtx.restore();
 
           for (const clipped of activeClipped) {
             const clipAcq = acquireLayerExportCanvas(clipped, dimensions, layerCanvasesMap, tileGrid);
             if (!clipAcq.canvas) continue;
-            const maskedClip = getMaskedLayerCanvas(clipped, clipAcq.canvas);
+            const clipEffOpacity = Math.max(0, Math.min(1, clipped.opacity * opacityMul));
+            const maskedClip = getPreparedLayerCanvas(clipped, clipAcq.canvas, clipEffOpacity);
 
             gCtx.save();
-            gCtx.globalAlpha = Math.max(0, Math.min(1, clipped.opacity * opacityMul));
+            gCtx.globalAlpha = maskedClip.opacityBaked ? 1.0 : clipEffOpacity;
             gCtx.globalCompositeOperation = 'source-atop';
             gCtx.drawImage(maskedClip.canvas, 0, 0);
             gCtx.restore();

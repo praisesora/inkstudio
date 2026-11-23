@@ -46,7 +46,7 @@ export interface UseDrawingHistoryParams {
   activeLayerIdRef: React.MutableRefObject<string>;
   colorModeRef: React.MutableRefObject<CanvasColorMode>;
   layersRef: React.MutableRefObject<LayerItem[] | undefined>;
-  onUpdateLayerThumbnail: (layerId: string) => void;
+  onUpdateLayerThumbnail: (layerId: string, immediate?: boolean) => void;
   onApplyLayerTreeDeltaRef?: React.MutableRefObject<ApplyLayerTreeDeltaFn | undefined>;
   onUpdateMaskThumbnailRef: React.MutableRefObject<((layerId: string) => void) | undefined>;
   isDrawingRef: React.MutableRefObject<boolean>;
@@ -274,6 +274,36 @@ export function useDrawingHistory({
 
       const hasDeltas = Boolean(tileDeltas && tileDeltas.length > 0);
 
+      // Coalesce rapid continuous property slider edits (e.g. opacity, tone frequency) into one undo step
+      if (
+        !hasDeltas &&
+        layerTreeDelta?.coalesceKey &&
+        layerTreeDelta.beforeLayers &&
+        layerTreeDelta.afterLayers &&
+        historyIndexRef.current >= 0 &&
+        historyIndexRef.current === historyRef.current.length - 1
+      ) {
+        const topItem = historyRef.current[historyIndexRef.current];
+        if (
+          topItem &&
+          topItem.layerTreeDelta?.coalesceKey === layerTreeDelta.coalesceKey &&
+          topItem.layerTreeDelta.beforeLayers &&
+          now - topItem.timestamp <= 800
+        ) {
+          topItem.label = label;
+          topItem.timestamp = now;
+          topItem.timeFormatted = formatTime(now);
+          topItem.layerTreeDelta = {
+            ...topItem.layerTreeDelta,
+            afterLayers: layerTreeDelta.afterLayers,
+            afterActiveLayerId: layerTreeDelta.afterActiveLayerId,
+          };
+          persistSessionHistory(docId);
+          syncHistoryState();
+          return;
+        }
+      }
+
       const item: HistoryItem = {
         id: `hist-${now}-${Math.random().toString(36).substring(2, 7)}`,
         type: actionType,
@@ -451,12 +481,6 @@ export function useDrawingHistory({
               const deltas = await undoCache.resolveDeltas(item);
 
               if (item.layerTreeDelta) {
-                if (deltas && deltas.length > 0) {
-                  grid.applyTileDeltas(deltas, 'undo');
-                  if (multiplayerService.isConnected()) {
-                    multiplayerService.sendTileDeltas(deltas, grid, { force: true });
-                  }
-                }
                 const applied = onApplyLayerTreeDeltaRef?.current?.(item.layerTreeDelta, 'undo');
                 if (applied) {
                   layersRef.current = applied.nextLayers;
@@ -464,6 +488,30 @@ export function useDrawingHistory({
                     activeLayerIdRef.current = applied.nextActiveLayerId;
                   }
                 }
+                if (deltas && deltas.length > 0) {
+                  grid.applyTileDeltas(deltas, 'undo');
+                  if (multiplayerService.isConnected()) {
+                    multiplayerService.sendTileDeltas(deltas, grid, { force: true });
+                  }
+                }
+                const liveLayerIds = new Set((layersRef.current ?? []).map((l) => l.id));
+                const affectedLayerIds = new Set<string>();
+                if (deltas) {
+                  for (const d of deltas) {
+                    affectedLayerIds.add(parseTileKey(d.key).layerId);
+                  }
+                }
+                if (applied) {
+                  for (const added of applied.addedLayers) {
+                    affectedLayerIds.add(added.id);
+                  }
+                }
+                for (const lid of affectedLayerIds) {
+                  if (lid !== targetLayerId && liveLayerIds.has(lid)) {
+                    onUpdateLayerThumbnail(lid, true);
+                  }
+                }
+                grid.notifyChange(true);
               } else if (item.isMaskEdit && targetLayer?.maskCanvas) {
                 const mCtx = get2DContext(targetLayer.maskCanvas);
                 if (mCtx && item.beforeImageData) {
@@ -546,7 +594,7 @@ export function useDrawingHistory({
                 }
                 for (const lid of affectedLayerIds) {
                   if (lid !== targetLayerId) {
-                    onUpdateLayerThumbnail(lid);
+                    onUpdateLayerThumbnail(lid, true);
                   }
                 }
               } else {
@@ -584,7 +632,12 @@ export function useDrawingHistory({
                 }
               }
 
-              onUpdateLayerThumbnail(targetLayerId);
+              if (
+                !item.layerTreeDelta ||
+                (layersRef.current ?? []).some((l) => l.id === targetLayerId)
+              ) {
+                onUpdateLayerThumbnail(targetLayerId, true);
+              }
             }
           }
         } else {
@@ -609,16 +662,25 @@ export function useDrawingHistory({
                   if (multiplayerService.isConnected()) {
                     multiplayerService.sendTileDeltas(deltas, grid, { force: true });
                   }
-                  const affectedLayerIds = new Set<string>();
+                }
+                const liveLayerIds = new Set((layersRef.current ?? []).map((l) => l.id));
+                const affectedLayerIds = new Set<string>();
+                if (deltas) {
                   for (const d of deltas) {
                     affectedLayerIds.add(parseTileKey(d.key).layerId);
                   }
-                  for (const lid of affectedLayerIds) {
-                    if (lid !== targetLayerId) {
-                      onUpdateLayerThumbnail(lid);
-                    }
+                }
+                if (applied) {
+                  for (const added of applied.addedLayers) {
+                    affectedLayerIds.add(added.id);
                   }
                 }
+                for (const lid of affectedLayerIds) {
+                  if (lid !== targetLayerId && liveLayerIds.has(lid)) {
+                    onUpdateLayerThumbnail(lid, true);
+                  }
+                }
+                grid.notifyChange(true);
               } else if (item.isMaskEdit && targetLayer?.maskCanvas) {
                 const mCtx = get2DContext(targetLayer.maskCanvas);
                 if (mCtx && dataToApply) {
@@ -701,7 +763,7 @@ export function useDrawingHistory({
                 }
                 for (const lid of affectedLayerIds) {
                   if (lid !== targetLayerId) {
-                    onUpdateLayerThumbnail(lid);
+                    onUpdateLayerThumbnail(lid, true);
                   }
                 }
               } else {
@@ -739,7 +801,12 @@ export function useDrawingHistory({
                 }
               }
 
-              onUpdateLayerThumbnail(targetLayerId);
+              if (
+                !item.layerTreeDelta ||
+                (layersRef.current ?? []).some((l) => l.id === targetLayerId)
+              ) {
+                onUpdateLayerThumbnail(targetLayerId, true);
+              }
             }
           }
         }

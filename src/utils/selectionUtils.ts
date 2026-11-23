@@ -147,8 +147,23 @@ export function selectionToMask(
   width: number,
   height: number
 ): Uint8Array {
-  if (selection.mask && selection.maskWidth === width && selection.maskHeight === height) {
-    return new Uint8Array(selection.mask);
+  if (selection.mask && selection.maskWidth && selection.maskHeight) {
+    if (selection.maskWidth === width && selection.maskHeight === height) {
+      return new Uint8Array(selection.mask);
+    }
+    const resized = new Uint8Array(width * height);
+    const mw = selection.maskWidth;
+    const mh = selection.maskHeight;
+    const copyW = Math.min(mw, width);
+    const copyH = Math.min(mh, height);
+    for (let y = 0; y < copyH; y++) {
+      const sRow = y * mw;
+      const dRow = y * width;
+      for (let x = 0; x < copyW; x++) {
+        resized[dRow + x] = selection.mask[sRow + x];
+      }
+    }
+    return resized;
   }
 
   const mask = new Uint8Array(width * height);
@@ -165,23 +180,59 @@ export function selectionToMask(
       }
     }
   } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
-    // Rasterize polygon onto offscreen 2D canvas
-    const offCanvas = document.createElement('canvas');
-    offCanvas.width = width;
-    offCanvas.height = height;
-    const offCtx = offCanvas.getContext('2d');
-    if (offCtx) {
-      offCtx.fillStyle = '#ffffff';
-      offCtx.beginPath();
-      offCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-      for (let i = 1; i < selection.polygon.length; i++) {
-        offCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
-      }
-      offCtx.closePath();
-      offCtx.fill();
-      const imgData = offCtx.getImageData(0, 0, width, height);
-      for (let i = 0; i < width * height; i++) {
-        mask[i] = imgData.data[i * 4 + 3];
+    const b = selection.bounds;
+    const x0 = Math.max(0, Math.floor(b.x));
+    const y0 = Math.max(0, Math.floor(b.y));
+    const x1 = Math.min(width, Math.ceil(b.x + b.width));
+    const y1 = Math.min(height, Math.ceil(b.y + b.height));
+    if (x1 > x0 && y1 > y0) {
+      const offCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+      const offCtx = offCanvas ? offCanvas.getContext('2d', { willReadFrequently: true }) : null;
+      if (offCanvas && offCtx) {
+        const CHUNK = 1024;
+        try {
+          for (let cy = y0; cy < y1; cy += CHUNK) {
+            const ch = Math.min(CHUNK, y1 - cy);
+            for (let cx = x0; cx < x1; cx += CHUNK) {
+              const cw = Math.min(CHUNK, x1 - cx);
+              if (offCanvas.width !== cw) offCanvas.width = cw;
+              if (offCanvas.height !== ch) offCanvas.height = ch;
+              offCtx.clearRect(0, 0, cw, ch);
+              offCtx.save();
+              offCtx.translate(-cx, -cy);
+              offCtx.fillStyle = '#ffffff';
+              offCtx.beginPath();
+              offCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+              for (let i = 1; i < selection.polygon.length; i++) {
+                offCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+              }
+              offCtx.closePath();
+              offCtx.fill();
+              offCtx.restore();
+              const imgData = offCtx.getImageData(0, 0, cw, ch);
+              for (let ly = 0; ly < ch; ly++) {
+                const dRow = (cy + ly) * width + cx;
+                const sRow = ly * cw * 4;
+                for (let lx = 0; lx < cw; lx++) {
+                  mask[dRow + lx] = imgData.data[sRow + lx * 4 + 3];
+                }
+              }
+            }
+          }
+        } finally {
+          releaseTemporaryCanvas(offCanvas);
+        }
+      } else {
+        const poly = selection.polygon;
+        for (let y = y0; y < y1; y++) {
+          const row = y * width;
+          const py = y + 0.5;
+          for (let x = x0; x < x1; x++) {
+            if (isPointInPolygon(x + 0.5, py, poly)) {
+              mask[row + x] = 255;
+            }
+          }
+        }
       }
     }
   }
@@ -1317,22 +1368,40 @@ export function fillSelectionInTileGrid(params: {
               }
             }
           }
-        } else if (polyCanvas && pCtx && selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
-          if (polyCanvas.width !== cw) polyCanvas.width = cw;
-          if (polyCanvas.height !== ch) polyCanvas.height = ch;
-          pCtx.clearRect(0, 0, cw, ch);
-          pCtx.save();
-          pCtx.translate(-cx, -cy);
-          pCtx.fillStyle = colorCss;
-          pCtx.beginPath();
-          pCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
-          for (let i = 1; i < selection.polygon.length; i++) {
-            pCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+        } else if (selection.type === 'lasso' && selection.polygon && selection.polygon.length >= 3) {
+          if (polyCanvas && pCtx) {
+            if (polyCanvas.width !== cw) polyCanvas.width = cw;
+            if (polyCanvas.height !== ch) polyCanvas.height = ch;
+            pCtx.clearRect(0, 0, cw, ch);
+            pCtx.save();
+            pCtx.translate(-cx, -cy);
+            pCtx.fillStyle = colorCss;
+            pCtx.beginPath();
+            pCtx.moveTo(selection.polygon[0].x, selection.polygon[0].y);
+            for (let i = 1; i < selection.polygon.length; i++) {
+              pCtx.lineTo(selection.polygon[i].x, selection.polygon[i].y);
+            }
+            pCtx.closePath();
+            pCtx.fill();
+            pCtx.restore();
+            chunkData = pCtx.getImageData(0, 0, cw, ch).data;
+          } else {
+            chunkData = new Uint8ClampedArray(cw * ch * 4);
+            const poly = selection.polygon;
+            for (let ly = 0; ly < ch; ly++) {
+              const gy = cy + ly + 0.5;
+              const dRow = ly * cw * 4;
+              for (let lx = 0; lx < cw; lx++) {
+                if (isPointInPolygon(cx + lx + 0.5, gy, poly)) {
+                  const off = dRow + lx * 4;
+                  chunkData[off] = r;
+                  chunkData[off + 1] = g;
+                  chunkData[off + 2] = b;
+                  chunkData[off + 3] = a;
+                }
+              }
+            }
           }
-          pCtx.closePath();
-          pCtx.fill();
-          pCtx.restore();
-          chunkData = pCtx.getImageData(0, 0, cw, ch).data;
         } else {
           // Solid rect fill
           chunkData = new Uint8ClampedArray(cw * ch * 4);

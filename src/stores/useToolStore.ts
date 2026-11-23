@@ -32,6 +32,8 @@ import { enforceColorMode } from '../utils/colorUtils';
 import { safeLocalStorageSetItem } from '../utils/safeStorage';
 import { createStore } from './createStore';
 import { useDocumentStore } from './useDocumentStore';
+import { uiStoreActions } from './useUiStore';
+import { store3DActions } from './use3DStore';
 
 export interface QuickModifiersState {
   isAltActive: boolean;
@@ -335,6 +337,15 @@ export const toolStoreActions = {
   selectTool(newTool: ToolType): void {
     const state = useToolStore.getState();
     const prevTool = state.tool;
+    if (newTool === '3d') {
+      if (prevTool !== '3d') {
+        store3DActions.setPreviousToolBefore3D(prevTool);
+      }
+      store3DActions.setReferenceVisible(true);
+      if (useDocumentStore.getState().documents.length > 0) {
+        uiStoreActions.set3DLayerOpen(true);
+      }
+    }
     if (prevTool === newTool) return;
 
     if (newTool === 'eraser') {

@@ -1,12 +1,21 @@
 import { useCallback } from 'react';
-import { ExpressionColor, LayerItem } from '../../types/editor';
+import {
+  CanvasSelection,
+  ExpressionColor,
+  LayerItem,
+  LayerTreeDelta,
+  isDedicatedToneLayer,
+  isFolderLikeLayer,
+} from '../../types/editor';
 import { createCanvasThumbnail } from '../../utils/canvasUtils';
 import {
   applyExpressionColorToImageData,
   applyLayerTintToImageData,
 } from '../../utils/layerEffectsEngine';
 import { HalftoneDotShape } from '../../utils/screentoneEngine';
+import { fillSelectionInTileGrid } from '../../utils/selectionUtils';
 import { TILE_SIZE, TileDelta, TileSnapshotEntry } from '../../utils/tileEngine';
+import { createLayerTreeSnapshotDelta } from './layerTreeOps';
 import { LayerCanvasRegistryApi, LayerManagerContext } from './types';
 
 export function useLayerEffects(
@@ -17,194 +26,338 @@ export function useLayerEffects(
     activeTileGridRef,
     dimensionsRef,
     defaultToneFrequencyRef,
-    layers,
+    layersRef,
+    activeLayerIdRef,
     setLayers,
+    recordLayerHistory,
   } = ctx;
   const { updateLayerThumbnail } = canvasRegistry;
 
-  // Toggle non-destructive screentone effect (rendered live on GPU by ViewportCompositor from raw tile data)
-  const toggleTone = useCallback((id: string) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
+  // Toggle non-destructive screentone effect (rendered live on GPU by ViewportCompositor from raw tile data).
+  // When enabling screentone on an empty raster layer while a selection is active, automatically fills
+  // the selection with tone so checking "Screentone" after Lasso/Marquee/Wand works immediately!
+  const toggleTone = useCallback((id: string, activeSelection?: CanvasSelection | null) => {
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target)) return;
 
-      const newEnabled = !target.toneEnabled;
-      const updatedLayer: LayerItem = {
-        ...target,
-        toneEnabled: newEnabled,
-        toneFrequency: target.toneFrequency ?? defaultToneFrequencyRef.current ?? 60,
-        toneAngle: target.toneAngle ?? 45,
-        toneDotShape: target.toneDotShape ?? 'circle',
-        toneDensity: target.toneDensity ?? 40,
-        toneDensityType: target.toneDensityType ?? 'specified',
+    const grid = activeTileGridRef.current;
+    const dims = dimensionsRef.current;
+    const newEnabled = !target.toneEnabled;
+    const shouldFillSelection =
+      newEnabled &&
+      Boolean(activeSelection) &&
+      target.type === 'raster' &&
+      !target.locked &&
+      !grid.hasLayerTiles(id);
+
+    let tileDeltas: TileDelta[] = [];
+    if (shouldFillSelection && activeSelection) {
+      const fillRes = fillSelectionInTileGrid({
+        grid,
+        layerId: id,
+        dimensions: dims,
+        selection: activeSelection,
+        colorCss: 'rgb(0,0,0)',
+        targetFormat: 'color-32bit',
+      });
+      tileDeltas = fillRes.tileDeltas;
+    }
+
+    const isToneLayer = shouldFillSelection ? true : isDedicatedToneLayer(target);
+    const updatedLayer: LayerItem = {
+      ...target,
+      isToneLayer: shouldFillSelection ? true : target.isToneLayer,
+      toneEnabled: newEnabled,
+      toneFrequency: target.toneFrequency ?? defaultToneFrequencyRef.current ?? 60,
+      toneAngle: target.toneAngle ?? 45,
+      toneDotShape: target.toneDotShape ?? 'circle',
+      toneDensity: target.toneDensity ?? 40,
+      toneDensityType: isToneLayer ? 'specified' : 'image',
+    };
+
+    let nextLayers = prev.map((l) => (l.id === id ? updatedLayer : l));
+
+    // Ensure white paper background exists when enabling screentone on a transparent doc
+    const hasBg = prev.some((l) => l.id.startsWith('layer-bg') || l.name.toLowerCase() === 'background');
+    if (newEnabled && !hasBg) {
+      const bgId = `layer-bg-${Date.now()}`;
+      grid.fillLayerSolidWhite(bgId, dims.width, dims.height, 'color-32bit');
+      const bgDeltas = grid.computeDeltasFromSnapshot(new Map(), bgId, {
+        x: 0,
+        y: 0,
+        width: dims.width,
+        height: dims.height,
+      });
+      tileDeltas = [...tileDeltas, ...bgDeltas];
+      const bgThumb = createCanvasThumbnail({ grid, layerId: bgId, dimensions: dims }, false);
+      const bgLayer: LayerItem = {
+        id: bgId,
+        name: 'Background',
+        type: 'raster',
+        visible: true,
+        opacity: 1,
+        blendMode: 'normal',
+        locked: true,
+        parentId: null,
+        thumbnailUrl: bgThumb,
       };
+      nextLayers = [...nextLayers, bgLayer];
+    }
 
-      const grid = activeTileGridRef.current;
-      let nextLayers = prev.map((l) => (l.id === id ? updatedLayer : l));
-
-      // Ensure white paper background exists when enabling screentone on a transparent doc
-      const hasBg = prev.some((l) => l.id.startsWith('layer-bg') || l.name.toLowerCase() === 'background');
-      if (newEnabled && !hasBg) {
-        const bgId = `layer-bg-${Date.now()}`;
-        const dims = dimensionsRef.current;
-        grid.fillLayerSolidWhite(bgId, dims.width, dims.height, 'color-32bit');
-        const bgThumb = createCanvasThumbnail({ grid, layerId: bgId, dimensions: dims }, false);
-        const bgLayer: LayerItem = {
-          id: bgId,
-          name: 'Background',
-          type: 'raster',
-          visible: true,
-          opacity: 1,
-          blendMode: 'normal',
-          locked: true,
-          parentId: null,
-          thumbnailUrl: bgThumb,
-        };
-        nextLayers = [...nextLayers, bgLayer];
-      }
-
-      grid.notifyChange(true);
-      updateLayerThumbnail(id, false);
-      return nextLayers;
-    });
-  }, [activeTileGridRef, defaultToneFrequencyRef, dimensionsRef, setLayers, updateLayerThumbnail]);
+    layersRef.current = nextLayers;
+    setLayers(nextLayers);
+    grid.notifyChange(true);
+    updateLayerThumbnail(id, shouldFillSelection);
+    recordLayerHistory(
+      newEnabled ? (shouldFillSelection ? 'Screentone Selection' : 'Enable Screentone') : 'Disable Screentone',
+      id,
+      createLayerTreeSnapshotDelta(prev, nextLayers, activeLayerIdRef.current, activeLayerIdRef.current),
+      tileDeltas,
+      'screentone'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, defaultToneFrequencyRef, dimensionsRef, layersRef, recordLayerHistory, setLayers, updateLayerThumbnail]);
 
   // Update screentone frequency (Lines / LPI, 20 to 85)
   const setToneFrequency = useCallback((id: string, frequency: number) => {
     const clampedFreq = Math.max(20, Math.min(85, Math.round(frequency)));
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, toneFrequency: clampedFreq } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.toneFrequency === clampedFreq) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, toneFrequency: clampedFreq } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Screentone Frequency',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current, {
+        coalesceKey: `toneFreq:${id}`,
+      }),
+      undefined,
+      'screentone'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update screentone angle (0 to 90 degrees)
   const setToneAngle = useCallback((id: string, angle: number) => {
     const clampedAngle = Math.max(0, Math.min(90, Math.round(angle)));
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, toneAngle: clampedAngle } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.toneAngle === clampedAngle) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, toneAngle: clampedAngle } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Screentone Angle',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current, {
+        coalesceKey: `toneAngle:${id}`,
+      }),
+      undefined,
+      'screentone'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update screentone dot shape (default: circle)
   const setToneDotShape = useCallback((id: string, dotShape: HalftoneDotShape) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, toneDotShape: dotShape } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.toneDotShape === dotShape) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, toneDotShape: dotShape } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Screentone Dot Shape',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current),
+      undefined,
+      'screentone'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update screentone density (1 to 100%)
   const setToneDensity = useCallback((id: string, density: number) => {
     const clampedDensity = Math.max(1, Math.min(100, Math.round(density)));
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, toneDensity: clampedDensity } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.toneDensity === clampedDensity) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, toneDensity: clampedDensity } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Screentone Density',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current, {
+        coalesceKey: `toneDensity:${id}`,
+      }),
+      undefined,
+      'screentone'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update screentone density mode ('specified' vs 'image')
   const setToneDensityType = useCallback((id: string, densityType: 'specified' | 'image') => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, toneDensityType: densityType } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.toneDensityType === densityType) return;
+    const next = prev.map((l) =>
+      l.id === id
+        ? { ...l, toneDensityType: densityType, isToneLayer: densityType === 'specified' }
+        : l
+    );
+    layersRef.current = next;
+    setLayers(next);
+    if (target.toneEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Screentone Density Mode',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current),
+      undefined,
+      'screentone'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Toggle non-destructive Layer Color (Tint) effect (rendered on GPU)
   const toggleLayerColor = useCallback((id: string) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target)) return;
 
-      const updatedLayer: LayerItem = {
-        ...target,
-        layerColorEnabled: !target.layerColorEnabled,
-        layerColor: target.layerColor || '#1c73c2',
-        layerSubColor: target.layerSubColor || '#ffffff',
-      };
-      activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? updatedLayer : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const updatedLayer: LayerItem = {
+      ...target,
+      layerColorEnabled: !target.layerColorEnabled,
+      layerColor: target.layerColor || '#1c73c2',
+      layerSubColor: target.layerSubColor || '#ffffff',
+    };
+    const next = prev.map((l) => (l.id === id ? updatedLayer : l));
+    layersRef.current = next;
+    setLayers(next);
+    activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      updatedLayer.layerColorEnabled ? 'Enable Layer Tint' : 'Disable Layer Tint',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current),
+      undefined,
+      'layer-color'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update Layer Color (Tint primary color)
   const setLayerColor = useCallback((id: string, color: string) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.layerColorEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, layerColor: color } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.layerColor === color) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, layerColor: color } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.layerColorEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Layer Tint Color',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current, {
+        coalesceKey: `layerColor:${id}`,
+      }),
+      undefined,
+      'layer-color'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update Layer Sub Color (Tint secondary color)
   const setLayerSubColor = useCallback((id: string, color: string) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.layerColorEnabled) activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, layerSubColor: color } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.layerSubColor === color) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, layerSubColor: color } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.layerColorEnabled) activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Layer Sub Color',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current, {
+        coalesceKey: `layerSubColor:${id}`,
+      }),
+      undefined,
+      'layer-color'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update non-destructive Expression Color preview ('color' | 'gray' | 'monochrome')
   const setLayerExpressionColor = useCallback((id: string, mode: ExpressionColor) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.expressionColor === mode) return;
 
-      const updatedLayer: LayerItem = {
-        ...target,
-        expressionColor: mode,
-        monoThreshold: target.monoThreshold ?? 128,
-        monoExpressBlack: target.monoExpressBlack ?? true,
-        monoExpressWhite: target.monoExpressWhite ?? true,
-      };
-      activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? updatedLayer : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const updatedLayer: LayerItem = {
+      ...target,
+      expressionColor: mode,
+      monoThreshold: target.monoThreshold ?? 128,
+      monoExpressBlack: target.monoExpressBlack ?? true,
+      monoExpressWhite: target.monoExpressWhite ?? true,
+    };
+    const next = prev.map((l) => (l.id === id ? updatedLayer : l));
+    layersRef.current = next;
+    setLayers(next);
+    activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      `Expression Color (${mode})`,
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current),
+      undefined,
+      'expression-color'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update Monochrome Color threshold (1 - 255)
   const setLayerMonoThreshold = useCallback((id: string, threshold: number) => {
     const clamped = Math.max(1, Math.min(255, Math.round(threshold)));
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.expressionColor === 'monochrome') activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) => (l.id === id ? { ...l, monoThreshold: clamped } : l));
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target) || target.monoThreshold === clamped) return;
+    const next = prev.map((l) => (l.id === id ? { ...l, monoThreshold: clamped } : l));
+    layersRef.current = next;
+    setLayers(next);
+    if (target.expressionColor === 'monochrome') activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Monochrome Threshold',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current, {
+        coalesceKey: `monoThreshold:${id}`,
+      }),
+      undefined,
+      'expression-color'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Update Monochrome Express Colors (express black, express white)
   const setLayerMonoExpressMode = useCallback((id: string, expressBlack: boolean, expressWhite: boolean) => {
-    setLayers((prev) => {
-      const target = prev.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return prev;
-      if (target.expressionColor === 'monochrome') activeTileGridRef.current.notifyChange(true);
-      return prev.map((l) =>
-        l.id === id ? { ...l, monoExpressBlack: expressBlack, monoExpressWhite: expressWhite } : l
-      );
-    });
-  }, [activeTileGridRef, setLayers]);
+    const prev = layersRef.current;
+    const target = prev.find((l) => l.id === id);
+    if (!target || isFolderLikeLayer(target)) return;
+    const next = prev.map((l) =>
+      l.id === id ? { ...l, monoExpressBlack: expressBlack, monoExpressWhite: expressWhite } : l
+    );
+    layersRef.current = next;
+    setLayers(next);
+    if (target.expressionColor === 'monochrome') activeTileGridRef.current.notifyChange(true);
+    recordLayerHistory(
+      'Monochrome Expression',
+      id,
+      createLayerTreeSnapshotDelta(prev, next, activeLayerIdRef.current, activeLayerIdRef.current),
+      undefined,
+      'expression-color'
+    );
+  }, [activeLayerIdRef, activeTileGridRef, layersRef, recordLayerHistory, setLayers]);
 
   // Bake previewed expression color permanently into SparseTileGrid tiles (tile-native, zero full-doc canvas)
   const applyExpressionColorOfPreview = useCallback(
     (id: string): { tileDeltas: TileDelta[] } | null => {
-      const target = layers.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return null;
+      const target = layersRef.current.find((l) => l.id === id);
+      if (!target || isFolderLikeLayer(target)) return null;
 
       const exprMode = target.expressionColor || 'color';
       if (exprMode === 'color') return null;
@@ -241,14 +394,15 @@ export function useLayerEffects(
       updateLayerThumbnail(id, true);
       return { tileDeltas };
     },
-    [activeTileGridRef, layers, updateLayerThumbnail]
+    [activeTileGridRef, layersRef, updateLayerThumbnail]
   );
 
   // Bake layer color tint permanently into SparseTileGrid tiles and disable layerColorEnabled
   const applyLayerColorPermanently = useCallback(
-    (id: string): { tileDeltas: TileDelta[] } | null => {
-      const target = layers.find((l) => l.id === id);
-      if (!target || target.type === 'folder' || !target.layerColorEnabled) return null;
+    (id: string): { tileDeltas: TileDelta[]; layerTreeDelta: LayerTreeDelta } | null => {
+      const prev = layersRef.current;
+      const target = prev.find((l) => l.id === id);
+      if (!target || isFolderLikeLayer(target) || !target.layerColorEnabled) return null;
 
       const grid = activeTileGridRef.current;
       const beforeSnapshot = new Map<string, TileSnapshotEntry>();
@@ -266,20 +420,26 @@ export function useLayerEffects(
         }
       );
 
-      setLayers((prev) =>
-        prev.map((l) => (l.id === id ? { ...l, layerColorEnabled: false } : l))
+      const next = prev.map((l) => (l.id === id ? { ...l, layerColorEnabled: false } : l));
+      layersRef.current = next;
+      setLayers(next);
+      const layerTreeDelta = createLayerTreeSnapshotDelta(
+        prev,
+        next,
+        activeLayerIdRef.current,
+        activeLayerIdRef.current
       );
 
       if (!modified) {
         grid.notifyChange(true);
-        return { tileDeltas: [] };
+        return { tileDeltas: [], layerTreeDelta };
       }
 
       const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, id);
       updateLayerThumbnail(id, true);
-      return { tileDeltas };
+      return { tileDeltas, layerTreeDelta };
     },
-    [activeTileGridRef, layers, setLayers, updateLayerThumbnail]
+    [activeLayerIdRef, activeTileGridRef, layersRef, setLayers, updateLayerThumbnail]
   );
 
   // Direct permanent conversion of any layer to Color, Gray, or Monochrome (tile-native)
@@ -288,9 +448,10 @@ export function useLayerEffects(
       id: string,
       targetMode: ExpressionColor,
       options?: { threshold?: number; expressBlack?: boolean; expressWhite?: boolean }
-    ): { tileDeltas: TileDelta[] } | null => {
-      const target = layers.find((l) => l.id === id);
-      if (!target || target.type === 'folder') return null;
+    ): { tileDeltas: TileDelta[]; layerTreeDelta: LayerTreeDelta } | null => {
+      const prev = layersRef.current;
+      const target = prev.find((l) => l.id === id);
+      if (!target || isFolderLikeLayer(target)) return null;
 
       const grid = activeTileGridRef.current;
       const beforeSnapshot = new Map<string, TileSnapshotEntry>();
@@ -334,12 +495,20 @@ export function useLayerEffects(
 
       grid.setLayerFormat(id, targetFormat);
       const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, id);
-      setLayers((prev) => prev.map((l) => (l.id === id ? updatedLayer : l)));
+      const next = prev.map((l) => (l.id === id ? updatedLayer : l));
+      layersRef.current = next;
+      setLayers(next);
       grid.notifyChange(true);
       updateLayerThumbnail(id, true);
-      return { tileDeltas };
+      const layerTreeDelta = createLayerTreeSnapshotDelta(
+        prev,
+        next,
+        activeLayerIdRef.current,
+        activeLayerIdRef.current
+      );
+      return { tileDeltas, layerTreeDelta };
     },
-    [activeTileGridRef, layers, setLayers, updateLayerThumbnail]
+    [activeLayerIdRef, activeTileGridRef, layersRef, setLayers, updateLayerThumbnail]
   );
 
   return {

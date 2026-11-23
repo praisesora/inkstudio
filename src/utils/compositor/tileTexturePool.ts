@@ -129,7 +129,8 @@ export function getOrUploadArrayTileSlice(
 export function getTileTexture(
   state: CompositorState,
   tile: TileBuffer,
-  grid: SparseTileGrid
+  grid: SparseTileGrid,
+  forceNearest: boolean = false
 ): WebGLTexture | null {
   if (!state.gl) return null;
   const gl = state.gl;
@@ -179,15 +180,17 @@ export function getTileTexture(
 
   slot.lastUsed = accessTick;
   const desiredTier =
-    state.filteringQuality === 'smooth'
-      ? 1
-      : state.filteringQuality === 'pixelated'
-        ? 2
-        : state.currentZoom < 0.99
-          ? 0
-          : state.currentZoom < 2.0
-            ? 1
-            : 2;
+    forceNearest
+      ? 2
+      : state.filteringQuality === 'smooth'
+        ? 1
+        : state.filteringQuality === 'pixelated'
+          ? 2
+          : state.currentZoom < 0.99
+            ? 0
+            : state.currentZoom < 2.0
+              ? 1
+              : 2;
 
   // Re-upload if version changed (direct GPU unpack premultiplication, zero JS pixel loop)
   if (slot.version !== tile.version) {
@@ -262,6 +265,8 @@ export function getMaskTexture(state: CompositorState, layer: LayerItem): WebGLT
   const currentVersion = layer.maskVersion ?? 0;
   const maskW = layer.maskCanvas.width;
   const maskH = layer.maskCanvas.height;
+  const useNearest =
+    (Boolean(layer.toneEnabled) || layer.expressionColor === 'monochrome') && state.currentZoom >= 0.99;
 
   if (!cached) {
     const tex = gl.createTexture();
@@ -270,12 +275,13 @@ export function getMaskTexture(state: CompositorState, layer: LayerItem): WebGLT
     state.maskTextureCache.set(layer.id, cached);
   }
 
+  const maskFilter = useNearest ? gl.NEAREST : gl.LINEAR;
   if (cached.version !== currentVersion || cached.width !== maskW || cached.height !== maskH) {
     gl.bindTexture(gl.TEXTURE_2D, cached.texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, maskFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, maskFilter);
 
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(
@@ -290,6 +296,10 @@ export function getMaskTexture(state: CompositorState, layer: LayerItem): WebGLT
     cached.version = currentVersion;
     cached.width = maskW;
     cached.height = maskH;
+  } else {
+    gl.bindTexture(gl.TEXTURE_2D, cached.texture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, maskFilter);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, maskFilter);
   }
 
   return cached.texture;

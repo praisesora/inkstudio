@@ -290,7 +290,7 @@ export function getCursorStyle({
   if (tool === 'liquify' || tool === 'retouch') {
     return { cursor: isOverCanvas ? 'none' : 'default' };
   }
-  if (tool === 'transform') {
+  if (tool === 'transform' || tool === '3d') {
     return { cursor: 'default' };
   }
   if (tool === 'brush' || tool === 'eraser' || tool === 'select-pen' || tool === 'select-eraser') {

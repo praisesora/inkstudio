@@ -61,6 +61,20 @@ export interface ProcessingBounds {
   y1: number;
 }
 
+function pointInPolygonLocal(px: number, py: number, polygon: Array<{ x: number; y: number }>): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x;
+    const yi = polygon[i].y;
+    const xj = polygon[j].x;
+    const yj = polygon[j].y;
+    const intersect = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
 /**
  * Creates an ultra-fast 1-byte lookup mask for active selection.
  * Returns null if no selection is active (meaning full canvas is processed).
@@ -70,13 +84,27 @@ export function createSelectionMask(
   width: number,
   height: number
 ): Uint8Array | null {
-  if (!selection) return null;
+  if (!selection || width <= 0 || height <= 0) return null;
 
-  if (selection.mask && selection.maskWidth === width && selection.maskHeight === height) {
+  if (selection.mask && selection.maskWidth && selection.maskHeight) {
     const mask = new Uint8Array(width * height);
     const src = selection.mask;
-    for (let i = 0; i < src.length; i++) {
-      if (src[i] >= 64) mask[i] = 1;
+    const mw = selection.maskWidth;
+    const mh = selection.maskHeight;
+    if (mw === width && mh === height) {
+      for (let i = 0; i < src.length; i++) {
+        if (src[i] >= 64) mask[i] = 1;
+      }
+      return mask;
+    }
+    const copyW = Math.min(mw, width);
+    const copyH = Math.min(mh, height);
+    for (let y = 0; y < copyH; y++) {
+      const sRow = y * mw;
+      const dRow = y * width;
+      for (let x = 0; x < copyW; x++) {
+        if (src[sRow + x] >= 64) mask[dRow + x] = 1;
+      }
     }
     return mask;
   }
@@ -98,27 +126,67 @@ export function createSelectionMask(
   }
 
   if (type === 'lasso' && polygon && polygon.length >= 3) {
-    const offCanvas = document.createElement('canvas');
-    offCanvas.width = width;
-    offCanvas.height = height;
-    const ctx = offCanvas.getContext('2d', { willReadFrequently: true });
-    if (!ctx) return null;
+    // Rasterize strictly within clamped selection bounds (avoids huge full-doc allocations on 600 DPI canvases)
+    const x0 = Math.max(0, Math.floor(bounds.x));
+    const y0 = Math.max(0, Math.floor(bounds.y));
+    const x1 = Math.min(width, Math.ceil(bounds.x + bounds.width));
+    const y1 = Math.min(height, Math.ceil(bounds.y + bounds.height));
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    if (bw <= 0 || bh <= 0) return mask;
 
-    ctx.beginPath();
-    ctx.moveTo(polygon[0].x, polygon[0].y);
-    for (let i = 1; i < polygon.length; i++) {
-      ctx.lineTo(polygon[i].x, polygon[i].y);
+    const offCanvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
+    const ctx = offCanvas ? offCanvas.getContext('2d', { willReadFrequently: true }) : null;
+    if (offCanvas && ctx) {
+      const CHUNK = 1024;
+      try {
+        for (let cy = y0; cy < y1; cy += CHUNK) {
+          const ch = Math.min(CHUNK, y1 - cy);
+          for (let cx = x0; cx < x1; cx += CHUNK) {
+            const cw = Math.min(CHUNK, x1 - cx);
+            if (offCanvas.width !== cw) offCanvas.width = cw;
+            if (offCanvas.height !== ch) offCanvas.height = ch;
+            ctx.clearRect(0, 0, cw, ch);
+            ctx.save();
+            ctx.translate(-cx, -cy);
+            ctx.beginPath();
+            ctx.moveTo(polygon[0].x, polygon[0].y);
+            for (let i = 1; i < polygon.length; i++) {
+              ctx.lineTo(polygon[i].x, polygon[i].y);
+            }
+            ctx.closePath();
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+            ctx.restore();
+
+            const imgData = ctx.getImageData(0, 0, cw, ch);
+            const d = imgData.data;
+            for (let ly = 0; ly < ch; ly++) {
+              const dstRow = (cy + ly) * width + cx;
+              const srcRow = ly * cw * 4;
+              for (let lx = 0; lx < cw; lx++) {
+                if (d[srcRow + lx * 4 + 3] > 64) {
+                  mask[dstRow + lx] = 1;
+                }
+              }
+            }
+          }
+        }
+      } finally {
+        offCanvas.width = 0;
+        offCanvas.height = 0;
+      }
+      return mask;
     }
-    ctx.closePath();
-    ctx.fillStyle = '#ffffff';
-    ctx.fill();
 
-    const imgData = ctx.getImageData(0, 0, width, height);
-    const d = imgData.data;
-    const totalPixels = width * height;
-    for (let i = 0; i < totalPixels; i++) {
-      if (d[i * 4 + 3] > 64) {
-        mask[i] = 1;
+    // Pure-math fallback when 2D canvas context is unavailable
+    for (let y = y0; y < y1; y++) {
+      const rowOffset = y * width;
+      const py = y + 0.5;
+      for (let x = x0; x < x1; x++) {
+        if (pointInPolygonLocal(x + 0.5, py, polygon)) {
+          mask[rowOffset + x] = 1;
+        }
       }
     }
     return mask;

@@ -1,4 +1,4 @@
-import { LayerItem } from '../../types/editor';
+import { LayerItem, resolveToneDensityType } from '../../types/editor';
 import { hasActiveLayerStyles } from './shaders/effectShaders';
 import { partitionLayerStack } from './layerTree';
 import {
@@ -23,7 +23,7 @@ function serializeLayerNodeSignature(
   const stylesSig = hasActiveLayerStyles(l.styles) ? JSON.stringify(l.styles) : '';
   const adjSig = l.type === 'adjustment' && l.adjustmentData ? JSON.stringify(l.adjustmentData) : '';
   const toneSig = l.toneEnabled
-    ? `1:${l.toneFrequency ?? 60}:${l.toneAngle ?? 45}:${l.toneDotShape ?? ''}:${l.toneDensity ?? 40}:${l.toneDensityType ?? ''}`
+    ? `1:${l.toneFrequency ?? 60}:${l.toneAngle ?? 45}:${l.toneDotShape ?? ''}:${l.toneDensity ?? 40}:${resolveToneDensityType(l)}`
     : '0';
   const tintSig = l.layerColorEnabled
     ? `1:${l.layerColor ?? ''}:${l.layerSubColor ?? ''}`

@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { CanvasDimensions, LayerItem } from '../types/editor';
+import { CanvasDimensions, HistoryActionType, LayerItem, LayerTreeDelta, TileDelta } from '../types/editor';
 import { SparseTileGrid, globalTileGrid } from '../utils/tileEngine';
 import { documentStore } from '../utils/documentStore';
 import { recoveryService } from '../services/recoveryService';
@@ -22,13 +22,21 @@ export {
   computeLayerSelection,
   computeBatchDeleteLayers,
   computeGroupLayers,
+  getFolderDescendantIds,
+  computeMergeFolderLayers,
   computeBatchReorderLayers,
   computeBatchVisibility,
   computeBatchLock,
   applyLayerTreeDelta,
+  createLayerTreeSnapshotDelta,
 } from './layerManager/layerTreeOps';
 
-export function useLayerManager({ dimensions: _dimensions, activeSessionId, tileGrid }: UseLayerManagerProps) {
+export function useLayerManager({
+  dimensions: _dimensions,
+  activeSessionId,
+  tileGrid,
+  pushHistoryStepRef,
+}: UseLayerManagerProps) {
   // Active document's SparseTileGrid (isolated per document tab)
   const activeTileGridRef = useRef<SparseTileGrid>(
     tileGrid ?? (activeSessionId ? documentStore.getOrCreateSession(activeSessionId).tileGrid : globalTileGrid)
@@ -146,6 +154,47 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     setSelectedLayerIds(res.nextSelectedIds);
   }, [setSelectedLayerIds]);
 
+  const suppressHistoryDepthRef = useRef<number>(0);
+
+  const recordLayerHistory = useCallback(
+    (
+      label: string,
+      targetLayerId: string,
+      layerTreeDelta?: LayerTreeDelta,
+      tileDeltas?: TileDelta[],
+      actionType: HistoryActionType = 'layer'
+    ) => {
+      if (suppressHistoryDepthRef.current > 0) return;
+      const pushFn = pushHistoryStepRef?.current;
+      if (!pushFn) return;
+      if (!layerTreeDelta && (!tileDeltas || tileDeltas.length === 0)) return;
+      pushFn(
+        actionType,
+        label,
+        null,
+        null,
+        targetLayerId,
+        undefined,
+        tileDeltas && tileDeltas.length > 0 ? tileDeltas : undefined,
+        undefined,
+        undefined,
+        undefined,
+        false,
+        layerTreeDelta
+      );
+    },
+    [pushHistoryStepRef]
+  );
+
+  const runWithoutLayerHistory = useCallback(<T,>(fn: () => T): T => {
+    suppressHistoryDepthRef.current += 1;
+    try {
+      return fn();
+    } finally {
+      suppressHistoryDepthRef.current = Math.max(0, suppressHistoryDepthRef.current - 1);
+    }
+  }, []);
+
   const ctx: LayerManagerContext = {
     dimensions: _dimensions,
     activeTileGridRef,
@@ -162,6 +211,8 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     selectedLayerIds,
     setSelectedLayerIds,
     selectedLayerIdsRef,
+    suppressHistoryDepthRef,
+    recordLayerHistory,
   };
 
   const canvasRegistry = useLayerCanvasRegistry(ctx);
@@ -238,6 +289,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     isLayerEffectivelyVisible: crud.isLayerEffectivelyVisible,
     clearActiveLayer: documentOps.clearActiveLayer,
     mergeDown: documentOps.mergeDown,
+    mergeFolder: documentOps.mergeFolder,
     resetToNewCanvas: documentOps.resetToNewCanvas,
     setDefaultToneFrequency: (freq: number) => {
       defaultToneFrequencyRef.current = Math.max(20, Math.min(85, Math.round(freq || 60)));
@@ -248,6 +300,7 @@ export function useLayerManager({ dimensions: _dimensions, activeSessionId, tile
     addLayerMask: propertiesAndMasks.addLayerMask,
     removeLayerMask: propertiesAndMasks.removeLayerMask,
     toggleLayerMask: propertiesAndMasks.toggleLayerMask,
+    runWithoutLayerHistory,
     toggleMaskLinked: propertiesAndMasks.toggleMaskLinked,
     updateMaskThumbnail: propertiesAndMasks.updateMaskThumbnail,
     addAdjustmentLayer: propertiesAndMasks.addAdjustmentLayer,

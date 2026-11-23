@@ -87,6 +87,7 @@ export interface BrushRenderOptions {
   taper?: CspTaperSettings;
   colorMixing?: boolean;
   perceptualMixing?: boolean;
+  pigmentMixingStrength?: number;
   amountOfPaint?: number;
   densityOfPaint?: number;
   colorStretch?: number;
@@ -1876,7 +1877,8 @@ function sampleAndMixColor(
     flow,
     stepDist,
     options.perceptualMixing !== false,
-    pressureAlreadyApplied
+    pressureAlreadyApplied,
+    options.pigmentMixingStrength ?? 1.0
   );
 
   // Spacing-aware alpha normalization for dense mixing strokes: prevents hard opaque walls
@@ -2044,6 +2046,7 @@ export function drawBrushDot(
       colorStretch: options.colorStretch ?? 0.75,
       mixingMode: options.mixingMode ?? 'blend',
       perceptualMixing: options.perceptualMixing !== false,
+      pigmentMixingStrength: options.pigmentMixingStrength ?? 1.0,
       tipImage: activeTip,
       sampler: options.sampler,
       grainDensity: grainAmount,
@@ -2606,6 +2609,7 @@ export function drawBrushCubicBezierSegment(
           colorStretch: options.colorStretch ?? 0.75,
           mixingMode: options.mixingMode ?? 'blend',
           perceptualMixing: options.perceptualMixing !== false,
+          pigmentMixingStrength: options.pigmentMixingStrength ?? 1.0,
           tipImage: activeTip,
           sampler: options.sampler,
           grainDensity: grainAmount,
@@ -2866,6 +2870,7 @@ export function buildBrushRenderOptions(
     taper: bs.taper,
     colorMixing: bs.colorMixing,
     perceptualMixing: bs.perceptualMixing,
+    pigmentMixingStrength: bs.naturalPaint?.pigmentMixingStrength ?? 1.0,
     amountOfPaint: bs.amountOfPaint,
     densityOfPaint: bs.densityOfPaint,
     colorStretch: bs.colorStretch,

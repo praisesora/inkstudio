@@ -119,6 +119,7 @@ const TOOL_TYPES_LIST: ToolType[] = [
   'liquify',
   'shape',
   'object',
+  '3d',
 ];
 
 export const DEEP_LINK_SCHEME = 'inkstudio:';

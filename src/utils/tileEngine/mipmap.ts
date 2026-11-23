@@ -267,7 +267,10 @@ export function getOrBuildLodTiles(
   const occ = host.layerLodOccupancy.get(layerId);
   const lodOccMap = occ ? occ[lod - 1] : null;
   if (!lodOccMap || lodOccMap.size === 0) {
-    return host.getLayerTiles(layerId, lod);
+    // Only return manually-populated clean LOD tiles (never stale dirty LOD tiles left behind after deletes)
+    return host
+      .getLayerTiles(layerId, lod)
+      .filter((t) => !isLodTileDirty(host, layerId, t.tileX, t.tileY, lod));
   }
 
   const result: TileBuffer[] = [];

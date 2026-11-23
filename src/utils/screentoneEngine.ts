@@ -43,8 +43,9 @@ export interface ScreentoneOptions {
   solidBlackAtMax?: boolean;
 
   /**
-   * Sub-pixel edge anti-aliasing for smooth on-screen display without moiré or staircase aliasing.
-   * Set false for strict 1-bit binary output (e.g. monochrome print). (default: true)
+   * Sub-pixel edge anti-aliasing for dots.
+   * Clip Studio Paint screentones are strictly 1-bit binary (pure black ink / transparent paper)
+   * with zero gray fringe. (default: false)
    */
   antiAliasing?: boolean;
 
@@ -62,10 +63,17 @@ export interface ScreentoneOptions {
   specifiedDensity?: number;
 
   /**
-   * Viewport zoom scale. When zoom < 1.0, automatically crossfades into equivalent
-   * continuous grayscale luminance to eliminate spatial aliasing and moiré patterns.
+   * Viewport zoom scale. When zoom < 1.0, smoothly prevents moiré at low zoom levels
+   * while keeping 100%+ zoom strictly 1-bit binary.
    */
   zoom?: number;
+
+  /**
+   * Optional document-space origin offset for tile-local CPU rendering so every tile
+   * aligns seamlessly to the global document halftone lattice.
+   */
+  docOriginX?: number;
+  docOriginY?: number;
 }
 
 // Runtime system endianness check for ultra-fast 32-bit pixel writes
@@ -93,18 +101,82 @@ export function fract(t: number): number {
   return t - Math.floor(t);
 }
 
+const TWO_PI = Math.PI * 2.0;
+const PI_OVER_4 = Math.PI * 0.25;
+const INV_PI = 1.0 / Math.PI;
+const ONE_MINUS_PI_OVER_4 = 1.0 - PI_OVER_4;
+
+export interface RationalHalftoneBasis {
+  a: number;
+  b: number;
+  denom: number;
+}
+
 /**
- * Evaluates the mathematical Clip Studio Paint style halftone formula for a single
- * document-space point (x, y) with a given ink density in [0.0, 1.0].
+ * Computes an exact integer-lattice orthogonal basis (a, b) & (-b, a) for Clip Studio Paint /
+ * Holladay rational-tangent halftone screening. Snapping the rotated cell vector to the integer
+ * pixel grid ensures every single screentone dot across the entire canvas is bit-for-bit
+ * identical with zero irrational-angle shape drift or beating artifacts.
+ */
+export function computeRationalHalftoneBasis(
+  cellSize: number,
+  cosA: number,
+  sinA: number
+): RationalHalftoneBasis {
+  const safeCell = Math.max(2.0, cellSize);
+  let a = Math.round(safeCell * cosA);
+  let b = Math.round(safeCell * sinA);
+  if (a * a + b * b < 4) {
+    const fallback = Math.max(2, Math.round(safeCell));
+    if (Math.abs(cosA) >= Math.abs(sinA)) {
+      a = cosA >= 0 ? fallback : -fallback;
+      b = 0;
+    } else {
+      a = 0;
+      b = sinA >= 0 ? fallback : -fallback;
+    }
+  }
+  return { a, b, denom: a * a + b * b };
+}
+
+/**
+ * Exact area-calibrated circle dot radius inside [-0.5, 0.5]^2 for density in [0, 1].
+ * - 0% to 78.54% (π/4): exact geometric circle radius R = sqrt(density / π)
+ * - 78.54% to 100%: smooth clipped-circle continuation to R = sqrt(2)/2 (max area error < 0.37%)
+ */
+function circleDotRadius(density: number): number {
+  if (density <= PI_OVER_4) {
+    return Math.sqrt(density * INV_PI);
+  }
+  const t = Math.max(0.0, (1.0 - density) / ONE_MINUS_PI_OVER_4);
+  return Math.SQRT1_2 - (Math.SQRT1_2 - 0.5) * Math.pow(t, 0.43);
+}
+
+/**
+ * Area-calibrated threshold for smooth continuous Euclidean (cosine) spot function
+ * spot(u, v) = 0.5 + 0.25 * (cos(2π u) + cos(2π v)).
+ */
+function euclideanSpotThreshold(density: number): number {
+  const u = density <= 0.5 ? 2.0 * density : 2.0 * (1.0 - density);
+  const offset = 0.78539816 * u - 0.28539816 * u * u;
+  return density <= 0.5 ? 1.0 - offset : offset;
+}
+
+/**
+ * Area-calibrated threshold for diamond spot function spot(u, v) = 1.0 - (|u| + |v|).
+ */
+function diamondSpotThreshold(density: number): number {
+  return density <= 0.5
+    ? 1.0 - Math.sqrt(0.5 * density)
+    : Math.sqrt(0.5 * (1.0 - density));
+}
+
+/**
+ * Evaluates the exact 1-bit binary Clip Studio Paint halftone formula for a single
+ * document-space pixel (x, y) with ink density in [0.0, 1.0].
  *
- * Formula:
- *  xr = x * cos(θ) - y * sin(θ)
- *  yr = x * sin(θ) + y * cos(θ)
- *  u = fract(xr / cellSize) - 0.5
- *  v = fract(yr / cellSize) - 0.5
- *  dist = sqrt(u * u + v * v)
- *  dotRadius = sqrt(density) * 0.5
- *  Binary Threshold: dist <= dotRadius => pure black (true), else transparent (false)
+ * Uses rational integer-lattice screening so every dot on the canvas has an identical,
+ * razor-sharp symmetric 1-bit bitmap shape with zero floating-point drift.
  */
 export function evaluateHalftoneDot(
   x: number,
@@ -119,41 +191,35 @@ export function evaluateHalftoneDot(
   if (density <= 0.001) return false;
   if (solidBlackAtMax && density >= 0.999) return true;
 
-  // 1. Coordinate Transformation in document space
-  const xr = x * cosA - y * sinA;
-  const yr = x * sinA + y * cosA;
+  const px = Math.floor(x);
+  const py = Math.floor(y);
+  const { a, b, denom } = computeRationalHalftoneBasis(cellSize, cosA, sinA);
 
-  // 2. Normalized Cell Coordinates centered in [-0.5, 0.5]
-  const invCellSize = 1.0 / cellSize;
-  const u = (xr * invCellSize) - Math.floor(xr * invCellSize) - 0.5;
-  const v = (yr * invCellSize) - Math.floor(yr * invCellSize) - 0.5;
+  const xr = px * a - py * b;
+  const yr = px * b + py * a;
+  const invDenom = 1.0 / denom;
+
+  const u = ((((xr % denom) + denom) % denom) * invDenom) - 0.5;
+  const v = ((((yr % denom) + denom) % denom) * invDenom) - 0.5;
 
   if (dotShape === 'line') {
     const spot = 1.0 - 2.0 * Math.abs(u);
-    return spot >= (1.0 - density);
+    return spot >= 1.0 - density;
   }
 
   if (dotShape === 'diamond') {
     const spot = 1.0 - (Math.abs(u) + Math.abs(v));
-    return spot >= (1.0 - density);
+    return spot >= diamondSpotThreshold(density);
   }
 
-  // Authentic Manga / Clip Studio Euclidean Round Dot Spot Function
-  const absU = Math.abs(u);
-  const absV = Math.abs(v);
-  let spot: number;
-
-  if (absU + absV <= 0.5) {
-    // Inner diamond: round black dot centered at (0, 0)
-    spot = 1.0 - 2.0 * (u * u + v * v);
-  } else {
-    // Corner region: white pinholes centered at cell corners (±0.5, ±0.5)
-    const uc = absU - 0.5;
-    const vc = absV - 0.5;
-    spot = 2.0 * (uc * uc + vc * vc);
+  if (dotShape === 'euclidean') {
+    const spot = 0.5 + 0.25 * (Math.cos(TWO_PI * u) + Math.cos(TWO_PI * v));
+    return spot >= euclideanSpotThreshold(density);
   }
 
-  return spot >= (1.0 - density);
+  // Clip Studio Paint standard Circle dot: true geometric round dot
+  const r = circleDotRadius(density);
+  return u * u + v * v <= r * r + 1e-7;
 }
 
 let cachedDstImageData: ImageData | null = null;
@@ -169,8 +235,8 @@ function getScratchImageData(ctx: CanvasRenderingContext2D, w: number, h: number
 /**
  * High-throughput CPU 32-bit TypedArray implementation.
  *
- * Guarantees bit-for-bit mathematical determinism across all dirtyRect updates
- * with zero floating-point accumulation drift and zero seam artifacts.
+ * Renders crisp 1-bit binary Clip Studio Paint screentone dots locked to the document-space
+ * rational integer lattice with bit-for-bit determinism across dirtyRect and tile updates.
  */
 export function applyScreentoneCPU(
   sourceCanvas: HTMLCanvasElement,
@@ -191,7 +257,7 @@ export function applyScreentoneCPU(
   const dstCtx = targetCanvas.getContext('2d');
   if (!srcCtx || !dstCtx) return;
 
-  // Bounding rect in document space
+  // Bounding rect in local canvas coordinates
   let minX = 0;
   let minY = 0;
   let maxX = width;
@@ -223,51 +289,63 @@ export function applyScreentoneCPU(
   const sinT = Math.sin(rad);
 
   const dpi = Math.max(1, options.dpi ?? 600);
-  // Ensure cellSize has a 3.5px minimum to prevent high-frequency moire noise on low-DPI canvases
+  // Ensure cellSize has a 3.5px minimum to prevent high-frequency noise on low-DPI canvases
   const cellSize = Math.max(3.5, dpi / frequency);
-  const invCellSize = 1.0 / cellSize;
+  const { a: basisA, b: basisB, denom } = computeRationalHalftoneBasis(cellSize, cosT, sinT);
+  const invDenom = 1.0 / denom;
+
   const dotShape = options.dotShape ?? 'circle';
   const isLine = dotShape === 'line';
   const isDiamond = dotShape === 'diamond';
+  const isEuclidean = dotShape === 'euclidean';
   const solidBlackAtMax = options.solidBlackAtMax !== false;
-  const antiAliasing = options.antiAliasing !== false;
+  // Clip Studio Paint screentones are strictly 1-bit binary by default (zero gray AA blur)
+  const antiAliasing = options.antiAliasing === true;
   const isSpecified = options.densityType !== 'image';
   const specDensity = Math.max(0, Math.min(1, options.specifiedDensity ?? 0.4));
-  const specOneMinusDensity = 1.0 - specDensity;
+  const docOriginX = Math.floor(options.docOriginX ?? 0);
+  const docOriginY = Math.floor(options.docOriginY ?? 0);
 
-  // Sub-pixel anti-aliasing transition half-width in spot function units
-  const aaHalfSpan = Math.min(0.25, 0.75 * invCellSize);
+  // Precompute threshold for full-alpha specified-density fast path
+  const specCircleR = !isLine && !isDiamond && !isEuclidean ? circleDotRadius(specDensity) : 0;
+  const specCircleR2 = specCircleR * specCircleR + 1e-7;
+  const specEuclidThresh = isEuclidean ? euclideanSpotThreshold(specDensity) : 0;
+  const specDiamondThresh = isDiamond ? diamondSpotThreshold(specDensity) : 0;
+  const specLineThresh = 1.0 - specDensity;
+
+  // Sub-pixel anti-aliasing transition half-width (only used when antiAliasing === true)
+  const aaHalfSpan = Math.min(0.18, 0.5 / Math.sqrt(denom));
   const invTwoAaHalfSpan = 1.0 / (2.0 * aaHalfSpan);
 
   let srcIdx = 0;
   let dstIdx = 0;
 
   const zoom = options.zoom ?? 1.0;
-  const isDownscaled = zoom < 0.95;
+  const isDownscaled = antiAliasing && zoom < 0.95;
   const moireBlend = isDownscaled ? Math.max(0, Math.min(1, (zoom - 0.35) / 0.6)) : 1.0;
 
   for (let y = minY; y < maxY; y++) {
-    const ySinT = y * sinT;
-    const yCosT = y * cosT;
-    let xr = minX * cosT - ySinT;
-    let yr = minX * sinT + yCosT;
+    const docY = y + docOriginY;
+    const baseXr = -docY * basisB;
+    const baseYr = docY * basisA;
 
-    for (let x = minX; x < maxX; x++, srcIdx += 4, dstIdx++, xr += cosT, yr += sinT) {
+    for (let x = minX; x < maxX; x++, srcIdx += 4, dstIdx++) {
       // 32-bit fast path: completely transparent pixel
       if (srcData32[dstIdx] === 0) {
         dstData32[dstIdx] = TRANSPARENT_U32;
         continue;
       }
 
-      const a = srcData[srcIdx + 3];
-      if (a === 0) {
+      const alphaByte = srcData[srcIdx + 3];
+      if (alphaByte === 0) {
         dstData32[dstIdx] = TRANSPARENT_U32;
         continue;
       }
 
-      let oneMinusDensity: number;
+      let density: number;
+      let isFastSpecFullAlpha = false;
       if (isSpecified) {
-        if (a === 255) {
+        if (alphaByte === 255) {
           if (specDensity <= 0.001) {
             dstData32[dstIdx] = TRANSPARENT_U32;
             continue;
@@ -276,9 +354,10 @@ export function applyScreentoneCPU(
             dstData32[dstIdx] = SOLID_BLACK_U32;
             continue;
           }
-          oneMinusDensity = specOneMinusDensity;
+          density = specDensity;
+          isFastSpecFullAlpha = true;
         } else {
-          const density = specDensity * (a * INV_255);
+          density = specDensity * (alphaByte * INV_255);
           if (density <= 0.001) {
             dstData32[dstIdx] = TRANSPARENT_U32;
             continue;
@@ -287,7 +366,6 @@ export function applyScreentoneCPU(
             dstData32[dstIdx] = SOLID_BLACK_U32;
             continue;
           }
-          oneMinusDensity = 1.0 - density;
         }
       } else {
         const r = srcData[srcIdx];
@@ -295,7 +373,7 @@ export function applyScreentoneCPU(
         const b = srcData[srcIdx + 2];
         // Perceptual ITU-R BT.601 luminance (0.0 = pure black, 1.0 = pure white)
         const luminance = (r * 299 + g * 587 + b * 114) * INV_LUMINANCE_255K;
-        const density = (1.0 - luminance) * (a * INV_255);
+        density = (1.0 - luminance) * (alphaByte * INV_255);
         if (density <= 0.001) {
           dstData32[dstIdx] = TRANSPARENT_U32;
           continue;
@@ -304,37 +382,56 @@ export function applyScreentoneCPU(
           dstData32[dstIdx] = SOLID_BLACK_U32;
           continue;
         }
-        oneMinusDensity = 1.0 - density;
       }
 
-      // Normalized cell coordinates in [-0.5, 0.5]
-      const u = (xr * invCellSize) - Math.floor(xr * invCellSize) - 0.5;
-      const v = (yr * invCellSize) - Math.floor(yr * invCellSize) - 0.5;
+      const docX = x + docOriginX;
+      const xr = docX * basisA + baseXr;
+      const yr = docX * basisB + baseYr;
 
-      let spot: number;
-      if (isLine) {
-        spot = 1.0 - 2.0 * Math.abs(u);
-      } else if (isDiamond) {
-        spot = 1.0 - (Math.abs(u) + Math.abs(v));
-      } else {
-        const absU = Math.abs(u);
-        const absV = Math.abs(v);
-        if (absU + absV <= 0.5) {
-          spot = 1.0 - 2.0 * (u * u + v * v);
+      // Exact integer modulo -> zero floating-point drift across arbitrary document sizes
+      const u = ((((xr % denom) + denom) % denom) * invDenom) - 0.5;
+      const v = ((((yr % denom) + denom) % denom) * invDenom) - 0.5;
+
+      if (!antiAliasing) {
+        let isInk: boolean;
+        if (isLine) {
+          const thresh = isFastSpecFullAlpha ? specLineThresh : 1.0 - density;
+          isInk = 1.0 - 2.0 * Math.abs(u) >= thresh;
+        } else if (isDiamond) {
+          const thresh = isFastSpecFullAlpha ? specDiamondThresh : diamondSpotThreshold(density);
+          isInk = 1.0 - (Math.abs(u) + Math.abs(v)) >= thresh;
+        } else if (isEuclidean) {
+          const thresh = isFastSpecFullAlpha ? specEuclidThresh : euclideanSpotThreshold(density);
+          const spot = 0.5 + 0.25 * (Math.cos(TWO_PI * u) + Math.cos(TWO_PI * v));
+          isInk = spot >= thresh;
         } else {
-          const uc = absU - 0.5;
-          const vc = absV - 0.5;
-          spot = 2.0 * (uc * uc + vc * vc);
+          const r2 = isFastSpecFullAlpha ? specCircleR2 : (() => {
+            const radDot = circleDotRadius(density);
+            return radDot * radDot + 1e-7;
+          })();
+          isInk = u * u + v * v <= r2;
         }
-      }
+        dstData32[dstIdx] = isInk ? SOLID_BLACK_U32 : TRANSPARENT_U32;
+      } else {
+        let diff: number;
+        if (isLine) {
+          const thresh = isFastSpecFullAlpha ? specLineThresh : 1.0 - density;
+          diff = (1.0 - 2.0 * Math.abs(u)) - thresh;
+        } else if (isDiamond) {
+          const thresh = isFastSpecFullAlpha ? specDiamondThresh : diamondSpotThreshold(density);
+          diff = (1.0 - (Math.abs(u) + Math.abs(v))) - thresh;
+        } else if (isEuclidean) {
+          const thresh = isFastSpecFullAlpha ? specEuclidThresh : euclideanSpotThreshold(density);
+          const spot = 0.5 + 0.25 * (Math.cos(TWO_PI * u) + Math.cos(TWO_PI * v));
+          diff = spot - thresh;
+        } else {
+          const radDot = isFastSpecFullAlpha ? specCircleR : circleDotRadius(density);
+          diff = radDot - Math.sqrt(u * u + v * v);
+        }
 
-      const diff = spot - oneMinusDensity;
-
-      if (antiAliasing) {
         let coverage = Math.max(0, Math.min(1, diff * invTwoAaHalfSpan + 0.5));
         if (isDownscaled) {
-          const contDensity = 1.0 - oneMinusDensity;
-          coverage = contDensity * (1.0 - moireBlend) + coverage * moireBlend;
+          coverage = density * (1.0 - moireBlend) + coverage * moireBlend;
         }
         if (coverage <= 0.0) {
           dstData32[dstIdx] = TRANSPARENT_U32;
@@ -344,8 +441,6 @@ export function applyScreentoneCPU(
           const alpha = (coverage * 255 + 0.5) | 0;
           dstData32[dstIdx] = isLittleEndian ? (alpha << 24) : alpha;
         }
-      } else {
-        dstData32[dstIdx] = (diff >= 0.0) ? SOLID_BLACK_U32 : TRANSPARENT_U32;
       }
     }
   }
@@ -411,55 +506,67 @@ void main() {
     return;
   }
 
-  float x = u_regionOrigin.x + v_texCoord.x * u_regionSize.x;
-  float y = u_regionOrigin.y + v_texCoord.y * u_regionSize.y;
+  float px = floor(u_regionOrigin.x + v_texCoord.x * u_regionSize.x);
+  float py = floor(u_regionOrigin.y + v_texCoord.y * u_regionSize.y);
 
   float cosA = cos(u_angleRad);
   float sinA = sin(u_angleRad);
-  float xr = x * cosA - y * sinA;
-  float yr = x * sinA + y * cosA;
-
-  float u = fract(xr / u_cellSize) - 0.5;
-  float v = fract(yr / u_cellSize) - 0.5;
-
-  float spot;
-  if (u_dotShape == 2) {
-    spot = 1.0 - 2.0 * abs(u);
-  } else if (u_dotShape == 3) {
-    spot = 1.0 - (abs(u) + abs(v));
-  } else {
-    float absU = abs(u);
-    float absV = abs(v);
-    if (absU + absV <= 0.5) {
-      spot = 1.0 - 2.0 * (u * u + v * v);
+  float safeCell = max(2.0, u_cellSize);
+  float a = floor(safeCell * cosA + 0.5);
+  float b = floor(safeCell * sinA + 0.5);
+  float denom = a * a + b * b;
+  if (denom < 4.0) {
+    float fb = max(2.0, floor(safeCell + 0.5));
+    if (abs(cosA) >= abs(sinA)) {
+      a = cosA >= 0.0 ? fb : -fb;
+      b = 0.0;
     } else {
-      float uc = absU - 0.5;
-      float vc = absV - 0.5;
-      spot = 2.0 * (uc * uc + vc * vc);
+      a = 0.0;
+      b = sinA >= 0.0 ? fb : -fb;
     }
+    denom = a * a + b * b;
   }
 
-  float diff = spot - (1.0 - density);
-  vec4 halftoneColor;
+  float xr = px * a - py * b;
+  float yr = px * b + py * a;
+  float u = (mod(xr, denom) / denom) - 0.5;
+  float v = (mod(yr, denom) / denom) - 0.5;
 
+  float diff;
+  if (u_dotShape == 2) {
+    diff = (1.0 - 2.0 * abs(u)) - (1.0 - density);
+  } else if (u_dotShape == 3) {
+    float dThresh = density <= 0.5 ? (1.0 - sqrt(0.5 * density)) : sqrt(0.5 * (1.0 - density));
+    diff = (1.0 - (abs(u) + abs(v))) - dThresh;
+  } else if (u_dotShape == 1) {
+    float spot = 0.5 + 0.25 * (cos(6.2831853 * u) + cos(6.2831853 * v));
+    float eu = density <= 0.5 ? (2.0 * density) : (2.0 * (1.0 - density));
+    float eOff = 0.78539816 * eu - 0.28539816 * eu * eu;
+    float eThresh = density <= 0.5 ? (1.0 - eOff) : eOff;
+    diff = spot - eThresh;
+  } else {
+    float rDot = density <= 0.78539816
+      ? sqrt(density * 0.31830989)
+      : (0.70710678 - 0.20710678 * pow(max(0.0, (1.0 - density) / 0.21460184), 0.43));
+    diff = rDot - length(vec2(u, v));
+  }
+
+  vec4 halftoneColor;
   if (u_antiAliasing == 1) {
-    float halfSpan = min(0.25, 0.75 / u_cellSize);
+    float halfSpan = min(0.18, 0.5 / sqrt(denom));
     float coverage = clamp(diff / (2.0 * halfSpan) + 0.5, 0.0, 1.0);
     halftoneColor = vec4(0.0, 0.0, 0.0, coverage);
   } else {
-    if (diff >= 0.0) {
-      halftoneColor = vec4(0.0, 0.0, 0.0, 1.0);
-    } else {
-      halftoneColor = vec4(0.0, 0.0, 0.0, 0.0);
-    }
+    halftoneColor = diff >= -0.000001 ? vec4(0.0, 0.0, 0.0, 1.0) : vec4(0.0, 0.0, 0.0, 0.0);
   }
 
-  // Clip Studio Paint style Anti-Moiré Viewport Downsampling:
-  // When viewport zoom Z < 1.0, high-frequency dots alias against screen pixels.
-  // Smoothstep crossfade from discrete dot pattern to continuous grayscale luminance.
-  float moireBlend = smoothstep(0.35, 0.95, u_zoom);
-  vec4 contColor = vec4(0.0, 0.0, 0.0, density);
-  gl_FragColor = mix(contColor, halftoneColor, moireBlend);
+  if (u_zoom >= 0.99) {
+    gl_FragColor = halftoneColor;
+  } else {
+    float moireBlend = smoothstep(0.25, 0.85, u_zoom);
+    vec4 contColor = vec4(0.0, 0.0, 0.0, density);
+    gl_FragColor = mix(contColor, halftoneColor, moireBlend);
+  }
 }
 `;
 
@@ -668,7 +775,7 @@ class WebGLHalftonePipeline {
     const dotShapeVal = options.dotShape === 'line' ? 2 : options.dotShape === 'diamond' ? 3 : (options.dotShape === 'euclidean' ? 1 : 0);
     gl.uniform1i(this.uDotShapeLoc, dotShapeVal);
     gl.uniform1i(this.uSolidBlackAtMaxLoc, options.solidBlackAtMax !== false ? 1 : 0);
-    gl.uniform1i(this.uAntiAliasingLoc, options.antiAliasing !== false ? 1 : 0);
+    gl.uniform1i(this.uAntiAliasingLoc, options.antiAliasing === true ? 1 : 0);
     gl.uniform1i(this.uDensityTypeLoc, options.densityType === 'image' ? 1 : 0);
     gl.uniform1f(this.uSpecifiedDensityLoc, Math.max(0, Math.min(1, options.specifiedDensity ?? 0.4)));
     if (this.uZoomLoc) {
@@ -727,22 +834,14 @@ export function createSeamlessHalftonePattern(
   const data32 = new Uint32Array(imgData.data.buffer);
   const solidBlack = isLittleEndian ? 0xff000000 : 0x000000ff;
 
+  const rDot = circleDotRadius(density);
+  const r2 = rDot * rDot + 1e-7;
   for (let cy = 0; cy < cH; cy++) {
     const v = (cy / cH) - 0.5;
     for (let cx = 0; cx < cW; cx++) {
       const u = (cx / cW) - 0.5;
-      const absU = Math.abs(u);
-      const absV = Math.abs(v);
-      let spot: number;
-      if (absU + absV <= 0.5) {
-        spot = 1.0 - 2.0 * (u * u + v * v);
-      } else {
-        const uc = absU - 0.5;
-        const vc = absV - 0.5;
-        spot = 2.0 * (uc * uc + vc * vc);
-      }
       const idx = cy * cW + cx;
-      data32[idx] = spot >= (1.0 - density) ? solidBlack : 0x00000000;
+      data32[idx] = (u * u + v * v) <= r2 ? solidBlack : 0x00000000;
     }
   }
   ctx.putImageData(imgData, 0, 0);

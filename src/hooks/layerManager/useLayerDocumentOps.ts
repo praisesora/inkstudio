@@ -4,13 +4,20 @@ import {
   CanvasDimensions,
   LayerItem,
   LoadedDocument,
+  TileDelta,
   hasTileBackedLayer,
+  isFolderLikeLayer,
 } from '../../types/editor';
 import { createCanvasThumbnail } from '../../utils/canvasUtils';
 import { documentStore } from '../../utils/documentStore';
 import { multiplayerService } from '../../services/multiplayerService';
+import { compositeCanvas } from '../../utils/saveManager/gpuComposite';
 import { releaseTemporaryCanvas } from '../../utils/tileEngine';
-import { isBackgroundLayerId } from './layerTreeOps';
+import {
+  computeMergeFolderLayers,
+  createLayerTreeSnapshotDelta,
+  isBackgroundLayerId,
+} from './layerTreeOps';
 import { LayerCanvasRegistryApi, LayerManagerContext } from './types';
 
 export function useLayerDocumentOps(
@@ -26,33 +33,49 @@ export function useLayerDocumentOps(
     setLayers,
     layersRef,
     activeLayerId,
+    activeLayerIdRef,
     setActiveLayerId,
     setSelectedLayerIds,
+    recordLayerHistory,
   } = ctx;
   const { updateLayerThumbnail } = canvasRegistry;
 
   // Clear active layer content directly in SparseTileGrid (zero forced full canvas allocation)
   const clearActiveLayer = useCallback(() => {
+    const targetId = activeLayerIdRef.current || activeLayerId;
+    if (!targetId) return;
     const grid = activeTileGridRef.current;
     const dims = dimensionsRef.current;
-    const isBg = isBackgroundLayerId(activeLayerId);
+    const isBg = isBackgroundLayerId(targetId);
 
+    const beforeSnapshot = grid.snapshotLayerTiles(targetId);
     if (isBg) {
-      grid.fillLayerSolidWhite(activeLayerId, dims.width, dims.height, 'color-32bit');
+      grid.fillLayerSolidWhite(targetId, dims.width, dims.height, 'color-32bit');
     } else {
-      grid.clearLayer(activeLayerId);
-      grid.markLayerIngested(activeLayerId);
+      grid.clearLayer(targetId);
+      grid.markLayerIngested(targetId);
     }
 
+    const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnapshot, targetId, {
+      x: 0,
+      y: 0,
+      width: dims.width,
+      height: dims.height,
+    });
     grid.notifyChange(true);
-    updateLayerThumbnail(activeLayerId);
-  }, [activeLayerId, activeTileGridRef, dimensionsRef, updateLayerThumbnail]);
+    updateLayerThumbnail(targetId, true);
+
+    if (tileDeltas.length > 0) {
+      recordLayerHistory('Clear Layer', targetId, undefined, tileDeltas, 'clear');
+    }
+  }, [activeLayerId, activeLayerIdRef, activeTileGridRef, dimensionsRef, recordLayerHistory, updateLayerThumbnail]);
 
   // Merge active raster layer down onto the raster layer directly below it (tile-by-tile, zero full-doc canvas)
   const mergeDown = useCallback(
     (targetLayerId?: string): { targetId: string; removedId: string } | null => {
       const currentLayers = layersRef.current;
-      const srcId = targetLayerId || activeLayerId;
+      const beforeActiveLayerId = activeLayerIdRef.current;
+      const srcId = targetLayerId || activeLayerIdRef.current || activeLayerId;
       const srcIdx = currentLayers.findIndex((l) => l.id === srcId);
       if (srcIdx < 0) return null;
 
@@ -72,6 +95,7 @@ export function useLayerDocumentOps(
       if (dstLayer.locked) return null;
 
       const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
       const dstFormat =
         dstLayer.expressionColor === 'monochrome'
           ? 'monochrome-1bit'
@@ -79,34 +103,275 @@ export function useLayerDocumentOps(
             ? 'grayscale-8bit'
             : 'color-32bit';
 
+      // Snapshot both source layer tiles (which will be removed) and destination layer tiles (before merge)
+      const srcTileDeltas: TileDelta[] = [];
+      for (const t of grid.getLayerTiles(srcLayer.id, 0)) {
+        if (t.data) {
+          srcTileDeltas.push({
+            key: `${srcLayer.id}:${t.tileX}:${t.tileY}`,
+            format: t.format,
+            beforeData: new Uint8Array(t.data),
+            afterData: null,
+          });
+        }
+      }
+      const dstBeforeSnapshot = grid.snapshotLayerTiles(dstLayer.id);
+
       grid.mergeLayersInGrid(srcLayer.id, dstLayer.id, {
         opacity: srcLayer.opacity,
         blendMode: srcLayer.blendMode,
         visible: srcLayer.visible,
         maskCanvas: srcLayer.maskCanvas,
         maskEnabled: srcLayer.maskEnabled,
-        dimensions: dimensionsRef.current,
+        dimensions: dims,
         dstFormat,
       });
+
+      const dstTileDeltas = grid.computeDeltasFromSnapshot(dstBeforeSnapshot, dstLayer.id, {
+        x: 0,
+        y: 0,
+        width: dims.width,
+        height: dims.height,
+      });
+      // Ensure any newly created tiles on dstLayer that weren't in dstBeforeSnapshot are captured too
+      const seenDstKeys = new Set(dstTileDeltas.map((d) => d.key));
+      for (const t of grid.getLayerTiles(dstLayer.id, 0)) {
+        const key = `${dstLayer.id}:${t.tileX}:${t.tileY}`;
+        if (!seenDstKeys.has(key) && t.data && !dstBeforeSnapshot.has(key)) {
+          dstTileDeltas.push({
+            key,
+            format: t.format,
+            beforeData: null,
+            afterData: new Uint8Array(t.data),
+          });
+        }
+      }
 
       if (multiplayerService.isConnected()) {
         multiplayerService.streamLayerTiles(dstLayer.id, grid, { force: true });
       }
 
-      if (srcLayer.maskCanvas) {
-        releaseTemporaryCanvas(srcLayer.maskCanvas);
-      }
-
       const nextLayers = currentLayers.filter((l) => l.id !== srcLayer.id);
+      const layerTreeDelta = createLayerTreeSnapshotDelta(
+        currentLayers,
+        nextLayers,
+        beforeActiveLayerId,
+        dstLayer.id,
+        { cloneMasks: true }
+      );
       layersRef.current = nextLayers;
       setLayers(nextLayers);
       setActiveLayerId(dstLayer.id);
       setSelectedLayerIds([dstLayer.id]);
 
-      updateLayerThumbnail(dstLayer.id);
+      updateLayerThumbnail(dstLayer.id, true);
+      recordLayerHistory(
+        'Merge Down',
+        dstLayer.id,
+        layerTreeDelta,
+        [...srcTileDeltas, ...dstTileDeltas],
+        'layer'
+      );
       return { targetId: dstLayer.id, removedId: srcLayer.id };
     },
-    [activeLayerId, activeTileGridRef, dimensionsRef, layersRef, setActiveLayerId, setLayers, setSelectedLayerIds, updateLayerThumbnail]
+    [activeLayerId, activeLayerIdRef, activeTileGridRef, dimensionsRef, layersRef, recordLayerHistory, setActiveLayerId, setLayers, setSelectedLayerIds, updateLayerThumbnail]
+  );
+
+  // Merge a folder (or frame-folder) and all of its descendants into a single raster layer
+  const mergeFolder = useCallback(
+    (
+      targetFolderId?: string,
+      customMergedId?: string
+    ): {
+      mergedLayerId: string;
+      removedFolderId: string;
+      removedDescendantIds: string[];
+    } | null => {
+      const currentLayers = layersRef.current;
+      const beforeActiveLayerId = activeLayerIdRef.current;
+      const folderId = targetFolderId || activeLayerIdRef.current || activeLayerId;
+      const mergePlan = computeMergeFolderLayers(currentLayers, folderId, customMergedId);
+      if (!mergePlan) return null;
+
+      const { folder, descendantLayers, descendantIds, mergedLayer, nextLayers } = mergePlan;
+      const grid = activeTileGridRef.current;
+      const dims = dimensionsRef.current;
+
+      const mergedFormat =
+        mergedLayer.expressionColor === 'monochrome'
+          ? 'monochrome-1bit'
+          : mergedLayer.expressionColor === 'gray'
+            ? 'grayscale-8bit'
+            : 'color-32bit';
+
+      // Snapshot all descendant tiles before mutating grid so undo restores everything atomically
+      const removedTileDeltas: TileDelta[] = [];
+      for (const descId of descendantIds) {
+        for (const t of grid.getLayerTiles(descId, 0)) {
+          if (t.data) {
+            removedTileDeltas.push({
+              key: `${descId}:${t.tileX}:${t.tileY}`,
+              format: t.format,
+              beforeData: new Uint8Array(t.data),
+              afterData: null,
+            });
+          }
+        }
+      }
+
+      // Render subtree with the root folder normalized to visible=true, opacity=1, blendMode='normal'
+      // so the folder's own visibility, opacity, and blend mode stay non-destructively on mergedLayer.
+      const rootForComposite: LayerItem = {
+        ...folder,
+        parentId: null,
+        visible: true,
+        opacity: 1,
+        blendMode: 'normal',
+        maskCanvas: undefined,
+        maskEnabled: false,
+      };
+      const subtreeLayers: LayerItem[] = [rootForComposite, ...descendantLayers];
+      const subtreeMap = new Map<string, LayerItem>(subtreeLayers.map((l) => [l.id, l]));
+
+      const getSubtreeOpacity = (layer: LayerItem): number => {
+        let alpha = layer.opacity;
+        let currParentId = layer.parentId;
+        while (currParentId) {
+          const parent = subtreeMap.get(currParentId);
+          if (!parent) break;
+          alpha *= parent.opacity;
+          currParentId = parent.parentId;
+        }
+        return alpha;
+      };
+
+      const isSubtreeVisible = (layer: LayerItem): boolean => {
+        let curr: LayerItem | undefined = layer;
+        while (curr) {
+          if (!curr.visible) return false;
+          curr = curr.parentId ? subtreeMap.get(curr.parentId) : undefined;
+        }
+        return true;
+      };
+
+      const hasRenderableContent =
+        folder.type === 'frame-folder' ||
+        descendantLayers.some(
+          (l) => !isFolderLikeLayer(l) && isSubtreeVisible(l) && getSubtreeOpacity(l) > 0.001
+        );
+
+      grid.setLayerFormat(mergedLayer.id, mergedFormat);
+      grid.markLayerIngested(mergedLayer.id);
+
+      if (hasRenderableContent && dims.width > 0 && dims.height > 0) {
+        let hasCanvas2D = false;
+        if (typeof document !== 'undefined') {
+          const probe = document.createElement('canvas');
+          probe.width = 1;
+          probe.height = 1;
+          hasCanvas2D = Boolean(probe.getContext('2d'));
+          releaseTemporaryCanvas(probe);
+        }
+
+        if (hasCanvas2D) {
+          const composited = compositeCanvas(
+            dims,
+            subtreeLayers,
+            undefined,
+            getSubtreeOpacity,
+            isSubtreeVisible,
+            false,
+            grid
+          );
+          grid.ingestCanvas(mergedLayer.id, composited, mergedFormat);
+          releaseTemporaryCanvas(composited);
+        } else {
+          // Headless / jsdom fallback when neither WebGL2 nor Canvas2D is available
+          const bottomToTop = descendantLayers.slice().reverse();
+          for (const child of bottomToTop) {
+            if (!hasTileBackedLayer(child)) continue;
+            if (!isSubtreeVisible(child)) continue;
+            const effOpacity = getSubtreeOpacity(child);
+            if (effOpacity <= 0.001 || !grid.hasLayerTiles(child.id)) continue;
+            grid.mergeLayersInGrid(child.id, mergedLayer.id, {
+              opacity: effOpacity,
+              blendMode: child.blendMode,
+              visible: true,
+              maskCanvas: child.maskCanvas,
+              maskEnabled: child.maskEnabled,
+              dimensions: dims,
+              dstFormat: mergedFormat,
+            });
+          }
+        }
+      }
+
+      for (const remId of [folder.id, ...descendantIds]) {
+        const timer = thumbDebounceTimersRef.current.get(remId);
+        if (timer) {
+          clearTimeout(timer);
+          thumbDebounceTimersRef.current.delete(remId);
+        }
+        grid.clearLayer(remId);
+      }
+
+      const mergedTileDeltas: TileDelta[] = [];
+      for (const t of grid.getLayerTiles(mergedLayer.id, 0)) {
+        if (t.data) {
+          mergedTileDeltas.push({
+            key: `${mergedLayer.id}:${t.tileX}:${t.tileY}`,
+            format: t.format,
+            beforeData: null,
+            afterData: new Uint8Array(t.data),
+          });
+        }
+      }
+
+      if (multiplayerService.isConnected()) {
+        multiplayerService.streamLayerTiles(mergedLayer.id, grid, { force: true });
+      }
+
+      const layerTreeDelta = createLayerTreeSnapshotDelta(
+        currentLayers,
+        nextLayers,
+        beforeActiveLayerId,
+        mergedLayer.id,
+        { cloneMasks: true }
+      );
+      layersRef.current = nextLayers;
+      setLayers(nextLayers);
+      setActiveLayerId(mergedLayer.id);
+      setSelectedLayerIds([mergedLayer.id]);
+      grid.notifyChange(true);
+      updateLayerThumbnail(mergedLayer.id, true);
+
+      recordLayerHistory(
+        'Merge Folder',
+        mergedLayer.id,
+        layerTreeDelta,
+        [...removedTileDeltas, ...mergedTileDeltas],
+        'layer'
+      );
+
+      return {
+        mergedLayerId: mergedLayer.id,
+        removedFolderId: folder.id,
+        removedDescendantIds: descendantIds,
+      };
+    },
+    [
+      activeLayerId,
+      activeLayerIdRef,
+      activeTileGridRef,
+      dimensionsRef,
+      layersRef,
+      recordLayerHistory,
+      setActiveLayerId,
+      setLayers,
+      setSelectedLayerIds,
+      thumbDebounceTimersRef,
+      updateLayerThumbnail,
+    ]
   );
 
   // Switch active document tab in O(1): binds session's SparseTileGrid without clearing or re-slicing
@@ -296,6 +561,7 @@ export function useLayerDocumentOps(
   return {
     clearActiveLayer,
     mergeDown,
+    mergeFolder,
     switchDocumentSession,
     resetToNewCanvas,
     clearDocument,

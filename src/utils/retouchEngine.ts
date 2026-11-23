@@ -23,6 +23,17 @@ import {
   unpack8BitToRGBA,
 } from './tileEngine';
 import { parseHexRgb } from './gradientEngine';
+import {
+  RgbColor,
+  decodeSpectralKSToSrgb,
+  encodeSrgbToSpectralKS,
+  mixPigmentRgbOut,
+} from './colorMixingEngine';
+
+const _smudgeMixOut: RgbColor = { r: 0, g: 0, b: 0 };
+const _smudgeReloadOut: RgbColor = { r: 0, g: 0, b: 0 };
+const _blurDecodeOut: RgbColor = { r: 0, g: 0, b: 0 };
+const _blurMixOut: RgbColor = { r: 0, g: 0, b: 0 };
 
 export type RetouchMode = 'smudge' | 'blur' | 'dodge' | 'burn' | 'clone-stamp';
 export type RetouchTonalRange = 'shadows' | 'midtones' | 'highlights';
@@ -38,6 +49,8 @@ export interface RetouchSettings {
   tonalRange: RetouchTonalRange; // Dodge / Burn range
   protectTones: boolean; // Dodge / Burn hue preservation
   smudgeFingerPainting: boolean; // Load primary color at stroke start
+  pigmentBlending: boolean; // Physical 7-band Kubelka-Munk spectral pigment blending for Smudge & Blur
+  pigmentStrength: number; // 0..100 % Kubelka-Munk pigment blending strength
   cloneAligned: boolean; // Keep relative offset across strokes
   cloneSampleMode: CloneSampleMode; // Active layer vs all visible composited
 }
@@ -52,6 +65,8 @@ export const DEFAULT_RETOUCH_SETTINGS: RetouchSettings = {
   tonalRange: 'midtones',
   protectTones: true,
   smudgeFingerPainting: false,
+  pigmentBlending: false,
+  pigmentStrength: 100,
   cloneAligned: true,
   cloneSampleMode: 'active',
 };
@@ -300,7 +315,9 @@ function applySmudgeDab(
   strength: number,
   hardness: number,
   primaryColor: string,
-  fingerPainting: boolean
+  fingerPainting: boolean,
+  pigmentBlending: boolean = false,
+  pigmentStrength: number = 1.0
 ): DirtyRect | null {
   const docW = session.dimensions.width;
   const docH = session.dimensions.height;
@@ -399,10 +416,50 @@ function applySmudgeDab(
       const srcA = buf[bIdx + 3];
 
       const invW = 1 - w;
-      const outPR = dstPR * invW + srcPR * w;
-      const outPG = dstPG * invW + srcPG * w;
-      const outPB = dstPB * invW + srcPB * w;
       const outA = alphaLock ? dstA : dstA * invW + srcA * w;
+      let outPR: number;
+      let outPG: number;
+      let outPB: number;
+      let outR = 0;
+      let outG = 0;
+      let outB = 0;
+
+      const usePigment = pigmentBlending && pigmentStrength > 0.005 && dstA > 0.5 && srcA > 0.5;
+      if (usePigment) {
+        const invSrcA = 255 / srcA;
+        const srcR = srcPR * invSrcA;
+        const srcG = srcPG * invSrcA;
+        const srcB = srcPB * invSrcA;
+        const colorW = (srcA * w) / Math.max(1e-4, dstA * invW + srcA * w);
+        mixPigmentRgbOut(
+          data[rIdx],
+          data[rIdx + 1],
+          data[rIdx + 2],
+          srcR,
+          srcG,
+          srcB,
+          colorW,
+          pigmentStrength,
+          _smudgeMixOut
+        );
+        outR = _smudgeMixOut.r;
+        outG = _smudgeMixOut.g;
+        outB = _smudgeMixOut.b;
+        const outANorm = outA / 255;
+        outPR = outR * outANorm;
+        outPG = outG * outANorm;
+        outPB = outB * outANorm;
+      } else {
+        outPR = dstPR * invW + srcPR * w;
+        outPG = dstPG * invW + srcPG * w;
+        outPB = dstPB * invW + srcPB * w;
+        if (outA > 0.5) {
+          const invOutA = 255 / outA;
+          outR = outPR * invOutA;
+          outG = outPG * invOutA;
+          outB = outPB * invOutA;
+        }
+      }
 
       if (outA <= 0.5) {
         data[rIdx] = 0;
@@ -410,20 +467,41 @@ function applySmudgeDab(
         data[rIdx + 2] = 0;
         data[rIdx + 3] = 0;
       } else {
-        const invOutA = 255 / outA;
-        data[rIdx] = clamp255(Math.round(outPR * invOutA));
-        data[rIdx + 1] = clamp255(Math.round(outPG * invOutA));
-        data[rIdx + 2] = clamp255(Math.round(outPB * invOutA));
+        data[rIdx] = clamp255(Math.round(outR));
+        data[rIdx + 1] = clamp255(Math.round(outG));
+        data[rIdx + 2] = clamp255(Math.round(outB));
         data[rIdx + 3] = clamp255(Math.round(outA));
       }
 
       // Reload pickup buffer from blended canvas pixel (prevents rapid fadeout while picking up new pigment)
       const pickupRate = 1 - str * 0.88;
       const invPickup = 1 - pickupRate;
-      buf[bIdx] = srcPR * invPickup + outPR * pickupRate;
-      buf[bIdx + 1] = srcPG * invPickup + outPG * pickupRate;
-      buf[bIdx + 2] = srcPB * invPickup + outPB * pickupRate;
-      buf[bIdx + 3] = srcA * invPickup + outA * pickupRate;
+      const nextBufA = srcA * invPickup + outA * pickupRate;
+      if (usePigment && nextBufA > 0.5) {
+        const invSrcA = 255 / srcA;
+        const reloadColorW = (outA * pickupRate) / Math.max(1e-4, srcA * invPickup + outA * pickupRate);
+        mixPigmentRgbOut(
+          srcPR * invSrcA,
+          srcPG * invSrcA,
+          srcPB * invSrcA,
+          outR,
+          outG,
+          outB,
+          reloadColorW,
+          pigmentStrength,
+          _smudgeReloadOut
+        );
+        const nextANorm = nextBufA / 255;
+        buf[bIdx] = _smudgeReloadOut.r * nextANorm;
+        buf[bIdx + 1] = _smudgeReloadOut.g * nextANorm;
+        buf[bIdx + 2] = _smudgeReloadOut.b * nextANorm;
+        buf[bIdx + 3] = nextBufA;
+      } else {
+        buf[bIdx] = srcPR * invPickup + outPR * pickupRate;
+        buf[bIdx + 1] = srcPG * invPickup + outPG * pickupRate;
+        buf[bIdx + 2] = srcPB * invPickup + outPB * pickupRate;
+        buf[bIdx + 3] = nextBufA;
+      }
       touched = true;
     }
   }
@@ -440,7 +518,9 @@ function applyBlurDab(
   cy: number,
   radius: number,
   strength: number,
-  hardness: number
+  hardness: number,
+  pigmentBlending: boolean = false,
+  pigmentStrength: number = 1.0
 ): DirtyRect | null {
   const docW = session.dimensions.width;
   const docH = session.dimensions.height;
@@ -466,6 +546,10 @@ function applyBlurDab(
   const srcRoi = grid.readImageData(session.layerId, px0, py0, pw, ph);
   const srcData = srcRoi.data;
 
+  const usePigment = pigmentBlending && pigmentStrength > 0.005;
+  const kSize = blurK * 2 + 1;
+  const invK = 1 / kSize;
+
   // Convert to premultiplied Float32 for fringe-free separable box blur
   const premul = new Float32Array(pw * ph * 4);
   const horiz = new Float32Array(pw * ph * 4);
@@ -478,16 +562,35 @@ function applyBlurDab(
     premul[o + 3] = srcData[o + 3];
   }
 
-  const kSize = blurK * 2 + 1;
-  const invK = 1 / kSize;
+  // Optional 10-channel premultiplied Kubelka-Munk K/S + residual buffers for true spectral pigment blur
+  let specPremul: Float32Array | null = null;
+  let specHoriz: Float32Array | null = null;
+  if (usePigment) {
+    specPremul = new Float32Array(pw * ph * 10);
+    specHoriz = new Float32Array(pw * ph * 10);
+    const tmpSpec = new Float32Array(10);
+    for (let i = 0; i < pw * ph; i++) {
+      const o = i * 4;
+      const a = srcData[o + 3] / 255;
+      if (a > 0) {
+        encodeSrgbToSpectralKS(srcData[o], srcData[o + 1], srcData[o + 2], tmpSpec, 0);
+        const so = i * 10;
+        for (let c = 0; c < 10; c++) {
+          specPremul[so + c] = tmpSpec[c] * a;
+        }
+      }
+    }
+  }
 
   // Horizontal pass
+  const sRowSum = usePigment ? new Float32Array(10) : null;
   for (let y = 0; y < ph; y++) {
     const rowBase = y * pw;
     let sr = 0;
     let sg = 0;
     let sb = 0;
     let sa = 0;
+    if (sRowSum) sRowSum.fill(0);
     for (let k = -blurK; k <= blurK; k++) {
       const sx = k < 0 ? 0 : k >= pw ? pw - 1 : k;
       const o = (rowBase + sx) * 4;
@@ -495,6 +598,10 @@ function applyBlurDab(
       sg += premul[o + 1];
       sb += premul[o + 2];
       sa += premul[o + 3];
+      if (sRowSum && specPremul) {
+        const so = (rowBase + sx) * 10;
+        for (let c = 0; c < 10; c++) sRowSum[c] += specPremul[so + c];
+      }
     }
     for (let x = 0; x < pw; x++) {
       const o = (rowBase + x) * 4;
@@ -502,6 +609,10 @@ function applyBlurDab(
       horiz[o + 1] = sg * invK;
       horiz[o + 2] = sb * invK;
       horiz[o + 3] = sa * invK;
+      if (sRowSum && specHoriz) {
+        const so = (rowBase + x) * 10;
+        for (let c = 0; c < 10; c++) specHoriz[so + c] = sRowSum[c] * invK;
+      }
 
       const remX = x - blurK < 0 ? 0 : x - blurK;
       const addX = x + blurK + 1 >= pw ? pw - 1 : x + blurK + 1;
@@ -511,6 +622,11 @@ function applyBlurDab(
       sg += premul[ao + 1] - premul[ro + 1];
       sb += premul[ao + 2] - premul[ro + 2];
       sa += premul[ao + 3] - premul[ro + 3];
+      if (sRowSum && specPremul) {
+        const rso = (rowBase + remX) * 10;
+        const aso = (rowBase + addX) * 10;
+        for (let c = 0; c < 10; c++) sRowSum[c] += specPremul[aso + c] - specPremul[rso + c];
+      }
     }
   }
 
@@ -525,6 +641,9 @@ function applyBlurDab(
 
   snapshotRoiTiles(grid, session.layerId, rx0, ry0, rw, rh, session.beforeSnapshot);
 
+  const sColSum = usePigment ? new Float32Array(10) : null;
+  const sColDec = usePigment ? new Float32Array(10) : null;
+
   for (let lx = 0; lx < rw; lx++) {
     const sx = rx0 - px0 + lx;
     const gx = rx0 + lx;
@@ -535,6 +654,7 @@ function applyBlurDab(
     let sg = 0;
     let sb = 0;
     let sa = 0;
+    if (sColSum) sColSum.fill(0);
     for (let k = -blurK; k <= blurK; k++) {
       const sy = Math.max(0, Math.min(ph - 1, startY + k));
       const o = (sy * pw + sx) * 4;
@@ -542,6 +662,10 @@ function applyBlurDab(
       sg += horiz[o + 1];
       sb += horiz[o + 2];
       sa += horiz[o + 3];
+      if (sColSum && specHoriz) {
+        const so = (sy * pw + sx) * 10;
+        for (let c = 0; c < 10; c++) sColSum[c] += specHoriz[so + c];
+      }
     }
 
     for (let ly = 0; ly < rh; ly++) {
@@ -552,6 +676,25 @@ function applyBlurDab(
       const bb = sb * invK;
       const ba = sa * invK;
 
+      let pigBlurR = 0;
+      let pigBlurG = 0;
+      let pigBlurB = 0;
+      const hasPigBlur = Boolean(sColSum && sColDec && ba > 0.5);
+      if (hasPigBlur && sColSum && sColDec) {
+        const invAlphaNorm = 1 / ((ba / 255) * kSize);
+        for (let c = 0; c < 10; c++) {
+          sColDec[c] = sColSum[c] * invAlphaNorm;
+        }
+        decodeSpectralKSToSrgb(sColDec, 0, _blurDecodeOut);
+        const invBa = 255 / ba;
+        const regBlurR = br * invBa;
+        const regBlurG = bg * invBa;
+        const regBlurB = bb * invBa;
+        pigBlurR = regBlurR + (_blurDecodeOut.r - regBlurR) * pigmentStrength;
+        pigBlurG = regBlurG + (_blurDecodeOut.g - regBlurG) * pigmentStrength;
+        pigBlurB = regBlurB + (_blurDecodeOut.b - regBlurB) * pigmentStrength;
+      }
+
       const remY = Math.max(0, curY - blurK);
       const addY = Math.min(ph - 1, curY + blurK + 1);
       const ro = (remY * pw + sx) * 4;
@@ -560,6 +703,11 @@ function applyBlurDab(
       sg += horiz[ao + 1] - horiz[ro + 1];
       sb += horiz[ao + 2] - horiz[ro + 2];
       sa += horiz[ao + 3] - horiz[ro + 3];
+      if (sColSum && specHoriz) {
+        const rso = (remY * pw + sx) * 10;
+        const aso = (addY * pw + sx) * 10;
+        for (let c = 0; c < 10; c++) sColSum[c] += specHoriz[aso + c] - specHoriz[rso + c];
+      }
 
       const distY = gy + 0.5 - cy;
       const dNorm = Math.hypot(distX, distY) * invR;
@@ -577,11 +725,7 @@ function applyBlurDab(
       const dstA = outData[oIdx + 3];
       if (alphaLock && dstA === 0) continue;
 
-      const dstANorm = dstA / 255;
       const invW = 1 - w;
-      const finalPR = outData[oIdx] * dstANorm * invW + br * w;
-      const finalPG = outData[oIdx + 1] * dstANorm * invW + bg * w;
-      const finalPB = outData[oIdx + 2] * dstANorm * invW + bb * w;
       const finalA = alphaLock ? dstA : dstA * invW + ba * w;
 
       if (finalA <= 0.5) {
@@ -589,7 +733,28 @@ function applyBlurDab(
         outData[oIdx + 1] = 0;
         outData[oIdx + 2] = 0;
         outData[oIdx + 3] = 0;
+      } else if (hasPigBlur && dstA > 0.5) {
+        const colorW = (ba * w) / Math.max(1e-4, dstA * invW + ba * w);
+        mixPigmentRgbOut(
+          outData[oIdx],
+          outData[oIdx + 1],
+          outData[oIdx + 2],
+          pigBlurR,
+          pigBlurG,
+          pigBlurB,
+          colorW,
+          pigmentStrength,
+          _blurMixOut
+        );
+        outData[oIdx] = clamp255(Math.round(_blurMixOut.r));
+        outData[oIdx + 1] = clamp255(Math.round(_blurMixOut.g));
+        outData[oIdx + 2] = clamp255(Math.round(_blurMixOut.b));
+        outData[oIdx + 3] = clamp255(Math.round(finalA));
       } else {
+        const dstANorm = dstA / 255;
+        const finalPR = outData[oIdx] * dstANorm * invW + br * w;
+        const finalPG = outData[oIdx + 1] * dstANorm * invW + bg * w;
+        const finalPB = outData[oIdx + 2] * dstANorm * invW + bb * w;
         const invA = 255 / finalA;
         outData[oIdx] = clamp255(Math.round(finalPR * invA));
         outData[oIdx + 1] = clamp255(Math.round(finalPG * invA));
@@ -843,6 +1008,9 @@ export function applyRetouchStrokeSegment(params: {
   const hardness = clamp01(settings.hardness / 100);
   const stepPx = Math.max(1, radius * Math.max(0.05, Math.min(0.5, settings.spacing || 0.15)) * 2);
 
+  const pigmentBlending = Boolean(settings.pigmentBlending);
+  const pigmentStrength = clamp01((settings.pigmentStrength ?? 100) / 100);
+
   const runDab = (dx: number, dy: number): DirtyRect | null => {
     switch (session.mode) {
       case 'smudge':
@@ -855,10 +1023,22 @@ export function applyRetouchStrokeSegment(params: {
           strength,
           hardness,
           primaryColor,
-          settings.smudgeFingerPainting
+          settings.smudgeFingerPainting,
+          pigmentBlending,
+          pigmentStrength
         );
       case 'blur':
-        return applyBlurDab(grid, session, dx, dy, radius, strength, hardness);
+        return applyBlurDab(
+          grid,
+          session,
+          dx,
+          dy,
+          radius,
+          strength,
+          hardness,
+          pigmentBlending,
+          pigmentStrength
+        );
       case 'dodge':
       case 'burn':
         return applyDodgeBurnDab(

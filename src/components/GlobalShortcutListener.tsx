@@ -117,11 +117,16 @@ const NON_TEXT_INPUT_TYPES = new Set([
   'image',
 ]);
 
-function isEditableTarget(target: EventTarget | null): boolean {
+export function isEditableTarget(target: EventTarget | null, e?: KeyboardEvent): boolean {
   if (!(target instanceof HTMLElement)) return false;
   if (target.isContentEditable) return true;
   const tag = target.tagName;
-  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (tag === 'TEXTAREA') return true;
+  if (tag === 'SELECT') {
+    // Allow Ctrl/Cmd shortcuts (such as Ctrl+Z Undo / Ctrl+Y Redo / Ctrl+S Save) even when a <select> dropdown retains focus
+    if (e && (e.ctrlKey || e.metaKey)) return false;
+    return true;
+  }
   if (tag === 'INPUT') {
     const inputType = ((target as HTMLInputElement).type || 'text').toLowerCase();
     return !NON_TEXT_INPUT_TYPES.has(inputType);
@@ -383,6 +388,11 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         },
 
         // Tools & Colors
+        'tool.3d': () => {
+          if (propsRef.current.hasOpenDocument) {
+            toolStoreActions.selectTool('3d');
+          }
+        },
         'tool.brushSizeDown': () => stepBrush(-1),
         'tool.brushSizeUp': () => stepBrush(1),
         'color.swap': () => toolStoreActions.swapColors(),
@@ -417,7 +427,7 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
         const p = propsRef.current;
         const uiState = useUiStore.getState();
         const isModalOpen = selectIsAnyModalOpen(uiState, p.isHostModalOpen) || uiState.isLoadingFile;
-        if (isModalOpen || isEditableTarget(e.target)) {
+        if (isModalOpen || isEditableTarget(e.target, e)) {
           return;
         }
 
@@ -453,7 +463,8 @@ export const GlobalShortcutListener: React.FC<GlobalShortcutListenerProps> = Rea
               modKey === 'Alt' &&
               tempTool === 'pipette' &&
               ((curState.tool === 'retouch' && curState.retouchSettings.mode === 'clone-stamp') ||
-                curState.tool === 'pen');
+                curState.tool === 'pen' ||
+                curState.tool === '3d');
             if (reserveAltForActiveTool) {
               return;
             }
