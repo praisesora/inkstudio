@@ -76,7 +76,8 @@ export function runPointerUp(
     !isEraser &&
     !state.isShiftLineStroke &&
     activeLayer?.type !== 'vector' &&
-    Boolean(bs.taper?.useOut);
+    Boolean(bs.taper?.useOut) &&
+    bs.taper?.inOutType === undefined;
 
   let addedFlickPoints = false;
   const tailSegments: CubicBezierSegment[] = [];
@@ -151,9 +152,16 @@ export function runPointerUp(
     exitSpeed = Math.hypot(pB.x - pA.x, pB.y - pA.y) / dt;
   }
 
+  const hasCspArcLengthTaper = Boolean(
+    bs.taper &&
+      (bs.taper.inOutType !== undefined ||
+        bs.taper.affectDensity ||
+        bs.taper.affectOpacity ||
+        bs.taper.minSizeRatio !== undefined)
+  );
   const shouldTaper =
-    Boolean(bs.taper?.useIn) || (Boolean(bs.taper?.useOut) && !addedFlickPoints);
-  if (shouldTaper && state.allStrokePoints.length >= 3) {
+    Boolean(bs.taper?.useIn) || (Boolean(bs.taper?.useOut) && (!addedFlickPoints || hasCspArcLengthTaper));
+  if (shouldTaper && !hasCspArcLengthTaper && state.allStrokePoints.length >= 3) {
     applyParametricTaper(state.allStrokePoints, {
       useIn: Boolean(bs.taper?.useIn),
       useOut: Boolean(bs.taper?.useOut) && !addedFlickPoints,
@@ -258,6 +266,7 @@ export function runPointerUp(
           isMonochrome,
           hasWetEdge,
           shouldTaper,
+          exitSpeed,
           strokeColor,
           allPoints,
           tailSegments,

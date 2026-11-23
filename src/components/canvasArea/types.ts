@@ -156,6 +156,8 @@ export interface CursorConfig {
   thicknessRatio: number;
   thicknessVertical: boolean;
   tipAngleDeg: number;
+  followDirection?: boolean;
+  dynamicDirDeg?: number;
   rotation: number;
   flipX: boolean;
   flipY: boolean;

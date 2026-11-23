@@ -366,29 +366,46 @@ export function runPointerDown(
   params.onCollabStrokeStartRef.current?.(strokeId, currentLayerId, bs, currentTool, startPoint);
 
   state.liveDabCounter.count = 0;
+  state.liveDabCounter.lastAngle = undefined;
+  state.liveDabCounter.lastStepDist = undefined;
   state.stampRemainderDist = bs.customTipImage
     ? Math.max(0.15, startPoint.width * (bs.spacing ?? 0.07))
     : Math.max(0.12, startPoint.width * (bs.spacing ?? 0.08));
 
   const firstDotPoint = state.allStrokePoints[0];
 
-  renderInitialStrokeDot(state, helpers, {
-    draftCtx,
-    firstDotPoint,
-    bs,
-    strokeColor,
-    strokeHardness,
-    strokeFlow,
-    strokeSpacing,
-    isMonochrome,
-    isEraser,
-    isBgEraser,
-    useWireframeEraser,
-    draftScale,
-    zoom: params.zoomRef.current,
-    canvas: maskCanvas,
-    activeLayer,
-  });
+  // For flat/elliptical direction-following brushes, wait for the first real movement segment
+  // to determine tangent orientation instead of stamping a sideways notch at baseAngleRad on pointerdown.
+  const deferDirectionInitialDot =
+    !isShiftLine &&
+    !state.naturalPaintSession &&
+    !useWireframeEraser &&
+    (bs.customTipAngleDynamics === 'direction' ||
+      bs.customTipAngleDynamics === 'direction-random') &&
+    (bs.thickness ?? 1.0) < 0.85;
+
+  if (!deferDirectionInitialDot) {
+    renderInitialStrokeDot(state, helpers, {
+      draftCtx,
+      firstDotPoint,
+      bs,
+      strokeColor,
+      strokeHardness,
+      strokeFlow,
+      strokeSpacing,
+      isMonochrome,
+      isEraser,
+      isBgEraser,
+      useWireframeEraser,
+      draftScale,
+      zoom: params.zoomRef.current,
+      canvas: maskCanvas,
+      activeLayer,
+    });
+  } else {
+    // Start stamping right at distance 0 on the first movement segment so there is no gap at stroke start
+    state.stampRemainderDist = 0;
+  }
 
   if (isShiftLine && prevStrokeEnd) {
     renderShiftLineInitialSegment(state, helpers, {

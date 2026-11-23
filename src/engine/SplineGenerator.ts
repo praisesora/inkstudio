@@ -197,12 +197,13 @@ export class SplineGenerator {
     const dt1 = Math.max(1e-4, Math.sqrt(d12));
     const dt2 = Math.max(1e-4, Math.sqrt(d23));
 
-    // Tangents at P1 and P2
-    const t1x = (p2.x - p1.x) / dt1 - (p1.x - p0.x) / dt0 + (p2.x - p0.x) / (dt0 + dt1);
-    const t1y = (p2.y - p1.y) / dt1 - (p1.y - p0.y) / dt0 + (p2.y - p0.y) / (dt0 + dt1);
+    // Non-uniform centripetal Catmull-Rom tangents at P1 and P2:
+    // m1 = (P1-P0)/dt0 - (P2-P0)/(dt0+dt1) + (P2-P1)/dt1  (reduces to (P2-P0)/2 for uniform knots)
+    const t1x = (p1.x - p0.x) / dt0 - (p2.x - p0.x) / (dt0 + dt1) + (p2.x - p1.x) / dt1;
+    const t1y = (p1.y - p0.y) / dt0 - (p2.y - p0.y) / (dt0 + dt1) + (p2.y - p1.y) / dt1;
 
-    const t2x = (p3.x - p2.x) / dt2 - (p2.x - p1.x) / dt1 + (p3.x - p1.x) / (dt1 + dt2);
-    const t2y = (p3.y - p2.y) / dt2 - (p2.y - p1.y) / dt1 + (p3.y - p1.y) / (dt1 + dt2);
+    const t2x = (p2.x - p1.x) / dt1 - (p3.x - p1.x) / (dt1 + dt2) + (p3.x - p2.x) / dt2;
+    const t2y = (p2.y - p1.y) / dt1 - (p3.y - p1.y) / (dt1 + dt2) + (p3.y - p2.y) / dt2;
 
     let dx1 = (t1x * dt1) / 3.0;
     let dy1 = (t1y * dt1) / 3.0;

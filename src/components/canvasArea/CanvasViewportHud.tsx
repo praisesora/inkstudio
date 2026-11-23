@@ -133,6 +133,7 @@ export const CanvasViewportHud: React.FC<CanvasViewportHudProps> = ({
       >
         <svg
           viewBox={isCustomTip && tipOutline ? tipOutline.viewBox : '0 0 100 100'}
+          preserveAspectRatio="none"
           className="w-full h-full overflow-visible pointer-events-none select-none"
           style={{ display: 'block' }}
         >
@@ -223,6 +224,7 @@ export const CanvasViewportHud: React.FC<CanvasViewportHudProps> = ({
           {isCustomTip && tipOutline ? (
             <svg
               viewBox={tipOutline.viewBox}
+              preserveAspectRatio="none"
               className="w-full h-full overflow-visible pointer-events-none"
               style={{ display: 'block' }}
             >

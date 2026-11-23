@@ -11,7 +11,7 @@ import {
   CspTipFlipMode,
 } from '../types/editor';
 import { evaluateFastSpline } from '../engine/BrushEngine';
-import { isNativeRustAvailable, parseSutSqliteNative } from './nativeBackend';
+import { isNativeRustAvailable, NativeSutExtract, parseSutSqliteNative } from './nativeBackend';
 
 const MAX_DECOMPRESSED_BLOB_BYTES = 64 * 1024 * 1024;
 const MAX_COMPRESSED_BLOB_BYTES = 16 * 1024 * 1024;
@@ -232,6 +232,24 @@ export function isPng(buf: Uint8Array): boolean {
 }
 
 /**
+ * Checks whether a MaterialFile TAR archive is tagged as a PaperTexture in icedata/layerData.xml.
+ */
+export function isMaterialPaperTexture(fileData: Uint8Array): boolean {
+  if (!fileData || fileData.length < 512) return false;
+  try {
+    const entries = extractTarEntries(fileData);
+    const xmlEntry = entries.find((e) => e.name.toLowerCase().endsWith('layerdata.xml'));
+    if (xmlEntry && xmlEntry.data.length > 0) {
+      const xml = new TextDecoder('utf-8', { fatal: false }).decode(xmlEntry.data);
+      return xml.includes('<data>PaperTexture</data>');
+    }
+  } catch {
+    // Ignore malformed TAR
+  }
+  return false;
+}
+
+/**
  * Extracts the primary raster image from a Clip Studio Paint MaterialFile BLOB.
  */
 export function extractMaterialPng(fileData: Uint8Array): Uint8Array | null {
@@ -342,7 +360,11 @@ export function parseCspEffector(blob: Uint8Array | null | undefined): DecodedEf
   const maxValue = rawMax > 0 ? Math.max(0, Math.min(1.0, rawMax / 100.0)) : 1.0;
 
   const curves: [number, number][][] = [];
-  let offset = 44;
+  const headerLen = view.getUint32(0, false);
+  let offset = headerLen >= 44 && headerLen <= blob.length ? headerLen : 48;
+  if (offset + 12 <= blob.length && view.getUint32(offset, false) !== 12 && blob.length >= 56 && view.getUint32(44, false) === 12) {
+    offset = 44;
+  }
 
   while (offset + 12 <= blob.length) {
     const magic = view.getUint32(offset, false);
@@ -596,14 +618,99 @@ function mapFlipMode(val: unknown): CspTipFlipMode {
   return 'none';
 }
 
+export interface DecodedInOutTarget {
+  affectSize: boolean;
+  minSizeRatio: number;
+  affectDensity: boolean;
+  minDensityRatio: number;
+  affectOpacity: boolean;
+  affectAmountOfPaint: boolean;
+  minAmountRatio: number;
+  affectDensityOfPaint: boolean;
+  minPaintDensityRatio: number;
+}
+
+/**
+ * Parses CSP Variant.BrushInOutTarget binary table:
+ * [header: magic(u32BE=12), count(u32BE), entrySize(u32BE=12)]
+ * followed by `count` entries of [paramId(u32BE), enabled(u32BE), minVal(u32BE)].
+ * Exact CSP param IDs (ordered by Sub Tool Detail -> Starting and Ending):
+ *  - 0x03e9 (1001): Opacity
+ *  - 0x03fd (1021): Brush Size (minVal in 0..100%)
+ *  - 0x0411 (1041): Brush Density / Flow (minVal in 0..100%)
+ *  - 0x043a (1082): Amount of Paint / BrushMixColor (minVal in 0..100%)
+ *  - 0x043c (1084): Density of Paint / BrushMixAlpha (minVal in 0..100%)
+ */
+export function parseCspInOutTarget(blob: Uint8Array | null | undefined): DecodedInOutTarget | null {
+  if (!blob || blob.length < 12) return null;
+  const view = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+  const magic = view.getUint32(0, false);
+  const count = view.getUint32(4, false);
+  const entrySize = view.getUint32(8, false);
+  if (magic !== 12 || entrySize !== 12 || count === 0 || 12 + count * 12 > blob.length) {
+    return null;
+  }
+
+  let affectSize = false;
+  let minSizeRatio = 0;
+  let affectDensity = false;
+  let minDensityRatio = 0;
+  let affectOpacity = false;
+  let affectAmountOfPaint = false;
+  let minAmountRatio = 0;
+  let affectDensityOfPaint = false;
+  let minPaintDensityRatio = 0;
+  let anyEnabled = false;
+
+  for (let i = 0; i < count; i++) {
+    const off = 12 + i * 12;
+    const paramId = view.getUint32(off, false);
+    const enabled = view.getUint32(off + 4, false) !== 0;
+    const val = view.getUint32(off + 8, false);
+    if (!enabled) continue;
+    anyEnabled = true;
+    const norm = Math.max(0, Math.min(1, val / 100));
+    if (paramId === 0x03fd) {
+      affectSize = true;
+      minSizeRatio = norm;
+    } else if (paramId === 0x03e9 || paramId === 0x03fc) {
+      affectOpacity = true;
+    } else if (paramId === 0x0411) {
+      affectDensity = true;
+      minDensityRatio = norm;
+    } else if (paramId === 0x043a) {
+      affectAmountOfPaint = true;
+      minAmountRatio = norm;
+    } else if (paramId === 0x043c) {
+      affectDensityOfPaint = true;
+      minPaintDensityRatio = norm;
+    }
+  }
+
+  if (!anyEnabled) return null;
+  return {
+    affectSize,
+    minSizeRatio,
+    affectDensity,
+    minDensityRatio,
+    affectOpacity,
+    affectAmountOfPaint,
+    minAmountRatio,
+    affectDensityOfPaint,
+    minPaintDensityRatio,
+  };
+}
+
 function mapTextureMode(val: unknown): CspPaperTextureMode {
   const n = Number(val);
-  if (n === 1) return 'subtract';
-  if (n === 2) return 'multiply';
-  if (n === 3) return 'compare';
+  // CSP TextureCompositeMode: 0=Normal, 1=Multiply, 2=Subtract, 3=Compare density,
+  // 4=Overlay, 5=Color burn, 6=Linear burn, 7=Height, 8=Outline
+  if (n === 0 || n === 1 || n === 5 || n === 6) return 'multiply';
+  if (n === 2) return 'subtract';
+  if (n === 3 || n === 7) return 'compare';
   if (n === 4) return 'overlay';
-  if (n === 5) return 'outline';
-  return 'subtract';
+  if (n === 8) return 'outline';
+  return 'multiply';
 }
 
 /**
@@ -619,7 +726,17 @@ export async function parseSutFile(
   }
 
   const extracted = await parseSutSqliteNative(rawBytes);
+  return parseSutExtractedData(extracted, fileName);
+}
 
+/**
+ * Pure mapper from extracted SQLite rows (Node/Variant/MaterialFile) to CspBrush.
+ * Exported directly for deterministic unit testing without Tauri IPC.
+ */
+export async function parseSutExtractedData(
+  extracted: NativeSutExtract,
+  fileName: string = 'Brush.sut'
+): Promise<CspBrush> {
   let brushName = extracted.nodeName || fileName.replace(/\.sut$/i, '').trim();
 
   let brushSize = 16;
@@ -650,6 +767,7 @@ export async function parseSutFile(
   let opacitySensor: CspSensorConfig | undefined = undefined;
   let densitySensor: CspSensorConfig | undefined = undefined;
   let colorMixing = false;
+  let perceptualMixing = false;
   let amountOfPaint = 0.7;
   let densityOfPaint = 0.8;
   let colorStretch = 0.6;
@@ -661,15 +779,17 @@ export async function parseSutFile(
   let textureDensity = 0;
   let paperTextureScale = 1.0;
   let paperTextureRotate = 0;
-  let paperTextureMode: CspPaperTextureMode = 'subtract';
+  let paperTextureMode: CspPaperTextureMode = 'multiply';
   let paperTextureBrightness = 0;
   let paperTextureContrast = 0;
+  let paperTextureApplyEachPlot = false;
   let paperTextureInverted = false;
   let spray: CspSpraySettings | undefined = undefined;
   let taper: CspTaperSettings | undefined = undefined;
   let isRibbon = false;
   let dualBrush = false;
   let dualBrushCompositeMode = 'multiply';
+  let usePatternImage: boolean | null = null;
   let rawPatternArrayBlob: Uint8Array | null = null;
   let rawTextureImageBlob: Uint8Array | null = null;
   let rawDualPatternBlob: Uint8Array | null = null;
@@ -718,22 +838,29 @@ export async function parseSutFile(
           const opacityEffBlob = getVal(['OpacityEffector', 'BrushOpacityEffector']);
           if (opacityEffBlob instanceof Uint8Array) {
             const eff = parseCspEffector(opacityEffBlob);
-            if (eff) opacitySensor = effectorToSensorConfig(eff);
+            if (eff && (eff.usePressure || eff.useTilt || eff.useVelocity || eff.useRandom)) {
+              opacitySensor = effectorToSensorConfig(eff);
+            }
           }
 
           const densityEffBlob = getVal(['BrushDensityEffector', 'BrushFlowEffector', 'DensityEffector']);
           if (densityEffBlob instanceof Uint8Array) {
             const eff = parseCspEffector(densityEffBlob);
-            if (eff) densitySensor = effectorToSensorConfig(eff);
+            if (eff && (eff.usePressure || eff.useTilt || eff.useVelocity || eff.useRandom)) {
+              densitySensor = effectorToSensorConfig(eff);
+            }
           }
 
-          // Spacing / Interval
+          // Spacing / Interval (CSP BrushAutoIntervalType: 0=Fixed %, 1=Wide, 2=Normal, 3=Narrow)
+          const rawAutoInterval = getVal(['BrushAutoIntervalType']);
           const rawSpacing = getVal(['BrushInterval', 'Interval', 'Spacing', 'BrushSpacing']);
-          if (typeof rawSpacing === 'number' && rawSpacing > 0) {
-            spacing =
-              rawSpacing > 1.0
-                ? Math.max(0.01, Math.min(1.0, rawSpacing / 100))
-                : Math.max(0.01, Math.min(1.0, rawSpacing));
+          if (typeof rawAutoInterval === 'number' && rawAutoInterval > 0) {
+            if (rawAutoInterval === 1) spacing = 0.25;
+            else if (rawAutoInterval === 2) spacing = 0.1;
+            else if (rawAutoInterval === 3) spacing = 0.04;
+          } else if (typeof rawSpacing === 'number' && rawSpacing > 0) {
+            // In CSP, BrushInterval in Fixed mode is ALWAYS a percentage (0.1%..200% -> 0.001..2.0)
+            spacing = Math.max(0.003, Math.min(2.0, rawSpacing / 100));
           }
 
           // Opacity (strictly stroke ceiling opacity, distinct from BrushDensity!)
@@ -748,7 +875,7 @@ export async function parseSutFile(
             flow = rawFlow > 1.0 ? Math.min(1.0, rawFlow / 100) : rawFlow;
           }
 
-          const rawAdjustGap = getVal(['BrushAdjustDensityByGap', 'AdjustDensityByGap']);
+          const rawAdjustGap = getVal(['BrushAdjustFlowByInterval', 'BrushAdjustDensityByGap', 'AdjustDensityByGap']);
           if (rawAdjustGap !== null) {
             adjustDensityByGap = Boolean(rawAdjustGap);
           }
@@ -777,12 +904,13 @@ export async function parseSutFile(
             thicknessVertical = Boolean(rawVertThick);
           }
 
-          const rawFlipH = getVal(['BrushFlipX', 'FlipHorizontal']);
+          const rawFlipH = getVal(['BrushPatternReverseHorizontal', 'BrushFlipX', 'FlipHorizontal']);
           if (rawFlipH !== null) flipH = mapFlipMode(rawFlipH);
-          const rawFlipV = getVal(['BrushFlipY', 'FlipVertical']);
+          const rawFlipV = getVal(['BrushPatternReverseVertical', 'BrushFlipY', 'FlipVertical']);
           if (rawFlipV !== null) flipV = mapFlipMode(rawFlipV);
 
           // Rotation & Rotation Dynamics
+          // CSP BrushRotationEffector low nibble: 1=None, 2=Pen direction (tilt), 3=Direction of line, 4=Random, 5=Pen rotation (twist)
           const rawAngle = getVal(['BrushRotation', 'Rotation', 'BrushAngle', 'Angle']);
           if (typeof rawAngle === 'number') {
             angle = ((rawAngle % 360) + 360) % 360;
@@ -790,7 +918,19 @@ export async function parseSutFile(
 
           const rawRotEff = getVal(['BrushRotationEffector', 'RotationEffector', 'AngleDynamics']);
           if (typeof rawRotEff === 'number') {
-            if (rawRotEff & 0x80 || rawRotEff === 3 || rawRotEff === 67 || rawRotEff === 131) {
+            const rotMode = rawRotEff & 0x0f;
+            if (rotMode === 3) {
+              angleDynamics = 'direction';
+            } else if (rotMode === 2) {
+              angleDynamics = 'tilt';
+              useTilt = true;
+            } else if (rotMode === 4) {
+              angleDynamics = 'random';
+            } else if (rotMode === 5) {
+              angleDynamics = 'twist';
+            } else if (rotMode === 1) {
+              angleDynamics = 'none';
+            } else if (rawRotEff & 0x80) {
               angleDynamics = 'direction';
             } else if (rawRotEff & 0x20) {
               angleDynamics = 'tilt';
@@ -798,12 +938,21 @@ export async function parseSutFile(
             }
           }
 
-          const rawRandRot = getVal(['BrushRotationRandomScale', 'RotationRandomScale']);
-          if (typeof rawRandRot === 'number' && rawRandRot > 0) {
-            rotationRandomScale = Math.min(1.0, rawRandRot / 100);
-            if (angleDynamics === 'none') {
-              angleDynamics = 'random';
+          // CSP stores BrushRotationRandomScale=100 by default even when Random rotation is OFF!
+          // Only apply random scale when random rotation mode is explicitly enabled.
+          if (angleDynamics === 'random') {
+            const rawRandRot = getVal(['BrushRotationRandomScale', 'RotationRandomScale']);
+            if (typeof rawRandRot === 'number' && rawRandRot > 0) {
+              rotationRandomScale = Math.min(1.0, rawRandRot / 100);
             }
+          } else {
+            rotationRandomScale = 0;
+          }
+
+          // CSP "Direction of line" aligns 12 o'clock (-Y) with the stroke tangent,
+          // whereas Ink Studio aligns 3 o'clock (+X) with atan2(dy, dx). Offset +90 deg to match CSP exactly.
+          if (angleDynamics === 'direction') {
+            angle = (angle + 90) % 360;
           }
 
           // Anti-Aliasing
@@ -813,15 +962,16 @@ export async function parseSutFile(
           }
 
           // Stabilization & Post-Correction
-          const rawRev = getVal(['BrushRevision', 'Revision', 'FlickerReduction', 'BrushStabilization']);
+          const rawRev = getVal(['FlickerReduction', 'BrushStabilization']);
           if (typeof rawRev === 'number' && rawRev >= 0) {
             stabilization = Math.min(50, Math.max(0, Math.round(rawRev)));
           }
-          const rawPostCorr = getVal(['BrushPostCorrection', 'PostCorrection']);
-          if (typeof rawPostCorr === 'number' && rawPostCorr >= 0) {
-            postCorrection = Math.min(5, Math.max(0, Math.round(rawPostCorr)));
+          const rawUseRev = getVal(['BrushUseRevision']);
+          const rawPostCorr = getVal(['BrushRevision', 'BrushPostCorrection', 'PostCorrection']);
+          if (Boolean(rawUseRev) && typeof rawPostCorr === 'number' && rawPostCorr >= 0) {
+            postCorrection = Math.min(5, Math.max(0, Math.round(rawPostCorr / 2)));
           }
-          const rawSharp = getVal(['BrushSharpAngles', 'SharpAngles']);
+          const rawSharp = getVal(['BrushSharpenCorner', 'BrushSharpAngles', 'SharpAngles']);
           if (rawSharp !== null) {
             sharpCorners = Boolean(rawSharp);
           }
@@ -863,17 +1013,21 @@ export async function parseSutFile(
             colorStretch = rawMixExt > 1.0 ? Math.min(1.0, rawMixExt / 100) : rawMixExt;
           }
 
-          const rawMixMode = getVal(['BrushColorMixingMode', 'MixingMode']);
+          // CSP Variant.BrushWaterColor selects Mixing Mode: 0=Blend, 1=Running color, 2=Smear/Blur.
+          // CSP Variant.BrushColorMixingMode (CSP 2.0+) selects Color Space: 0=Standard, 1=Perceptual.
+          const rawMixMode = getVal(['BrushWaterColor', 'MixingMode']);
           if (rawMixMode !== null) {
             const m = Number(rawMixMode);
             mixingMode = m === 2 ? 'smear' : m === 1 ? 'running_color' : 'blend';
           }
-
-          // Wet Edge
-          const rawWetEdge = getVal(['BrushUseWaterEdge', 'UseWaterEdge']);
-          if (rawWetEdge !== null) {
-            wetEdge = Boolean(rawWetEdge) ? 0.75 : 0;
+          const rawColorSpaceMode = getVal(['BrushColorMixingMode', 'PerceptualMixing']);
+          if (rawColorSpaceMode !== null) {
+            perceptualMixing = Number(rawColorSpaceMode) === 1;
           }
+
+          // Wet Edge (strictly gated on BrushUseWaterEdge!)
+          const rawWetEdge = getVal(['BrushUseWaterEdge', 'UseWaterEdge']);
+          const wetEdgeEnabled = Boolean(rawWetEdge);
           const rawWetRad = getVal(['BrushWaterEdgeRadius', 'WaterEdgeRadius']);
           if (typeof rawWetRad === 'number' && rawWetRad > 0) {
             wetEdgeRadius = rawWetRad;
@@ -881,12 +1035,14 @@ export async function parseSutFile(
           const rawWetAlpha = getVal(['BrushWaterEdgeAlphaPower', 'WaterEdgeAlphaPower']);
           if (typeof rawWetAlpha === 'number' && rawWetAlpha > 0) {
             wetEdgeAlphaPower = rawWetAlpha;
-            if (!rawWetEdge) wetEdge = Math.min(1.0, rawWetAlpha / 100);
           }
           const rawWetVal = getVal(['BrushWaterEdgeValuePower', 'WaterEdgeValuePower']);
           if (typeof rawWetVal === 'number' && rawWetVal > 0) {
             wetEdgeValuePower = rawWetVal;
           }
+          wetEdge = wetEdgeEnabled
+            ? Math.max(0.15, Math.min(1.0, (wetEdgeAlphaPower || 75) / 100))
+            : 0;
 
           // Paper Grain / Texture
           const rawTexDensity = getVal(['TextureDensity', 'Grain', 'BrushTextureDensity']);
@@ -902,21 +1058,25 @@ export async function parseSutFile(
           if (typeof rawTexRotate === 'number') {
             paperTextureRotate = rawTexRotate;
           }
-          const rawTexMode = getVal(['TextureMode', 'BrushTextureMode']);
+          const rawTexMode = getVal(['TextureCompositeMode', 'TextureMode', 'BrushTextureMode']);
           if (rawTexMode !== null) {
             paperTextureMode = mapTextureMode(rawTexMode);
           }
-          const rawTexInvert = getVal(['TextureInvert', 'BrushTextureInvert']);
+          const rawTexInvert = getVal(['TextureReverseDensity', 'TextureInvert', 'BrushTextureInvert']);
           if (rawTexInvert !== null) {
             paperTextureInverted = Boolean(rawTexInvert);
           }
+          const rawTexForPlot = getVal(['TextureForPlot']);
+          if (rawTexForPlot !== null) {
+            paperTextureApplyEachPlot = Boolean(rawTexForPlot);
+          }
           const rawTexBright = getVal(['TextureBrightness']);
           if (typeof rawTexBright === 'number') {
-            paperTextureBrightness = Math.max(-1, Math.min(1, rawTexBright / 100));
+            paperTextureBrightness = Math.max(-100, Math.min(100, rawTexBright));
           }
           const rawTexContrast = getVal(['TextureContrast']);
           if (typeof rawTexContrast === 'number') {
-            paperTextureContrast = Math.max(-1, Math.min(1, rawTexContrast / 100));
+            paperTextureContrast = Math.max(-100, Math.min(100, rawTexContrast));
           }
 
           // Spray / Airbrush
@@ -939,19 +1099,22 @@ export async function parseSutFile(
             };
           }
 
-          // Taper (In / Out)
+          // Taper (Starting and Ending)
           const rawUseIn = getVal(['BrushUseIn']);
           const rawUseOut = getVal(['BrushUseOut']);
           const useIn = rawUseIn !== null ? Boolean(rawUseIn) : false;
           const useOut = rawUseOut !== null ? Boolean(rawUseOut) : false;
           const inLength = Number(getVal(['BrushInLength']) || 0);
-          const inRatio = Number(getVal(['BrushInRatio']) || 0);
+          const rawInRatio = Number(getVal(['BrushInRatio']) || 0);
+          const inRatio = rawInRatio > 1 ? Math.min(1, rawInRatio / 100) : Math.max(0, rawInRatio);
           const outLength = Number(getVal(['BrushOutLength']) || 0);
-          const outRatio = Number(getVal(['BrushOutRatio']) || 0);
+          const rawOutRatio = Number(getVal(['BrushOutRatio']) || 0);
+          const outRatio = rawOutRatio > 1 ? Math.min(1, rawOutRatio / 100) : Math.max(0, rawOutRatio);
           const inOutType = Number(getVal(['BrushInOutType']) || 0);
           const inOutBySpeed = Boolean(getVal(['BrushInOutBySpeed']));
+          const decodedInOut = parseCspInOutTarget(getVal(['BrushInOutTarget']));
 
-          if (useIn || useOut || inLength > 0 || outLength > 0 || inRatio > 0 || outRatio > 0) {
+          if ((useIn || useOut) && inOutType !== 0) {
             taper = {
               useIn,
               inLength,
@@ -961,6 +1124,15 @@ export async function parseSutFile(
               outRatio,
               inOutType,
               inOutBySpeed,
+              affectSize: decodedInOut ? decodedInOut.affectSize : true,
+              minSizeRatio: decodedInOut ? decodedInOut.minSizeRatio : 0,
+              affectDensity: decodedInOut ? decodedInOut.affectDensity : false,
+              minDensityRatio: decodedInOut ? decodedInOut.minDensityRatio : 0,
+              affectOpacity: decodedInOut ? decodedInOut.affectOpacity : false,
+              affectAmountOfPaint: decodedInOut ? decodedInOut.affectAmountOfPaint : false,
+              minAmountRatio: decodedInOut ? decodedInOut.minAmountRatio : 0,
+              affectDensityOfPaint: decodedInOut ? decodedInOut.affectDensityOfPaint : false,
+              minPaintDensityRatio: decodedInOut ? decodedInOut.minPaintDensityRatio : 0,
             };
           }
 
@@ -969,7 +1141,7 @@ export async function parseSutFile(
           if (Boolean(rawDual)) {
             dualBrush = true;
           }
-          const rawDualMode = getVal(['DualBrushMode', 'DualCompositeMode']);
+          const rawDualMode = getVal(['DualBrushCompositeMode', 'DualBrushMode', 'DualCompositeMode']);
           if (rawDualMode !== null) {
             const dm = Number(rawDualMode);
             if (dm === 1) dualBrushCompositeMode = 'subtract';
@@ -978,6 +1150,10 @@ export async function parseSutFile(
             else if (dm === 4) dualBrushCompositeMode = 'screen';
           }
 
+          const rawUsePattern = getVal(['BrushUsePatternImage']);
+          if (rawUsePattern !== null) {
+            usePatternImage = Boolean(rawUsePattern);
+          }
           rawPatternArrayBlob = getVal(['BrushPatternImageArray']);
           rawTextureImageBlob = getVal(['TextureImage']);
           rawDualPatternBlob = getVal(['DualPatternImageArray']);
@@ -988,8 +1164,15 @@ export async function parseSutFile(
     }
 
     // 4. MaterialFile extraction (from native Rust rusqlite rows)
-    const materialMap = new Map<string, { mainPng: Uint8Array; width: number; height: number }>();
-    const allMaterialsList: { mainPng: Uint8Array; catalogPath: string; width: number; height: number }[] = [];
+    interface ExtractedMaterial {
+      mainPng: Uint8Array;
+      catalogPath: string;
+      width: number;
+      height: number;
+      isPaperTexture: boolean;
+    }
+    const materialMap = new Map<string, ExtractedMaterial>();
+    const allMaterialsList: ExtractedMaterial[] = [];
 
     for (const mat of extracted.materials) {
       const fileData = mat.fileData;
@@ -1007,7 +1190,13 @@ export async function parseSutFile(
             height = view.getUint32(20, false);
           }
 
-          const entry = { mainPng, width, height };
+          const entry: ExtractedMaterial = {
+            mainPng,
+            catalogPath: catPath,
+            width,
+            height,
+            isPaperTexture: isMaterialPaperTexture(fileData),
+          };
           if (catPath) materialMap.set(catPath, entry);
           materialMap.set(pwId, entry);
 
@@ -1018,14 +1207,14 @@ export async function parseSutFile(
             materialMap.set(uuidMatch[0], entry);
           }
 
-          allMaterialsList.push({ mainPng, catalogPath: catPath, width, height });
+          allMaterialsList.push(entry);
         }
       }
     }
 
     // 5. Match Paper Texture
     let paperTexture: string | undefined = undefined;
-    let paperTextureEntry: { mainPng: Uint8Array } | null = null;
+    let paperTextureEntry: ExtractedMaterial | null = null;
 
     if (rawTextureImageBlob) {
       const texIds = extractCatalogIdsFromBlob(rawTextureImageBlob);
@@ -1037,37 +1226,49 @@ export async function parseSutFile(
         }
       }
     }
+    if (!paperTexture) {
+      // CSP stores TextureDensity=50 even when no texture image is bound; avoid ghost grain.
+      textureDensity = 0;
+    }
 
-    // 6. Match Brush Tip(s)
-    const tipPngEntries: { mainPng: Uint8Array; width: number; height: number }[] = [];
+    // 6. Match Brush Tip(s) — NEVER hijack a PaperTexture or ignore BrushUsePatternImage=0!
+    const tipPngEntries: ExtractedMaterial[] = [];
 
-    if (rawPatternArrayBlob) {
-      const patternIds = extractCatalogIdsFromBlob(rawPatternArrayBlob);
-      for (const pid of patternIds) {
-        if (materialMap.has(pid)) {
-          const entry = materialMap.get(pid)!;
-          if (entry !== paperTextureEntry && !tipPngEntries.includes(entry)) {
-            tipPngEntries.push(entry);
+    if (usePatternImage !== false) {
+      if (rawPatternArrayBlob) {
+        const patternIds = extractCatalogIdsFromBlob(rawPatternArrayBlob);
+        for (const pid of patternIds) {
+          if (materialMap.has(pid)) {
+            const entry = materialMap.get(pid)!;
+            if (entry !== paperTextureEntry && !tipPngEntries.includes(entry)) {
+              tipPngEntries.push(entry);
+            }
+          }
+        }
+      }
+
+      if (tipPngEntries.length === 0 && allMaterialsList.length > 0 && usePatternImage === true) {
+        for (const m of allMaterialsList) {
+          if (
+            m !== paperTextureEntry &&
+            !m.isPaperTexture &&
+            !tipPngEntries.some((e) => e.mainPng === m.mainPng)
+          ) {
+            tipPngEntries.push(m);
           }
         }
       }
     }
 
-    if (tipPngEntries.length === 0 && allMaterialsList.length > 0) {
-      for (const m of allMaterialsList) {
-        if (m !== paperTextureEntry && !tipPngEntries.some((e) => e.mainPng === m.mainPng)) {
-          tipPngEntries.push(m);
-        }
-      }
-    }
-
-    // 7. Process extracted tips or generate procedural tip
+    // 7. Process extracted custom tips; for Circle tips (BrushUsePatternImage=0), leave tipDataUrl undefined
+    // so BrushEngine renders its analytical/SDF circular/elliptical tip at native crisp resolution
+    // without double-applying thickness!
     let tipDataUrl: string | undefined = undefined;
     let tipWidth: number | undefined = undefined;
     let tipHeight: number | undefined = undefined;
     let isColorTip = false;
     const subTips: CspSubTip[] = [];
-    const fallbackProc = { hardness, thickness, antiAlias };
+    const fallbackProc = { hardness, thickness: 1.0, antiAlias };
 
     if (tipPngEntries.length > 0) {
       const primaryEntry = tipPngEntries[0];
@@ -1088,11 +1289,6 @@ export async function parseSutFile(
           isColor: p.isColor,
         });
       }
-    } else {
-      const proc = generateProceduralTip(hardness, thickness, antiAlias);
-      tipDataUrl = proc.dataUrl;
-      tipWidth = proc.width;
-      tipHeight = proc.height;
     }
 
     let secondaryTipDataUrl: string | undefined = undefined;
@@ -1120,7 +1316,7 @@ export async function parseSutFile(
       id: uniqueId,
       name: brushName,
       badge: 'CSP',
-      desc: tipPngEntries.length > 0 ? 'Clip Studio Paint Textured Brush' : 'Clip Studio Paint Inking Pen',
+      desc: tipPngEntries.length > 0 ? 'Clip Studio Paint Textured Brush' : 'Clip Studio Paint Brush',
       tipDataUrl,
       tipWidth,
       tipHeight,
@@ -1158,6 +1354,7 @@ export async function parseSutFile(
       pressureCurve,
       velocityCurve,
       colorMixing,
+      perceptualMixing,
       amountOfPaint,
       densityOfPaint,
       colorStretch,
@@ -1173,6 +1370,7 @@ export async function parseSutFile(
       paperTextureMode,
       paperTextureBrightness,
       paperTextureContrast,
+      paperTextureApplyEachPlot,
       paperTextureInverted,
       dualBrush,
       dualBrushCompositeMode,

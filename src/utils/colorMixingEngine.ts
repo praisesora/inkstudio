@@ -700,6 +700,83 @@ export class LayerPixelSampler {
   }
 
   /**
+   * Zero-allocation O(1) bilinear single-pixel sample for 2D SpatialTipMixer.
+   */
+  public sampleBilinearFast(cx: number, cy: number, out: RgbaColor): RgbaColor {
+    const w = this.width;
+    const h = this.height;
+    if (w <= 0 || h <= 0 || cx < -0.5 || cy < -0.5 || cx >= w - 0.5 || cy >= h - 0.5) {
+      out.r = 255;
+      out.g = 255;
+      out.b = 255;
+      out.a = 0;
+      return out;
+    }
+
+    const x0 = Math.max(0, Math.min(w - 1, Math.floor(cx)));
+    const y0 = Math.max(0, Math.min(h - 1, Math.floor(cy)));
+    const x1 = Math.min(w - 1, x0 + 1);
+    const y1 = Math.min(h - 1, y0 + 1);
+    const fx = Math.max(0, Math.min(1, cx - x0));
+    const fy = Math.max(0, Math.min(1, cy - y0));
+
+    const w00 = (1 - fx) * (1 - fy);
+    const w10 = fx * (1 - fy);
+    const w01 = (1 - fx) * fy;
+    const w11 = fx * fy;
+
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let sumA = 0;
+
+    const accum = (px: number, py: number, wt: number) => {
+      if (wt <= 1e-4) return;
+      let tr: number, tg: number, tb: number, ta: number;
+      if (this.useLazyTiles) {
+        const tile = this.getOrLoadTile(px >> 8, py >> 8);
+        const idx = (((py & 255) << 8) + (px & 255)) << 2;
+        tr = tile[idx];
+        tg = tile[idx + 1];
+        tb = tile[idx + 2];
+        ta = tile[idx + 3] / 255;
+      } else {
+        const idx = (py * w + px) << 2;
+        tr = this.data[idx];
+        tg = this.data[idx + 1];
+        tb = this.data[idx + 2];
+        ta = this.data[idx + 3] / 255;
+      }
+      if (ta > 0.002) {
+        const aw = wt * ta;
+        sumR += tr * aw;
+        sumG += tg * aw;
+        sumB += tb * aw;
+        sumA += aw;
+      }
+    };
+
+    accum(x0, y0, w00);
+    if (x1 !== x0) accum(x1, y0, w10);
+    if (y1 !== y0) accum(x0, y1, w01);
+    if (x1 !== x0 && y1 !== y0) accum(x1, y1, w11);
+
+    if (sumA > 0.002) {
+      const inv = 1 / sumA;
+      out.r = sumR * inv;
+      out.g = sumG * inv;
+      out.b = sumB * inv;
+      out.a = Math.min(1, sumA);
+    } else {
+      out.r = 255;
+      out.g = 255;
+      out.b = 255;
+      out.a = 0;
+    }
+    return out;
+  }
+
+  /**
    * Lightweight per-bristle pixel deposit so overlapping turns immediately pick up
    * freshly mixed multi-colored streaks laid down earlier in the same stroke.
    */
@@ -843,6 +920,7 @@ export class PaintReservoir {
   public isLoadedWithCanvasColor: boolean = false;
   public cumulativeDistance: number = 0;
   public smoothedAngle: number = 0;
+  public spatialMixer?: SpatialTipMixer;
 
   constructor(initialColor: string) {
     const rgb = parseColorToRgb(initialColor);
@@ -1477,5 +1555,675 @@ export class SpatialBristleReservoir {
     out.load = squeezedLoad;
     out.height = this.grooveWeights[i] * (0.28 + 0.72 * squeezedLoad) * (0.45 + 0.55 * effPressure);
     return out;
+  }
+}
+
+// -------------------------------------------------------------
+// 2D Spatial Per-Pixel Tip Mixer (Clip Studio Paint Blend / Running Color / Smear)
+// Maintains an oriented 2D RGBA pickup buffer across the brush tip footprint so
+// one edge of a flat brush picks up & drags underlying paint independently while
+// the rest of the brush lays down clean foreground color — matching CSP exactly.
+// -------------------------------------------------------------
+
+export interface SpatialTipStampParams {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  angleRad: number;
+  dirX: number;
+  dirY: number;
+  stepDist: number;
+  spacingRatio?: number;
+  adjustDensityByGap?: boolean;
+  dabSeq?: number;
+  hardness: number;
+  antiAlias: number;
+  flipX: number;
+  flipY: number;
+  flow: number;
+  pressure: number;
+  pressureAlreadyApplied: boolean;
+  amountOfPaint: number;
+  densityOfPaint: number;
+  colorStretch: number;
+  mixingMode: NaturalMixingMode;
+  perceptualMixing: boolean;
+  tipImage?: HTMLImageElement;
+  sampler?: LayerPixelSampler;
+  grainDensity?: number;
+  grainModulate?: (wx: number, wy: number, tipAlpha: number) => number;
+}
+
+interface CachedTipMask {
+  width: number;
+  height: number;
+  alpha: Uint8Array;
+}
+
+const tipAlphaMaskCache = new WeakMap<HTMLImageElement, CachedTipMask>();
+
+function getCachedTipAlphaMask(img: HTMLImageElement): CachedTipMask | null {
+  const cached = tipAlphaMaskCache.get(img);
+  if (cached) return cached;
+  if (typeof document === 'undefined') return null;
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (w <= 0 || h <= 0) return null;
+  const maxDim = 64;
+  const scale = Math.min(1, maxDim / Math.max(w, h));
+  const dw = Math.max(4, Math.round(w * scale));
+  const dh = Math.max(4, Math.round(h * scale));
+  const c = document.createElement('canvas');
+  c.width = dw;
+  c.height = dh;
+  const ctx = c.getContext('2d');
+  if (!ctx || typeof ctx.getImageData !== 'function') return null;
+  ctx.clearRect(0, 0, dw, dh);
+  ctx.drawImage(img, 0, 0, dw, dh);
+  const raw = ctx.getImageData(0, 0, dw, dh).data;
+  const alpha = new Uint8Array(dw * dh);
+  for (let i = 0; i < alpha.length; i++) {
+    alpha[i] = raw[i * 4 + 3];
+  }
+  const mask: CachedTipMask = { width: dw, height: dh, alpha };
+  tipAlphaMaskCache.set(img, mask);
+  return mask;
+}
+
+const MAX_SPATIAL_COLOR_DIM = 64;
+const MAX_SPATIAL_OUT_DIM = 256;
+
+export class SpatialTipMixer {
+  public readonly origR: number;
+  public readonly origG: number;
+  public readonly origB: number;
+
+  private gridW: number = 0;
+  private gridH: number = 0;
+  private initialized: boolean = false;
+  private readonly bufR = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly bufG = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly bufB = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly bufA = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly bufCarry = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly tmpR = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly tmpG = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+  private readonly tmpB = new Float32Array(MAX_SPATIAL_COLOR_DIM * MAX_SPATIAL_COLOR_DIM);
+
+  private scratchCanvas: HTMLCanvasElement | null = null;
+  private scratchCtx: CanvasRenderingContext2D | null = null;
+  private scratchImgData: ImageData | null = null;
+  private scratchW: number = 0;
+  private scratchH: number = 0;
+
+  private readonly sampleScratch: RgbaColor = { r: 0, g: 0, b: 0, a: 0 };
+  private readonly c1Scratch: RgbColor = { r: 0, g: 0, b: 0 };
+  private readonly c2Scratch: RgbColor = { r: 0, g: 0, b: 0 };
+
+  constructor(initialColor: string) {
+    const rgb = parseColorToRgb(initialColor);
+    this.origR = rgb.r;
+    this.origG = rgb.g;
+    this.origB = rgb.b;
+  }
+
+  private ensureGrid(width: number, height: number): void {
+    if (this.initialized && this.gridW > 0 && this.gridH > 0) {
+      return;
+    }
+    const maxDim = Math.max(width, height, 1);
+    const scale = Math.min(1, MAX_SPATIAL_COLOR_DIM / maxDim);
+    this.gridW = Math.max(8, Math.min(MAX_SPATIAL_COLOR_DIM, Math.ceil(width * scale)));
+    this.gridH = Math.max(8, Math.min(MAX_SPATIAL_COLOR_DIM, Math.ceil(height * scale)));
+  }
+
+  private ensureScratchSurface(outW: number, outH: number): boolean {
+    if (typeof document === 'undefined') return false;
+    if (!this.scratchCanvas) {
+      this.scratchCanvas = document.createElement('canvas');
+      this.scratchCanvas.width = outW;
+      this.scratchCanvas.height = outH;
+      this.scratchCtx = this.scratchCanvas.getContext('2d');
+      this.scratchW = outW;
+      this.scratchH = outH;
+    } else if (this.scratchW !== outW || this.scratchH !== outH) {
+      this.scratchCanvas.width = outW;
+      this.scratchCanvas.height = outH;
+      this.scratchW = outW;
+      this.scratchH = outH;
+      this.scratchImgData = null;
+    }
+    if (!this.scratchCtx || typeof this.scratchCtx.createImageData !== 'function') return false;
+    if (!this.scratchImgData) {
+      this.scratchImgData = this.scratchCtx.createImageData(outW, outH);
+    }
+    return true;
+  }
+
+  /**
+   * Samples underlying canvas across the oriented 2D brush tip footprint, updates per-texel
+   * pickup buffer with CSP Blend / Running Color / Smear physics, and composites a crisp 1:1
+   * anti-aliased tip stamp (decoupled from the color-pickup grid so large brushes stay razor-sharp).
+   */
+  public stepAndBuildStamp(p: SpatialTipStampParams): {
+    canvas: HTMLCanvasElement;
+    srcW: number;
+    srcH: number;
+    drawW: number;
+    drawH: number;
+    hasVisiblePixels: boolean;
+    avgR: number;
+    avgG: number;
+    avgB: number;
+    avgA: number;
+    pickedUpCanvas: boolean;
+  } | null {
+    if (p.width < 0.25 || p.height < 0.25 || p.flow <= 0.002) return null;
+
+    this.ensureGrid(p.width, p.height);
+    const gw = this.gridW;
+    const gh = this.gridH;
+
+    // 1:1 output stamp dimensions (capped at 256px) with 1px transparent padding on each edge
+    // so Canvas2D bilinear filtering never blurs or clips sharp rotated chisel corners.
+    const maxAxis = Math.max(p.width, p.height);
+    const outScale = maxAxis > MAX_SPATIAL_OUT_DIM - 2 ? (MAX_SPATIAL_OUT_DIM - 2) / maxAxis : 1.0;
+    const innerW = Math.max(4, Math.ceil(p.width * outScale));
+    const innerH = Math.max(4, Math.ceil(p.height * outScale));
+    const outW = innerW + 2;
+    const outH = innerH + 2;
+
+    if (!this.ensureScratchSurface(outW, outH) || !this.scratchCtx || !this.scratchCanvas || !this.scratchImgData) {
+      return null;
+    }
+
+    const clampedAmount = Math.max(0, Math.min(1, p.amountOfPaint));
+    const clampedDensity = Math.max(0, Math.min(1, p.densityOfPaint));
+    const clampedStretch = Math.max(0, Math.min(1, p.colorStretch));
+    const isPureSmudge = clampedAmount <= 0.005 || p.mixingMode === 'smear';
+    const isFullFresh = !isPureSmudge && clampedAmount >= 0.995;
+    const isRunning = p.mixingMode === 'running_color';
+
+    const cosA = Math.cos(p.angleRad);
+    const sinA = Math.sin(p.angleRad);
+    const halfW = p.width * 0.5;
+    const halfH = p.height * 0.5;
+    const invGw = 1 / gw;
+    const invGh = 1 / gh;
+
+    const brushSpan = Math.max(6, Math.max(p.width, p.height));
+    const thinSpan = Math.max(1.5, Math.min(p.width, p.height));
+    const step = Math.max(0, p.stepDist);
+
+    // Effective ellipse diameter along the motion direction (for footprint-normalized alpha & pickup)
+    let diamAlongStroke = thinSpan;
+    if (p.dirX !== 0 || p.dirY !== 0) {
+      const localDirX = p.dirX * cosA + p.dirY * sinA;
+      const localDirY = -p.dirX * sinA + p.dirY * cosA;
+      const dDenom = Math.hypot(localDirX / Math.max(0.5, p.width), localDirY / Math.max(0.5, p.height));
+      if (dDenom > 1e-5) {
+        diamAlongStroke = 1.0 / dDenom;
+      }
+    }
+
+    // Fast canvas pickup on contact (~0.25..0.75x tip thickness along stroke);
+    // Color Stretch governs long carry persistence (even on small 15-35px brushes!).
+    const carryScale = Math.max(0.75, brushSpan / 36);
+    const pickupLen = Math.max(1.8, diamAlongStroke * (0.26 + 0.44 * clampedStretch));
+    const pickupRate = step > 0 ? 1.0 - Math.exp(-step / pickupLen) : 0.9;
+
+    const stretchDist = Math.max(16.0, (24 + clampedStretch * clampedStretch * 340) * carryScale);
+    const carryDecay = step > 0 ? 1.0 - Math.exp(-step / stretchDist) : 0.0;
+    const recoverLen = Math.max(
+      18.0,
+      stretchDist / Math.max(0.18, clampedAmount)
+    );
+    const recoverRate = step > 0 ? 1.0 - Math.exp(-step / recoverLen) : 0.0;
+
+    const smudgeDecay = carryDecay;
+
+    const mixColorInto = (
+      r1: number,
+      g1: number,
+      b1: number,
+      r2: number,
+      g2: number,
+      b2: number,
+      w2: number
+    ): RgbColor => {
+      const w = w2 <= 0 ? 0 : w2 >= 1 ? 1 : w2;
+      if (w <= 0.0005) {
+        this.c1Scratch.r = r1;
+        this.c1Scratch.g = g1;
+        this.c1Scratch.b = b1;
+        return this.c1Scratch;
+      }
+      if (w >= 0.9995) {
+        this.c1Scratch.r = r2;
+        this.c1Scratch.g = g2;
+        this.c1Scratch.b = b2;
+        return this.c1Scratch;
+      }
+      if (p.perceptualMixing) {
+        this.c1Scratch.r = r1;
+        this.c1Scratch.g = g1;
+        this.c1Scratch.b = b1;
+        this.c2Scratch.r = r2;
+        this.c2Scratch.g = g2;
+        this.c2Scratch.b = b2;
+        return mixSubtractivePigments(this.c1Scratch, this.c2Scratch, w);
+      }
+      this.c1Scratch.r = r1 + (r2 - r1) * w;
+      this.c1Scratch.g = g1 + (g2 - g1) * w;
+      this.c1Scratch.b = b1 + (b2 - b1) * w;
+      return this.c1Scratch;
+    };
+
+    const sampler = p.sampler;
+    const firstTouch = !this.initialized;
+    let pickedUpCanvas = false;
+    let sumBufR = 0;
+    let sumBufG = 0;
+    let sumBufB = 0;
+    let sumBufA = 0;
+    const totalTexels = gw * gh;
+
+    // 1. Sample underlying canvas & update 2D oriented paint buffer
+    for (let gy = 0; gy < gh; gy++) {
+      const ny = ((gy + 0.5) * invGh - 0.5) * 2.0; // [-1, 1]
+      const ly = ny * halfH;
+      const rowOff = gy * gw;
+      for (let gx = 0; gx < gw; gx++) {
+        const nx = ((gx + 0.5) * invGw - 0.5) * 2.0; // [-1, 1]
+        const lx = nx * halfW;
+        const idx = rowOff + gx;
+
+        if (isFullFresh) {
+          this.bufR[idx] = this.origR;
+          this.bufG[idx] = this.origG;
+          this.bufB[idx] = this.origB;
+          this.bufA[idx] = 1.0;
+          this.bufCarry[idx] = 0.0;
+          sumBufR += this.origR;
+          sumBufG += this.origG;
+          sumBufB += this.origB;
+          sumBufA += 1.0;
+          continue;
+        }
+
+        const wx = p.x + lx * cosA - ly * sinA;
+        const wy = p.y + lx * sinA + ly * cosA;
+        const sampled = sampler
+          ? sampler.sampleBilinearFast(wx, wy, this.sampleScratch)
+          : ((this.sampleScratch.a = 0), this.sampleScratch);
+        const ca = sampled.a;
+        if (ca > 0.015) pickedUpCanvas = true;
+
+        // CSP Blend wet pickup: when crossing existing paint, load canvas pigment strongly into the
+        // carried tip buffer (proportional to (1 - amount) boosted by colorStretch) so overlapping
+        // colors smear visibly into blank canvas instead of snapping back to pure foreground.
+        const stretchPickupBoost = 1.0 + clampedStretch * (isRunning ? 1.45 : 1.15);
+
+        if (firstTouch) {
+          if (isPureSmudge) {
+            this.bufR[idx] = sampled.r;
+            this.bufG[idx] = sampled.g;
+            this.bufB[idx] = sampled.b;
+            this.bufA[idx] = ca;
+            this.bufCarry[idx] = ca;
+          } else if (ca > 0.015) {
+            const wCanvas = (1.0 - clampedAmount) * stretchPickupBoost * ca;
+            const wFresh = clampedAmount * (isRunning ? 0.75 : 0.9);
+            const eqFresh = wFresh / Math.max(1e-4, wFresh + wCanvas);
+            const m = mixColorInto(sampled.r, sampled.g, sampled.b, this.origR, this.origG, this.origB, eqFresh);
+            this.bufR[idx] = m.r;
+            this.bufG[idx] = m.g;
+            this.bufB[idx] = m.b;
+            this.bufA[idx] = 1.0;
+            this.bufCarry[idx] = Math.min(1.0, ca * (1.0 - eqFresh * 0.65));
+          } else {
+            this.bufR[idx] = this.origR;
+            this.bufG[idx] = this.origG;
+            this.bufB[idx] = this.origB;
+            this.bufA[idx] = 1.0;
+            this.bufCarry[idx] = 0.0;
+          }
+        } else if (ca > 0.015) {
+          if (isPureSmudge) {
+            const rate = Math.min(1.0, pickupRate * (0.45 + 0.55 * ca));
+            const curA = this.bufA[idx];
+            if (curA <= 0.01) {
+              this.bufR[idx] = sampled.r;
+              this.bufG[idx] = sampled.g;
+              this.bufB[idx] = sampled.b;
+              this.bufA[idx] = ca * rate;
+            } else {
+              const m = mixColorInto(this.bufR[idx], this.bufG[idx], this.bufB[idx], sampled.r, sampled.g, sampled.b, rate);
+              this.bufR[idx] = m.r;
+              this.bufG[idx] = m.g;
+              this.bufB[idx] = m.b;
+              this.bufA[idx] = curA + (ca - curA) * rate;
+            }
+            this.bufCarry[idx] = Math.min(1.0, this.bufCarry[idx] + (ca - this.bufCarry[idx]) * rate);
+          } else {
+            const wCanvas = (1.0 - clampedAmount) * stretchPickupBoost * ca;
+            const wFresh = clampedAmount * (isRunning ? 0.72 : 0.88);
+            const eqFresh = wFresh / Math.max(1e-4, wFresh + wCanvas);
+            const eq = mixColorInto(sampled.r, sampled.g, sampled.b, this.origR, this.origG, this.origB, eqFresh);
+            const eqR = eq.r;
+            const eqG = eq.g;
+            const eqB = eq.b;
+            const m = mixColorInto(this.bufR[idx], this.bufG[idx], this.bufB[idx], eqR, eqG, eqB, pickupRate);
+            this.bufR[idx] = m.r;
+            this.bufG[idx] = m.g;
+            this.bufB[idx] = m.b;
+            this.bufA[idx] = Math.min(1.0, this.bufA[idx] + (1.0 - this.bufA[idx]) * pickupRate);
+            const targetCarry = Math.min(1.0, ca * (1.0 - eqFresh * 0.55));
+            this.bufCarry[idx] = this.bufCarry[idx] + (targetCarry - this.bufCarry[idx]) * pickupRate;
+          }
+        } else if (step > 0) {
+          if (isPureSmudge) {
+            this.bufA[idx] = Math.max(0, this.bufA[idx] * (1.0 - smudgeDecay));
+            this.bufCarry[idx] = Math.max(0, this.bufCarry[idx] * (1.0 - carryDecay));
+          } else {
+            const m = mixColorInto(
+              this.bufR[idx],
+              this.bufG[idx],
+              this.bufB[idx],
+              this.origR,
+              this.origG,
+              this.origB,
+              recoverRate
+            );
+            this.bufR[idx] = m.r;
+            this.bufG[idx] = m.g;
+            this.bufB[idx] = m.b;
+            this.bufA[idx] = Math.min(1.0, this.bufA[idx] + (1.0 - this.bufA[idx]) * recoverRate);
+            this.bufCarry[idx] = Math.max(0, this.bufCarry[idx] * (1.0 - carryDecay));
+          }
+        }
+        sumBufR += this.bufR[idx];
+        sumBufG += this.bufG[idx];
+        sumBufB += this.bufB[idx];
+        sumBufA += this.bufA[idx];
+      }
+    }
+
+    this.initialized = true;
+
+    // 2. Gentle lateral diffusion (softens red-to-black cross-brush seam like real oil paint)
+    if (!isFullFresh && step > 0 && gw >= 4 && gh >= 4) {
+      const diff = (isRunning ? 0.095 : 0.045) * Math.min(1, step / Math.max(1, thinSpan * 0.28));
+      if (diff > 0.003) {
+        const centerW = 1.0 - 2.0 * diff;
+        const wideAlongX = p.width >= p.height;
+        if (wideAlongX) {
+          for (let gy = 0; gy < gh; gy++) {
+            const row = gy * gw;
+            this.tmpR[row] = this.bufR[row];
+            this.tmpG[row] = this.bufG[row];
+            this.tmpB[row] = this.bufB[row];
+            this.tmpR[row + gw - 1] = this.bufR[row + gw - 1];
+            this.tmpG[row + gw - 1] = this.bufG[row + gw - 1];
+            this.tmpB[row + gw - 1] = this.bufB[row + gw - 1];
+            for (let gx = 1; gx < gw - 1; gx++) {
+              const i = row + gx;
+              this.tmpR[i] = this.bufR[i - 1] * diff + this.bufR[i] * centerW + this.bufR[i + 1] * diff;
+              this.tmpG[i] = this.bufG[i - 1] * diff + this.bufG[i] * centerW + this.bufG[i + 1] * diff;
+              this.tmpB[i] = this.bufB[i - 1] * diff + this.bufB[i] * centerW + this.bufB[i + 1] * diff;
+            }
+          }
+        } else {
+          for (let gx = 0; gx < gw; gx++) {
+            this.tmpR[gx] = this.bufR[gx];
+            this.tmpG[gx] = this.bufG[gx];
+            this.tmpB[gx] = this.bufB[gx];
+            const last = (gh - 1) * gw + gx;
+            this.tmpR[last] = this.bufR[last];
+            this.tmpG[last] = this.bufG[last];
+            this.tmpB[last] = this.bufB[last];
+          }
+          for (let gy = 1; gy < gh - 1; gy++) {
+            const row = gy * gw;
+            for (let gx = 0; gx < gw; gx++) {
+              const i = row + gx;
+              this.tmpR[i] = this.bufR[i - gw] * diff + this.bufR[i] * centerW + this.bufR[i + gw] * diff;
+              this.tmpG[i] = this.bufG[i - gw] * diff + this.bufG[i] * centerW + this.bufG[i + gw] * diff;
+              this.tmpB[i] = this.bufB[i - gw] * diff + this.bufB[i] * centerW + this.bufB[i + gw] * diff;
+            }
+          }
+        }
+        const total = gw * gh;
+        for (let i = 0; i < total; i++) {
+          this.bufR[i] = this.tmpR[i];
+          this.bufG[i] = this.tmpG[i];
+          this.bufB[i] = this.tmpB[i];
+        }
+      }
+    }
+
+    // 3. Footprint-chord-normalized Beer-Lambert optical-depth model (exact CSP Blend + TextureForPlot):
+    // Dense fixed-interval CSP brushes (BrushAdjustFlowByInterval=0, spacing=0.3%) fill into rich
+    // velvety oil paint even at normal tablet pressure (p=0.45..0.85), while still glazing smoothly
+    // at light pressure and tapering cleanly to 0 at ending tails. When Density of Paint tapers to 0
+    // at the end of a stroke, carried pigment (bufCarry * colorStretch) keeps stretching smoothly!
+    const effPressure = Math.max(0.02, Math.min(1.0, p.pressure));
+    const pressureMod = p.pressureAlreadyApplied ? 1.0 : 0.35 + 0.65 * effPressure;
+    const flowFactor = Math.max(0, Math.min(1.0, p.flow * pressureMod));
+    const freshDensity = Math.max(0, Math.min(1.0, flowFactor * clampedDensity));
+    const spacingRatio = Math.max(0.003, Math.min(2.0, p.spacingRatio ?? 0.06));
+    const gapBoost = !p.adjustDensityByGap
+      ? 1.0 + 13.5 * Math.pow(Math.max(0, 1.0 - spacingRatio / 0.15), 2)
+      : 1.0;
+    const baseOpticalDepth =
+      freshDensity >= 0.995
+        ? 12.0
+        : gapBoost * Math.pow(freshDensity, 1.18);
+    const carriedOpticalScale = flowFactor * clampedStretch * 0.65;
+    const effectiveChord = Math.max(1.0, diamAlongStroke * 0.85);
+    const nominalStep = step > 0 ? Math.max(0.2, step) : Math.max(0.55, Math.min(1.05, thinSpan * 0.1));
+    const overlapHits = Math.max(1.0, effectiveChord / nominalStep);
+    const invOverlapHits = 1.0 / overlapHits;
+    const dabSalt = Math.imul((p.dabSeq ?? 0) + 1, 83492791);
+
+    // 4. Composite crisp 1:1 silhouette SDF + bilinear pigment grid + per-plot paper grain
+    const out = this.scratchImgData.data;
+    const tipMask = p.tipImage ? getCachedTipAlphaMask(p.tipImage) : null;
+    const hNorm = Math.max(0.02, Math.min(1.0, p.hardness));
+    const aaFeatherPx = p.antiAlias === 0 ? 0 : p.antiAlias === 1 ? 0.65 : p.antiAlias === 3 ? 1.65 : 1.0;
+    const hasGrain = Boolean(p.grainModulate && (p.grainDensity ?? 0) > 0.005);
+    const flipX = p.flipX < 0 ? -1 : 1;
+    const flipY = p.flipY < 0 ? -1 : 1;
+    const invInnerW = 1 / innerW;
+    const invInnerH = 1 / innerH;
+    const gwM1 = gw - 1;
+    const ghM1 = gh - 1;
+
+    let hasVisiblePixels = false;
+
+    for (let oy = 0; oy < outH; oy++) {
+      const rowOff = oy * outW;
+      // 1px transparent border ring
+      if (oy === 0 || oy === outH - 1) {
+        const start = rowOff << 2;
+        out.fill(0, start, start + (outW << 2));
+        continue;
+      }
+      const vNorm = (oy - 0.5) * invInnerH; // [0, 1] across exact tip height
+      const ny = (vNorm - 0.5) * 2.0; // [-1, 1]
+      const ly = ny * halfH;
+
+      const fy = Math.max(0, Math.min(ghM1, vNorm * gh - 0.5));
+      const gy0 = Math.floor(fy);
+      const gy1 = gy0 < ghM1 ? gy0 + 1 : ghM1;
+      const ty = fy - gy0;
+      const gRow0 = gy0 * gw;
+      const gRow1 = gy1 * gw;
+
+      for (let ox = 0; ox < outW; ox++) {
+        const pOff = (rowOff + ox) << 2;
+        if (ox === 0 || ox === outW - 1) {
+          out[pOff] = 0;
+          out[pOff + 1] = 0;
+          out[pOff + 2] = 0;
+          out[pOff + 3] = 0;
+          continue;
+        }
+
+        const uNorm = (ox - 0.5) * invInnerW; // [0, 1] across exact tip width
+        const nx = (uNorm - 0.5) * 2.0; // [-1, 1]
+
+        let tipAlpha = 0;
+        if (tipMask) {
+          const su = flipX < 0 ? 1.0 - uNorm : uNorm;
+          const sv = flipY < 0 ? 1.0 - vNorm : vNorm;
+          const tx = Math.max(0, Math.min(tipMask.width - 1, Math.floor(su * tipMask.width)));
+          const tyM = Math.max(0, Math.min(tipMask.height - 1, Math.floor(sv * tipMask.height)));
+          tipAlpha = tipMask.alpha[tyM * tipMask.width + tx] / 255;
+        } else {
+          const dist = Math.hypot(nx, ny);
+          if (dist < 1.0) {
+            if (p.antiAlias === 0) {
+              tipAlpha = 1.0;
+            } else if (hNorm >= 0.98) {
+              const gradLen = Math.hypot(nx / Math.max(0.5, halfW), ny / Math.max(0.5, halfH));
+              const edgePx = gradLen > 1e-5 ? (1.0 - dist) / gradLen : halfH;
+              const u = Math.max(0, Math.min(1, edgePx / Math.max(0.35, aaFeatherPx)));
+              tipAlpha = u * u * (3.0 - 2.0 * u);
+            } else if (dist <= hNorm) {
+              tipAlpha = 1.0;
+            } else {
+              const t = (dist - hNorm) / Math.max(1e-4, 1.0 - hNorm);
+              tipAlpha = hNorm <= 0.05 ? 0.5 * (1.0 + Math.cos(t * Math.PI)) : 1.0 - (3.0 * t * t - 2.0 * t * t * t);
+            }
+          }
+        }
+
+        if (tipAlpha <= 0.002) {
+          out[pOff] = 0;
+          out[pOff + 1] = 0;
+          out[pOff + 2] = 0;
+          out[pOff + 3] = 0;
+          continue;
+        }
+
+        let grainFactor = 1.0;
+        if (hasGrain && p.grainModulate) {
+          const lx = nx * halfW;
+          const wx = p.x + lx * cosA - ly * sinA;
+          const wy = p.y + lx * sinA + ly * cosA;
+          const rawGrain = p.grainModulate(wx, wy, 1.0);
+          // Wet oil paint fills paper valleys rather than punching static world-locked holes;
+          // blend grain depth softly so tooth shows delicately in fades while body stays creamy.
+          grainFactor = 0.62 + 0.38 * rawGrain;
+          if (grainFactor <= 0.002) {
+            out[pOff] = 0;
+            out[pOff + 1] = 0;
+            out[pOff + 2] = 0;
+            out[pOff + 3] = 0;
+            continue;
+          }
+        }
+
+        // Bilinear sample from color pickup buffer
+        const fx = Math.max(0, Math.min(gwM1, uNorm * gw - 0.5));
+        const gx0 = Math.floor(fx);
+        const gx1 = gx0 < gwM1 ? gx0 + 1 : gwM1;
+        const tx = fx - gx0;
+        const i00 = gRow0 + gx0;
+        const i10 = gRow0 + gx1;
+        const i01 = gRow1 + gx0;
+        const i11 = gRow1 + gx1;
+        const w00 = (1 - tx) * (1 - ty);
+        const w10 = tx * (1 - ty);
+        const w01 = (1 - tx) * ty;
+        const w11 = tx * ty;
+
+        const bA = this.bufA[i00] * w00 + this.bufA[i10] * w10 + this.bufA[i01] * w01 + this.bufA[i11] * w11;
+        const bCarry =
+          this.bufCarry[i00] * w00 +
+          this.bufCarry[i10] * w10 +
+          this.bufCarry[i01] * w01 +
+          this.bufCarry[i11] * w11;
+        const carriedDensity = bCarry * carriedOpticalScale;
+        const carriedTau = carriedDensity > 0.002 ? gapBoost * Math.pow(carriedDensity, 1.18) : 0;
+        const localTau = Math.max(baseOpticalDepth, carriedTau) * grainFactor * bA;
+        const perStampBody = localTau > 0.0005 ? 1.0 - Math.exp(-localTau * invOverlapHits) : 0;
+        const finalAlpha = Math.max(0, Math.min(1, tipAlpha * perStampBody));
+
+        if (finalAlpha <= 0.001) {
+          out[pOff] = 0;
+          out[pOff + 1] = 0;
+          out[pOff + 2] = 0;
+          out[pOff + 3] = 0;
+          continue;
+        }
+
+        const bR = this.bufR[i00] * w00 + this.bufR[i10] * w10 + this.bufR[i01] * w01 + this.bufR[i11] * w11;
+        const bG = this.bufG[i00] * w00 + this.bufG[i10] * w10 + this.bufG[i01] * w01 + this.bufG[i11] * w11;
+        const bB = this.bufB[i00] * w00 + this.bufB[i10] * w10 + this.bufB[i01] * w01 + this.bufB[i11] * w11;
+
+        // Deterministic sub-LSB alpha dither prevents 8-bit quantization banding across 15+ low-alpha Fade stamps
+        let h = (Math.imul(ox, 73856093) ^ Math.imul(oy, 19349663) ^ dabSalt) | 0;
+        h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+        const dither = ((h ^ (h >>> 13)) >>> 0) / 4294967296 - 0.5;
+        const qAlpha = Math.max(0, Math.min(255, Math.floor(finalAlpha * 255 + 0.5 + dither * 0.95)));
+        if (qAlpha === 0) {
+          out[pOff] = 0;
+          out[pOff + 1] = 0;
+          out[pOff + 2] = 0;
+          out[pOff + 3] = 0;
+          continue;
+        }
+
+        out[pOff] = Math.max(0, Math.min(255, Math.round(bR)));
+        out[pOff + 1] = Math.max(0, Math.min(255, Math.round(bG)));
+        out[pOff + 2] = Math.max(0, Math.min(255, Math.round(bB)));
+        out[pOff + 3] = qAlpha;
+        hasVisiblePixels = true;
+      }
+    }
+
+    if (!hasVisiblePixels) return null;
+
+    this.scratchCtx.putImageData(this.scratchImgData, 0, 0);
+
+    // 5. Trailing self-pickup deposit into LayerPixelSampler strictly behind the trailing edge
+    // Dense across the full brush width so continuous back-and-forth scrubbing blends freshly laid strokes cleanly!
+    const depositBodyAlpha = baseOpticalDepth > 0.0005 ? 1.0 - Math.exp(-baseOpticalDepth * invOverlapHits) : 0;
+    if (sampler && step > 0 && (p.dirX !== 0 || p.dirY !== 0)) {
+      const trailDist = thinSpan * 0.6 + 1.25;
+      const targetSamples = Math.max(6, Math.min(gw, 18));
+      const sampleStride = Math.max(1, Math.floor(gw / targetSamples));
+      const midRow = (gh >> 1) * gw;
+      const depRad = Math.max(1, Math.min(6, Math.ceil((brushSpan / targetSamples) * 0.75)));
+      const depAlphaBoost = Math.min(0.85, Math.max(depositBodyAlpha * 2.1, Math.min(0.45, depositBodyAlpha * 1.4)));
+      for (let gx = 0; gx < gw; gx += sampleStride) {
+        const idx = midRow + gx;
+        const a = this.bufA[idx] * depAlphaBoost;
+        if (a <= 0.01) continue;
+        const nx = ((gx + 0.5) * invGw - 0.5) * 2.0;
+        const lx = nx * halfW;
+        const depX = p.x + lx * cosA - p.dirX * trailDist;
+        const depY = p.y + lx * sinA - p.dirY * trailDist;
+        sampler.depositPointFast(depX, depY, depRad, this.bufR[idx], this.bufG[idx], this.bufB[idx], a);
+      }
+    }
+
+    const invTotal = totalTexels > 0 ? 1 / totalTexels : 1;
+    return {
+      canvas: this.scratchCanvas,
+      srcW: outW,
+      srcH: outH,
+      drawW: p.width * (outW / innerW),
+      drawH: p.height * (outH / innerH),
+      hasVisiblePixels,
+      avgR: sumBufR * invTotal,
+      avgG: sumBufG * invTotal,
+      avgB: sumBufB * invTotal,
+      avgA: sumBufA * invTotal,
+      pickedUpCanvas,
+    };
   }
 }

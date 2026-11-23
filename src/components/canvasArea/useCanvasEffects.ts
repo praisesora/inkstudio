@@ -124,6 +124,10 @@ export function useCanvasEffects({
   const thicknessRatio = tool === 'brush' ? (brushSettings.thickness ?? 1.0) : 1.0;
   const thicknessVertical = Boolean(brushSettings.thicknessVertical && tool === 'brush');
   const tipAngleDeg = tool === 'brush' ? (brushSettings.customTipAngle ?? 0) : 0;
+  const followDirection =
+    tool === 'brush' &&
+    (brushSettings.customTipAngleDynamics === 'direction' ||
+      brushSettings.customTipAngleDynamics === 'direction-random');
 
   const cursorWidth = thicknessVertical
     ? Math.max(2, cursorBaseWidth * thicknessRatio)
@@ -134,12 +138,16 @@ export function useCanvasEffects({
 
   // Brush tip rotation: tip angle relative to canvas + viewport canvas rotation
   const totalAngleDeg = tipAngleDeg + liveRotation;
+  const dynamicDirDegRef = useRef<number>(0);
+  const lastDirAnchorRef = useRef<{ x: number; y: number } | null>(null);
   const cursorConfigRef = useRef<CursorConfig>({
     activeToolSize,
     tipAspect,
     thicknessRatio,
     thicknessVertical,
     tipAngleDeg,
+    followDirection,
+    dynamicDirDeg: 0,
     rotation: liveRotation,
     flipX: liveFlipX,
     flipY: liveFlipY,
@@ -150,6 +158,8 @@ export function useCanvasEffects({
     thicknessRatio,
     thicknessVertical,
     tipAngleDeg,
+    followDirection,
+    dynamicDirDeg: dynamicDirDegRef.current,
     rotation: liveRotation,
     flipX: liveFlipX,
     flipY: liveFlipY,
@@ -198,7 +208,7 @@ export function useCanvasEffects({
         cfg.rotation,
         cfg.flipX,
         cfg.flipY,
-        cfg.tipAngleDeg
+        cfg.tipAngleDeg + (cfg.followDirection ? cfg.dynamicDirDeg ?? 0 : 0)
       );
     }
   }, [tipAngleDeg, liveRotation, liveFlipX, liveFlipY]);
@@ -234,13 +244,38 @@ export function useCanvasEffects({
       const ring = cursorRingRef.current;
       if (!ring) return;
       const cfg = cursorConfigRef.current;
+      let effectiveTipAngle = cfg.tipAngleDeg;
+      if (cfg.followDirection) {
+        const anchor = lastDirAnchorRef.current;
+        if (anchor) {
+          const sdx = x - anchor.x;
+          const sdy = y - anchor.y;
+          if (sdx * sdx + sdy * sdy >= 16) {
+            const rad = (-cfg.rotation * Math.PI) / 180;
+            const c = Math.cos(rad);
+            const s = Math.sin(rad);
+            const cdx = (sdx * c - sdy * s) * (cfg.flipX ? -1 : 1);
+            const cdy = (sdx * s + sdy * c) * (cfg.flipY ? -1 : 1);
+            const targetDeg = (Math.atan2(cdy, cdx) * 180) / Math.PI;
+            let delta = targetDeg - dynamicDirDegRef.current;
+            while (delta > 180) delta -= 360;
+            while (delta < -180) delta += 360;
+            dynamicDirDegRef.current += delta * 0.45;
+            cfg.dynamicDirDeg = dynamicDirDegRef.current;
+            lastDirAnchorRef.current = { x, y };
+          }
+        } else {
+          lastDirAnchorRef.current = { x, y };
+        }
+        effectiveTipAngle = cfg.tipAngleDeg + dynamicDirDegRef.current;
+      }
       ring.style.transform = formatCursorRingTransform(
         x,
         y,
         cfg.rotation,
         cfg.flipX,
         cfg.flipY,
-        cfg.tipAngleDeg
+        effectiveTipAngle
       );
       if (ring.style.display !== 'block') {
         ring.style.display = 'block';

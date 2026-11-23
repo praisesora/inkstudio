@@ -258,7 +258,13 @@ function sanitizeTaper(val: unknown): CspTaperSettings | undefined {
     affectSize: optBool(t.affectSize),
     affectDensity: optBool(t.affectDensity),
     affectOpacity: optBool(t.affectOpacity),
+    affectAmountOfPaint: optBool(t.affectAmountOfPaint),
+    minAmountRatio: optNum(t.minAmountRatio, 0, 1),
+    affectDensityOfPaint: optBool(t.affectDensityOfPaint),
+    minPaintDensityRatio: optNum(t.minPaintDensityRatio, 0, 1),
     affectLoad: optBool(t.affectLoad),
+    minSizeRatio: optNum(t.minSizeRatio, 0, 1),
+    minDensityRatio: optNum(t.minDensityRatio, 0, 1),
   };
 }
 

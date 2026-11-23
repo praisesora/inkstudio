@@ -222,7 +222,7 @@ export function useCompositorViewport({
             cam.rotation,
             cam.flipX,
             cam.flipY,
-            cfg.tipAngleDeg
+            cfg.tipAngleDeg + (cfg.followDirection ? cfg.dynamicDirDeg ?? 0 : 0)
           );
         }
       }

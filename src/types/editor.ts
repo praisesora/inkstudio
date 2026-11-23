@@ -224,9 +224,15 @@ export interface CspTaperSettings {
   startingSharpness?: number; // 0.0 to 1.0 (CSP Starting sharpness)
   endingSharpness?: number;   // 0.0 to 1.0 (CSP Ending sharpness)
   affectSize?: boolean;       // Taper modulates brush size (default true)
-  affectDensity?: boolean;    // Taper modulates brush density
-  affectOpacity?: boolean;    // Taper modulates dab opacity
+  affectDensity?: boolean;    // Taper modulates brush density (CSP 0x411)
+  affectOpacity?: boolean;    // Taper modulates dab opacity (CSP 0x3e9)
+  affectAmountOfPaint?: boolean; // Taper modulates CSP Amount of Paint (CSP 0x43a)
+  minAmountRatio?: number;    // 0.0 to 1.0 minimum Amount of Paint ratio at taper endpoint
+  affectDensityOfPaint?: boolean; // Taper modulates CSP Density of Paint (CSP 0x43c)
+  minPaintDensityRatio?: number;  // 0.0 to 1.0 minimum Density of Paint ratio at taper endpoint
   affectLoad?: boolean;       // Taper modulates Natural Paint load / dry-brush fade
+  minSizeRatio?: number;      // 0.0 to 1.0 minimum size ratio at taper endpoint (CSP BrushInOutTarget 0x3fd)
+  minDensityRatio?: number;   // 0.0 to 1.0 minimum density ratio at taper endpoint
 }
 
 export type CspAntiAliasLevel = 0 | 1 | 2 | 3; // 0: None (Binary), 1: Weak, 2: Medium, 3: Strong

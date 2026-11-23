@@ -1551,19 +1551,23 @@ pub fn extract_sut_sqlite_binary(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut variant_blobs = HashMap::new();
 
     if tables.contains("Variant") {
+        let query_variant_by_col = |col: &str, vid: i64| -> rusqlite::Result<(Vec<String>, Vec<Value>)> {
+            let sql = format!("SELECT * FROM Variant WHERE {} = ?1 LIMIT 1", col);
+            let mut s = conn.prepare(&sql)?;
+            let cols: Vec<String> = s.column_names().into_iter().map(String::from).collect();
+            let row = s.query_row([vid], |r| {
+                let mut vals = Vec::with_capacity(cols.len());
+                for i in 0..cols.len() {
+                    vals.push(r.get::<_, Value>(i).unwrap_or(Value::Null));
+                }
+                Ok(vals)
+            })?;
+            Ok((cols, row))
+        };
+
         let query_res: rusqlite::Result<(Vec<String>, Vec<Value>)> = if let Some(vid) = variant_id {
-            conn.prepare("SELECT * FROM Variant WHERE _PW_ID = ?1 LIMIT 1")
-                .and_then(|mut s| {
-                    let cols: Vec<String> = s.column_names().into_iter().map(String::from).collect();
-                    let row = s.query_row([vid], |r| {
-                        let mut vals = Vec::with_capacity(cols.len());
-                        for i in 0..cols.len() {
-                            vals.push(r.get::<_, Value>(i).unwrap_or(Value::Null));
-                        }
-                        Ok(vals)
-                    })?;
-                    Ok((cols, row))
-                })
+            query_variant_by_col("VariantID", vid)
+                .or_else(|_| query_variant_by_col("_PW_ID", vid))
         } else {
             Err(rusqlite::Error::QueryReturnedNoRows)
         }

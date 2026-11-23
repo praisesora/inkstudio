@@ -59,6 +59,7 @@ export interface CommitRasterStrokeParams {
   isMonochrome: boolean;
   hasWetEdge: boolean;
   shouldTaper: boolean;
+  exitSpeed?: number;
   strokeColor: string;
   allPoints: Point[];
   tailSegments: CubicBezierSegment[];
@@ -91,6 +92,7 @@ export function commitRasterStrokeToTiles(
     isMonochrome,
     hasWetEdge,
     shouldTaper,
+    exitSpeed,
     strokeColor,
     allPoints,
     tailSegments,
@@ -284,7 +286,8 @@ export function commitRasterStrokeToTiles(
       undefined,
       false,
       undefined,
-      allowGpuMonoBake
+      allowGpuMonoBake,
+      exitSpeed
     );
     bCtx.restore();
 
@@ -386,7 +389,8 @@ export function commitRasterStrokeToTiles(
       undefined,
       Boolean(activeLayer?.alphaLocked),
       bakeSampler,
-      allowGpuMonoBake
+      allowGpuMonoBake,
+      exitSpeed
     );
   } else {
     rCtx.globalAlpha = Math.max(0.01, Math.min(1.0, bakeBs.opacity ?? 1.0));
@@ -414,7 +418,8 @@ export function commitRasterStrokeToTiles(
         undefined,
         false,
         bakeSampler,
-        allowGpuMonoBake
+        allowGpuMonoBake,
+        exitSpeed
       );
       bCtx.restore();
 

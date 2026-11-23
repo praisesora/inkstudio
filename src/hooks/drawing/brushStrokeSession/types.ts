@@ -145,7 +145,7 @@ export interface StrokeSessionState {
   lastQueuedPressure: number;
   stabilizedPoint: Point | null;
   stampRemainderDist: number;
-  liveDabCounter: { count: number };
+  liveDabCounter: { count: number; lastAngle?: number; lastStepDist?: number };
   activeReservoir: PaintReservoir | null;
   layerPixelSampler: LayerPixelSampler | null;
   naturalPaintSession: NaturalPaintStrokeSession | null;

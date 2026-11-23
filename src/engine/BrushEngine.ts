@@ -32,6 +32,7 @@ import {
 import { enforceColorMode } from '../utils/colorUtils';
 import {
   PaintReservoir,
+  SpatialTipMixer,
   LayerPixelSampler,
   sampleCanvasColor,
   parseColorToRgb,
@@ -127,6 +128,8 @@ export interface BrushRenderOptions {
   strokeIndex?: number;
   totalLength?: number;
   currentStrokeDist?: number;
+  exitSpeed?: number;
+  initialAngleRad?: number;
   dynamics?: BrushDynamics;
   secondaryColor?: string;
 }
@@ -531,7 +534,7 @@ export function computeEllipticalStepDistance(
   spacingRatio: number,
   minStepPx: number = 0.12
 ): number {
-  const ratio = Math.max(0.01, Math.min(2.0, spacingRatio));
+  const ratio = Math.max(0.003, Math.min(2.0, spacingRatio));
   const w = Math.max(0.1, width);
   const h = Math.max(0.1, height);
 
@@ -899,6 +902,19 @@ const sharedBezierSample: EvaluatedBezierSample = {
   twist: 0,
 };
 
+const peekBezierSample: EvaluatedBezierSample = {
+  x: 0,
+  y: 0,
+  width: 0,
+  pressure: 0,
+  dx: 0,
+  dy: 0,
+  speed: 0,
+  tiltX: 0,
+  tiltY: 0,
+  twist: 0,
+};
+
 function evalCubicBezierInto(
   p0: Point,
   c1: Point,
@@ -1046,10 +1062,10 @@ export function centripetalCatmullRomToBezier(
   const dt1 = Math.max(1e-4, Math.sqrt(d12));
   const dt2 = Math.max(1e-4, Math.sqrt(d23));
 
-  const t1x = (p2.x - p1.x) / dt1 - (p1.x - effP0.x) / dt0 + (p2.x - effP0.x) / (dt0 + dt1);
-  const t1y = (p2.y - p1.y) / dt1 - (p1.y - effP0.y) / dt0 + (p2.y - effP0.y) / (dt0 + dt1);
-  const t2x = (effP3.x - p2.x) / dt2 - (p2.x - p1.x) / dt1 + (effP3.x - p1.x) / (dt1 + dt2);
-  const t2y = (effP3.y - p2.y) / dt2 - (p2.y - p1.y) / dt1 + (effP3.y - p1.y) / (dt1 + dt2);
+  const t1x = (p1.x - effP0.x) / dt0 - (p2.x - effP0.x) / (dt0 + dt1) + (p2.x - p1.x) / dt1;
+  const t1y = (p1.y - effP0.y) / dt0 - (p2.y - effP0.y) / (dt0 + dt1) + (p2.y - p1.y) / dt1;
+  const t2x = (p2.x - p1.x) / dt1 - (effP3.x - p1.x) / (dt1 + dt2) + (effP3.x - p2.x) / dt2;
+  const t2y = (p2.y - p1.y) / dt1 - (effP3.y - p1.y) / (dt1 + dt2) + (effP3.y - p2.y) / dt2;
 
   let dx1 = (t1x * dt1) / 3;
   let dy1 = (t1y * dt1) / 3;
@@ -1429,11 +1445,14 @@ function getInvertedGrainPattern(
       const img = gCtx.getImageData(0, 0, w, h);
       const d = img.data;
       for (let i = 0; i < d.length; i += 4) {
-        const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const aNorm = d[i + 3] / 255;
+        const rgbLum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        // CSP paper textures are black-on-transparent RGBA (RGB=0, A=density); composite over white
+        const effLum = rgbLum * aNorm + 255 * (1 - aNorm);
         d[i] = 255;
         d[i + 1] = 255;
         d[i + 2] = 255;
-        d[i + 3] = 255 - Math.round(lum);
+        d[i + 3] = 255 - Math.round(effLum);
       }
       gCtx.putImageData(img, 0, 0);
       const pat = scratchCtx.createPattern(c, 'repeat');
@@ -1601,6 +1620,184 @@ export function flushGpuDabs(
 // 9. Unified Dab & Stroke Renderer (Textured, Radial & Pencil Presets)
 // ============================================================================
 
+const _customGrainLumCache = new WeakMap<
+  HTMLImageElement,
+  { width: number; height: number; lum: Uint8Array }
+>();
+
+function getCustomPaperLuminance(
+  img: HTMLImageElement
+): { width: number; height: number; lum: Uint8Array } | null {
+  const cached = _customGrainLumCache.get(img);
+  if (cached) return cached;
+  if (typeof document === 'undefined') return null;
+  if (img.complete === false) return null;
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  if (w <= 0 || h <= 0) return null;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const gCtx = c.getContext('2d', { willReadFrequently: true });
+  if (!gCtx || typeof gCtx.getImageData !== 'function') return null;
+  gCtx.drawImage(img, 0, 0, w, h);
+  const d = gCtx.getImageData(0, 0, w, h).data;
+  const lum = new Uint8Array(w * h);
+  for (let i = 0; i < lum.length; i++) {
+    const p = i << 2;
+    const aNorm = d[p + 3] / 255;
+    const rgbLum = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
+    // CSP paper textures encode density in alpha with RGB=0; composite over white to recover height
+    lum[i] = Math.round(rgbLum * aNorm + 255 * (1 - aNorm));
+  }
+  const entry = { width: w, height: h, lum };
+  _customGrainLumCache.set(img, entry);
+  return entry;
+}
+
+function sampleWorldPaperGrainNorm(
+  wx: number,
+  wy: number,
+  scale: number,
+  rotateDeg: number,
+  customPaper?: { width: number; height: number; lum: Uint8Array } | null
+): number {
+  const invScale = 1.0 / Math.max(0.05, scale);
+  let sx = wx * invScale;
+  let sy = wy * invScale;
+  if (rotateDeg !== 0) {
+    const rad = (-rotateDeg * Math.PI) / 180;
+    const c = Math.cos(rad);
+    const s = Math.sin(rad);
+    const rx = sx * c - sy * s;
+    const ry = sx * s + sy * c;
+    sx = rx;
+    sy = ry;
+  }
+  if (customPaper) {
+    const cw = customPaper.width;
+    const ch = customPaper.height;
+    const fx = Math.floor(sx);
+    const fy = Math.floor(sy);
+    const tx = sx - fx;
+    const ty = sy - fy;
+    const x0 = ((fx % cw) + cw) % cw;
+    const y0 = ((fy % ch) + ch) % ch;
+    const x1 = (x0 + 1) % cw;
+    const y1 = (y0 + 1) % ch;
+    const v00 = customPaper.lum[y0 * cw + x0];
+    const v10 = customPaper.lum[y0 * cw + x1];
+    const v01 = customPaper.lum[y1 * cw + x0];
+    const v11 = customPaper.lum[y1 * cw + x1];
+    const top = v00 + (v10 - v00) * tx;
+    const bot = v01 + (v11 - v01) * tx;
+    return (top + (bot - top) * ty) / 255.0;
+  }
+  return getPaperGrain(sx, sy) / 255.0;
+}
+
+function evaluateCspTaperFactors(
+  taper: CspTaperSettings | undefined,
+  strokeDist: number,
+  totalLength: number | undefined,
+  exitSpeed?: number
+): { sizeScale: number; alphaScale: number; amountScale: number; paintDensityScale: number } {
+  if (!taper || (!taper.useIn && !taper.useOut)) {
+    return { sizeScale: 1.0, alphaScale: 1.0, amountScale: 1.0, paintDensityScale: 1.0 };
+  }
+
+  const inSharp = 0.35 + (1.0 - (taper.startingSharpness ?? 0.5)) * 1.1;
+  const outSharp = 0.35 + (1.0 - (taper.endingSharpness ?? 0.5)) * 1.1;
+  const minSize = Math.max(0, Math.min(1, taper.minSizeRatio ?? 0));
+  const minDens = Math.max(0, Math.min(1, taper.minDensityRatio ?? 0));
+  const minAmount = Math.max(0, Math.min(1, taper.minAmountRatio ?? 0));
+  const minPaintDens = Math.max(0, Math.min(1, taper.minPaintDensityRatio ?? 0));
+  const affectSize = taper.affectSize !== false;
+  const affectFlow = Boolean(taper.affectDensity || taper.affectOpacity);
+  const affectAmount = Boolean(taper.affectAmountOfPaint || taper.affectOpacity);
+  const affectPaintDensity = Boolean(taper.affectDensityOfPaint);
+
+  // CSP BrushInOutType enum:
+  //  0 = Off
+  //  1 = Specify by percentage (inRatio / outRatio of totalLength)
+  //  2 = Specify by length (inLength px at start, outLength px at END — never kills mid-stroke!)
+  //  3 = Fade (continuous decay from strokeDist=0 over outLength px)
+  if (taper.inOutType === 3 && taper.useOut) {
+    const fadeLen = taper.outLength > 0 ? taper.outLength : 200;
+    const remain = Math.max(0, Math.min(1, 1.0 - strokeDist / fadeLen));
+    return {
+      sizeScale: affectSize ? minSize + (1.0 - minSize) * remain : 1.0,
+      alphaScale: affectFlow ? minDens + (1.0 - minDens) * Math.pow(remain, 1.1) : 1.0,
+      amountScale: affectAmount ? minAmount + (1.0 - minAmount) * remain : 1.0,
+      paintDensityScale: affectPaintDensity ? minPaintDens + (1.0 - minPaintDens) * remain : 1.0,
+    };
+  }
+
+  const usePercentage = taper.inOutType === 1 && (taper.inRatio > 0 || taper.outRatio > 0);
+
+  let inLen = 0;
+  if (taper.useIn) {
+    if (usePercentage && totalLength && totalLength > 0) {
+      inLen = totalLength * Math.max(0, Math.min(1, taper.inRatio));
+    } else {
+      inLen = taper.inLength > 0 ? taper.inLength : taper.inRatio > 0 ? taper.inRatio * 120 : 0;
+    }
+    if (taper.inOutBySpeed) {
+      // Pen lands near zero entry velocity in CSP "Starting and ending by speed"
+      inLen *= 0.15;
+    }
+  }
+
+  let outLen = 0;
+  if (taper.useOut && totalLength && totalLength > 0) {
+    if (usePercentage) {
+      outLen = totalLength * Math.max(0, Math.min(1, taper.outRatio));
+    } else {
+      outLen = taper.outLength > 0 ? taper.outLength : taper.outRatio > 0 ? taper.outRatio * 180 : 0;
+    }
+    if (taper.inOutBySpeed && exitSpeed !== undefined && Number.isFinite(exitSpeed)) {
+      // Faster flick exits stretch the ending taper toward full outLength; deliberate stops stay crisp
+      const speedNorm = Math.max(0, Math.min(1, exitSpeed / 1.1));
+      outLen *= 0.35 + 0.65 * speedNorm;
+    }
+    if (inLen + outLen > totalLength && inLen + outLen > 0) {
+      const ratio = totalLength / (inLen + outLen);
+      inLen *= ratio;
+      outLen *= ratio;
+    }
+  }
+
+  let sizeScale = 1.0;
+  let alphaScale = 1.0;
+  let amountScale = 1.0;
+  let paintDensityScale = 1.0;
+
+  if (taper.useIn && inLen > 0 && strokeDist < inLen) {
+    const u = Math.max(0.08, Math.min(1.0, strokeDist / inLen));
+    const smoothU = u * u * (3 - 2 * u);
+    const t = Math.pow(smoothU, inSharp);
+    if (affectSize) sizeScale *= minSize + (1.0 - minSize) * t;
+    if (affectFlow) alphaScale *= minDens + (1.0 - minDens) * t;
+    if (affectAmount) amountScale *= minAmount + (1.0 - minAmount) * t;
+    if (affectPaintDensity) paintDensityScale *= minPaintDens + (1.0 - minPaintDens) * t;
+  }
+
+  if (taper.useOut && outLen > 0 && totalLength && totalLength > 0) {
+    const distFromEnd = Math.max(0, totalLength - strokeDist);
+    if (distFromEnd < outLen) {
+      const u = Math.max(0.0, Math.min(1.0, distFromEnd / outLen));
+      const smoothU = u * u * (3 - 2 * u);
+      const t = Math.pow(smoothU, outSharp);
+      if (affectSize) sizeScale *= minSize + (1.0 - minSize) * t;
+      if (affectFlow) alphaScale *= minDens + (1.0 - minDens) * t;
+      if (affectAmount) amountScale *= minAmount + (1.0 - minAmount) * t;
+      if (affectPaintDensity) paintDensityScale *= minPaintDens + (1.0 - minPaintDens) * t;
+    }
+  }
+
+  return { sizeScale, alphaScale, amountScale, paintDensityScale };
+}
+
 function sampleScalarPaperGrainNorm(x: number, y: number, width: number, scale: number): number {
   const invScale = 1.0 / Math.max(0.1, scale);
   const sx = x * invScale;
@@ -1729,6 +1926,16 @@ export function drawBrushDot(
       ? Math.max(0.4, point.width)
       : Math.max(0.5, (options.size ?? 10) * (minFactor + (1.0 - minFactor) * effPressure));
 
+  let startAmountScale = 1.0;
+  let startPaintDensityScale = 1.0;
+  if (options.taper && options.totalLength && options.totalLength > 0) {
+    const startTaper = evaluateCspTaperFactors(options.taper, 0, options.totalLength, options.exitSpeed);
+    effWidth *= startTaper.sizeScale;
+    effectiveFlow *= startTaper.alphaScale;
+    startAmountScale = startTaper.amountScale;
+    startPaintDensityScale = startTaper.paintDensityScale;
+  }
+
   const tiltX = useTilt ? point.tiltX ?? 0 : 0;
   const tiltY = useTilt ? point.tiltY ?? 0 : 0;
   const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
@@ -1738,9 +1945,14 @@ export function drawBrushDot(
     useTilt && tiltMagnitude > 0.01 ? effPressure * (1.0 - tiltMagnitude * 0.55) : effPressure;
 
   if (options.sizeSensor) {
+    // Avoid double-applying pressure when point.width already has pressure baked from calculateStrokeWidth
+    const effectiveSizeSensor =
+      point.width > 0 && options.usePressure !== false && options.sizeSensor.usePressure
+        ? { ...options.sizeSensor, usePressure: false }
+        : options.sizeSensor;
     effWidth = Math.max(
       0.15,
-      effWidth * evaluateCspSensor(options.sizeSensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 50))
+      effWidth * evaluateCspSensor(effectiveSizeSensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 50))
     );
   }
   if (options.opacitySensor) {
@@ -1753,15 +1965,6 @@ export function drawBrushDot(
     effectiveFlow *= 1.0 - tiltMagnitude * 0.28;
   }
 
-  const isColorMixing = Boolean(options.colorMixing) && !isEraser && !isBgEraser;
-  if (isColorMixing) {
-    if (!options.reservoir) options.reservoir = new PaintReservoir(effectiveColor);
-    const mixed = sampleAndMixColor(ctx, point.x, point.y, Math.max(1, effWidth * 0.5), effPressure, effectiveFlow, 0, options);
-    effectiveColor = mixed.colorHex;
-    effectiveFlow = mixed.alpha;
-  }
-  if (effectiveFlow <= 0.002) return;
-
   const gpuDabs = batchGpuDabs || null;
   const activeTip = options.tipImage
     ? selectTipImage(options.subTipImages, options.tipImage, options.subTipOrder, 0, 0, point.x, point.y)
@@ -1771,13 +1974,126 @@ export function drawBrushDot(
     ? (activeTip.naturalHeight || activeTip.height || 1) / (activeTip.naturalWidth || activeTip.width || 1)
     : 1.0;
 
-  let angleRad = ((options.angle ?? 0) * Math.PI) / 180;
+  let angleRad =
+    options.initialAngleRad !== undefined
+      ? options.initialAngleRad
+      : ((options.angle ?? 0) * Math.PI) / 180;
   if (useTilt && tiltMagnitude > 0.05) {
-    angleRad = Math.atan2(tiltY, tiltX) + angleRad;
+    angleRad = Math.atan2(tiltY, tiltX) + ((options.angle ?? 0) * Math.PI) / 180;
   }
   if (point.twist && (options.angleDynamics === 'twist' || useTilt)) {
     angleRad += (point.twist * Math.PI) / 180;
   }
+
+  const isColorMixing = Boolean(options.colorMixing) && !isEraser && !isBgEraser;
+  const useSpatialTipMixing =
+    isColorMixing &&
+    !gpuDabs &&
+    !isColorTip &&
+    !options.dynamics?.colorJitterEnabled &&
+    !options.spray?.enabled;
+
+  if (useSpatialTipMixing) {
+    if (!options.reservoir) options.reservoir = new PaintReservoir(effectiveColor);
+    if (!options.reservoir.spatialMixer) {
+      options.reservoir.spatialMixer = new SpatialTipMixer(effectiveColor);
+    }
+    const pressureAlreadyApplied = Boolean(
+      options.opacitySensor?.usePressure || options.densitySensor?.usePressure
+    );
+    let finalW = isVert ? effWidth * thickness : effWidth;
+    let finalH = isVert ? effWidth * aspect : effWidth * aspect * thickness;
+    if (useTilt && tiltMagnitude > 0.01) {
+      finalW *= 1.0 + tiltSpread * 1.85;
+      finalH *= Math.max(0.55, 1.0 / (1.0 + tiltMagnitude * 0.45));
+    }
+    const flips = resolveTipFlipSigns(options.flipH, options.flipV, 0, point.x, point.y);
+    const customPaper = options.paperTextureImage ? getCustomPaperLuminance(options.paperTextureImage) : null;
+    const texScale = options.paperTextureScale ?? 1.0;
+    const texRot = options.paperTextureRotate ?? 0;
+    const texMode = options.paperTextureMode ?? 'multiply';
+    const texBright = options.paperTextureBrightness ?? 0;
+    const texContrast = options.paperTextureContrast ?? 0;
+    const texInv = Boolean(options.paperTextureInverted);
+
+    const built = options.reservoir.spatialMixer.stepAndBuildStamp({
+      x: point.x,
+      y: point.y,
+      width: finalW,
+      height: finalH,
+      angleRad,
+      dirX: 0,
+      dirY: 0,
+      stepDist: 0,
+      spacingRatio: spacing,
+      adjustDensityByGap: Boolean(options.adjustDensityByGap),
+      hardness,
+      antiAlias: aaMode,
+      flipX: flips.signX,
+      flipY: flips.signY,
+      flow: effectiveFlow,
+      pressure: effPressure,
+      pressureAlreadyApplied,
+      amountOfPaint: (options.amountOfPaint ?? 0.65) * startAmountScale,
+      densityOfPaint: (options.densityOfPaint ?? 0.9) * startPaintDensityScale,
+      colorStretch: options.colorStretch ?? 0.75,
+      mixingMode: options.mixingMode ?? 'blend',
+      perceptualMixing: options.perceptualMixing !== false,
+      tipImage: activeTip,
+      sampler: options.sampler,
+      grainDensity: grainAmount,
+      grainModulate:
+        grainAmount > 0.005
+          ? (wx, wy, tipA) =>
+              applyCspPaperTextureAlpha(
+                tipA,
+                sampleWorldPaperGrainNorm(wx, wy, texScale, texRot, customPaper),
+                grainAmount,
+                grainPressure,
+                texMode,
+                texBright,
+                texContrast,
+                texInv
+              )
+          : undefined,
+    });
+    if (built) {
+      options.reservoir.r = built.avgR;
+      options.reservoir.g = built.avgG;
+      options.reservoir.b = built.avgB;
+      options.reservoir.a = built.avgA;
+      if (built.pickedUpCanvas) options.reservoir.isLoadedWithCanvasColor = true;
+    }
+    if (built && built.hasVisiblePixels) {
+      drawSingleStamp(
+        ctx,
+        built.canvas,
+        point.x,
+        point.y,
+        built.drawW,
+        built.drawH,
+        angleRad,
+        1.0,
+        false,
+        false,
+        options.alphaLocked,
+        options.isTransparentInk,
+        1,
+        1,
+        aaMode,
+        options.blendTipsMode
+      );
+    }
+    return;
+  }
+
+  if (isColorMixing) {
+    if (!options.reservoir) options.reservoir = new PaintReservoir(effectiveColor);
+    const mixed = sampleAndMixColor(ctx, point.x, point.y, Math.max(1, effWidth * 0.5), effPressure, effectiveFlow, 0, options);
+    effectiveColor = mixed.colorHex;
+    effectiveFlow = mixed.alpha;
+  }
+  if (effectiveFlow <= 0.002) return;
 
   const hasPerPixelCpuGrain = !gpuDabs && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
   if (!gpuDabs && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
@@ -1933,7 +2249,7 @@ export function drawBrushCubicBezierSegment(
   color: string,
   options: BrushRenderOptions = {},
   remainderDist: number = 0,
-  dabCounter: { count: number } = { count: 0 },
+  dabCounter: { count: number; lastAngle?: number; lastStepDist?: number } = { count: 0 },
   batchGpuDabs?: GpuDab[]
 ): number {
   const { totalLength: totalCurveLength, steps: arcSteps } = buildFastArcLengthScratch(p0, c1, c2, p3);
@@ -1957,7 +2273,7 @@ export function drawBrushCubicBezierSegment(
     : 1.0;
   const baseAngleRad = ((options.angle ?? 0) * Math.PI) / 180;
   const rawDensity = options.brushDensity ?? options.flow ?? (tipImage ? 0.85 : 1.0);
-  const spacingRatio = Math.max(0.015, Math.min(1.0, options.spacing ?? (tipImage ? 0.07 : 0.08)));
+  const spacingRatio = Math.max(0.003, Math.min(2.0, options.spacing ?? (tipImage ? 0.07 : 0.08)));
   const baseFlow = computeGapAdjustedAlpha(rawDensity, spacingRatio, options.adjustDensityByGap);
   const thickness = options.thickness ?? 1.0;
   const isVert = Boolean(options.thicknessVertical);
@@ -1970,11 +2286,6 @@ export function drawBrushCubicBezierSegment(
   const gpuDabs = batchGpuDabs || null;
   const avgSegWidth = Math.max(0.5, (p0.width + p3.width) * 0.5);
   const hasMultiSubTips = Boolean(tipImage && options.subTipImages && options.subTipImages.length > 1);
-  const staticMaster =
-    isColorMixing || gpuDabs || hasMultiSubTips
-      ? null
-      : resolveCpuMaster(tipImage, baseColor, hardness, isEraser, isBgEraser, isColorTip, avgSegWidth, aaMode);
-
   const dynamics = options.dynamics;
   const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
   const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
@@ -1984,14 +2295,51 @@ export function drawBrushCubicBezierSegment(
   const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
   const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
   const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+  const useSpatialTipMixing =
+    isColorMixing &&
+    !gpuDabs &&
+    !isColorTip &&
+    !colorJitterEnabled &&
+    !options.spray?.enabled;
+  if (useSpatialTipMixing && options.reservoir && !options.reservoir.spatialMixer) {
+    options.reservoir.spatialMixer = new SpatialTipMixer(baseColor);
+  }
+  const pressureAlreadyAppliedToFlow = Boolean(
+    options.opacitySensor?.usePressure || options.densitySensor?.usePressure
+  );
+  const customPaper =
+    useSpatialTipMixing && grainAmount > 0.005 && options.paperTextureImage
+      ? getCustomPaperLuminance(options.paperTextureImage)
+      : null;
+  const texScale = options.paperTextureScale ?? 1.0;
+  const texRot = options.paperTextureRotate ?? 0;
+  const texMode = options.paperTextureMode ?? 'multiply';
+  const texBright = options.paperTextureBrightness ?? 0;
+  const texContrast = options.paperTextureContrast ?? 0;
+  const texInv = Boolean(options.paperTextureInverted);
+
+  const staticMaster =
+    isColorMixing || gpuDabs || hasMultiSubTips
+      ? null
+      : resolveCpuMaster(tipImage, baseColor, hardness, isEraser, isBgEraser, isColorTip, avgSegWidth, aaMode);
+
   const baseRgb = colorJitterEnabled || gpuDabs ? parseColorToRgb(baseColor) : null;
   const secRgb = colorJitterEnabled ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
-  const minStepPx = tipImage ? 0.15 : 0.12;
-  const hasPerPixelCpuGrain = !gpuDabs && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
+  const baseMinStepPx = tipImage ? 0.15 : 0.12;
+  const hasPerPixelCpuGrain =
+    !gpuDabs && !useSpatialTipMixing && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
 
-  let smoothCos = Math.cos(baseAngleRad);
-  let smoothSin = Math.sin(baseAngleRad);
+  let hasSmoothAngle = dabCounter.lastAngle !== undefined;
+  let smoothCos = hasSmoothAngle ? Math.cos(dabCounter.lastAngle!) : Math.cos(baseAngleRad);
+  let smoothSin = hasSmoothAngle ? Math.sin(dabCounter.lastAngle!) : Math.sin(baseAngleRad);
   let currentDist = remainderDist > 0 ? remainderDist : 0;
+  // Preserve true inter-stamp arc distance across Bezier segment boundaries (never reset to partial remainderDist)
+  let prevStepDist =
+    dabCounter.lastStepDist !== undefined && dabCounter.lastStepDist > 0
+      ? dabCounter.lastStepDist
+      : remainderDist > 0
+      ? remainderDist
+      : 0;
 
   while (currentDist <= totalCurveLength) {
     const pt = sampleFastArcLengthInto(p0, c1, c2, p3, currentDist, totalCurveLength, arcSteps, sharedBezierSample);
@@ -2008,26 +2356,16 @@ export function drawBrushCubicBezierSegment(
 
     const strokeDist = (options.currentStrokeDist ?? 0) + currentDist;
 
-    let taperAlphaScale = 1.0;
-    if (options.taper) {
-      const inSharp = 0.35 + (1.0 - (options.taper.startingSharpness ?? 0.5)) * 1.1;
-      const outSharp = 0.35 + (1.0 - (options.taper.endingSharpness ?? 0.5)) * 1.1;
-      const inLen = options.taper.inLength || (options.taper.inRatio ? options.taper.inRatio * 2.5 : 0);
-      if (options.taper.useIn && inLen > 0 && strokeDist < inLen) {
-        const inFactor = Math.pow(Math.max(0.01, Math.min(1.0, strokeDist / inLen)), inSharp);
-        if (options.taper.affectSize !== false) curWidth *= inFactor;
-        if (options.taper.affectDensity || options.taper.affectOpacity) taperAlphaScale *= inFactor;
-      }
-      if (options.totalLength && options.totalLength > 0) {
-        const distFromEnd = options.totalLength - strokeDist;
-        const outLen = options.taper.outLength || (options.taper.outRatio ? options.taper.outRatio * 3.0 : 0);
-        if (options.taper.useOut && outLen > 0 && distFromEnd < outLen) {
-          const outFactor = Math.pow(Math.max(0.01, Math.min(1.0, distFromEnd / outLen)), outSharp);
-          if (options.taper.affectSize !== false) curWidth *= outFactor;
-          if (options.taper.affectDensity || options.taper.affectOpacity) taperAlphaScale *= outFactor;
-        }
-      }
-    }
+    const taperFactors = evaluateCspTaperFactors(
+      options.taper,
+      strokeDist,
+      options.totalLength,
+      options.exitSpeed
+    );
+    curWidth *= taperFactors.sizeScale;
+    const taperAlphaScale = taperFactors.alphaScale;
+    const taperAmountScale = taperFactors.amountScale;
+    const taperPaintDensityScale = taperFactors.paintDensityScale;
 
     const dabSeq = dabCounter.count++;
     const tiltX = useTilt ? pt.tiltX : 0;
@@ -2039,8 +2377,13 @@ export function drawBrushCubicBezierSegment(
       useTilt && tiltMagnitude > 0.01 ? effPressure * (1.0 - tiltMagnitude * 0.55) : effPressure;
 
     if (options.sizeSensor) {
+      // Avoid double-applying pressure when pt.width already has pressure baked from calculateStrokeWidth
+      const effectiveSizeSensor =
+        pt.width > 0 && options.usePressure !== false && options.sizeSensor.usePressure
+          ? { ...options.sizeSensor, usePressure: false }
+          : options.sizeSensor;
       curWidth *= evaluateCspSensor(
-        options.sizeSensor,
+        effectiveSizeSensor,
         effPressure,
         tiltMagnitude,
         pt.speed * 0.05,
@@ -2051,11 +2394,36 @@ export function drawBrushCubicBezierSegment(
 
     let stampAngle = baseAngleRad;
     const angleMode = options.angleDynamics;
-    if ((angleMode === 'direction' || angleMode === 'direction-random') && pt.speed > 0.05) {
-      const targetAngle = Math.atan2(pt.dy, pt.dx) + baseAngleRad;
-      smoothCos = smoothCos * 0.6 + Math.cos(targetAngle) * 0.4;
-      smoothSin = smoothSin * 0.6 + Math.sin(targetAngle) * 0.4;
-      stampAngle = Math.atan2(smoothSin, smoothCos);
+    if (angleMode === 'direction' || angleMode === 'direction-random') {
+      // Deadzone + arc-length-bounded turn rate prevents micro-jitter / pointer-up hooks
+      // from spinning flat blades into starbursts while tracking smooth curves faithfully
+      const minTangentSpeed = hasSmoothAngle ? 1.2 : 0.2;
+      const segLongEnough = !hasSmoothAngle || totalCurveLength >= 1.2;
+      if (segLongEnough && pt.speed > minTangentSpeed) {
+        const targetAngle = Math.atan2(pt.dy, pt.dx) + baseAngleRad;
+        if (!hasSmoothAngle) {
+          smoothCos = Math.cos(targetAngle);
+          smoothSin = Math.sin(targetAngle);
+          hasSmoothAngle = true;
+        } else {
+          const curA = Math.atan2(smoothSin, smoothCos);
+          let delta = targetAngle - curA;
+          while (delta > Math.PI) delta -= Math.PI * 2;
+          while (delta < -Math.PI) delta += Math.PI * 2;
+          const stepRef = prevStepDist > 0 ? prevStepDist : 1.0;
+          const halfBlade = Math.max(2.0, curWidth * 0.5);
+          // Bound per-step rotation so the outer edge of a wide flat blade never sweeps > 1.8px per stamp
+          const maxOuterTipTurn = Math.max(0.025, Math.min(0.45, (1.8 + stepRef * 0.45) / halfBlade));
+          const clampedDelta = Math.max(-maxOuterTipTurn, Math.min(maxOuterTipTurn, delta * 0.52));
+          const nextA = curA + clampedDelta;
+          smoothCos = Math.cos(nextA);
+          smoothSin = Math.sin(nextA);
+        }
+        stampAngle = Math.atan2(smoothSin, smoothCos);
+        dabCounter.lastAngle = stampAngle;
+      } else if (hasSmoothAngle) {
+        stampAngle = Math.atan2(smoothSin, smoothCos);
+      }
     }
     if (angleMode === 'random' || angleMode === 'direction-random') {
       const rScale = angleMode === 'random' ? 1.0 : rotationRandomScale || 0.35;
@@ -2097,10 +2465,11 @@ export function drawBrushCubicBezierSegment(
       dabAlpha *= 1.0 - tiltMagnitude * 0.28;
     }
 
-    if (isColorMixing && options.reservoir) {
+    const dirX = pt.speed > 0.001 ? pt.dx / pt.speed : 0;
+    const dirY = pt.speed > 0.001 ? pt.dy / pt.speed : 0;
+
+    if (isColorMixing && !useSpatialTipMixing && options.reservoir) {
       const prelimStep = Math.max(0.15, curWidth * spacingRatio);
-      const dirX = pt.speed > 0.001 ? pt.dx / pt.speed : 0;
-      const dirY = pt.speed > 0.001 ? pt.dy / pt.speed : 0;
       const mixed = sampleAndMixColor(
         ctx,
         pt.x,
@@ -2121,7 +2490,7 @@ export function drawBrushCubicBezierSegment(
       }
     }
 
-    if (!gpuDabs && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
+    if (!gpuDabs && !useSpatialTipMixing && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
       const gNorm = sampleScalarPaperGrainNorm(pt.x, pt.y, curWidth, options.paperTextureScale ?? 1.0);
       const scalarMode = options.paperTextureMode === 'compare' ? 'subtract' : (options.paperTextureMode ?? 'subtract');
       dabAlpha *= applyCspPaperTextureAlpha(
@@ -2142,17 +2511,18 @@ export function drawBrushCubicBezierSegment(
     const activeTip = tipImage
       ? selectTipImage(options.subTipImages, tipImage, options.subTipOrder, dabSeq, stampAngle, pt.x, pt.y)
       : undefined;
-    const baseMaster = gpuDabs
-      ? null
-      : staticMaster ?? resolveCpuMaster(activeTip, dabColor, hardness, isEraser, isBgEraser, isColorTip, curWidth, aaMode);
+    const baseMaster =
+      gpuDabs || useSpatialTipMixing
+        ? null
+        : staticMaster ?? resolveCpuMaster(activeTip, dabColor, hardness, isEraser, isBgEraser, isColorTip, curWidth, aaMode);
 
     let tx = 1;
     let ty = 0;
     let nx = 0;
     let ny = 1;
     if (pt.speed > 0.001) {
-      tx = pt.dx / pt.speed;
-      ty = pt.dy / pt.speed;
+      tx = dirX;
+      ty = dirY;
       nx = -ty;
       ny = tx;
     }
@@ -2191,6 +2561,94 @@ export function drawBrushCubicBezierSegment(
       let curDabAlpha = dabAlpha;
       if (flowJitter > 0) curDabAlpha *= Math.max(0.005, 1.0 - dabHashFloat(pt.x, pt.y, seedIdx, 6) * flowJitter);
 
+      let finalW = isVert ? curDabW * curDabThickness : curDabW;
+      let finalH = isVert ? curDabW * aspect : curDabW * aspect * curDabThickness;
+      if (useTilt && tiltMagnitude > 0.01) {
+        finalW *= 1.0 + tiltSpread * 1.85;
+        finalH *= Math.max(0.55, 1.0 / (1.0 + tiltMagnitude * 0.45));
+      }
+      stepRefW = finalW;
+      stepRefH = finalH;
+
+      if (curDabAlpha <= 0.002) continue;
+
+      const flips = resolveTipFlipSigns(options.flipH, options.flipV, seedIdx, curDabX, curDabY);
+
+      if (useSpatialTipMixing && options.reservoir?.spatialMixer) {
+        const effectiveStep =
+          prevStepDist > 0 ? prevStepDist : Math.max(0.85, Math.min(finalW, finalH) * Math.max(0.12, spacingRatio));
+        const built = options.reservoir.spatialMixer.stepAndBuildStamp({
+          x: curDabX,
+          y: curDabY,
+          width: finalW,
+          height: finalH,
+          angleRad: curDabAngle,
+          dirX,
+          dirY,
+          stepDist: effectiveStep,
+          spacingRatio,
+          adjustDensityByGap: Boolean(options.adjustDensityByGap),
+          dabSeq,
+          hardness,
+          antiAlias: aaMode,
+          flipX: flips.signX,
+          flipY: flips.signY,
+          flow: curDabAlpha,
+          pressure: effPressure,
+          pressureAlreadyApplied: pressureAlreadyAppliedToFlow,
+          amountOfPaint: (options.amountOfPaint ?? 0.65) * taperAmountScale,
+          densityOfPaint: (options.densityOfPaint ?? 0.9) * taperPaintDensityScale,
+          colorStretch: options.colorStretch ?? 0.75,
+          mixingMode: options.mixingMode ?? 'blend',
+          perceptualMixing: options.perceptualMixing !== false,
+          tipImage: activeTip,
+          sampler: options.sampler,
+          grainDensity: grainAmount,
+          grainModulate:
+            grainAmount > 0.005
+              ? (wx, wy, tipA) =>
+                  applyCspPaperTextureAlpha(
+                    tipA,
+                    sampleWorldPaperGrainNorm(wx, wy, texScale, texRot, customPaper),
+                    grainAmount,
+                    grainPressure,
+                    texMode,
+                    texBright,
+                    texContrast,
+                    texInv
+                  )
+              : undefined,
+        });
+        if (built) {
+          options.reservoir.r = built.avgR;
+          options.reservoir.g = built.avgG;
+          options.reservoir.b = built.avgB;
+          options.reservoir.a = built.avgA;
+          if (built.pickedUpCanvas) options.reservoir.isLoadedWithCanvasColor = true;
+        }
+        if (built && built.hasVisiblePixels) {
+          drawSingleStamp(
+            ctx,
+            built.canvas,
+            curDabX,
+            curDabY,
+            built.drawW,
+            built.drawH,
+            curDabAngle,
+            1.0,
+            false,
+            false,
+            options.alphaLocked,
+            options.isTransparentInk,
+            1,
+            1,
+            aaMode,
+            options.blendTipsMode
+          );
+        }
+        continue;
+      }
+
       let curMaster: CanvasImageSource | null = baseMaster;
       let dabR = primRgb ? primRgb.r / 255 : 0;
       let dabG = primRgb ? primRgb.g / 255 : 0;
@@ -2211,19 +2669,6 @@ export function drawBrushCubicBezierSegment(
           curMaster = resolveCpuMaster(activeTip, cd.hex, hardness, isEraser, isBgEraser, isColorTip, curDabW, aaMode);
         }
       }
-
-      let finalW = isVert ? curDabW * curDabThickness : curDabW;
-      let finalH = isVert ? curDabW * aspect : curDabW * aspect * curDabThickness;
-      if (useTilt && tiltMagnitude > 0.01) {
-        finalW *= 1.0 + tiltSpread * 1.85;
-        finalH *= Math.max(0.55, 1.0 / (1.0 + tiltMagnitude * 0.45));
-      }
-      stepRefW = finalW;
-      stepRefH = finalH;
-
-      if (curDabAlpha <= 0.002) continue;
-
-      const flips = resolveTipFlipSigns(options.flipH, options.flipV, seedIdx, curDabX, curDabY);
 
       if (curMaster && hasPerPixelCpuGrain) {
         const grained = applyCpuPerPixelPaperGrain(
@@ -2282,15 +2727,51 @@ export function drawBrushCubicBezierSegment(
       }
     }
 
-    currentDist += computeEllipticalStepDistance(
+    const effectiveMinStep = useSpatialTipMixing
+      ? Math.max(0.55, Math.min(1.05, Math.min(stepRefW, stepRefH) * 0.1))
+      : baseMinStepPx;
+    let stepAdvance = computeEllipticalStepDistance(
       stepRefW,
       stepRefH,
       stampAngle,
       pt.dx,
       pt.dy,
       spacingRatio,
-      minStepPx
+      effectiveMinStep
     );
+    // Angular-sweep stepping: tighten step on curves so outer tips of wide flat blades never fan into comb teeth
+    const maxAxis = Math.max(stepRefW, stepRefH);
+    const minAxis = Math.max(0.5, Math.min(stepRefW, stepRefH));
+    if (
+      (angleMode === 'direction' || angleMode === 'direction-random') &&
+      maxAxis > minAxis * 1.35 &&
+      currentDist + stepAdvance <= totalCurveLength
+    ) {
+      const peek = sampleFastArcLengthInto(
+        p0,
+        c1,
+        c2,
+        p3,
+        currentDist + stepAdvance,
+        totalCurveLength,
+        arcSteps,
+        peekBezierSample
+      );
+      if (peek.speed > 0.5) {
+        const peekAngle = Math.atan2(peek.dy, peek.dx) + baseAngleRad;
+        let dTheta = peekAngle - stampAngle;
+        while (dTheta > Math.PI) dTheta -= Math.PI * 2;
+        while (dTheta < -Math.PI) dTheta += Math.PI * 2;
+        const outerArc = 0.5 * maxAxis * Math.abs(dTheta);
+        const maxOuterArc = Math.max(0.75, minAxis * 0.14);
+        if (outerArc > maxOuterArc) {
+          stepAdvance = Math.max(0.2, stepAdvance * (maxOuterArc / outerArc));
+        }
+      }
+    }
+    prevStepDist = stepAdvance;
+    dabCounter.lastStepDist = stepAdvance;
+    currentDist += stepAdvance;
   }
 
   return Math.max(0, currentDist - totalCurveLength);
@@ -2433,7 +2914,8 @@ export function renderCompleteStroke(
   underlyingCanvas?: HTMLCanvasElement,
   alphaLocked: boolean = false,
   explicitSampler?: LayerPixelSampler,
-  allowGpuForMonochrome: boolean = false
+  allowGpuForMonochrome: boolean = false,
+  exitSpeed?: number
 ): void {
   if (!points || points.length === 0) return;
 
@@ -2506,13 +2988,45 @@ export function renderCompleteStroke(
     totalLen += Math.hypot(effectivePoints[i].x - effectivePoints[i - 1].x, effectivePoints[i].y - effectivePoints[i - 1].y);
   }
   options.totalLength = totalLen;
+  options.exitSpeed = exitSpeed;
+
+  // Align initial dot with initial stroke tangent using a >=4px lookahead chord to ignore landing jitter
+  let initAngleRad: number | undefined = undefined;
+  if (
+    effectivePoints.length >= 2 &&
+    (options.angleDynamics === 'direction' || options.angleDynamics === 'direction-random')
+  ) {
+    const p0 = effectivePoints[0];
+    const minChord = Math.max(4.0, (options.size ?? 10) * 0.12);
+    const minChordSq = minChord * minChord;
+    let fallbackAngle: number | undefined = undefined;
+    for (let i = 1; i < effectivePoints.length; i++) {
+      const dx = effectivePoints[i].x - p0.x;
+      const dy = effectivePoints[i].y - p0.y;
+      const dSq = dx * dx + dy * dy;
+      if (dSq > 0.25 && fallbackAngle === undefined) {
+        fallbackAngle = Math.atan2(dy, dx) + ((options.angle ?? 0) * Math.PI) / 180;
+      }
+      if (dSq >= minChordSq) {
+        initAngleRad = Math.atan2(dy, dx) + ((options.angle ?? 0) * Math.PI) / 180;
+        break;
+      }
+    }
+    if (initAngleRad === undefined) {
+      initAngleRad = fallbackAngle;
+    }
+  }
+  options.initialAngleRad = initAngleRad;
 
   const emitStroke = (batchGpuDabs: GpuDab[] | undefined) => {
     options.currentStrokeDist = 0;
     drawBrushDot(ctx, effectivePoints[0], strokeColor, options, batchGpuDabs);
     if (effectivePoints.length === 1) return;
 
-    const dabCounter = { count: 0 };
+    const dabCounter: { count: number; lastAngle?: number } = {
+      count: 0,
+      lastAngle: initAngleRad,
+    };
     const minInitDist = options.tipImage ? 0.15 : 0.12;
     let accDist = Math.max(minInitDist, Math.max(0.2, effectivePoints[0].width) * strokeSpacing);
 
