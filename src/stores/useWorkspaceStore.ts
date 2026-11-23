@@ -37,6 +37,7 @@ export interface WorkspaceStoreState {
   showStatusBar: boolean;
   showDocumentTabs: boolean;
   showCommandBar: boolean;
+  migratedPanels?: DockPanelId[];
 }
 
 const createInitialWorkspaceState = (): WorkspaceStoreState => {
@@ -53,6 +54,7 @@ const createInitialWorkspaceState = (): WorkspaceStoreState => {
     showStatusBar: loaded.showStatusBar,
     showDocumentTabs: loaded.showDocumentTabs,
     showCommandBar: loaded.showCommandBar,
+    migratedPanels: loaded.migratedPanels,
   };
 };
 
@@ -71,6 +73,7 @@ function persistCurrentWorkspace(): void {
     showStatusBar: s.showStatusBar,
     showDocumentTabs: s.showDocumentTabs,
     showCommandBar: s.showCommandBar,
+    migratedPanels: s.migratedPanels,
   };
   saveWorkspaceState(payload);
 }

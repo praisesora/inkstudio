@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,37 @@ static SCRATCH_IO_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+static CUSTOM_SCRATCH_BASE: std::sync::LazyLock<RwLock<Option<PathBuf>>> =
+    std::sync::LazyLock::new(|| RwLock::new(None));
+
+static SCRATCH_LZ4_ENABLED: AtomicBool = AtomicBool::new(true);
+
+const RAW_TILE_FLAG: u32 = 0x8000_0000;
+const RAW_TILE_LEN_MASK: u32 = 0x7fff_ffff;
+
+pub fn set_custom_scratch_dir(dir: Option<PathBuf>) {
+    if let Ok(mut guard) = CUSTOM_SCRATCH_BASE.write() {
+        *guard = dir;
+    }
+}
+
+pub fn set_scratch_compression_enabled(enabled: bool) {
+    SCRATCH_LZ4_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_scratch_compression_enabled() -> bool {
+    SCRATCH_LZ4_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn get_scratch_base_dir() -> PathBuf {
+    if let Ok(guard) = CUSTOM_SCRATCH_BASE.read() {
+        if let Some(custom) = guard.as_ref() {
+            return custom.join("inkstudio_scratch");
+        }
+    }
+    std::env::temp_dir().join("inkstudio_scratch")
+}
 
 const MAX_UNCOMPRESSED_TILE_BYTES: usize = 4 * 1024 * 1024; // 4 MB max per 256x256 tile
 const MAX_COMPRESSED_TILE_BYTES: u32 = 8 * 1024 * 1024;     // 8 MB max compressed payload
@@ -149,9 +181,7 @@ pub fn unpack_tile_batch(bytes: &[u8]) -> Result<Vec<TileWritePayload>, String> 
 
 pub fn get_scratch_root(session_id: &str) -> PathBuf {
     let safe_session = sanitize_layer_id(session_id);
-    std::env::temp_dir()
-        .join("inkstudio_scratch")
-        .join(safe_session)
+    get_scratch_base_dir().join(safe_session)
 }
 
 fn sanitize_layer_id(layer_id: &str) -> String {
@@ -197,7 +227,9 @@ pub async fn write_tiles(
         return Ok(0);
     }
 
-    // Validate & LZ4-compress tiles off Tokio async worker threads and BEFORE acquiring SCRATCH_IO_LOCK
+    let use_lz4 = is_scratch_compression_enabled();
+
+    // Validate & optionally LZ4-compress tiles off Tokio async worker threads and BEFORE acquiring SCRATCH_IO_LOCK
     let compressed_by_layer = tokio::task::spawn_blocking(move || -> Result<(usize, HashMap<String, Vec<CompressedTileWrite>>), String> {
         let mut grouped: HashMap<String, Vec<CompressedTileWrite>> = HashMap::new();
         let count = tiles.len();
@@ -205,8 +237,12 @@ pub async fn write_tiles(
             if tile.data.len() > MAX_UNCOMPRESSED_TILE_BYTES {
                 return Err("Tile uncompressed payload exceeds 4 MB safety ceiling".to_string());
             }
-            let uncompressed_len = tile.data.len() as u32;
-            let compressed = lz4_flex::compress_prepend_size(&tile.data);
+            let raw_len = tile.data.len() as u32;
+            let (uncompressed_len, payload) = if use_lz4 {
+                (raw_len, lz4_flex::compress_prepend_size(&tile.data))
+            } else {
+                (raw_len | RAW_TILE_FLAG, tile.data)
+            };
             grouped
                 .entry(tile.layer_id)
                 .or_default()
@@ -214,7 +250,7 @@ pub async fn write_tiles(
                     tile_x: tile.tile_x,
                     tile_y: tile.tile_y,
                     uncompressed_len,
-                    compressed,
+                    compressed: payload,
                 });
         }
         Ok((count, grouped))
@@ -446,14 +482,17 @@ pub async fn read_tile(
         }
     };
 
+    let is_raw_tile = (entry.uncompressed_len & RAW_TILE_FLAG) != 0;
+    let logical_uncompressed_len = (entry.uncompressed_len & RAW_TILE_LEN_MASK) as usize;
+
     if entry.compressed_len == 0
         || entry.compressed_len > MAX_COMPRESSED_TILE_BYTES
-        || (entry.uncompressed_len as usize) > MAX_UNCOMPRESSED_TILE_BYTES
+        || logical_uncompressed_len > MAX_UNCOMPRESSED_TILE_BYTES
     {
         return Err("Corrupt or oversized tile index entry".to_string());
     }
 
-    // 2. Read compressed payload from bucket file
+    // 2. Read payload from bucket file
     let safe_name = sanitize_layer_id(layer_id);
     let bucket_path = get_scratch_root(session_id).join(format!("bucket_{}.bin", safe_name));
 
@@ -475,6 +514,10 @@ pub async fn read_tile(
     // Release file/IO mutex before CPU decompression
     drop(bucket_file);
     drop(_io_guard);
+
+    if is_raw_tile {
+        return Ok(compressed_buf);
+    }
 
     if compressed_buf.len() < 4 {
         return Err("Corrupt LZ4 tile header".to_string());
@@ -570,6 +613,40 @@ mod tests {
         // Clear scratch disk
         clear_scratch_disk(&session_id).await.expect("clear failed");
         assert!(!get_scratch_root(&session_id).exists());
+    }
+
+    #[tokio::test]
+    async fn test_scratch_disk_uncompressed_mode_roundtrip() {
+        let session_id = format!(
+            "test_raw_session_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        set_scratch_compression_enabled(false);
+        let _ = init_scratch_disk(&session_id).await.expect("init failed");
+        let payload = vec![0x5Au8; 65536];
+        let count = write_tiles(
+            &session_id,
+            vec![TileWritePayload {
+                layer_id: "raw_layer".to_string(),
+                tile_x: 2,
+                tile_y: 3,
+                data: payload.clone(),
+            }],
+        )
+        .await
+        .expect("raw write failed");
+        assert_eq!(count, 1);
+
+        let read_back = read_tile(&session_id, "raw_layer", 2, 3)
+            .await
+            .expect("raw read failed");
+        assert_eq!(read_back, payload);
+
+        set_scratch_compression_enabled(true);
+        clear_scratch_disk(&session_id).await.expect("clear failed");
     }
 
     #[test]

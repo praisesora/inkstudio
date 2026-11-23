@@ -2,6 +2,7 @@ import { AppSettings, loadAppSettings, saveAppSettings } from '../types/settings
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType, ProcessingBounds, TileHistogramMap } from '../utils/tonalEngine';
 import type { TileSnapshotEntry } from '../utils/tileEngine';
+import { performanceManager } from '../utils/performanceManager';
 import { safeLocalStorageSetItem, setStorageQuotaNotifier } from '../utils/safeStorage';
 import { createStore } from './createStore';
 import { useUpdaterStore } from './useUpdaterStore';
@@ -104,37 +105,41 @@ function readStoredNumber(key: string, fallback: number): number {
   return fallback;
 }
 
-const createInitialUiState = (): UiStoreState => ({
-  appView: 'workspace',
-  leftPanelWidth: readStoredNumber('ink_left_panel_width_v3', 118),
-  isLeftPanelHidden: false,
-  rightSidebarWidth: readStoredNumber('ink_right_sidebar_width_v3', 162),
-  isRightSidebarHidden: false,
-  isWebtoonMode: false,
-  is3DLayerOpen: false,
-  initial3DFile: null,
-  appSettings: loadAppSettings(),
+const createInitialUiState = (): UiStoreState => {
+  const initialSettings = loadAppSettings();
+  performanceManager.applySettings(initialSettings);
+  return {
+    appView: 'workspace',
+    leftPanelWidth: readStoredNumber('ink_left_panel_width_v3', 118),
+    isLeftPanelHidden: false,
+    rightSidebarWidth: readStoredNumber('ink_right_sidebar_width_v3', 162),
+    isRightSidebarHidden: false,
+    isWebtoonMode: false,
+    is3DLayerOpen: false,
+    initial3DFile: null,
+    appSettings: initialSettings,
 
-  isNewCanvasModalOpen: false,
-  isResizeCanvasModalOpen: false,
-  isSettingsModalOpen: false,
-  isAboutModalOpen: false,
-  isToneModalOpen: false,
-  isMangaEffectsModalOpen: false,
-  isWebtoonExportModalOpen: false,
-  isTimelapseExportModalOpen: false,
-  isBrushStudioModalOpen: false,
-  isRecoveryModalOpen: false,
-  crashedSessions: [],
-  tonalModalState: { ...DEFAULT_TONAL_MODAL_STATE },
-  adjustmentModalState: { isOpen: false },
-  layerStylesModalState: { isOpen: false },
-  appClosePrompt: { ...INITIAL_APP_CLOSE_PROMPT_STATE },
+    isNewCanvasModalOpen: false,
+    isResizeCanvasModalOpen: false,
+    isSettingsModalOpen: false,
+    isAboutModalOpen: false,
+    isToneModalOpen: false,
+    isMangaEffectsModalOpen: false,
+    isWebtoonExportModalOpen: false,
+    isTimelapseExportModalOpen: false,
+    isBrushStudioModalOpen: false,
+    isRecoveryModalOpen: false,
+    crashedSessions: [],
+    tonalModalState: { ...DEFAULT_TONAL_MODAL_STATE },
+    adjustmentModalState: { isOpen: false },
+    layerStylesModalState: { isOpen: false },
+    appClosePrompt: { ...INITIAL_APP_CLOSE_PROMPT_STATE },
 
-  isLoadingFile: false,
-  loadingStatus: '',
-  toastMessage: null,
-});
+    isLoadingFile: false,
+    loadingStatus: '',
+    toastMessage: null,
+  };
+};
 
 export const useUiStore = createStore<UiStoreState>(createInitialUiState);
 
@@ -197,6 +202,7 @@ export const uiStoreActions = {
   },
 
   updateAppSettings(newSettings: AppSettings): void {
+    performanceManager.applySettings(newSettings);
     useUiStore.setState({ appSettings: newSettings });
     saveAppSettings(newSettings);
   },

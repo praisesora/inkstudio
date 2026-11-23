@@ -20,6 +20,7 @@ import {
   Eye,
   Compass,
   Images,
+  Info,
   Play,
 } from 'lucide-react';
 import { CanvasColorMode, CspBrush } from '../types/editor';
@@ -57,6 +58,7 @@ import { RightSidebar, RightSidebarColorSection, RightSidebarProps } from './Rig
 import { QuickAccessPanel } from './QuickAccessPanel';
 import { NavigatorPanel, NavigatorPanelProps } from './NavigatorPanel';
 import { SubViewPanel } from './SubViewPanel';
+import { InfoPanel } from './InfoPanel';
 import { AutoActionPanel, AutoActionPanelProps } from './AutoActionPanel';
 import { WorkspaceCommandHandlers } from './CommandBar';
 
@@ -76,6 +78,8 @@ export function renderPanelIcon(panelId: DockPanelId, className = 'w-3.5 h-3.5')
       return <Compass className={className} />;
     case 'sub-view':
       return <Images className={className} />;
+    case 'info':
+      return <Info className={className} />;
     case 'color':
       return <Palette className={className} />;
     case 'layers':
@@ -913,6 +917,14 @@ export const DockWorkspace: React.FC<DockWorkspaceProps> = React.memo(({
           ) : null;
         case 'sub-view':
           return <SubViewPanel colorMode={colorMode} themePreset={themePreset} />;
+        case 'info':
+          return (
+            <InfoPanel
+              layers={layerSidebarProps.layers}
+              colorMode={colorMode}
+              themePreset={themePreset}
+            />
+          );
         case 'color':
           return (
             <RightSidebarColorSection

@@ -179,6 +179,16 @@ export const DEFAULT_PRESSURE_CURVE_SETTINGS: PressureCurveSettings = {
   ],
 };
 
+export type RenderBackend = 'auto' | 'webgl2' | 'canvas2d';
+export type GpuPowerPreference = 'high-performance' | 'low-power' | 'default';
+export type DesktopGraphicsApi = 'auto' | 'd3d11' | 'vulkan' | 'gl' | 'warp';
+export type GpuTexturePoolPreset = 'low' | 'balanced' | 'high' | 'ultra';
+export type ViewportResolutionScale = 'native' | 'capped-2x' | '1x' | '0.75x';
+export type CanvasFilteringQuality = 'auto' | 'smooth' | 'pixelated';
+export type ScratchDiskCompression = 'lz4' | 'none';
+export type Preview3DMaxResolution = 1024 | 1920 | 2560;
+export type PerformancePresetId = 'battery' | 'balanced' | 'maximum' | 'compatibility';
+
 export interface AppSettings {
   // User Profile
   userName: string;
@@ -213,8 +223,26 @@ export interface AppSettings {
   modifierKeys: ModifierKeySettings;
   pressureCurve: PressureCurveSettings;
 
-  // Performance & Scratch Disk
+  // Performance, GPU, Memory & Scratch Disk
+  autoOptimizePerformance: boolean;
   tileMemoryBudgetMb: number;
+  memoryAllocationPercent: number;
+  undoRamSteps: number;
+  offloadInactiveTabs: boolean;
+  renderBackend: RenderBackend;
+  gpuPowerPreference: GpuPowerPreference;
+  desktopGraphicsApi: DesktopGraphicsApi;
+  gpuBrushAcceleration: boolean;
+  gpuTexturePoolPreset: GpuTexturePoolPreset;
+  layerStackCaching: boolean;
+  viewportResolutionScale: ViewportResolutionScale;
+  canvasFilteringQuality: CanvasFilteringQuality;
+  scratchDiskPath: string;
+  scratchDiskCompression: ScratchDiskCompression;
+  cpuWorkerThreads: number; // 0 = Auto (all logical cores)
+  useNativeRustAcceleration: boolean;
+  preview3DMaxResolution: Preview3DMaxResolution;
+  preview3DAntialias: boolean;
 
   // Auto-Updater (Desktop)
   autoCheckUpdates: boolean;
@@ -252,7 +280,25 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
     points: DEFAULT_PRESSURE_CURVE_SETTINGS.points.map(([x, y]) => [x, y] as PressureCurvePoint),
   },
 
+  autoOptimizePerformance: true,
   tileMemoryBudgetMb: 1024,
+  memoryAllocationPercent: 60,
+  undoRamSteps: 15,
+  offloadInactiveTabs: true,
+  renderBackend: 'auto',
+  gpuPowerPreference: 'high-performance',
+  desktopGraphicsApi: 'auto',
+  gpuBrushAcceleration: true,
+  gpuTexturePoolPreset: 'high',
+  layerStackCaching: true,
+  viewportResolutionScale: 'capped-2x',
+  canvasFilteringQuality: 'auto',
+  scratchDiskPath: '',
+  scratchDiskCompression: 'lz4',
+  cpuWorkerThreads: 0,
+  useNativeRustAcceleration: true,
+  preview3DMaxResolution: 1920,
+  preview3DAntialias: true,
 
   autoCheckUpdates: true,
   skippedUpdateVersion: '',
@@ -405,10 +451,112 @@ export function loadAppSettings(): AppSettings {
       const validTone: 'slate' | 'oled' | 'charcoal' = ['slate', 'oled', 'charcoal'].includes(parsed.uiTone)
         ? parsed.uiTone
         : 'charcoal';
+      const validAutoOptimizePerformance: boolean =
+        typeof parsed.autoOptimizePerformance === 'boolean'
+          ? parsed.autoOptimizePerformance
+          : DEFAULT_APP_SETTINGS.autoOptimizePerformance;
       const validBudget: number =
-        typeof parsed.tileMemoryBudgetMb === 'number' && parsed.tileMemoryBudgetMb >= 256 && parsed.tileMemoryBudgetMb <= 8192
-          ? parsed.tileMemoryBudgetMb
-          : 1024;
+        typeof parsed.tileMemoryBudgetMb === 'number' &&
+        Number.isFinite(parsed.tileMemoryBudgetMb) &&
+        parsed.tileMemoryBudgetMb >= 256 &&
+        parsed.tileMemoryBudgetMb <= 32768
+          ? Math.round(parsed.tileMemoryBudgetMb)
+          : DEFAULT_APP_SETTINGS.tileMemoryBudgetMb;
+      const validMemoryPercent: number =
+        typeof parsed.memoryAllocationPercent === 'number' &&
+        Number.isFinite(parsed.memoryAllocationPercent)
+          ? Math.max(20, Math.min(85, Math.round(parsed.memoryAllocationPercent)))
+          : DEFAULT_APP_SETTINGS.memoryAllocationPercent;
+      const validMaxHistorySteps: number =
+        typeof parsed.maxHistorySteps === 'number' && Number.isFinite(parsed.maxHistorySteps)
+          ? Math.max(10, Math.min(200, Math.round(parsed.maxHistorySteps)))
+          : DEFAULT_APP_SETTINGS.maxHistorySteps;
+      const validUndoRamSteps: number =
+        typeof parsed.undoRamSteps === 'number' && Number.isFinite(parsed.undoRamSteps)
+          ? Math.max(4, Math.min(50, Math.round(parsed.undoRamSteps)))
+          : DEFAULT_APP_SETTINGS.undoRamSteps;
+      const validOffloadInactiveTabs: boolean =
+        typeof parsed.offloadInactiveTabs === 'boolean'
+          ? parsed.offloadInactiveTabs
+          : DEFAULT_APP_SETTINGS.offloadInactiveTabs;
+      const validRenderBackend: RenderBackend = ['auto', 'webgl2', 'canvas2d'].includes(
+        parsed.renderBackend
+      )
+        ? parsed.renderBackend
+        : DEFAULT_APP_SETTINGS.renderBackend;
+      const validGpuPowerPreference: GpuPowerPreference = [
+        'high-performance',
+        'low-power',
+        'default',
+      ].includes(parsed.gpuPowerPreference)
+        ? parsed.gpuPowerPreference
+        : DEFAULT_APP_SETTINGS.gpuPowerPreference;
+      const validDesktopGraphicsApi: DesktopGraphicsApi = [
+        'auto',
+        'd3d11',
+        'vulkan',
+        'gl',
+        'warp',
+      ].includes(parsed.desktopGraphicsApi)
+        ? parsed.desktopGraphicsApi
+        : DEFAULT_APP_SETTINGS.desktopGraphicsApi;
+      const validGpuBrushAcceleration: boolean =
+        typeof parsed.gpuBrushAcceleration === 'boolean'
+          ? parsed.gpuBrushAcceleration
+          : DEFAULT_APP_SETTINGS.gpuBrushAcceleration;
+      const validGpuTexturePoolPreset: GpuTexturePoolPreset = [
+        'low',
+        'balanced',
+        'high',
+        'ultra',
+      ].includes(parsed.gpuTexturePoolPreset)
+        ? parsed.gpuTexturePoolPreset
+        : DEFAULT_APP_SETTINGS.gpuTexturePoolPreset;
+      const validLayerStackCaching: boolean =
+        typeof parsed.layerStackCaching === 'boolean'
+          ? parsed.layerStackCaching
+          : DEFAULT_APP_SETTINGS.layerStackCaching;
+      const validViewportResolutionScale: ViewportResolutionScale = [
+        'native',
+        'capped-2x',
+        '1x',
+        '0.75x',
+      ].includes(parsed.viewportResolutionScale)
+        ? parsed.viewportResolutionScale
+        : DEFAULT_APP_SETTINGS.viewportResolutionScale;
+      const validCanvasFilteringQuality: CanvasFilteringQuality = [
+        'auto',
+        'smooth',
+        'pixelated',
+      ].includes(parsed.canvasFilteringQuality)
+        ? parsed.canvasFilteringQuality
+        : DEFAULT_APP_SETTINGS.canvasFilteringQuality;
+      const validScratchDiskPath: string =
+        typeof parsed.scratchDiskPath === 'string' && !parsed.scratchDiskPath.includes('\0')
+          ? parsed.scratchDiskPath.trim()
+          : DEFAULT_APP_SETTINGS.scratchDiskPath;
+      const validScratchDiskCompression: ScratchDiskCompression = ['lz4', 'none'].includes(
+        parsed.scratchDiskCompression
+      )
+        ? parsed.scratchDiskCompression
+        : DEFAULT_APP_SETTINGS.scratchDiskCompression;
+      const validCpuWorkerThreads: number =
+        typeof parsed.cpuWorkerThreads === 'number' && Number.isFinite(parsed.cpuWorkerThreads)
+          ? Math.max(0, Math.min(64, Math.round(parsed.cpuWorkerThreads)))
+          : DEFAULT_APP_SETTINGS.cpuWorkerThreads;
+      const validUseNativeRustAcceleration: boolean =
+        typeof parsed.useNativeRustAcceleration === 'boolean'
+          ? parsed.useNativeRustAcceleration
+          : DEFAULT_APP_SETTINGS.useNativeRustAcceleration;
+      const validPreview3DMaxResolution: Preview3DMaxResolution = [1024, 1920, 2560].includes(
+        parsed.preview3DMaxResolution
+      )
+        ? parsed.preview3DMaxResolution
+        : DEFAULT_APP_SETTINGS.preview3DMaxResolution;
+      const validPreview3DAntialias: boolean =
+        typeof parsed.preview3DAntialias === 'boolean'
+          ? parsed.preview3DAntialias
+          : DEFAULT_APP_SETTINGS.preview3DAntialias;
       const validAutoCheckUpdates: boolean =
         typeof parsed.autoCheckUpdates === 'boolean'
           ? parsed.autoCheckUpdates
@@ -426,7 +574,26 @@ export function loadAppSettings(): AppSettings {
         modernAccent: validAccent,
         modernCustomColor: validCustomColor,
         uiTone: validTone,
+        maxHistorySteps: validMaxHistorySteps,
+        autoOptimizePerformance: validAutoOptimizePerformance,
         tileMemoryBudgetMb: validBudget,
+        memoryAllocationPercent: validMemoryPercent,
+        undoRamSteps: validUndoRamSteps,
+        offloadInactiveTabs: validOffloadInactiveTabs,
+        renderBackend: validRenderBackend,
+        gpuPowerPreference: validGpuPowerPreference,
+        desktopGraphicsApi: validDesktopGraphicsApi,
+        gpuBrushAcceleration: validGpuBrushAcceleration,
+        gpuTexturePoolPreset: validGpuTexturePoolPreset,
+        layerStackCaching: validLayerStackCaching,
+        viewportResolutionScale: validViewportResolutionScale,
+        canvasFilteringQuality: validCanvasFilteringQuality,
+        scratchDiskPath: validScratchDiskPath,
+        scratchDiskCompression: validScratchDiskCompression,
+        cpuWorkerThreads: validCpuWorkerThreads,
+        useNativeRustAcceleration: validUseNativeRustAcceleration,
+        preview3DMaxResolution: validPreview3DMaxResolution,
+        preview3DAntialias: validPreview3DAntialias,
         autoCheckUpdates: validAutoCheckUpdates,
         skippedUpdateVersion: validSkippedUpdateVersion,
         shortcuts: sanitizeShortcuts(parsed.shortcuts),

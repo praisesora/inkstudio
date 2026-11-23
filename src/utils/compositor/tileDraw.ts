@@ -85,7 +85,16 @@ export function drawVisibleTiles(
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D_ARRAY, state.tileArrayTexture);
 
-    const desiredTier = state.currentZoom < 0.99 ? 0 : state.currentZoom < 2.0 ? 1 : 2;
+    const desiredTier =
+      state.filteringQuality === 'smooth'
+        ? 1
+        : state.filteringQuality === 'pixelated'
+          ? 2
+          : state.currentZoom < 0.99
+            ? 0
+            : state.currentZoom < 2.0
+              ? 1
+              : 2;
     if (state.arrayPoolFilterTier !== desiredTier) {
       const filter = desiredTier <= 1 ? gl.LINEAR : gl.NEAREST;
       gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, filter);
@@ -251,7 +260,15 @@ export function renderActiveDraftForLayer(
       needsMipmap ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR
     );
   }
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, state.currentZoom >= 2.0 ? gl.NEAREST : gl.LINEAR);
+  const draftMagFilter =
+    state.filteringQuality === 'smooth'
+      ? gl.LINEAR
+      : state.filteringQuality === 'pixelated'
+        ? gl.NEAREST
+        : state.currentZoom >= 2.0
+          ? gl.NEAREST
+          : gl.LINEAR;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, draftMagFilter);
 
   let effectiveDraftLayer: LayerItem =
     state.currentOptions?.activeDraftMonochrome && layer.expressionColor !== 'monochrome'

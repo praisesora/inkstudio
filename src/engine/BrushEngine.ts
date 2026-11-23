@@ -39,6 +39,7 @@ import {
   rgbToHex,
 } from '../utils/colorMixingEngine';
 import { GpuDab, WebGlBrushEngine } from './WebGlBrushEngine';
+import { performanceManager } from '../utils/performanceManager';
 import { isNaturalPaintBrush, renderCompleteNaturalPaintStroke } from './NaturalPaintRenderer';
 
 // ============================================================================
@@ -1542,6 +1543,10 @@ function applyCpuPerPixelPaperGrain(
 // ============================================================================
 
 export function canUseWebGlForBrush(options?: BrushRenderOptions): boolean {
+  const perf = performanceManager.getConfig();
+  if (perf.renderBackend === 'canvas2d' || !perf.gpuBrushAcceleration) {
+    return false;
+  }
   if (!options) return WebGlBrushEngine.getInstance().isAvailable();
   if (options.useGpu === false) return false;
   if (options.colorMixing) return false;

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Trash2, EyeOff, AlertTriangle, X, FileText } from 'lucide-react';
 import { RecentDocument, formatFileSize } from '../utils/recentDocumentsManager';
 
@@ -17,37 +17,60 @@ export const DeleteDocumentModal: React.FC<DeleteDocumentModalProps> = ({
   onHideFromApp,
   onPermanentlyDelete,
 }) => {
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen, onClose]);
+
   if (!isOpen || !document) return null;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 select-none"
-      onKeyDown={(e) => {
-        if (e.key === 'Escape') onClose();
-      }}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="delete-document-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
+      onClick={onClose}
     >
-      <div className="bg-[#444447] border border-[#242426] rounded-[2px] shadow-[0_8px_24px_rgba(0,0,0,0.7)] w-full max-w-md overflow-hidden text-[#d6d6da]">
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-[#202020] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] w-full max-w-[430px] overflow-hidden text-xs text-[#e5e5e5] border border-[#2c2c2c]"
+      >
         {/* Title Bar */}
-        <div className="px-3.5 py-2 border-b border-[#242426] bg-gradient-to-b from-[#525255] to-[#3e3e40] flex items-center justify-between">
-          <div className="flex items-center space-x-2">
-            <Trash2 className="w-3.5 h-3.5 text-rose-400" />
-            <span className="text-xs font-semibold text-[#f0f0f4] tracking-wide">
+        <div className="h-9 px-3.5 flex items-center justify-between bg-[#161616] border-b border-[#2c2c2c]">
+          <div className="flex items-center gap-2 min-w-0">
+            <Trash2 className="w-3.5 h-3.5 text-red-400 shrink-0" />
+            <span
+              id="delete-document-modal-title"
+              className="text-xs font-medium text-[#e5e5e5] tracking-wide"
+            >
               Delete Document
             </span>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="p-0.5 rounded-[2px] text-[#a0a0a5] hover:text-white hover:bg-[#525255] transition-colors"
+            aria-label="Close"
+            title="Cancel (Esc)"
+            className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         {/* Content */}
-        <div className="p-4 space-y-3.5 text-xs">
+        <div className="p-4 space-y-3">
           {/* Target File Info */}
-          <div className="bg-[#2b2b2e] border border-[#1e1e20] rounded-[2px] p-2.5 flex items-center space-x-3 shadow-[inset_1px_1px_2px_rgba(0,0,0,0.4)]">
-            <div className="w-10 h-10 bg-[#202022] border border-[#1a1a1c] overflow-hidden shrink-0 flex items-center justify-center rounded-[1px]">
+          <div className="bg-[#161616] border border-[#2c2c2c] rounded-md p-2.5 flex items-center gap-3">
+            <div className="w-11 h-11 bg-[#202020] border border-[#2c2c2c] overflow-hidden shrink-0 flex items-center justify-center rounded">
               {document.coverUrl ? (
                 <img
                   src={document.coverUrl}
@@ -55,64 +78,70 @@ export const DeleteDocumentModal: React.FC<DeleteDocumentModalProps> = ({
                   className="w-full h-full object-cover"
                 />
               ) : (
-                <FileText className="w-5 h-5 text-[#6c6c72]" />
+                <FileText className="w-4 h-4 text-[#8a8a8a]" />
               )}
             </div>
             <div className="flex-1 min-w-0">
-              <div className="font-medium text-[#f0f0f4] truncate" title={document.title}>
+              <div className="text-xs font-medium text-[#e5e5e5] truncate" title={document.title}>
                 {document.title}
               </div>
-              <div className="text-[10px] text-[#8c8c92] font-mono truncate" title={document.path}>
+              <div className="text-[10px] text-[#8a8a8a] font-mono truncate mt-0.5" title={document.path}>
                 {formatFileSize(document.size)} • {document.path}
               </div>
             </div>
           </div>
 
-          <p className="text-[11px] text-[#a0a0a5]">
-            Select action:
-          </p>
+          <div className="text-[11px] font-medium text-[#8a8a8a] uppercase tracking-wider pt-0.5">
+            Select action
+          </div>
 
-          {/* Action 1: Remove from list */}
-          <button
-            type="button"
-            onClick={() => onHideFromApp(document)}
-            className="w-full flex items-start space-x-2.5 p-2.5 rounded-[2px] border border-[#2b2b2e] bg-[#3a3a3d] hover:bg-[#46464a] hover:border-[#525256] text-left transition-colors cursor-pointer"
-          >
-            <EyeOff className="w-4 h-4 text-[#93c5fd] shrink-0 mt-0.5" />
-            <div>
-              <div className="font-medium text-[#f0f0f4]">
-                Remove from Recent List
+          <div className="space-y-2">
+            {/* Action 1: Remove from list */}
+            <button
+              type="button"
+              onClick={() => onHideFromApp(document)}
+              className="w-full flex items-start gap-3 p-3 rounded-md bg-[#262626] hover:bg-[#2c2c2c] border border-[#2c2c2c] hover:border-[#3a3a3a] text-left transition-colors cursor-pointer"
+            >
+              <div className="w-7 h-7 rounded bg-[#161616] border border-[#2c2c2c] flex items-center justify-center shrink-0 text-[#8a8a8a]">
+                <EyeOff className="w-3.5 h-3.5" />
               </div>
-              <div className="text-[10px] text-[#8c8c92] mt-0.5">
-                Removes entry from the studio. Keeps the file intact on disk.
+              <div className="min-w-0">
+                <div className="text-xs font-medium text-[#e5e5e5]">
+                  Remove from Recent List
+                </div>
+                <div className="text-[11px] text-[#8a8a8a] mt-0.5 leading-snug">
+                  Removes entry from the studio. Keeps the file intact on disk.
+                </div>
               </div>
-            </div>
-          </button>
+            </button>
 
-          {/* Action 2: Permanently delete */}
-          <button
-            type="button"
-            onClick={() => onPermanentlyDelete(document)}
-            className="w-full flex items-start space-x-2.5 p-2.5 rounded-[2px] border border-rose-900/50 bg-[#3d2c2f] hover:bg-[#4a3438] hover:border-rose-700/60 text-left transition-colors cursor-pointer"
-          >
-            <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-            <div>
-              <div className="font-medium text-rose-200">
-                Permanently Delete from Disk
+            {/* Action 2: Permanently delete */}
+            <button
+              type="button"
+              onClick={() => onPermanentlyDelete(document)}
+              className="w-full flex items-start gap-3 p-3 rounded-md bg-red-500/[0.08] hover:bg-red-500/[0.14] border border-red-500/25 hover:border-red-500/45 text-left transition-colors cursor-pointer"
+            >
+              <div className="w-7 h-7 rounded bg-red-500/15 border border-red-500/25 flex items-center justify-center shrink-0 text-red-400">
+                <AlertTriangle className="w-3.5 h-3.5" />
               </div>
-              <div className="text-[10px] text-rose-300/70 mt-0.5">
-                Erases file permanently from storage. Cannot be undone.
+              <div className="min-w-0">
+                <div className="text-xs font-medium text-red-300">
+                  Permanently Delete from Disk
+                </div>
+                <div className="text-[11px] text-red-300/70 mt-0.5 leading-snug">
+                  Erases file permanently from storage. Cannot be undone.
+                </div>
               </div>
-            </div>
-          </button>
+            </button>
+          </div>
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-2 bg-[#3a3a3d] border-t border-[#242426] flex justify-end">
+        <div className="px-4 py-2.5 bg-[#161616] border-t border-[#2c2c2c] flex items-center justify-end">
           <button
             type="button"
             onClick={onClose}
-            className="px-3 py-1 rounded-[2px] text-xs font-medium bg-gradient-to-b from-[#56565a] to-[#424245] hover:from-[#626266] hover:to-[#4b4b4e] border border-[#242426] text-[#d6d6da] shadow-[inset_0_1px_0_rgba(255,255,255,0.18)] cursor-pointer"
+            className="px-3.5 py-1.5 rounded bg-[#2a2a2a] hover:bg-[#363636] text-xs font-medium text-[#e5e5e5] transition-colors cursor-pointer"
           >
             Cancel
           </button>

@@ -5,6 +5,11 @@ import {
   CanvasColorMode,
   SoftProofSettings,
 } from '../../types/editor';
+import type {
+  CanvasFilteringQuality,
+  GpuPowerPreference,
+  RenderBackend,
+} from '../../types/settings';
 import { SparseTileGrid } from '../tileEngine';
 
 export const DEFAULT_ARRAY_POOL_LAYERS = 512;
@@ -394,5 +399,16 @@ export interface CompositorState {
   texturePool: Texture2DPoolSlot[];
   activePoolByKey: Map<string, Texture2DPoolSlot>;
   fallbackTileCanvas: HTMLCanvasElement | null;
+  fallbackTileImageData: ImageData | null;
+  fallbackIsoCanvas: HTMLCanvasElement | null;
   lastRenderedGrid: SparseTileGrid | null;
+
+  // Performance & Renderer Configuration
+  renderBackend: RenderBackend;
+  powerPreference: GpuPowerPreference;
+  requestedArrayPoolLayers: number;
+  maxTexturePoolSize: number;
+  filteringQuality: CanvasFilteringQuality;
+  activeRendererName: string;
+  layerVisScratch: Map<string, boolean>;
 }

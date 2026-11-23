@@ -7,6 +7,7 @@ export type DockPanelId =
   | 'brush-size'
   | 'navigator'
   | 'sub-view'
+  | 'info'
   | 'color'
   | 'layers'
   | 'history'
@@ -84,6 +85,7 @@ export interface PersistedWorkspaceState {
   showStatusBar: boolean;
   showDocumentTabs: boolean;
   showCommandBar: boolean;
+  migratedPanels?: DockPanelId[];
 }
 
 export interface DockPanelMeta {
@@ -103,6 +105,7 @@ export const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
   'brush-size',
   'navigator',
   'sub-view',
+  'info',
   'color',
   'layers',
   'history',
@@ -164,6 +167,15 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 176,
     maxWidth: 400,
+  },
+  info: {
+    id: 'info',
+    title: 'Info',
+    shortTitle: 'Info',
+    defaultSide: 'right',
+    defaultWidth: 224,
+    minWidth: 176,
+    maxWidth: 380,
   },
   color: {
     id: 'color',

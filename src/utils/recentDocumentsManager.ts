@@ -5,6 +5,14 @@ import {
   safeLocalStorageSetItem,
 } from './safeStorage';
 
+export interface FileSystemFileHandleLike {
+  name: string;
+  getFile: () => Promise<File>;
+  createWritable?: () => Promise<FileSystemWritableFileStream>;
+  queryPermission?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<'granted' | 'denied' | 'prompt'>;
+  requestPermission?: (opts?: { mode?: 'read' | 'readwrite' }) => Promise<'granted' | 'denied' | 'prompt'>;
+}
+
 export interface RecentDocument {
   id: string;
   title: string;
@@ -15,6 +23,7 @@ export interface RecentDocument {
   isStarred: boolean;
   fileType?: string;
   isSaved?: boolean;
+  handle?: FileSystemFileHandleLike;
 }
 
 const DB_NAME = 'InkStudioRecentDocsDB';
@@ -39,11 +48,12 @@ export function isActualSavedDocument(doc: RecentDocument): boolean {
 }
 
 /**
- * Strips heavy coverUrl thumbnails so localStorage only ever stores lightweight metadata/IDs.
+ * Strips heavy coverUrl thumbnails and non-JSON-serializable handles so localStorage
+ * only ever stores lightweight metadata/IDs.
  */
-function stripRecentDocThumbnail(doc: RecentDocument): RecentDocument {
-  if (!doc.coverUrl) return doc;
-  const { coverUrl: _omit, ...lightweight } = doc;
+function stripForLocalStorage(doc: RecentDocument): RecentDocument {
+  if (!doc.coverUrl && !doc.handle) return doc;
+  const { coverUrl: _omitCover, handle: _omitHandle, ...lightweight } = doc;
   return lightweight;
 }
 
@@ -74,7 +84,7 @@ function openDB(): Promise<IDBDatabase> {
 }
 
 function writeFallbackDocs(docs: RecentDocument[]): void {
-  const stripped = docs.filter(isActualSavedDocument).map(stripRecentDocThumbnail);
+  const stripped = docs.filter(isActualSavedDocument).map(stripForLocalStorage);
   safeLocalStorageSetItem(RECENT_DOCS_LS_KEY, JSON.stringify(stripped), 'recent documents');
 }
 
@@ -94,7 +104,7 @@ function getRawFallbackDocs(): RecentDocument[] {
 }
 
 function getFallbackDocs(): RecentDocument[] {
-  return getRawFallbackDocs().map(stripRecentDocThumbnail);
+  return getRawFallbackDocs().map(stripForLocalStorage);
 }
 
 export async function loadRecentDocuments(): Promise<RecentDocument[]> {
@@ -170,10 +180,26 @@ export async function saveRecentDocument(
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
+    if (fullDoc.handle) {
+      const { handle: _omitHandle, ...withoutHandle } = fullDoc;
+      try {
+        const db = await openDB();
+        await new Promise<void>((resolve, reject) => {
+          const tx = db.transaction(STORE_NAME, 'readwrite');
+          const req = tx.objectStore(STORE_NAME).put(withoutHandle);
+          req.onerror = () => reject(req.error);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+        return;
+      } catch {
+        // Fall through to localStorage fallback
+      }
+    }
     handleIndexedDbError(err, 'recent document thumbnail');
-    // Fallback to localStorage without heavy thumbnail payloads
+    // Fallback to localStorage without heavy thumbnail payloads or file handles
     const current = getFallbackDocs().filter((d) => d.id !== fullDoc.id);
-    writeFallbackDocs([stripRecentDocThumbnail(fullDoc), ...current]);
+    writeFallbackDocs([stripForLocalStorage(fullDoc), ...current]);
   }
 }
 

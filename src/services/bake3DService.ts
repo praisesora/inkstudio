@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { LayerItem, BlendMode } from '../types/editor';
 import { documentStore } from '../utils/documentStore';
+import { performanceManager } from '../utils/performanceManager';
 import { multiplayerService } from './multiplayerService';
 import { applyScreentoneCPU } from '../utils/screentoneEngine';
 
@@ -79,9 +80,10 @@ export function createSafeWebGLRenderer(
   options: SafeWebGLRendererOptions = {}
 ): THREE.WebGLRenderer {
   const alpha = options.alpha ?? true;
-  const antialias = options.antialias ?? true;
+  const antialias = options.antialias ?? performanceManager.getConfig().preview3DAntialias;
   const preserveDrawingBuffer = options.preserveDrawingBuffer ?? true;
-  const preferredPower = options.powerPreference ?? 'high-performance';
+  const preferredPower =
+    options.powerPreference ?? performanceManager.getConfig().gpuPowerPreference ?? 'high-performance';
 
   const attempts: Array<{ antialias: boolean; powerPreference?: WebGLPowerPreference }> = [
     { antialias, powerPreference: preferredPower },

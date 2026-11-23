@@ -148,6 +148,7 @@ export async function openFile(file: File): Promise<LoadedDocument> {
       perspectiveRuler: project.perspectiveRuler ?? null,
       animationTimeline: project.animationTimeline ?? null,
       timelapse: project.timelapse ?? null,
+      workTimeMs: project.workTimeMs,
       previewDataUrl: project.previewDataUrl,
     };
   }

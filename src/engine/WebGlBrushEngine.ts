@@ -1,5 +1,6 @@
 import { Point, BrushSettings, ToolType, SurfaceTextureId, ImpastoSettings } from '../types/editor';
 import { getSurfaceTextureHeightField, SURFACE_TEXTURE_SIZE } from '../utils/proceduralBrushTips';
+import { performanceManager } from '../utils/performanceManager';
 
 export interface GpuInfo {
   isSupported: boolean;
@@ -643,7 +644,26 @@ export class WebGlBrushEngine {
     }
   }
 
+  private activePowerPreference: WebGLPowerPreference = 'high-performance';
+
   private constructor() {
+    this.initCanvasAndGl();
+  }
+
+  private initCanvasAndGl() {
+    const perf = performanceManager.getConfig();
+    if (perf.renderBackend === 'canvas2d' || !perf.gpuBrushAcceleration) {
+      this.isGpuAvailable = false;
+      this.gpuInfo = {
+        isSupported: false,
+        renderer: 'CPU Fallback (GPU Brush Disabled)',
+        vendor: 'Standard',
+        glVersion: 'None',
+      };
+      return;
+    }
+    this.activePowerPreference = perf.gpuPowerPreference || 'high-performance';
+
     if (typeof document !== 'undefined') {
       const c = document.createElement('canvas');
       c.width = 1024;
@@ -653,20 +673,7 @@ export class WebGlBrushEngine {
         c.addEventListener('webglcontextlost', (ev) => {
           ev.preventDefault();
           this.isGpuAvailable = false;
-          this.tipTexturesMap.clear();
-          this.multiTipAtlasCache.clear();
-          this.surfaceTexturesMap.clear();
-          this.builtinPaperTexture = null;
-          this.canvasLayerTexture = null;
-          this.canvasLayerWidth = 0;
-          this.canvasLayerHeight = 0;
-          this.canvasLayerSource = null;
-          this.impastoColorTex = null;
-          this.impastoHeightTex = null;
-          this.dabFbo = null;
-          this.dabFboTex = null;
-          this.dabFboWidth = 0;
-          this.dabFboHeight = 0;
+          this.clearTextureMapsState();
         });
         c.addEventListener('webglcontextrestored', () => {
           this.initGl();
@@ -674,6 +681,94 @@ export class WebGlBrushEngine {
       }
       this.initGl();
     }
+  }
+
+  private clearTextureMapsState() {
+    this.tipTexturesMap.clear();
+    this.multiTipAtlasCache.clear();
+    this.surfaceTexturesMap.clear();
+    this.builtinPaperTexture = null;
+    this.canvasLayerTexture = null;
+    this.canvasLayerWidth = 0;
+    this.canvasLayerHeight = 0;
+    this.canvasLayerSource = null;
+    this.impastoColorTex = null;
+    this.impastoHeightTex = null;
+    this.dabFbo = null;
+    this.dabFboTex = null;
+    this.dabFboWidth = 0;
+    this.dabFboHeight = 0;
+  }
+
+  /**
+   * Releases cached brush tip/surface/layer textures to immediately reclaim GPU VRAM.
+   */
+  public releaseCaches(): void {
+    const gl = this.gl;
+    if (gl) {
+      for (const tex of this.tipTexturesMap.values()) gl.deleteTexture(tex);
+      for (const entry of this.multiTipAtlasCache.values()) gl.deleteTexture(entry.tex);
+      for (const tex of this.surfaceTexturesMap.values()) gl.deleteTexture(tex);
+      if (this.canvasLayerTexture) gl.deleteTexture(this.canvasLayerTexture);
+      if (this.impastoColorTex) gl.deleteTexture(this.impastoColorTex);
+      if (this.impastoHeightTex) gl.deleteTexture(this.impastoHeightTex);
+    }
+    this.tipTexturesMap.clear();
+    this.multiTipAtlasCache.clear();
+    this.surfaceTexturesMap.clear();
+    this.canvasLayerTexture = null;
+    this.canvasLayerWidth = 0;
+    this.canvasLayerHeight = 0;
+    this.canvasLayerSource = null;
+    this.impastoColorTex = null;
+    this.impastoHeightTex = null;
+  }
+
+  /**
+   * Reconfigures GPU brush engine when renderBackend, gpuPowerPreference, or gpuBrushAcceleration changes.
+   */
+  public reconfigureFromPerformance(): void {
+    const perf = performanceManager.getConfig();
+    const shouldEnable = perf.renderBackend !== 'canvas2d' && perf.gpuBrushAcceleration;
+    const nextPower: WebGLPowerPreference = perf.gpuPowerPreference || 'high-performance';
+
+    if (!shouldEnable) {
+      this.releaseCaches();
+      if (this.gl) {
+        this.gl.getExtension?.('WEBGL_lose_context')?.loseContext?.();
+      }
+      this.gl = null;
+      this.program = null;
+      this.ribbonProgram = null;
+      this.impastoProgram = null;
+      this.canvas = null;
+      this.isGpuAvailable = false;
+      this.clearTextureMapsState();
+      this.gpuInfo = {
+        isSupported: false,
+        renderer: 'CPU Fallback (GPU Brush Disabled)',
+        vendor: 'Standard',
+        glVersion: 'None',
+      };
+      return;
+    }
+
+    if (this.isGpuAvailable && this.activePowerPreference === nextPower) {
+      return;
+    }
+
+    this.releaseCaches();
+    if (this.gl) {
+      this.gl.getExtension?.('WEBGL_lose_context')?.loseContext?.();
+    }
+    this.gl = null;
+    this.program = null;
+    this.ribbonProgram = null;
+    this.impastoProgram = null;
+    this.canvas = null;
+    this.isGpuAvailable = false;
+    this.clearTextureMapsState();
+    this.initCanvasAndGl();
   }
 
   public static getInstance(): WebGlBrushEngine {
@@ -696,7 +791,7 @@ export class WebGlBrushEngine {
         stencil: false,
         premultipliedAlpha: true,
         preserveDrawingBuffer: true,
-        powerPreference: 'high-performance',
+        powerPreference: this.activePowerPreference,
       };
 
       const gl2 = this.canvas.getContext('webgl2', glOpts) as WebGL2RenderingContext | null;

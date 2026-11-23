@@ -22,6 +22,7 @@ import {
 } from '../utils/tileEngine';
 import { deflateAsync } from '../utils/asyncCompression';
 import { documentStore } from '../utils/documentStore';
+import { artworkTimeTracker } from '../utils/artworkTimeTracker';
 
 export const WAL_MAGIC_BYTES = new Uint8Array([0x49, 0x4e, 0x4b, 0x57]); // 'INKW'
 export const WAL_ENTRY_STROKE_TILE_DELTA = 1;
@@ -135,6 +136,7 @@ export interface DocumentManifest {
   layers: LayerItem[];
   activeLayerId: string;
   timestamp: number;
+  workTimeMs?: number;
 }
 
 export interface CrashedSessionInfo {
@@ -404,6 +406,7 @@ class RecoveryService {
    */
   public setDrawingActive(active: boolean): void {
     this.isDrawingActive = active;
+    artworkTimeTracker.setDrawingActive(active);
     if (active) {
       if (this.idleCheckpointTimer) {
         clearTimeout(this.idleCheckpointTimer);

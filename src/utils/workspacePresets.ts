@@ -82,7 +82,7 @@ export const DEFAULT_ILLUSTRATION_LAYOUT: WorkspaceLayout = {
       groups: [
         {
           id: 'grp-navigator-subview',
-          panelIds: ['navigator', 'sub-view'],
+          panelIds: ['navigator', 'sub-view', 'info'],
           activePanelId: 'navigator',
           heightRatio: 0.26,
         },
@@ -178,7 +178,7 @@ export const MANGA_STUDIO_LAYOUT: WorkspaceLayout = {
       groups: [
         {
           id: 'grp-manga-nav-subview',
-          panelIds: ['navigator', 'sub-view'],
+          panelIds: ['navigator', 'sub-view', 'info'],
           activePanelId: 'navigator',
           heightRatio: 0.26,
         },
@@ -236,7 +236,7 @@ export const MINIMALIST_TABLET_LAYOUT: WorkspaceLayout = {
       groups: [
         {
           id: 'grp-tablet-layers',
-          panelIds: ['navigator', 'sub-view', 'layers', 'history', 'auto-actions', 'quick-access'],
+          panelIds: ['navigator', 'sub-view', 'info', 'layers', 'history', 'auto-actions', 'quick-access'],
           activePanelId: 'layers',
           heightRatio: 1,
         },
@@ -718,6 +718,28 @@ function sanitizeCommandBarIds(raw: unknown): CommandActionId[] {
   return out;
 }
 
+const AUTO_MIGRATED_PANELS: DockPanelId[] = ['info'];
+
+function attachMigratedPanelToLayout(
+  layout: WorkspaceLayout,
+  panelId: DockPanelId
+): WorkspaceLayout {
+  if (findPanelLocation(layout, panelId)) return layout;
+  const anchor =
+    findPanelLocation(layout, 'navigator') ?? findPanelLocation(layout, 'sub-view');
+  if (anchor) {
+    const next = cloneLayout(layout);
+    const cols = anchor.side === 'left' ? next.leftDocks : next.rightDocks;
+    const col = cols.find((c) => c.id === anchor.colId);
+    const grp = col?.groups.find((g) => g.id === anchor.groupId);
+    if (grp && !grp.panelIds.includes(panelId)) {
+      grp.panelIds.push(panelId);
+      return next;
+    }
+  }
+  return togglePanelInLayout(layout, panelId);
+}
+
 export function createDefaultPersistedWorkspace(): PersistedWorkspaceState {
   return {
     version: 1,
@@ -730,6 +752,7 @@ export function createDefaultPersistedWorkspace(): PersistedWorkspaceState {
     showStatusBar: true,
     showDocumentTabs: true,
     showCommandBar: true,
+    migratedPanels: [...AUTO_MIGRATED_PANELS],
   };
 }
 
@@ -752,8 +775,26 @@ export function loadWorkspaceState(): PersistedWorkspaceState {
       ? (parsed.activePreset as WorkspacePresetId)
       : 'default-illustration';
 
-    const layout = sanitizeLayout(parsed.layout) ?? fallback.layout;
-    const savedCustomLayout = sanitizeLayout(parsed.savedCustomLayout);
+    const existingMigrated = new Set<DockPanelId>(
+      Array.isArray(parsed.migratedPanels)
+        ? parsed.migratedPanels.filter(
+            (id): id is DockPanelId => typeof id === 'string' && VALID_PANEL_SET.has(id)
+          )
+        : []
+    );
+
+    let layout = sanitizeLayout(parsed.layout) ?? fallback.layout;
+    let savedCustomLayout = sanitizeLayout(parsed.savedCustomLayout);
+    for (const panelId of AUTO_MIGRATED_PANELS) {
+      if (!existingMigrated.has(panelId)) {
+        layout = attachMigratedPanelToLayout(layout, panelId);
+        if (savedCustomLayout) {
+          savedCustomLayout = attachMigratedPanelToLayout(savedCustomLayout, panelId);
+        }
+        existingMigrated.add(panelId);
+      }
+    }
+
     const quickAccessItems = sanitizeQuickAccessItems(parsed.quickAccessItems);
     const quickAccessViewMode: QuickAccessViewMode =
       parsed.quickAccessViewMode === 'list' ? 'list' : 'grid';
@@ -770,6 +811,7 @@ export function loadWorkspaceState(): PersistedWorkspaceState {
       showStatusBar: typeof parsed.showStatusBar === 'boolean' ? parsed.showStatusBar : true,
       showDocumentTabs: typeof parsed.showDocumentTabs === 'boolean' ? parsed.showDocumentTabs : true,
       showCommandBar: typeof parsed.showCommandBar === 'boolean' ? parsed.showCommandBar : true,
+      migratedPanels: Array.from(existingMigrated),
     };
   } catch {
     return fallback;

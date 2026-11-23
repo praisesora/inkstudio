@@ -15,6 +15,7 @@ import {
   createSafeWebGLRenderer,
   disposeThreeResources,
 } from '../services/bake3DService';
+import { performanceManager } from '../utils/performanceManager';
 import {
   createProceduralMannequin,
   findHumanoidBones,
@@ -139,6 +140,10 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
           m.userData.silhouetteMaterial.dispose();
           m.userData.silhouetteMaterial = null;
         }
+        if (m.userData.shadedMaterial) {
+          m.userData.shadedMaterial.dispose();
+          m.userData.shadedMaterial = null;
+        }
         if (m.userData.smoothMaterial) {
           if (Array.isArray(m.userData.smoothMaterial)) {
             m.userData.smoothMaterial.forEach((mat: THREE.Material) => mat.dispose());
@@ -233,11 +238,14 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
         if (mesh.userData.origMaterial && mesh.userData.hasCustomMaterial) {
           mesh.material = mesh.userData.origMaterial;
         } else {
-          mesh.material = new THREE.MeshStandardMaterial({
-            color: 0xe2e8f0,
-            roughness: 0.35,
-            metalness: 0.1,
-          });
+          if (!mesh.userData.shadedMaterial) {
+            mesh.userData.shadedMaterial = new THREE.MeshStandardMaterial({
+              color: 0xe2e8f0,
+              roughness: 0.35,
+              metalness: 0.1,
+            });
+          }
+          mesh.material = mesh.userData.shadedMaterial;
         }
       }
     });
@@ -265,7 +273,8 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
 
     const docAspect = dimensions.width / Math.max(1, dimensions.height);
 
-    const MAX_PREVIEW = 1920;
+    const perf = performanceManager.getConfig();
+    const MAX_PREVIEW = perf.preview3DMaxResolution || 1920;
     let previewW = dimensions.width;
     let previewH = dimensions.height;
     if (previewW > MAX_PREVIEW || previewH > MAX_PREVIEW) {
@@ -283,8 +292,8 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     try {
       renderer = createSafeWebGLRenderer({
         alpha: true,
-        antialias: true,
-        powerPreference: 'high-performance',
+        antialias: perf.preview3DAntialias,
+        powerPreference: perf.gpuPowerPreference,
         preserveDrawingBuffer: true,
       });
     } catch (err) {
@@ -397,15 +406,17 @@ export const Local3DContainer: React.FC<Local3DContainerProps> = ({
     transformControlsRef.current = transformControls;
     transformHelperRef.current = transformHelper;
 
-    // 8. Render Loop
+    // 8. Render Loop (skips GPU work while document/tab is hidden to save battery & VRAM bandwidth)
     let running = true;
     const animate = () => {
       if (!running) return;
-      try {
-        controls.update();
-        renderer.render(scene, camera);
-      } catch (err) {
-        console.warn('[3D Render Loop Error]:', err);
+      if (typeof document === 'undefined' || !document.hidden) {
+        try {
+          controls.update();
+          renderer.render(scene, camera);
+        } catch (err) {
+          console.warn('[3D Render Loop Error]:', err);
+        }
       }
       animFrameRef.current = requestAnimationFrame(animate);
     };

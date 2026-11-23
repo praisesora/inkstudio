@@ -3,6 +3,7 @@ import { BlendMode, CanvasColorMode, LayerItem, LoadedDocument } from '../types/
 import { createCanvasThumbnail } from './canvasUtils';
 import { isNativeRustAvailable, parsePsdNative } from './nativeBackend';
 import { SparseTileGrid, releaseTemporaryCanvas } from './tileEngine';
+import { extractWorkTimeMsFromPsdBuffer, extractWorkTimeMsFromXmp } from './artworkTimeTracker';
 
 initializeCanvas(
   (w, h) => {
@@ -247,7 +248,12 @@ export async function parsePsdFile(
   targetGrid?: SparseTileGrid
 ): Promise<LoadedDocument> {
   if (isNativeRustAvailable()) {
-    return await parsePsdNative(buffer, fileName, targetGrid);
+    const nativeDoc = await parsePsdNative(buffer, fileName, targetGrid);
+    const nativeWorkTimeMs = extractWorkTimeMsFromPsdBuffer(buffer);
+    if (nativeWorkTimeMs !== undefined) {
+      return { ...nativeDoc, workTimeMs: nativeWorkTimeMs };
+    }
+    return nativeDoc;
   }
 
   const psd = readPsd(buffer, {
@@ -416,11 +422,14 @@ export async function parsePsdFile(
     });
   }
 
+  const workTimeMs = extractWorkTimeMsFromXmp(psd.imageResources?.xmpMetadata);
+
   return {
     name: fileName.replace(/\.[^/.]+$/, ''),
     dimensions: { width, height, dpi },
     colorMode,
     layers,
     tileGrid,
+    ...(workTimeMs !== undefined ? { workTimeMs } : {}),
   };
 }

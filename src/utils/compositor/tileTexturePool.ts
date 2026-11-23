@@ -144,7 +144,8 @@ export function getTileTexture(
     state.activePoolByKey.delete(key);
     state.activePoolByKey.set(key, slot);
   } else {
-    if (state.texturePool.length < MAX_TEXTURE_POOL_SIZE) {
+    const maxPoolSize = state.maxTexturePoolSize || MAX_TEXTURE_POOL_SIZE;
+    if (state.texturePool.length < maxPoolSize) {
       const tex = gl.createTexture();
       if (!tex) return null;
       slot = {
@@ -177,7 +178,16 @@ export function getTileTexture(
   }
 
   slot.lastUsed = accessTick;
-  const desiredTier = state.currentZoom < 0.99 ? 0 : state.currentZoom < 2.0 ? 1 : 2;
+  const desiredTier =
+    state.filteringQuality === 'smooth'
+      ? 1
+      : state.filteringQuality === 'pixelated'
+        ? 2
+        : state.currentZoom < 0.99
+          ? 0
+          : state.currentZoom < 2.0
+            ? 1
+            : 2;
 
   // Re-upload if version changed (direct GPU unpack premultiplication, zero JS pixel loop)
   if (slot.version !== tile.version) {
@@ -289,9 +299,10 @@ export function getMaskTexture(state: CompositorState, layer: LayerItem): WebGLT
  * Evict least recently used tile textures when texture pool exceeds threshold.
  */
 export function evictStaleTextures(state: CompositorState): void {
-  if (!state.gl || state.texturePool.length <= MAX_TEXTURE_POOL_SIZE) return;
+  const maxPoolSize = state.maxTexturePoolSize || MAX_TEXTURE_POOL_SIZE;
+  if (!state.gl || state.texturePool.length <= maxPoolSize) return;
   state.texturePool.sort((a, b) => a.lastUsed - b.lastUsed);
-  while (state.texturePool.length > MAX_TEXTURE_POOL_SIZE) {
+  while (state.texturePool.length > maxPoolSize) {
     const slot = state.texturePool.shift();
     if (slot) {
       if (slot.currentKey) state.activePoolByKey.delete(slot.currentKey);

@@ -17,10 +17,20 @@ import {
   saveToExistingHandle,
 } from '../utils/saveManager';
 import { globalTimelapseManager } from '../utils/timelapseEngine';
-import { saveRecentDocument, RecentDocument } from '../utils/recentDocumentsManager';
+import {
+  FileSystemFileHandleLike,
+  RecentDocument,
+  saveRecentDocument,
+} from '../utils/recentDocumentsManager';
 import { enforceColorMode } from '../utils/colorUtils';
 import { importBrushFile, isSupportedBrushFileName } from '../utils/inkbBrushFormat';
 import { documentStore } from '../utils/documentStore';
+import { computeRecommendedSettings, performanceManager } from '../utils/performanceManager';
+import { WebGlBrushEngine } from '../engine/WebGlBrushEngine';
+import {
+  artworkTimeTracker,
+  sanitizeWorkTimeMs,
+} from '../utils/artworkTimeTracker';
 import { shortcutManager } from '../utils/shortcutManager';
 import { recoveryService, CrashedSessionInfo } from '../services/recoveryService';
 import { multiplayerService } from '../services/multiplayerService';
@@ -39,6 +49,48 @@ import {
   isFinalizingAppClose,
   requestAppClose,
 } from '../utils/appCloseFlow';
+
+function hasMeaningfulLayerEdit(prev: LayerItem[], next: LayerItem[]): boolean {
+  if (prev === next) return false;
+  if (prev.length !== next.length) return true;
+  for (let i = 0; i < prev.length; i++) {
+    const a = prev[i];
+    const b = next[i];
+    if (a === b) continue;
+    if (
+      a.id !== b.id ||
+      a.name !== b.name ||
+      a.type !== b.type ||
+      a.visible !== b.visible ||
+      a.opacity !== b.opacity ||
+      a.blendMode !== b.blendMode ||
+      a.locked !== b.locked ||
+      a.alphaLocked !== b.alphaLocked ||
+      a.clipped !== b.clipped ||
+      a.parentId !== b.parentId ||
+      a.isReference !== b.isReference ||
+      a.toneEnabled !== b.toneEnabled ||
+      a.toneFrequency !== b.toneFrequency ||
+      a.toneAngle !== b.toneAngle ||
+      a.toneDensity !== b.toneDensity ||
+      a.layerColorEnabled !== b.layerColorEnabled ||
+      a.layerColor !== b.layerColor ||
+      a.expressionColor !== b.expressionColor ||
+      a.maskEnabled !== b.maskEnabled ||
+      a.maskLinked !== b.maskLinked ||
+      a.maskVersion !== b.maskVersion ||
+      a.adjustmentData !== b.adjustmentData ||
+      a.styles !== b.styles ||
+      a.vectorStrokes !== b.vectorStrokes ||
+      a.textData !== b.textData ||
+      a.balloonData !== b.balloonData ||
+      a.comicFrames !== b.comicFrames
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function computeEffectiveOpacityForLayers(allLayers: LayerItem[], layer: LayerItem): number {
   let opacity = layer.opacity;
@@ -75,6 +127,55 @@ interface FileWithOptionalPath extends File {
 interface TauriWindow extends Window {
   __TAURI_INTERNALS__?: unknown;
 }
+
+interface PickerWindow extends Window {
+  showOpenFilePicker?: (options?: {
+    types?: Array<{ description?: string; accept: Record<string, string[]> }>;
+    multiple?: boolean;
+  }) => Promise<FileSystemFileHandleLike[]>;
+}
+
+interface ProcessFileOptions {
+  handle?: FileSystemFileHandleLike | null;
+  sourcePath?: string;
+  docId?: string;
+  isStarred?: boolean;
+}
+
+const DIRECT_SAVE_EXTENSIONS = new Set([
+  '.ink',
+  '.psd',
+  '.psb',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+]);
+
+const OPEN_FILE_PICKER_TYPES = [
+  {
+    description: 'Ink Studio & Image Files',
+    accept: {
+      'application/octet-stream': [
+        '.ink',
+        '.psd',
+        '.psb',
+        '.clip',
+        '.csp',
+        '.lip',
+        '.inkb',
+        '.sut',
+        '.sora',
+      ],
+      'image/png': ['.png'],
+      'image/jpeg': ['.jpg', '.jpeg'],
+      'image/webp': ['.webp'],
+      'image/bmp': ['.bmp'],
+      'image/gif': ['.gif'],
+      'image/svg+xml': ['.svg'],
+    },
+  },
+];
 
 export interface UseDocumentLifecycleParams {
   layers: LayerItem[];
@@ -222,8 +323,10 @@ export function useDocumentLifecycle({
         activeLayerId: topId,
         perspectiveRuler: null,
         defaultFrequency: defaultFreq,
+        workTimeMs: 0,
       };
 
+      artworkTimeTracker.initDocument(newDocId, 0);
       documentStoreActions.setPerspectiveRuler(null);
       documentStoreActions.setStraightRuler(null);
       documentStoreActions.setDocuments((prev) => [...prev, newDoc]);
@@ -349,6 +452,28 @@ export function useDocumentLifecycle({
     if (prev.tileMemoryBudgetMb !== newSettings.tileMemoryBudgetMb) {
       documentStore.setTileBudgetMb(newSettings.tileMemoryBudgetMb || 1024);
     }
+    if (prev.undoRamSteps !== newSettings.undoRamSteps) {
+      documentStore.setSharedUndoRamStepsBudget(newSettings.undoRamSteps || 15);
+    }
+    if (prev.offloadInactiveTabs !== newSettings.offloadInactiveTabs) {
+      documentStore.setOffloadInactiveUndoOnSwitch(newSettings.offloadInactiveTabs);
+    }
+    if (
+      prev.renderBackend !== newSettings.renderBackend ||
+      prev.gpuPowerPreference !== newSettings.gpuPowerPreference ||
+      prev.gpuBrushAcceleration !== newSettings.gpuBrushAcceleration
+    ) {
+      WebGlBrushEngine.getInstance().reconfigureFromPerformance();
+    }
+    if (
+      prev.gpuPowerPreference !== newSettings.gpuPowerPreference ||
+      prev.desktopGraphicsApi !== newSettings.desktopGraphicsApi ||
+      prev.scratchDiskPath !== newSettings.scratchDiskPath ||
+      prev.scratchDiskCompression !== newSettings.scratchDiskCompression ||
+      prev.cpuWorkerThreads !== newSettings.cpuWorkerThreads
+    ) {
+      void performanceManager.syncDesktopBackendConfig(newSettings);
+    }
     if (
       prev.defaultStabilization !== newSettings.defaultStabilization ||
       prev.usePressureByDefault !== newSettings.usePressureByDefault ||
@@ -363,7 +488,7 @@ export function useDocumentLifecycle({
   }, []);
 
   const handleProcessFile = useCallback(
-    async (file: File) => {
+    async (file: File, options?: ProcessFileOptions) => {
       if (isSupportedBrushFileName(file.name)) {
         try {
           uiStoreActions.setLoading(true, `Importing Brush: ${file.name}...`);
@@ -385,11 +510,26 @@ export function useDocumentLifecycle({
         uiStoreActions.setLoading(true, `Loading ${file.name}...`);
 
         const doc = await openFile(file);
-        const newDocId = `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const alreadyOpenId = options?.docId
+          ? useDocumentStore.getState().documents.some((d) => d.id === options.docId)
+          : false;
+        const newDocId =
+          options?.docId && !alreadyOpenId
+            ? options.docId
+            : `doc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        const openedExt = file.name.includes('.')
+          ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
+          : '';
+        const fileHandle = options?.handle ?? undefined;
+        const initialSavedInfo =
+          fileHandle && DIRECT_SAVE_EXTENSIONS.has(openedExt)
+            ? { name: file.name, handle: fileHandle, extension: openedExt }
+            : null;
+
         documentStoreActions.setDimensions(doc.dimensions);
         documentStoreActions.setColorMode(doc.colorMode);
         documentStoreActions.setDocumentName(doc.name);
-        documentStoreActions.setSavedFileInfo(null);
+        documentStoreActions.setSavedFileInfo(initialSavedInfo);
 
         loadDocument(doc, newDocId);
         needsAdaptiveFitRef.current = true;
@@ -398,6 +538,8 @@ export function useDocumentLifecycle({
         resetHistory(newDocId);
 
         const topEditableLayer = doc.layers.find((l) => l.type === 'raster');
+        const restoredWorkTimeMs = sanitizeWorkTimeMs(doc.workTimeMs);
+        artworkTimeTracker.initDocument(newDocId, restoredWorkTimeMs);
         const newDoc: DocumentTab = {
           id: newDocId,
           name: doc.name,
@@ -406,6 +548,8 @@ export function useDocumentLifecycle({
           layers: doc.layers,
           activeLayerId: topEditableLayer?.id || doc.layers[0]?.id || 'layer-1',
           perspectiveRuler: doc.perspectiveRuler ?? null,
+          savedFileInfo: initialSavedInfo ?? undefined,
+          workTimeMs: restoredWorkTimeMs,
         };
 
         documentStoreActions.setPerspectiveRuler(doc.perspectiveRuler ?? null);
@@ -415,22 +559,24 @@ export function useDocumentLifecycle({
         }
         documentStoreActions.setDocuments((prev) => [...prev, newDoc]);
         documentStoreActions.setActiveDocumentId(newDocId);
+        uiStoreActions.setAppView('workspace');
 
         const fileWithPath = file as FileWithOptionalPath;
         saveRecentDocument({
           id: newDocId,
           title: file.name,
-          path: fileWithPath.path || `C:\\Users\\Artist\\Documents\\InkStudio\\${file.name}`,
+          path:
+            options?.sourcePath ||
+            fileWithPath.path ||
+            `C:\\Users\\Artist\\Documents\\InkStudio\\${file.name}`,
           size: file.size || 1048576,
           coverUrl: doc.previewDataUrl || doc.layers[0]?.thumbnailUrl,
-          isStarred: false,
-          fileType: file.name.slice(file.name.lastIndexOf('.')),
+          isStarred: options?.isStarred ?? false,
+          fileType: openedExt || undefined,
           isSaved: true,
+          handle: fileHandle,
         }).catch(console.warn);
 
-        const openedExt = file.name.includes('.')
-          ? file.name.slice(file.name.lastIndexOf('.')).toLowerCase()
-          : '';
         showToast(
           openedExt === '.sora'
             ? `Migrated legacy ${file.name} (read-only) — save as .ink`
@@ -536,6 +682,7 @@ export function useDocumentLifecycle({
         return next;
       });
       if (id) {
+        artworkTimeTracker.removeDocument(id);
         documentStore.closeSession(id).catch(console.warn);
         recoveryService.closeSession(id).catch(console.warn);
       }
@@ -575,6 +722,8 @@ export function useDocumentLifecycle({
         documentStoreActions.setColorMode(manifest.colorMode);
         documentStoreActions.setDocumentName(manifest.documentName);
 
+        const restoredWorkTimeMs = sanitizeWorkTimeMs(manifest.workTimeMs);
+        artworkTimeTracker.initDocument(session.session_id, restoredWorkTimeMs);
         const restoredDoc: DocumentTab = {
           id: session.session_id,
           name: manifest.documentName,
@@ -583,6 +732,7 @@ export function useDocumentLifecycle({
           colorMode: manifest.colorMode,
           layers: manifest.layers,
           activeLayerId: manifest.activeLayerId || manifest.layers[0]?.id || '',
+          workTimeMs: restoredWorkTimeMs,
         };
 
         documentStoreActions.setDocuments((prev) => {
@@ -655,8 +805,29 @@ export function useDocumentLifecycle({
   );
 
   const handleTriggerOpenFile = useCallback(() => {
+    const pickerWindow = typeof window !== 'undefined' ? (window as PickerWindow) : undefined;
+    if (pickerWindow && typeof pickerWindow.showOpenFilePicker === 'function') {
+      void pickerWindow
+        .showOpenFilePicker({
+          types: OPEN_FILE_PICKER_TYPES,
+          multiple: false,
+        })
+        .then(async ([handle]) => {
+          if (!handle) return;
+          const file = await handle.getFile();
+          await handleProcessFile(file, { handle });
+        })
+        .catch((err: unknown) => {
+          if (err && typeof err === 'object' && 'name' in err && err.name === 'AbortError') {
+            return;
+          }
+          console.warn('showOpenFilePicker failed, falling back to file input:', err);
+          fileInputRef.current?.click();
+        });
+      return;
+    }
     fileInputRef.current?.click();
-  }, []);
+  }, [handleProcessFile]);
 
   const handleFileInputChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -673,6 +844,8 @@ export function useDocumentLifecycle({
       const cleanNameForSave = documentName.replace(/\*+$/, '') || 'Untitled';
       const docStoreState = useDocumentStore.getState();
       const tlStats = globalTimelapseManager.getStats(activeDocumentId);
+      artworkTimeTracker.flush(activeDocumentId);
+      const workTimeMs = artworkTimeTracker.getWorkTimeMs(activeDocumentId);
       return {
         name: cleanNameForSave,
         dimensions,
@@ -688,6 +861,7 @@ export function useDocumentLifecycle({
           tlStats.enabled || tlStats.frameCount > 0
             ? { enabled: tlStats.enabled, frameCount: tlStats.frameCount }
             : null,
+        workTimeMs,
         onProgress,
       };
     },
@@ -717,6 +891,8 @@ export function useDocumentLifecycle({
         documentStore.getSession(docId)?.tileGrid ?? documentStore.getActiveTileGrid();
       const cleanNameForSave = targetDoc.name.replace(/\*+$/, '') || 'Untitled';
       const tlStats = globalTimelapseManager.getStats(docId);
+      artworkTimeTracker.flush(docId);
+      const docWorkTimeMs = artworkTimeTracker.getWorkTimeMs(docId);
 
       const onProgress = (p: SaveProgress) => {
         uiStoreActions.setLoading(true, `${p.message} (${p.percent}%)`);
@@ -744,6 +920,7 @@ export function useDocumentLifecycle({
           tlStats.enabled || tlStats.frameCount > 0
             ? { enabled: tlStats.enabled, frameCount: tlStats.frameCount }
             : null,
+        workTimeMs: docWorkTimeMs,
         onProgress,
       };
 
@@ -771,6 +948,7 @@ export function useDocumentLifecycle({
                   name: info.name,
                   ...(updateHandle ? { savedFileInfo: info } : {}),
                   isDirty: false,
+                  workTimeMs: docWorkTimeMs,
                 }
               : d
           )
@@ -784,6 +962,7 @@ export function useDocumentLifecycle({
           isStarred: false,
           fileType: info.extension,
           isSaved: true,
+          handle: info.handle,
         }).catch(console.warn);
         showToast(`Saved to ${info.name}`);
       };
@@ -861,7 +1040,9 @@ export function useDocumentLifecycle({
       documentStoreActions.setDocumentName(info.name);
       documentStoreActions.setDocuments((prev) =>
         prev.map((d) =>
-          d.id === activeDocumentId ? { ...d, name: info.name, savedFileInfo: info, isDirty: false } : d
+          d.id === activeDocumentId
+            ? { ...d, name: info.name, savedFileInfo: info, isDirty: false, workTimeMs: docData.workTimeMs }
+            : d
         )
       );
       saveRecentDocument({
@@ -873,6 +1054,7 @@ export function useDocumentLifecycle({
         isStarred: false,
         fileType: info.extension,
         isSaved: true,
+        handle: info.handle,
       }).catch(console.warn);
       showToast(`Saved as ${info.name}`);
     } catch (err: unknown) {
@@ -907,37 +1089,74 @@ export function useDocumentLifecycle({
 
   const handleSelectWelcomeDocument = useCallback(
     async (doc: RecentDocument) => {
-      if (typeof window !== 'undefined' && (window as TauriWindow).__TAURI_INTERNALS__) {
+      const openDoc = useDocumentStore.getState().documents.find((d) => d.id === doc.id);
+      if (openDoc) {
+        handleSelectDocument(openDoc.id);
+        return;
+      }
+
+      if (doc.handle && typeof doc.handle.getFile === 'function') {
         try {
-          const { invoke } = await import('@tauri-apps/api/core');
-          const bytes = await invoke<number[]>('read_file_from_disk', { path: doc.path });
-          if (bytes && bytes.length > 0) {
-            const uint8 = new Uint8Array(bytes);
-            const file = new File([uint8], doc.title, { type: 'application/octet-stream' });
-            await handleProcessFile(file);
-            uiStoreActions.setAppView('workspace');
+          let permission: 'granted' | 'denied' | 'prompt' = 'granted';
+          if (typeof doc.handle.queryPermission === 'function') {
+            permission = await doc.handle.queryPermission({ mode: 'read' });
+            if (permission !== 'granted' && typeof doc.handle.requestPermission === 'function') {
+              permission = await doc.handle.requestPermission({ mode: 'read' });
+            }
+          }
+          if (permission === 'granted') {
+            const file = await doc.handle.getFile();
+            await handleProcessFile(file, {
+              handle: doc.handle,
+              sourcePath: doc.path,
+              docId: doc.id,
+              isStarred: doc.isStarred,
+            });
             return;
           }
+          showToast(`Permission denied to open "${doc.title}"`);
+          return;
         } catch (err) {
-          console.warn('Direct disk read via Tauri failed, fallback:', err);
+          console.warn('Direct FileSystemFileHandle read failed:', err);
         }
       }
 
-      handleCreateNewCanvas({
-        width: 1920,
-        height: 1080,
-        dpi: 300,
-        colorMode: 'color',
-        name: doc.title,
-        backgroundColor: '#ffffff',
-        aspectRatioPreset: '16:9',
-        aspectRatioX: 16,
-        aspectRatioY: 9,
-        lockAspectRatio: true,
-      });
-      showToast(`Loaded workspace for "${doc.title}"`);
+      if (typeof window !== 'undefined' && (window as TauriWindow).__TAURI_INTERNALS__ && doc.path) {
+        try {
+          const { invoke } = await import('@tauri-apps/api/core');
+          let bytes: Uint8Array;
+          try {
+            const buf = await invoke<ArrayBuffer>('read_file_binary', { path: doc.path });
+            bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+          } catch (binErr) {
+            const msg = binErr instanceof Error ? binErr.message : String(binErr);
+            if (msg.toLowerCase().includes('not found') || msg.toLowerCase().includes('unknown')) {
+              const arr = await invoke<number[]>('read_file_from_disk', { path: doc.path });
+              bytes = new Uint8Array(arr);
+            } else {
+              throw binErr;
+            }
+          }
+          if (bytes.byteLength > 0) {
+            const copy = new Uint8Array(bytes.byteLength);
+            copy.set(bytes);
+            const file = new File([copy.buffer], doc.title, { type: 'application/octet-stream' });
+            await handleProcessFile(file, {
+              sourcePath: doc.path,
+              docId: doc.id,
+              isStarred: doc.isStarred,
+            });
+            return;
+          }
+        } catch (err) {
+          console.warn('Direct disk read via Tauri failed:', err);
+        }
+      }
+
+      showToast(`Cannot reopen "${doc.title}" directly — select the file to open`);
+      handleTriggerOpenFile();
     },
-    [handleCreateNewCanvas, handleProcessFile, showToast]
+    [handleProcessFile, handleSelectDocument, handleTriggerOpenFile, showToast]
   );
 
   return {
@@ -1013,6 +1232,8 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
     const documentName = useDocumentStore((s) => s.documentName);
     const appSettings = useUiStore((s) => s.appSettings);
     const appClosePrompt = useUiStore((s) => s.appClosePrompt);
+    const appView = useUiStore((s) => s.appView);
+    const isLoadingFile = useUiStore((s) => s.isLoadingFile);
 
     // 1. Scan for unfinalized crashed WAL sessions on launch
     useEffect(() => {
@@ -1028,10 +1249,63 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
         });
     }, []);
 
-    // 2. Synchronize tile memory budget across all open documents
+    // 2. Synchronize tile RAM, undo RAM, inactive tab offload, and memory telemetry hooks
     useEffect(() => {
       documentStore.setTileBudgetMb(appSettings.tileMemoryBudgetMb || 1024);
-    }, [appSettings.tileMemoryBudgetMb]);
+      documentStore.setSharedUndoRamStepsBudget(appSettings.undoRamSteps || 15);
+      documentStore.setOffloadInactiveUndoOnSwitch(appSettings.offloadInactiveTabs);
+    }, [
+      appSettings.tileMemoryBudgetMb,
+      appSettings.undoRamSteps,
+      appSettings.offloadInactiveTabs,
+    ]);
+
+    useEffect(() => {
+      performanceManager.registerMemoryHooks({
+        getActiveTileBytes: () => documentStore.getTotalActiveTileBytes(),
+        getTileBudgetBytes: () => documentStore.getTileBudgetBytes(),
+        getUndoStats: () => documentStore.getUndoMemoryStats(),
+        getActiveSessionIds: () => documentStore.getActiveSessionIds(),
+        purgeTiles: () => documentStore.purgeTileMemory(),
+        purgeUndo: () => documentStore.purgeUndoMemory(),
+        flushBrushGpuCaches: () => WebGlBrushEngine.getInstance().releaseCaches(),
+      });
+
+      let cancelled = false;
+      const current = useUiStore.getState().appSettings;
+      if (current.autoOptimizePerformance !== false) {
+        performanceManager
+          .detectHardwareInfo(false)
+          .then((hw) => {
+            if (cancelled) return;
+            const latest = useUiStore.getState().appSettings;
+            if (latest.autoOptimizePerformance === false) return;
+            const rec = computeRecommendedSettings(hw);
+            const next: AppSettings = { ...latest, ...rec.settings };
+            const changed = (
+              Object.keys(rec.settings) as Array<keyof AppSettings>
+            ).some((k) => latest[k] !== next[k]);
+            if (changed) {
+              uiStoreActions.updateAppSettings(next);
+              documentStore.setTileBudgetMb(next.tileMemoryBudgetMb || 1024);
+              documentStore.setSharedUndoRamStepsBudget(next.undoRamSteps || 15);
+              documentStore.setOffloadInactiveUndoOnSwitch(next.offloadInactiveTabs);
+              WebGlBrushEngine.getInstance().reconfigureFromPerformance();
+            }
+            void performanceManager.syncDesktopBackendConfig(next);
+          })
+          .catch(() => {
+            void performanceManager.syncDesktopBackendConfig(current);
+          });
+      } else {
+        void performanceManager.syncDesktopBackendConfig(current);
+      }
+
+      return () => {
+        cancelled = true;
+        performanceManager.registerMemoryHooks(null);
+      };
+    }, []);
 
     // 3. Auto-create initial white canvas on launch
     const hasAutoCreatedInitialDocRef = useRef(false);
@@ -1061,6 +1335,7 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
       pendingFitDimsRef.current = initDims;
       resetZoomAndCenter(initDims);
       resetHistory(newDocId);
+      artworkTimeTracker.initDocument(newDocId, 0);
       documentStoreActions.setDocuments([
         {
           id: newDocId,
@@ -1071,6 +1346,7 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
           activeLayerId: topId,
           perspectiveRuler: null,
           defaultFrequency: 60,
+          workTimeMs: 0,
         },
       ]);
       documentStoreActions.setActiveDocumentId(newDocId);
@@ -1128,6 +1404,7 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
             layers: doc?.layers || cur.layers,
             activeLayerId: doc?.activeLayerId || cur.activeLayerId,
             timestamp: Date.now(),
+            workTimeMs: artworkTimeTracker.getWorkTimeMs(activeDocumentId),
           };
         },
         async () => {
@@ -1236,6 +1513,139 @@ export const DocumentLifecycleManager: React.FC<DocumentLifecycleManagerProps> =
       if (!pendingCloseDocId) return;
       onSelectDocument(pendingCloseDocId);
     }, [pendingCloseDocId, onSelectDocument]);
+
+    // 8. Smart, action-gated artwork time tracking (never starts until genuine artwork action; adapts to drawing cadence)
+    const isWorkspaceTimeTrackable = Boolean(
+      activeDocumentId && appView === 'workspace' && !isLoadingFile
+    );
+
+    useEffect(() => {
+      artworkTimeTracker.setActiveDocument(activeDocumentId, isWorkspaceTimeTrackable);
+    }, [activeDocumentId, isWorkspaceTimeTrackable]);
+
+    // Detect genuine layer structure/property edits on the active document (ignores doc switch / initial mount)
+    const lastTrackedLayersRef = useRef<{ docId: string | null; layers: LayerItem[] }>({
+      docId: null,
+      layers,
+    });
+    useEffect(() => {
+      if (!isWorkspaceTimeTrackable || !activeDocumentId) {
+        lastTrackedLayersRef.current = { docId: activeDocumentId, layers };
+        return;
+      }
+      const prev = lastTrackedLayersRef.current;
+      if (prev.docId === activeDocumentId && hasMeaningfulLayerEdit(prev.layers, layers)) {
+        artworkTimeTracker.recordArtworkAction(activeDocumentId);
+      }
+      lastTrackedLayersRef.current = { docId: activeDocumentId, layers };
+    }, [activeDocumentId, isWorkspaceTimeTrackable, layers]);
+
+    // Detect genuine canvas pixel/tile mutations (strokes, undo/redo, paste, filters, tonal edits, fills)
+    useEffect(() => {
+      if (!isWorkspaceTimeTrackable || !activeDocumentId) return;
+      const tileGrid = documentStore.getSession(activeDocumentId)?.tileGrid;
+      if (!tileGrid || typeof tileGrid.subscribe !== 'function') return;
+
+      let lastContentVersion =
+        typeof tileGrid.getContentVersion === 'function' ? tileGrid.getContentVersion() : 0;
+
+      return tileGrid.subscribe(() => {
+        if (typeof tileGrid.getContentVersion !== 'function') return;
+        const nextVersion = tileGrid.getContentVersion();
+        if (nextVersion !== lastContentVersion) {
+          lastContentVersion = nextVersion;
+          artworkTimeTracker.recordArtworkAction(activeDocumentId);
+        }
+      });
+    }, [activeDocumentId, isWorkspaceTimeTrackable]);
+
+    useEffect(() => {
+      if (!isWorkspaceTimeTrackable || typeof window === 'undefined' || typeof document === 'undefined') {
+        return;
+      }
+
+      const isFocusedNow = () =>
+        document.visibilityState === 'visible' &&
+        (typeof document.hasFocus !== 'function' || document.hasFocus());
+
+      artworkTimeTracker.setWindowFocused(isFocusedNow());
+
+      let lastSupportReportAt = 0;
+      let lastStylusReportAt = 0;
+
+      const isInsideInfoPanel = (target: EventTarget | null): boolean => {
+        if (!target || typeof Element === 'undefined' || !(target instanceof Element)) {
+          return false;
+        }
+        return Boolean(target.closest('[data-testid="info-panel"]'));
+      };
+
+      // Supporting workspace interactions (zoom, shortcuts, tool/color clicks, active drags):
+      // NEVER wake an idle timer; only sustain an already-active artwork session up to the safety cap.
+      const handleSupportingEvent = (e: Event) => {
+        if (isInsideInfoPanel(e.target)) return;
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (now - lastSupportReportAt >= 350) {
+          lastSupportReportAt = now;
+          artworkTimeTracker.recordSupportingActivity();
+        }
+      };
+
+      const handlePointerMove = (e: PointerEvent) => {
+        // Hovering without holding a button never counts as activity
+        if (e.buttons === 0 || isInsideInfoPanel(e.target)) return;
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (now - lastSupportReportAt >= 350) {
+          lastSupportReportAt = now;
+          artworkTimeTracker.recordSupportingActivity();
+        }
+      };
+
+      // Native WinTab / Windows Ink stylus pressure stream (bypasses DOM pointer events)
+      const handleCanvasPointerStat = (e: Event) => {
+        const detail = (e as CustomEvent<{ x: number | null; y: number | null; pressure: number }>)
+          .detail;
+        if (!detail || (detail.pressure ?? 0) <= 0) return;
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        if (now - lastStylusReportAt >= 350) {
+          lastStylusReportAt = now;
+          artworkTimeTracker.recordArtworkAction();
+        }
+      };
+
+      const handleBlur = () => {
+        artworkTimeTracker.setWindowFocused(false);
+      };
+
+      const handleFocus = () => {
+        artworkTimeTracker.setWindowFocused(document.visibilityState === 'visible');
+      };
+
+      const handleVisibilityChange = () => {
+        artworkTimeTracker.setWindowFocused(isFocusedNow());
+      };
+
+      window.addEventListener('pointerdown', handleSupportingEvent, { passive: true });
+      window.addEventListener('pointermove', handlePointerMove, { passive: true });
+      window.addEventListener('wheel', handleSupportingEvent, { passive: true });
+      window.addEventListener('keydown', handleSupportingEvent, { passive: true });
+      window.addEventListener('canvas-pointer-stat', handleCanvasPointerStat);
+      window.addEventListener('blur', handleBlur);
+      window.addEventListener('focus', handleFocus);
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+
+      return () => {
+        artworkTimeTracker.flush();
+        window.removeEventListener('pointerdown', handleSupportingEvent);
+        window.removeEventListener('pointermove', handlePointerMove);
+        window.removeEventListener('wheel', handleSupportingEvent);
+        window.removeEventListener('keydown', handleSupportingEvent);
+        window.removeEventListener('canvas-pointer-stat', handleCanvasPointerStat);
+        window.removeEventListener('blur', handleBlur);
+        window.removeEventListener('focus', handleFocus);
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
+    }, [isWorkspaceTimeTrackable]);
 
     return null;
   }

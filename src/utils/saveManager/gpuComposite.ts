@@ -1,5 +1,6 @@
 import type { CanvasColorMode, CanvasDimensions, LayerItem } from '../../types/editor';
 import { ViewportCompositor, ViewportTransform } from '../compositor';
+import { performanceManager } from '../performanceManager';
 import { SparseTileGrid, releaseTemporaryCanvas } from '../tileEngine';
 import {
   CompositeCanvasOptions,
@@ -22,7 +23,12 @@ function tryCompositeCanvasGpuSync(
   tileGrid?: SparseTileGrid,
   options?: CompositeCanvasOptions
 ): HTMLCanvasElement | null {
-  if (typeof document === 'undefined' || dimensions.width <= 0 || dimensions.height <= 0) {
+  if (
+    typeof document === 'undefined' ||
+    dimensions.width <= 0 ||
+    dimensions.height <= 0 ||
+    performanceManager.getConfig().renderBackend === 'canvas2d'
+  ) {
     return null;
   }
 
@@ -133,7 +139,12 @@ export async function compositeCanvasAsync(
 ): Promise<{ canvas: HTMLCanvasElement; usedGpu: boolean }> {
   await hydratePagedTilesForLayers(tileGrid, layers, true);
 
-  if (typeof document !== 'undefined' && dimensions.width > 0 && dimensions.height > 0) {
+  if (
+    typeof document !== 'undefined' &&
+    dimensions.width > 0 &&
+    dimensions.height > 0 &&
+    performanceManager.getConfig().renderBackend !== 'canvas2d'
+  ) {
     const requestedTileSize = options?.tileSize ?? INK_DEFAULT_TILE_EXPORT_SIZE;
     const probeCanvas = document.createElement('canvas');
     probeCanvas.width = Math.min(requestedTileSize, dimensions.width);

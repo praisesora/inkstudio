@@ -132,7 +132,7 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
     resizeStartSettingsRef,
   });
 
-  const { viewportCanvasRef } = useCompositorViewport({
+  const { viewportCanvasRef, compositorKey } = useCompositorViewport({
     viewportRef,
     onViewportReady,
     artboardRef,
@@ -266,8 +266,9 @@ export const CanvasArea: React.FC<CanvasAreaProps> = React.memo((props) => {
           zoom={zoom}
         />
       )}
-      {/* Unified GPU Viewport Canvas (WebGL2 with Frustum Culling & Shaders) */}
+      {/* Unified GPU Viewport Canvas (WebGL2 with Frustum Culling & Shaders, or Canvas 2D Software) */}
       <canvas
+        key={compositorKey}
         ref={viewportCanvasRef}
         className="absolute inset-0 pointer-events-none z-10"
         style={{

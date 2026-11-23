@@ -8,6 +8,7 @@ import { createCanvasThumbnail } from './canvasUtils';
 import { lz4DecompressBlock } from './lz4';
 import { BYTES_32BIT, SparseTileGrid } from './tileEngine';
 import { isTauriEnvironment } from './tileEngine/scratchDriver';
+import { performanceManager } from './performanceManager';
 import type { LiquifyMode } from './liquifyEngine';
 
 type TauriInvoke = typeof import('@tauri-apps/api/core').invoke;
@@ -15,7 +16,7 @@ type TauriInvoke = typeof import('@tauri-apps/api/core').invoke;
 let cachedInvokePromise: Promise<TauriInvoke> | null = null;
 
 export function isNativeRustAvailable(): boolean {
-  return isTauriEnvironment();
+  return isTauriEnvironment() && performanceManager.getConfig().useNativeRustAcceleration;
 }
 
 function getInvoke(): Promise<TauriInvoke> {

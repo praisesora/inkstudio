@@ -19,6 +19,7 @@ import {
 } from '../../utils/tileEngine';
 import { UndoCacheManager, globalUndoCache } from '../../utils/undoCache';
 import { documentStore } from '../../utils/documentStore';
+import { performanceManager } from '../../utils/performanceManager';
 import { multiplayerService } from '../../services/multiplayerService';
 import { recoveryService } from '../../services/recoveryService';
 import { renderVectorLayer } from '../../utils/vectorEngine';
@@ -296,7 +297,11 @@ export function useDrawingHistory({
       const newHistory = historyRef.current.slice(0, historyIndexRef.current + 1);
       newHistory.push(item);
 
-      if (newHistory.length > 50) {
+      const maxHistorySteps = Math.max(
+        10,
+        Math.min(200, performanceManager.getConfig().maxHistorySteps || 50)
+      );
+      while (newHistory.length > maxHistorySteps) {
         newHistory.shift();
       }
 
@@ -322,7 +327,11 @@ export function useDrawingHistory({
       if (tileDeltas && tileDeltas.length > 0) {
         const registerPromise = docId
           ? documentStore.registerUndoStep(docId, item)
-          : undoCache.registerStep(item, historyRef.current);
+          : undoCache.registerStep(
+              item,
+              historyRef.current,
+              performanceManager.getConfig().undoRamSteps
+            );
         registerPromise.catch((err) => {
           console.warn('[History] LRU cache registration failed:', err);
         });

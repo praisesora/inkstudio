@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AnimationTimeline as AnimationTimelineType,
   CanvasColorMode,
@@ -10,6 +10,11 @@ import { CanvasNavigationHandle } from '../../hooks/useCanvasNavigation';
 import { ViewportCompositor } from '../../utils/compositor';
 import { SparseTileGrid } from '../../utils/tileEngine';
 import { getOnionSkinFrames } from '../../utils/animationEngine';
+import {
+  RuntimePerformanceConfig,
+  performanceManager,
+  resolveEffectiveDpr,
+} from '../../utils/performanceManager';
 import {
   CursorConfig,
   formatArtboardTransform,
@@ -107,6 +112,58 @@ export function useCompositorViewport({
   const viewportCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const compositorRef = useRef<ViewportCompositor | null>(null);
   const viewportCssSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const [perfConfig, setPerfConfig] = useState<RuntimePerformanceConfig>(() =>
+    performanceManager.getConfig()
+  );
+  const perfConfigRef = useRef<RuntimePerformanceConfig>(perfConfig);
+  perfConfigRef.current = perfConfig;
+
+  useEffect(() => {
+    return performanceManager.subscribe((next) => {
+      setPerfConfig(next);
+    });
+  }, []);
+
+  const compositorKey = `${perfConfig.renderBackend}:${perfConfig.gpuPowerPreference}:${perfConfig.gpuTexturePoolPreset}`;
+
+  const getEffectiveDpr = () =>
+    resolveEffectiveDpr(
+      typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1,
+      perfConfigRef.current.viewportResolutionScale
+    );
+
+  // Register live compositor telemetry & GPU cache flush hooks with performanceManager
+  useEffect(() => {
+    performanceManager.registerCompositorHooks({
+      getTelemetry: () => {
+        if (compositorRef.current) {
+          return compositorRef.current.getTelemetry();
+        }
+        return {
+          backend: perfConfigRef.current.renderBackend === 'canvas2d' ? 'canvas2d' : 'webgl2',
+          rendererName:
+            perfConfigRef.current.renderBackend === 'canvas2d'
+              ? 'Canvas 2D (CPU Software)'
+              : 'WebGL2',
+          arrayPoolUsed: 0,
+          arrayPoolCapacity: 0,
+          texture2DPoolUsed: 0,
+          estimatedVramMb: 0,
+          stackCacheHits: 0,
+          stackCacheRebuilds: 0,
+        };
+      },
+      flushGpuCaches: () => {
+        if (compositorRef.current) {
+          compositorRef.current.flushGpuCaches();
+          tileGridRef.current.notifyChange(true);
+        }
+      },
+    });
+    return () => {
+      performanceManager.registerCompositorHooks(null);
+    };
+  }, []);
   const renderParamsRef = useRef({
     effectiveLayers,
     pan: livePan,
@@ -161,6 +218,7 @@ export function useCompositorViewport({
     return {
       dimensions: rp.dimensions,
       showCheckerboard: rp.showCheckerboard,
+      bypassStackCache: !perfConfigRef.current.layerStackCaching,
       devicePixelRatio: dpr,
       onionSkinFrames: rp.onionSkinFrames,
       softProof: rp.softProofSettings,
@@ -231,7 +289,7 @@ export function useCompositorViewport({
         compositorRef.current = new ViewportCompositor(viewportCanvasRef.current);
       }
       if (compositorRef.current) {
-        const dpr = window.devicePixelRatio || 1;
+        const dpr = getEffectiveDpr();
         compositorRef.current.render(
           rp.effectiveLayers,
           {
@@ -260,7 +318,7 @@ export function useCompositorViewport({
       if (rect.width > 0 && rect.height > 0) {
         viewportCssSizeRef.current = { width: rect.width, height: rect.height };
       }
-      const dpr = window.devicePixelRatio || 1;
+      const dpr = getEffectiveDpr();
       const w = Math.max(1, Math.round(rect.width * dpr));
       const h = Math.max(1, Math.round(rect.height * dpr));
 
@@ -346,7 +404,14 @@ export function useCompositorViewport({
       dprMql?.removeEventListener?.('change', handleDprChange);
       ro?.disconnect();
     };
-  }, [viewportRef, effectiveDraftCanvasRef, effectivePredictedCanvasRef, hasOpenDocument]);
+  }, [
+    viewportRef,
+    effectiveDraftCanvasRef,
+    effectivePredictedCanvasRef,
+    hasOpenDocument,
+    compositorKey,
+    perfConfig.viewportResolutionScale,
+  ]);
 
   useEffect(() => {
     if (viewportRef.current) {
@@ -371,8 +436,9 @@ export function useCompositorViewport({
     if (!compositorRef.current) {
       compositorRef.current = new ViewportCompositor(vCanvas);
     }
+    compositorRef.current.setFilteringQuality(perfConfig.canvasFilteringQuality);
 
-    const dpr = window.devicePixelRatio || 1;
+    const dpr = getEffectiveDpr();
     const rp = renderParamsRef.current;
     compositorRef.current.render(
       effectiveLayers,
@@ -387,7 +453,27 @@ export function useCompositorViewport({
       tileGrid,
       buildCompositorOptions(rp, dpr)
     );
-  }, [effectiveLayers, layers, pan, zoom, rotation, flipX, flipY, dimensions, showCheckerboard, onionSkinFrames, softProofSettings, activeLayerId, brushOpacity, colorMode, tileGrid]);
+  }, [
+    effectiveLayers,
+    layers,
+    pan,
+    zoom,
+    rotation,
+    flipX,
+    flipY,
+    dimensions,
+    showCheckerboard,
+    onionSkinFrames,
+    softProofSettings,
+    activeLayerId,
+    brushOpacity,
+    colorMode,
+    tileGrid,
+    compositorKey,
+    perfConfig.layerStackCaching,
+    perfConfig.canvasFilteringQuality,
+    perfConfig.viewportResolutionScale,
+  ]);
 
   // Event-Driven Compositor Invalidation via active document's SparseTileGrid subscription
   useEffect(() => {
@@ -395,7 +481,7 @@ export function useCompositorViewport({
     const activeGrid = tileGrid;
     const renderCompositor = () => {
       if (compositorRef.current) {
-        const dpr = window.devicePixelRatio || 1;
+        const dpr = getEffectiveDpr();
         const rp = renderParamsRef.current;
         compositorRef.current.render(
           rp.effectiveLayers,
@@ -447,5 +533,6 @@ export function useCompositorViewport({
 
   return {
     viewportCanvasRef,
+    compositorKey,
   };
 }

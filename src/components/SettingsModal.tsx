@@ -8,6 +8,7 @@ import {
   Paintbrush,
   Keyboard,
   SlidersHorizontal,
+  Gauge,
   Info,
   RotateCcw,
   Check,
@@ -39,6 +40,7 @@ import {
 import { CanvasColorMode } from '../types/editor';
 import { DPI_PRESETS } from './NewCanvasModal';
 import { PressureCurveEditor } from './PressureCurveEditor';
+import { PerformanceSettingsTab } from './PerformanceSettingsTab';
 import {
   CommandDefinition,
   DEFAULT_COMMANDS,
@@ -57,7 +59,14 @@ interface SettingsModalProps {
   onShowToast: (message: string) => void;
 }
 
-type SettingsTab = 'appearance' | 'canvas' | 'brush' | 'shortcuts' | 'modifiers' | 'about';
+type SettingsTab =
+  | 'appearance'
+  | 'canvas'
+  | 'brush'
+  | 'performance'
+  | 'shortcuts'
+  | 'modifiers'
+  | 'about';
 
 const MODIFIER_ACTION_OPTIONS: Array<{ value: ModifierAction; label: string }> = [
   { value: 'none', label: 'None' },
@@ -122,7 +131,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onShowToast,
 }) => {
   const [activeTab, setActiveTab] = useState<SettingsTab>('appearance');
-  const [localSettings, setLocalSettings] = useState<AppSettings>(settings);
+  const [localSettings, setLocalSettings] = useState<AppSettings>(() => ({
+    ...DEFAULT_APP_SETTINGS,
+    ...settings,
+  }));
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedCategory, setSelectedCategory] = useState<'All' | ShortcutCategory>('All');
   const [recordingCommandId, setRecordingCommandId] = useState<string | null>(null);
@@ -140,7 +152,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const updateErrorMessage = useUpdaterStore((s) => s.errorMessage);
 
   useEffect(() => {
-    setLocalSettings(settings);
+    setLocalSettings({
+      ...DEFAULT_APP_SETTINGS,
+      ...settings,
+    });
   }, [settings]);
 
   useEffect(() => {
@@ -304,6 +319,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     { id: 'appearance', label: 'Appearance', icon: <Palette className="w-3.5 h-3.5" /> },
     { id: 'canvas', label: 'Canvas', icon: <Layers className="w-3.5 h-3.5" /> },
     { id: 'brush', label: 'Brush & Stylus', icon: <Paintbrush className="w-3.5 h-3.5" /> },
+    { id: 'performance', label: 'Performance', icon: <Gauge className="w-3.5 h-3.5" /> },
     { id: 'shortcuts', label: 'Shortcuts', icon: <Keyboard className="w-3.5 h-3.5" /> },
     {
       id: 'modifiers',
@@ -616,24 +632,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </section>
 
-                <section className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-xs font-medium text-[#e5e5e5]">Tile RAM Budget</h3>
-                    <span className="font-mono text-xs text-[#e5e5e5]">
-                      {localSettings.tileMemoryBudgetMb || 1024} MB
-                    </span>
+                <section className="p-3 rounded bg-[#161616] flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-xs font-medium text-[#e5e5e5]">RAM, GPU & Scratch Disk</h3>
+                    <p className="text-[11px] text-[#8a8a8a]">
+                      Configure RAM allocation ({localSettings.tileMemoryBudgetMb || 1024} MB), GPU adapter, and rendering optimization
+                    </p>
                   </div>
-                  <input
-                    type="range"
-                    min="512"
-                    max="4096"
-                    step="128"
-                    value={localSettings.tileMemoryBudgetMb || 1024}
-                    onChange={(e) => handleChange('tileMemoryBudgetMb', Number(e.target.value))}
-                    className="w-full"
-                  />
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('performance')}
+                    className="px-2.5 py-1.5 rounded bg-[#2c2c2c] hover:bg-[#383838] text-[11px] text-[#e5e5e5] font-medium shrink-0 cursor-pointer transition-colors"
+                  >
+                    Open Performance
+                  </button>
                 </section>
               </>
+            )}
+
+            {activeTab === 'performance' && (
+              <PerformanceSettingsTab
+                settings={localSettings}
+                isDesktopTauri={isDesktopTauri}
+                onUpdateSettings={(updated) => {
+                  setLocalSettings(updated);
+                  onUpdateSettings(updated);
+                }}
+                onShowToast={onShowToast}
+              />
             )}
 
             {activeTab === 'brush' && (

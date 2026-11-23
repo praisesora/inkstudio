@@ -8,6 +8,7 @@ import {
   getTileByteSize,
 } from '../tileEngine';
 import { documentStore } from '../documentStore';
+import { sanitizeWorkTimeMs } from '../artworkTimeTracker';
 import {
   CHUNK_YIELD_INTERVAL,
   InkProjectManifest,
@@ -157,6 +158,7 @@ export async function serializeInkProject(
     perspectiveRuler: data.perspectiveRuler ?? null,
     animationTimeline: data.animationTimeline ?? null,
     timelapse: data.timelapse ?? null,
+    workTimeMs: sanitizeWorkTimeMs(data.workTimeMs),
     preview: preview ? { path: 'preview.png', width: preview.width, height: preview.height } : null,
     savedAt: Date.now(),
   };

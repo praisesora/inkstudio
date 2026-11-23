@@ -2,6 +2,7 @@ import { buildLayerTree } from '../compositor';
 import { recoveryService } from '../../services/recoveryService';
 import { releaseTemporaryCanvas } from '../tileEngine';
 import { documentStore } from '../documentStore';
+import { buildInkStudioXmpMetadata, sanitizeWorkTimeMs } from '../artworkTimeTracker';
 import {
   ExportImageOptions,
   ExportImageResult,
@@ -106,6 +107,7 @@ export async function serializeDocument(
       );
 
       const dpi = data.dimensions.dpi || 300;
+      const workTimeMs = sanitizeWorkTimeMs(data.workTimeMs);
       const { writePsd } = await import('ag-psd');
       const psdBuffer = writePsd(
         {
@@ -121,6 +123,7 @@ export async function serializeDocument(
               verticalResolutionUnit: 'PPI',
               heightUnit: 'Inches',
             },
+            ...(workTimeMs > 0 ? { xmpMetadata: buildInkStudioXmpMetadata(workTimeMs) } : {}),
           },
         },
         {

@@ -9,6 +9,17 @@
  */
 
 import { CanvasDimensions, LayerItem } from '../types/editor';
+import type {
+  CanvasFilteringQuality,
+  GpuPowerPreference,
+  GpuTexturePoolPreset,
+  RenderBackend,
+} from '../types/settings';
+import {
+  CompositorTelemetry,
+  GPU_TEXTURE_POOL_CONFIGS,
+  performanceManager,
+} from './performanceManager';
 import { SparseTileGrid, TILE_SIZE, globalTileGrid } from './tileEngine';
 import { calculateVisibleDocumentBounds } from './compositor/bounds';
 import { disposeFboSurface, disposePingPongTarget } from './compositor/fboManager';
@@ -85,10 +96,26 @@ export {
 
 export { calculateVisibleDocumentBounds } from './compositor/bounds';
 
+export interface ViewportCompositorInitOptions {
+  preserveDrawingBuffer?: boolean;
+  renderBackend?: RenderBackend;
+  powerPreference?: GpuPowerPreference;
+  gpuTexturePoolPreset?: GpuTexturePoolPreset;
+  filteringQuality?: CanvasFilteringQuality;
+}
+
 function createInitialCompositorState(
   canvas: HTMLCanvasElement,
-  preserveDrawingBuffer: boolean
+  options?: ViewportCompositorInitOptions
 ): CompositorState {
+  const perf = performanceManager.getConfig();
+  const renderBackend: RenderBackend = options?.renderBackend ?? perf.renderBackend;
+  const powerPreference: GpuPowerPreference = options?.powerPreference ?? perf.gpuPowerPreference;
+  const poolPreset: GpuTexturePoolPreset = options?.gpuTexturePoolPreset ?? perf.gpuTexturePoolPreset;
+  const poolSpec = GPU_TEXTURE_POOL_CONFIGS[poolPreset] ?? GPU_TEXTURE_POOL_CONFIGS.high;
+  const filteringQuality: CanvasFilteringQuality =
+    options?.filteringQuality ?? perf.canvasFilteringQuality;
+
   return {
     canvas,
     gl: null,
@@ -108,7 +135,9 @@ function createInitialCompositorState(
     aInstDataLoc: -1,
     instancedVao: null,
     instanceBuffer: null,
-    instanceFloatScratch: new Float32Array(DEFAULT_ARRAY_POOL_LAYERS * 3),
+    instanceFloatScratch: new Float32Array(
+      Math.max(DEFAULT_ARRAY_POOL_LAYERS, poolSpec.arrayLayers) * 3
+    ),
     tileArrayTexture: null,
     arrayPoolCapacity: 0,
     arrayPoolFilterTier: -1,
@@ -118,7 +147,7 @@ function createInitialCompositorState(
     arrayAccessCounter: 0,
     arrayBatchCounter: 0,
     uploadPremulScratch: new Uint8Array(TILE_SIZE * TILE_SIZE * 4),
-    preserveDrawingBuffer,
+    preserveDrawingBuffer: Boolean(options?.preserveDrawingBuffer),
     viewportDraftProgram: null,
     viewportDraftLocs: null,
     uViewportDraftTileTexLoc: null,
@@ -217,7 +246,17 @@ function createInitialCompositorState(
     texturePool: [],
     activePoolByKey: new Map(),
     fallbackTileCanvas: null,
+    fallbackTileImageData: null,
+    fallbackIsoCanvas: null,
     lastRenderedGrid: null,
+    renderBackend,
+    powerPreference,
+    requestedArrayPoolLayers: poolSpec.arrayLayers,
+    maxTexturePoolSize: poolSpec.maxTexture2D,
+    filteringQuality,
+    activeRendererName:
+      renderBackend === 'canvas2d' ? 'Canvas 2D (CPU Software)' : 'WebGL2 GPU',
+    layerVisScratch: new Map(),
   };
 }
 
@@ -227,8 +266,8 @@ function createInitialCompositorState(
 export class ViewportCompositor {
   private state: CompositorState;
 
-  constructor(canvas: HTMLCanvasElement, options?: { preserveDrawingBuffer?: boolean }) {
-    this.state = createInitialCompositorState(canvas, Boolean(options?.preserveDrawingBuffer));
+  constructor(canvas: HTMLCanvasElement, options?: ViewportCompositorInitOptions) {
+    this.state = createInitialCompositorState(canvas, options);
     if (typeof canvas.addEventListener === 'function') {
       this.state.onContextLostHandler = (e: Event) => {
         e.preventDefault();
@@ -247,6 +286,62 @@ export class ViewportCompositor {
 
   public isReady(): boolean {
     return !this.state.contextLost && this.state.gl !== null && this.state.program !== null;
+  }
+
+  public getBackend(): 'webgl2' | 'canvas2d' {
+    return this.isReady() ? 'webgl2' : 'canvas2d';
+  }
+
+  public getRendererName(): string {
+    return this.state.activeRendererName;
+  }
+
+  public setFilteringQuality(quality: CanvasFilteringQuality): void {
+    if (this.state.filteringQuality === quality) return;
+    this.state.filteringQuality = quality;
+    this.state.arrayPoolFilterTier = -1;
+    for (const slot of this.state.texturePool) {
+      slot.filterTier = -1;
+    }
+  }
+
+  public getTelemetry(): CompositorTelemetry {
+    const backend = this.getBackend();
+    const arrayUsed = this.state.arrayPoolByKey.size;
+    const tex2DUsed = this.state.texturePool.length;
+    const tileBytes = TILE_SIZE * TILE_SIZE * 4;
+    // Array texture reserves full capacity slices upfront when allocated on GPU
+    const arrayBytes = this.state.tileArrayTexture
+      ? this.state.arrayPoolCapacity * tileBytes
+      : 0;
+    const tex2DBytes = tex2DUsed * tileBytes;
+    const fboPixels =
+      (this.state.scenePingPong ? 2 : 0) +
+      (this.state.belowActiveCacheFbo ? 1 : 0) +
+      (this.state.aboveActiveCacheFbo ? 1 : 0);
+    const fboBytes = fboPixels * this.state.canvas.width * this.state.canvas.height * 4;
+    const estimatedVramMb =
+      backend === 'webgl2'
+        ? Math.round(((arrayBytes + tex2DBytes + fboBytes) / (1024 * 1024)) * 10) / 10
+        : 0;
+
+    return {
+      backend,
+      rendererName: this.state.activeRendererName,
+      arrayPoolUsed: arrayUsed,
+      arrayPoolCapacity: this.state.arrayPoolCapacity,
+      texture2DPoolUsed: tex2DUsed,
+      estimatedVramMb,
+      stackCacheHits: this.state.stackCacheStats.cacheHits,
+      stackCacheRebuilds:
+        this.state.stackCacheStats.belowRebuilds + this.state.stackCacheStats.aboveRebuilds,
+    };
+  }
+
+  public flushGpuCaches(): void {
+    invalidateTileTextures(this.state);
+    invalidateMaskTexture(this.state);
+    this.state.stackCache.invalidateAll();
   }
 
   public getCanvas(): HTMLCanvasElement {
@@ -445,8 +540,17 @@ export class ViewportCompositor {
     }
     s.stackCache.invalidateAll();
     if (s.fallbackTileCanvas) {
+      s.fallbackTileCanvas.width = 0;
+      s.fallbackTileCanvas.height = 0;
       s.fallbackTileCanvas = null;
     }
+    s.fallbackTileImageData = null;
+    if (s.fallbackIsoCanvas) {
+      s.fallbackIsoCanvas.width = 0;
+      s.fallbackIsoCanvas.height = 0;
+      s.fallbackIsoCanvas = null;
+    }
+    s.layerVisScratch.clear();
     if (typeof s.canvas.removeEventListener === 'function') {
       if (s.onContextLostHandler) {
         s.canvas.removeEventListener('webglcontextlost', s.onContextLostHandler);

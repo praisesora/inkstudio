@@ -122,9 +122,10 @@ export function initTileArrayPool(state: CompositorState, gl: WebGL2RenderingCon
     return;
   }
 
+  const desiredLayers = state.requestedArrayPoolLayers || DEFAULT_ARRAY_POOL_LAYERS;
   const maxLayersParam =
-    Number(gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS)) || DEFAULT_ARRAY_POOL_LAYERS;
-  const capacity = Math.max(1, Math.min(DEFAULT_ARRAY_POOL_LAYERS, maxLayersParam));
+    Number(gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS)) || desiredLayers;
+  const capacity = Math.max(1, Math.min(desiredLayers, maxLayersParam));
 
   const arrTex = gl.createTexture();
   const instBuf = gl.createBuffer();
@@ -247,6 +248,10 @@ export function resetGLStateOnContextLost(state: CompositorState): void {
 }
 
 export function initGL(state: CompositorState): boolean {
+  if (state.renderBackend === 'canvas2d') {
+    state.activeRendererName = 'Canvas 2D (CPU Software)';
+    return false;
+  }
   if (state.gl && state.program) return true;
 
   try {
@@ -257,11 +262,27 @@ export function initGL(state: CompositorState): boolean {
       depth: false,
       stencil: true,
       preserveDrawingBuffer: state.preserveDrawingBuffer,
-      powerPreference: 'high-performance',
+      powerPreference: state.powerPreference || 'high-performance',
     });
 
-    if (!gl) return false;
+    if (!gl) {
+      state.activeRendererName = 'Canvas 2D Fallback';
+      return false;
+    }
     state.gl = gl;
+
+    // Detect active GPU renderer string once on context creation
+    let rendererName = 'WebGL2 GPU';
+    if (typeof gl.getExtension === 'function') {
+      const debugExt = gl.getExtension('WEBGL_debug_renderer_info');
+      if (debugExt) {
+        const rawRenderer = gl.getParameter(debugExt.UNMASKED_RENDERER_WEBGL);
+        if (typeof rawRenderer === 'string' && rawRenderer.trim()) {
+          rendererName = rawRenderer.trim();
+        }
+      }
+    }
+    state.activeRendererName = rendererName;
 
     // Compile vertex shader
     const vs = compileShader(gl, gl.VERTEX_SHADER, COMPOSITOR_VERTEX_SHADER);

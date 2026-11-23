@@ -113,6 +113,14 @@ export class UndoCacheManager {
     return this.compressedRamCache.size;
   }
 
+  public getCompressedRamBytes(): number {
+    let total = 0;
+    for (const buf of this.compressedRamCache.values()) {
+      total += buf.byteLength;
+    }
+    return total;
+  }
+
   public isOffloaded(itemId: string): boolean {
     return this.diskCachedIds.has(itemId) || this.compressedRamCache.has(itemId);
   }

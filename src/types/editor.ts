@@ -544,6 +544,8 @@ export interface DocumentTab {
   straightRuler?: StraightRuler | null;
   defaultFrequency?: number;
   animation?: AnimationTimeline | null;
+  /** Total active time spent working on this artwork, in milliseconds. */
+  workTimeMs?: number;
 }
 
 export type HistoryActionType =
@@ -1137,6 +1139,8 @@ export interface LoadedDocument {
   animationTimeline?: AnimationTimeline | null;
   timelapse?: InkTimelapseMetadata | null;
   previewDataUrl?: string;
+  /** Persisted active work time in milliseconds (restored from .ink, .sora, .psd/.psb). */
+  workTimeMs?: number;
 }
 
 export type CmykStandard = 'japan-color-2001' | 'us-web-coated-swop' | 'iso-coated-v2';

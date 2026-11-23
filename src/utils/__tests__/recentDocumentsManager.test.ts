@@ -148,4 +148,26 @@ describe('recentDocumentsManager', () => {
     expect(docs.find((d) => d.id === 'doc-saved-1')).toBeDefined();
     expect(docs.length).toBe(1);
   });
+
+  it('strips non-serializable file handles in localStorage fallback', async () => {
+    const fakeHandle = {
+      name: 'Panel.ink',
+      getFile: async () => new File([new Uint8Array([1, 2, 3])], 'Panel.ink'),
+    };
+    await saveRecentDocument({
+      id: 'doc-with-handle',
+      title: 'Panel.ink',
+      path: 'InkStudio\\Panel.ink',
+      size: 2048,
+      isStarred: false,
+      isSaved: true,
+      fileType: '.ink',
+      handle: fakeHandle,
+    });
+
+    const docs = await loadRecentDocuments();
+    const saved = docs.find((d) => d.id === 'doc-with-handle');
+    expect(saved).toBeDefined();
+    expect(saved?.handle).toBeUndefined();
+  });
 });

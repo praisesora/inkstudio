@@ -11,6 +11,7 @@ import { CanvasNavigationHandle } from '../../hooks/useCanvasNavigation';
 import { screenToCanvas } from '../../utils/canvasUtils';
 import { resolvePointerModifierAction } from '../../utils/shortcutManager';
 import { isNativePenStreamActive } from '../../utils/nativeTabletInput';
+import { artworkTimeTracker } from '../../utils/artworkTimeTracker';
 import { toolStoreActions, useToolStore, useUiStore } from '../../stores';
 import { extractCoalescedEvents, extractPredictedEvents } from './types';
 
@@ -301,6 +302,7 @@ export function useCanvasPointerHandlers({
     if (e.nativeEvent) {
       (e.nativeEvent as any).coalescedEvents = coalesced;
     }
+    artworkTimeTracker.recordArtworkAction();
     onPointerDown(e, coalesced);
   };
 

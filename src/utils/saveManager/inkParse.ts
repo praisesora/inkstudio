@@ -1,6 +1,7 @@
 import { unzipSync } from 'fflate';
 import { CanvasColorMode, LayerItem, hasTileBackedLayer } from '../../types/editor';
 import { SparseTileGrid, TileBuffer, TileFormat } from '../tileEngine';
+import { extractWorkTimeMsFromManifest } from '../artworkTimeTracker';
 import {
   CHUNK_YIELD_INTERVAL,
   MAX_DOCUMENT_DIM,
@@ -236,6 +237,7 @@ export async function parseInkZipBytes(
     perspectiveRuler: parsedManifest.perspectiveRuler ?? null,
     animationTimeline: parsedManifest.animationTimeline ?? null,
     timelapse: parsedManifest.timelapse ?? null,
+    workTimeMs: extractWorkTimeMsFromManifest(parsedManifest),
     previewBytes,
     previewDataUrl,
   };

@@ -5,6 +5,7 @@ mod raster_ops;
 mod recovery;
 mod scratch_disk;
 mod server;
+mod system_perf;
 mod tablet_input;
 mod timelapse;
 
@@ -324,7 +325,7 @@ async fn save_undo_tile_cache(request: tauri::ipc::Request<'_>) -> Result<(), St
     }
     let safe_session = sanitize_id(&session_id);
     let safe_state = sanitize_id(&state_id);
-    let temp_dir = std::env::temp_dir().join("inkstudio_undo").join(&safe_session);
+    let temp_dir = system_perf::get_undo_cache_base_dir().join(&safe_session);
     tokio::fs::create_dir_all(&temp_dir)
         .await
         .map_err(|e| e.to_string())?;
@@ -343,8 +344,7 @@ async fn load_undo_tile_cache(
     let state_id = header_str(&request, "x-state-id")?;
     let safe_session = sanitize_id(&session_id);
     let safe_state = sanitize_id(&state_id);
-    let file_path = std::env::temp_dir()
-        .join("inkstudio_undo")
+    let file_path = system_perf::get_undo_cache_base_dir()
         .join(&safe_session)
         .join(format!("{}.bin", safe_state));
     let data = tokio::fs::read(&file_path)
@@ -356,7 +356,7 @@ async fn load_undo_tile_cache(
 #[tauri::command]
 async fn clear_undo_tile_cache(session_id: String) -> Result<(), String> {
     let safe_session = sanitize_id(&session_id);
-    let temp_dir = std::env::temp_dir().join("inkstudio_undo").join(&safe_session);
+    let temp_dir = system_perf::get_undo_cache_base_dir().join(&safe_session);
     if temp_dir.exists() {
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
@@ -599,20 +599,22 @@ async fn native_apply_filter(
         return Err("Filter payload exceeds raster safety ceiling".to_string());
     }
     let owned = body.to_vec();
-    let out = tokio::task::spawn_blocking(move || match filter_type.as_str() {
-        "gaussian-blur" => raster_ops::gaussian_blur_rgba(&owned, width, height, p_a),
-        "motion-blur" => raster_ops::motion_blur_rgba(&owned, width, height, p_a, p_b),
-        "unsharp-mask" => raster_ops::unsharp_mask_rgba(&owned, width, height, p_a, p_b, p_c),
-        "film-grain" => raster_ops::film_grain_rgba(
-            &owned,
-            width,
-            height,
-            p_a,
-            p_b.round().max(1.0) as u32,
-            p_c > 0.5,
-            p_d,
-        ),
-        other => Err(format!("Unsupported filter type: {}", other)),
+    let out = tokio::task::spawn_blocking(move || {
+        system_perf::run_on_worker_pool(|| match filter_type.as_str() {
+            "gaussian-blur" => raster_ops::gaussian_blur_rgba(&owned, width, height, p_a),
+            "motion-blur" => raster_ops::motion_blur_rgba(&owned, width, height, p_a, p_b),
+            "unsharp-mask" => raster_ops::unsharp_mask_rgba(&owned, width, height, p_a, p_b, p_c),
+            "film-grain" => raster_ops::film_grain_rgba(
+                &owned,
+                width,
+                height,
+                p_a,
+                p_b.round().max(1.0) as u32,
+                p_c > 0.5,
+                p_d,
+            ),
+            other => Err(format!("Unsupported filter type: {}", other)),
+        })
     })
     .await
     .map_err(|e| format!("Filter worker failed: {}", e))??;
@@ -746,21 +748,23 @@ async fn native_liquify_step(
     };
 
     let out = tokio::task::spawn_blocking(move || {
-        let src_roi = &owned[..roi_bytes];
-        let mut off = roi_bytes;
-        let init_opt = if has_init {
-            let s = &owned[off..off + roi_bytes];
-            off += roi_bytes;
-            Some(s)
-        } else {
-            None
-        };
-        let mask_opt = if has_mask {
-            Some(&owned[off..off + roi_pixels])
-        } else {
-            None
-        };
-        raster_ops::liquify_step_rgba(src_roi, init_opt, mask_opt, &params)
+        system_perf::run_on_worker_pool(|| {
+            let src_roi = &owned[..roi_bytes];
+            let mut off = roi_bytes;
+            let init_opt = if has_init {
+                let s = &owned[off..off + roi_bytes];
+                off += roi_bytes;
+                Some(s)
+            } else {
+                None
+            };
+            let mask_opt = if has_mask {
+                Some(&owned[off..off + roi_pixels])
+            } else {
+                None
+            };
+            raster_ops::liquify_step_rgba(src_roi, init_opt, mask_opt, &params)
+        })
     })
     .await
     .map_err(|e| format!("Liquify worker failed: {}", e))??;
@@ -773,7 +777,9 @@ async fn native_compress_tiles_lz4(
     request: tauri::ipc::Request<'_>,
 ) -> Result<tauri::ipc::Response, String> {
     let owned = raw_body(&request)?.to_vec();
-    let out = tokio::task::spawn_blocking(move || raster_ops::compress_tiles_lz4_batch(&owned))
+    let out = tokio::task::spawn_blocking(move || {
+        system_perf::run_on_worker_pool(|| raster_ops::compress_tiles_lz4_batch(&owned))
+    })
         .await
         .map_err(|e| format!("LZ4 compress worker failed: {}", e))??;
     Ok(tauri::ipc::Response::new(out))
@@ -784,7 +790,9 @@ async fn native_decompress_tiles_lz4(
     request: tauri::ipc::Request<'_>,
 ) -> Result<tauri::ipc::Response, String> {
     let owned = raw_body(&request)?.to_vec();
-    let out = tokio::task::spawn_blocking(move || raster_ops::decompress_tiles_lz4_batch(&owned))
+    let out = tokio::task::spawn_blocking(move || {
+        system_perf::run_on_worker_pool(|| raster_ops::decompress_tiles_lz4_batch(&owned))
+    })
         .await
         .map_err(|e| format!("LZ4 decompress worker failed: {}", e))??;
     Ok(tauri::ipc::Response::new(out))
@@ -837,15 +845,107 @@ fn tablet_get_status() -> tablet_input::TabletStatus {
     tablet_input::get_tablet_status()
 }
 
+#[tauri::command]
+async fn get_system_hardware_info() -> Result<system_perf::SystemHardwareInfo, String> {
+    tokio::task::spawn_blocking(system_perf::collect_system_hardware_info)
+        .await
+        .map_err(|e| format!("Failed to query system hardware info: {}", e))
+}
+
+#[tauri::command]
+async fn get_scratch_disk_usage() -> Result<system_perf::ScratchDiskUsageReport, String> {
+    tokio::task::spawn_blocking(system_perf::collect_scratch_disk_usage)
+        .await
+        .map_err(|e| format!("Failed to query scratch disk usage: {}", e))
+}
+
+#[tauri::command]
+async fn apply_performance_config(
+    config: system_perf::StartupPerformanceConfig,
+) -> Result<system_perf::SystemHardwareInfo, String> {
+    tokio::task::spawn_blocking(move || -> Result<system_perf::SystemHardwareInfo, String> {
+        let validated_dir = system_perf::validate_custom_scratch_dir(&config.scratch_disk_path)?;
+        let saved = system_perf::save_startup_config(system_perf::StartupPerformanceConfig {
+            scratch_disk_path: validated_dir
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            ..config
+        })?;
+
+        scratch_disk::set_custom_scratch_dir(validated_dir);
+        scratch_disk::set_scratch_compression_enabled(saved.scratch_disk_compression != "none");
+        let _ = system_perf::set_cpu_worker_threads(saved.cpu_worker_threads)?;
+        Ok(system_perf::collect_system_hardware_info())
+    })
+    .await
+    .map_err(|e| format!("Failed to apply performance config: {}", e))?
+}
+
+#[tauri::command]
+async fn purge_unused_scratch_files(active_session_ids: Vec<String>) -> Result<u64, String> {
+    tokio::task::spawn_blocking(move || -> Result<u64, String> {
+        let active_sanitized: HashSet<String> = active_session_ids
+            .iter()
+            .map(|id| sanitize_id(id))
+            .collect();
+        let mut freed: u64 = 0;
+
+        for base in [
+            scratch_disk::get_scratch_base_dir(),
+            system_perf::get_undo_cache_base_dir(),
+        ] {
+            if !base.exists() {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&base) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if active_sanitized.contains(&name) {
+                    continue;
+                }
+                let bytes = system_perf::compute_dir_bytes(&path);
+                if std::fs::remove_dir_all(&path).is_ok() {
+                    freed = freed.saturating_add(bytes);
+                }
+            }
+        }
+        Ok(freed)
+    })
+    .await
+    .map_err(|e| format!("Failed to purge unused scratch files: {}", e))?
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Load persisted desktop performance settings BEFORE WebView2 initializes
+    let startup_perf = system_perf::load_startup_config();
+    if !startup_perf.scratch_disk_path.is_empty() {
+        if let Ok(Some(valid_dir)) =
+            system_perf::validate_custom_scratch_dir(&startup_perf.scratch_disk_path)
+        {
+            scratch_disk::set_custom_scratch_dir(Some(valid_dir));
+        }
+    }
+    scratch_disk::set_scratch_compression_enabled(startup_perf.scratch_disk_compression != "none");
+    if startup_perf.cpu_worker_threads > 0 {
+        let _ = system_perf::set_cpu_worker_threads(startup_perf.cpu_worker_threads);
+    }
+
     // Disable Windows 11 WebView2 Shell Handwriting / DirectInk overlay so stylus input on
-    // sidebar text fields (e.g. layer rename) never draws ink strokes over the UI.
+    // sidebar text fields (e.g. layer rename) never draws ink strokes over the UI,
+    // and apply user-configured GPU adapter / ANGLE backend flags.
     #[cfg(target_os = "windows")]
     {
         const HANDWRITING_DISABLE_FLAG: &str =
             "--disable-features=StylusHandwritingWin,StylusHandwriting,msAbydos,msAbydosHandwritingAttr,msAbydosGestureSupport";
-        let merged = match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+        let mut merged = match std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
             Ok(existing) if !existing.trim().is_empty() => {
                 if existing.contains("StylusHandwritingWin") {
                     existing
@@ -855,6 +955,12 @@ pub fn run() {
             }
             _ => HANDWRITING_DISABLE_FLAG.to_string(),
         };
+        for flag in system_perf::build_webview_perf_args(&startup_perf) {
+            if !merged.contains(&flag) {
+                merged.push(' ');
+                merged.push_str(&flag);
+            }
+        }
         std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", merged);
     }
 
@@ -925,7 +1031,11 @@ pub fn run() {
             native_flate_decompress,
             tablet_start_input,
             tablet_stop_input,
-            tablet_get_status
+            tablet_get_status,
+            get_system_hardware_info,
+            get_scratch_disk_usage,
+            apply_performance_config,
+            purge_unused_scratch_files
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

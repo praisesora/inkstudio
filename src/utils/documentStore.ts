@@ -209,6 +209,68 @@ export class DocumentStore {
     void this.enforceSharedUndoBudget();
   }
 
+  public setOffloadInactiveUndoOnSwitch(enabled: boolean): void {
+    this.offloadInactiveUndoOnSwitch = Boolean(enabled);
+  }
+
+  public getOffloadInactiveUndoOnSwitch(): boolean {
+    return this.offloadInactiveUndoOnSwitch;
+  }
+
+  public getUndoMemoryStats(): {
+    ramSteps: number;
+    diskSteps: number;
+    compressedRamBytes: number;
+  } {
+    let ramSteps = 0;
+    let diskSteps = 0;
+    let compressedRamBytes = 0;
+    for (const session of this.sessions.values()) {
+      if (session.isDisposed()) continue;
+      ramSteps += session.undoCache.getRamStepCount();
+      diskSteps += session.undoCache.getDiskCachedCount();
+      compressedRamBytes += session.undoCache.getCompressedRamBytes();
+    }
+    return { ramSteps, diskSteps, compressedRamBytes };
+  }
+
+  public getActiveSessionIds(): string[] {
+    return this.getAllSessions().map((s) => s.documentId);
+  }
+
+  /**
+   * Reclaims RAM immediately by dropping cached mipmap LODs across all sessions
+   * and offloading inactive document tiles to scratch disk.
+   */
+  public async purgeTileMemory(): Promise<number> {
+    let freed = 0;
+    for (const session of this.getAllSessions()) {
+      const mm = session.tileGrid.getMemoryManager();
+      if (!mm) continue;
+      if (!session.isActive) {
+        freed += await mm.evictAllToDisk();
+      } else {
+        // Drop regenerable LOD > 0 mipmaps & evict hidden/off-frustum tiles down to 50% of active bytes
+        const activeBytes = mm.getActiveMemoryBytes();
+        if (activeBytes > 0) {
+          freed += await mm.evictBytesToDisk(Math.floor(activeBytes * 0.5));
+        }
+      }
+    }
+    return freed;
+  }
+
+  /**
+   * Offloads in-RAM undo tile deltas to scratch disk / compressed storage across all sessions.
+   */
+  public async purgeUndoMemory(): Promise<number> {
+    let offloaded = 0;
+    for (const session of this.getAllSessions()) {
+      offloaded += await session.undoCache.offloadAllToDisk(session.history);
+    }
+    return offloaded;
+  }
+
   public getTotalActiveTileBytes(): number {
     let total = 0;
     for (const session of this.sessions.values()) {

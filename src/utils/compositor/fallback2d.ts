@@ -1,16 +1,84 @@
 import { CanvasDimensions, LayerItem, isFolderLikeLayer } from '../../types/editor';
 import { getCanvasCompositeOperation } from '../canvasUtils';
 import { applyMultiFrameClip, renderFrameBorder } from '../frameEngine';
-import { SparseTileGrid, TILE_SIZE } from '../tileEngine';
+import { SparseTileGrid, TILE_SIZE, TileBuffer } from '../tileEngine';
 import { applyAdjustment } from '../tonalEngine';
+import { calculateVisibleDocumentBounds } from './bounds';
 import { buildLayerTree, groupTreeNodesForCompositing } from './layerTree';
 import { hasActiveLayerStyles } from './shaders/effectShaders';
 import {
   CompositorOptions,
   CompositorState,
+  DocumentBounds,
   LayerTreeNode,
   ViewportTransform,
 } from './types';
+
+function collectVisible2DTiles(
+  grid: SparseTileGrid,
+  layerId: string,
+  zoom: number,
+  frustum?: DocumentBounds | null
+): { tiles: TileBuffer[]; lodTileDocSize: number } {
+  const targetLod =
+    !frustum
+      ? 0
+      : zoom <= 0.125
+        ? 3
+        : zoom <= 0.25
+          ? 2
+          : zoom <= 0.5
+            ? 1
+            : 0;
+  const lodScale = 1 << targetLod;
+  const lodTileDocSize = TILE_SIZE * lodScale;
+
+  if (!frustum) {
+    return { tiles: grid.getLayerTiles(layerId, 0), lodTileDocSize: TILE_SIZE };
+  }
+
+  const hasLayerTiles =
+    typeof grid.hasLayerTiles === 'function' ? grid.hasLayerTiles(layerId) : true;
+  if (!hasLayerTiles) {
+    return { tiles: [], lodTileDocSize };
+  }
+
+  const hasOccCheck = typeof grid.hasPopulatedLodTile === 'function';
+  const startTileX = Math.floor(frustum.minX / lodTileDocSize);
+  const endTileX = Math.floor(frustum.maxX / lodTileDocSize);
+  const startTileY = Math.floor(frustum.minY / lodTileDocSize);
+  const endTileY = Math.floor(frustum.maxY / lodTileDocSize);
+
+  const visibleTiles: TileBuffer[] = [];
+  for (let ty = startTileY; ty <= endTileY; ty++) {
+    for (let tx = startTileX; tx <= endTileX; tx++) {
+      if (targetLod > 0 && hasOccCheck && !grid.hasPopulatedLodTile(layerId, tx, ty, targetLod)) {
+        continue;
+      }
+      let tile = grid.getTile(layerId, tx, ty, targetLod);
+      if (
+        targetLod > 0 &&
+        (!tile || tile.data === null || grid.isLodTileDirty(layerId, tx, ty, targetLod))
+      ) {
+        tile = grid.generateLodTile(layerId, tx, ty, targetLod);
+      }
+      if (tile) {
+        visibleTiles.push(tile);
+      }
+    }
+  }
+  return { tiles: visibleTiles, lodTileDocSize };
+}
+
+function getReusableTileImageData(
+  state: CompositorState,
+  tileCtx: CanvasRenderingContext2D
+): ImageData {
+  if (!state.fallbackTileImageData) {
+    state.fallbackTileImageData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
+  }
+  return state.fallbackTileImageData;
+}
 
 /**
  * Helper to render a single layer onto a 2D canvas context.
@@ -21,25 +89,32 @@ export function render2DSingleLayer(
   layer: LayerItem,
   grid: SparseTileGrid,
   tileCtx: CanvasRenderingContext2D | null | undefined,
-  opacityMultiplier: number = 1.0
+  opacityMultiplier: number = 1.0,
+  frustum?: DocumentBounds | null
 ): void {
   targetCtx.save();
   targetCtx.globalAlpha = Math.max(0, Math.min(1, layer.opacity * opacityMultiplier));
   targetCtx.globalCompositeOperation = getCanvasCompositeOperation(layer.blendMode);
 
-  const tiles = grid.getLayerTiles(layer.id);
+  const { tiles, lodTileDocSize } = collectVisible2DTiles(
+    grid,
+    layer.id,
+    state.currentZoom,
+    frustum
+  );
   const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
   const maskCtx = hasMask && layer.maskCanvas ? layer.maskCanvas.getContext('2d', { willReadFrequently: true }) : null;
 
-  // Helper to render tiles into target context
+  // Helper to render tiles into target context (reuses single ImageData buffer — zero per-tile GC)
   const drawTiles = (ctx: CanvasRenderingContext2D) => {
+    if (!tileCtx || !state.fallbackTileCanvas) return;
+    const imgData = getReusableTileImageData(state, tileCtx);
+    const scaleRatio = lodTileDocSize / TILE_SIZE;
     for (const tile of tiles) {
-      if (!tileCtx || !state.fallbackTileCanvas) continue;
       const rgba = grid.getTileAsRGBA(tile);
-      const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
       imgData.data.set(rgba);
 
-      if (hasMask && maskCtx) {
+      if (hasMask && maskCtx && scaleRatio === 1) {
         const maskImgData = maskCtx.getImageData(tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE, TILE_SIZE, TILE_SIZE);
         const md = maskImgData.data;
         const d = imgData.data;
@@ -51,7 +126,17 @@ export function render2DSingleLayer(
       }
 
       tileCtx.putImageData(imgData, 0, 0);
-      ctx.drawImage(state.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+      if (scaleRatio === 1) {
+        ctx.drawImage(state.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+      } else {
+        ctx.drawImage(
+          state.fallbackTileCanvas,
+          tile.tileX * lodTileDocSize,
+          tile.tileY * lodTileDocSize,
+          lodTileDocSize,
+          lodTileDocSize
+        );
+      }
     }
   };
 
@@ -102,11 +187,20 @@ export function render2DSingleLayer(
     typeof document !== 'undefined' &&
     targetCtx.canvas
   ) {
-    const iso = document.createElement('canvas');
-    iso.width = targetCtx.canvas.width;
-    iso.height = targetCtx.canvas.height;
+    if (!state.fallbackIsoCanvas) {
+      state.fallbackIsoCanvas = document.createElement('canvas');
+    }
+    const iso = state.fallbackIsoCanvas;
+    if (iso.width !== targetCtx.canvas.width || iso.height !== targetCtx.canvas.height) {
+      iso.width = targetCtx.canvas.width;
+      iso.height = targetCtx.canvas.height;
+    }
     const isoCtx = iso.getContext('2d');
     if (isoCtx) {
+      if (typeof isoCtx.setTransform === 'function') {
+        isoCtx.setTransform(1, 0, 0, 1, 0, 0);
+      }
+      isoCtx.clearRect(0, 0, iso.width, iso.height);
       if (typeof targetCtx.getTransform === 'function' && typeof isoCtx.setTransform === 'function') {
         isoCtx.setTransform(targetCtx.getTransform());
       }
@@ -179,7 +273,8 @@ export function render2DNodeList(
   dimensions: CanvasDimensions,
   grid: SparseTileGrid,
   tileCtx: CanvasRenderingContext2D | null | undefined,
-  opacityMultiplier: number = 1.0
+  opacityMultiplier: number = 1.0,
+  frustum?: DocumentBounds | null
 ): void {
   const renderOrder = nodes.slice().reverse();
   const groups = groupTreeNodesForCompositing(renderOrder);
@@ -295,7 +390,7 @@ export function render2DNodeList(
     );
 
     if (activeClipped.length === 0) {
-      render2DSingleLayer(state, targetCtx, baseLayer, grid, tileCtx, opacityMultiplier);
+      render2DSingleLayer(state, targetCtx, baseLayer, grid, tileCtx, opacityMultiplier, frustum);
     } else {
       let groupCanvas: HTMLCanvasElement | null = null;
       if (typeof document !== 'undefined') {
@@ -305,11 +400,11 @@ export function render2DNodeList(
       }
       const gCtx = groupCanvas?.getContext('2d');
       if (!gCtx || !groupCanvas) {
-        render2DSingleLayer(state, targetCtx, baseLayer, grid, tileCtx, opacityMultiplier);
+        render2DSingleLayer(state, targetCtx, baseLayer, grid, tileCtx, opacityMultiplier, frustum);
         continue;
       }
 
-      render2DSingleLayer(state, gCtx, baseLayer, grid, tileCtx, 1.0);
+      render2DSingleLayer(state, gCtx, baseLayer, grid, tileCtx, 1.0, null);
 
       for (const clippedNode of activeClipped) {
         const clipped = clippedNode.layer;
@@ -318,13 +413,14 @@ export function render2DNodeList(
         gCtx.globalCompositeOperation = 'source-atop';
 
         const tiles = grid.getLayerTiles(clipped.id);
-        for (const tile of tiles) {
-          if (!tileCtx || !state.fallbackTileCanvas) continue;
-          const rgba = grid.getTileAsRGBA(tile);
-          const imgData = tileCtx.createImageData(TILE_SIZE, TILE_SIZE);
-          imgData.data.set(rgba);
-          tileCtx.putImageData(imgData, 0, 0);
-          gCtx.drawImage(state.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+        if (tileCtx && state.fallbackTileCanvas) {
+          const imgData = getReusableTileImageData(state, tileCtx);
+          for (const tile of tiles) {
+            const rgba = grid.getTileAsRGBA(tile);
+            imgData.data.set(rgba);
+            tileCtx.putImageData(imgData, 0, 0);
+            gCtx.drawImage(state.fallbackTileCanvas, tile.tileX * TILE_SIZE, tile.tileY * TILE_SIZE);
+          }
         }
         gCtx.restore();
       }
@@ -339,7 +435,8 @@ export function render2DNodeList(
 }
 
 /**
- * 2D Canvas Fallback Pass: Blits tiles when WebGL2 context is unavailable.
+ * 2D Canvas Fallback Pass: Blits visible tiles using frustum culling and adaptive LOD
+ * when WebGL2 is unavailable or Canvas 2D software mode is selected.
  */
 export function render2DFallback(
   state: CompositorState,
@@ -356,8 +453,33 @@ export function render2DFallback(
   const viewportH = state.canvas.height;
   const dpr = _options.devicePixelRatio ?? (typeof window !== 'undefined' ? window.devicePixelRatio : 1) ?? 1;
 
+  // Frustum Culling & Memory Manager Sync (keeps RAM eviction accurate even in CPU 2D mode)
+  const frustum = calculateVisibleDocumentBounds(
+    viewportW / Math.max(0.01, dpr),
+    viewportH / Math.max(0.01, dpr),
+    transform,
+    dimensions.width,
+    dimensions.height
+  );
+  const activeLayerId = _options.activeLayerId ?? _options.activeDraftLayerId ?? null;
+  const layerVis = state.layerVisScratch;
+  layerVis.clear();
+  for (let i = 0; i < layers.length; i++) {
+    layerVis.set(layers[i].id, layers[i].visible);
+  }
+  grid.getMemoryManager()?.updateViewport(frustum, activeLayerId, layerVis);
+
   ctx.save();
   ctx.clearRect(0, 0, viewportW, viewportH);
+
+  // Respect texture filtering quality preference in 2D mode
+  const shouldSmooth =
+    state.filteringQuality === 'smooth'
+      ? true
+      : state.filteringQuality === 'pixelated'
+        ? false
+        : transform.zoom < 2.0;
+  ctx.imageSmoothingEnabled = shouldSmooth;
 
   ctx.scale(dpr, dpr);
   ctx.translate(transform.pan.x, transform.pan.y);
@@ -368,12 +490,14 @@ export function render2DFallback(
   );
   ctx.translate(-dimensions.width / 2, -dimensions.height / 2);
 
-  if (_options.showCheckerboard) {
-    ctx.fillStyle = '#1e1e1e';
-  } else {
-    ctx.fillStyle = '#ffffff';
+  if (!_options.transparentBackground) {
+    if (_options.showCheckerboard) {
+      ctx.fillStyle = '#1e1e1e';
+    } else {
+      ctx.fillStyle = '#ffffff';
+    }
+    ctx.fillRect(0, 0, dimensions.width, dimensions.height);
   }
-  ctx.fillRect(0, 0, dimensions.width, dimensions.height);
 
   if (!state.fallbackTileCanvas && typeof document !== 'undefined') {
     state.fallbackTileCanvas = document.createElement('canvas');
@@ -383,7 +507,7 @@ export function render2DFallback(
   const tileCtx = state.fallbackTileCanvas?.getContext('2d', { willReadFrequently: true });
 
   const tree = buildLayerTree(layers);
-  render2DNodeList(state, ctx, tree, dimensions, grid, tileCtx, 1.0);
+  render2DNodeList(state, ctx, tree, dimensions, grid, tileCtx, 1.0, frustum);
 
   ctx.restore();
 }

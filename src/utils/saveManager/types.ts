@@ -39,6 +39,7 @@ export interface SaveDocumentData {
   perspectiveRuler?: PerspectiveRuler | null;
   animationTimeline?: AnimationTimeline | null;
   timelapse?: InkTimelapseMetadata | null;
+  workTimeMs?: number;
   onProgress?: (progress: SaveProgress) => void;
   compressionLevel?: 0 | 1 | 2 | 3 | 4 | 5 | 6;
 }
@@ -58,6 +59,7 @@ export interface InkProjectManifest {
   perspectiveRuler?: PerspectiveRuler | null;
   animationTimeline?: AnimationTimeline | null;
   timelapse?: InkTimelapseMetadata | null;
+  workTimeMs?: number;
   preview: { path: string; width: number; height: number } | null;
   savedAt: number;
 }
@@ -75,6 +77,7 @@ export interface ParsedInkProject {
   perspectiveRuler?: PerspectiveRuler | null;
   animationTimeline?: AnimationTimeline | null;
   timelapse?: InkTimelapseMetadata | null;
+  workTimeMs?: number;
   previewBytes?: Uint8Array | null;
   previewDataUrl?: string;
 }

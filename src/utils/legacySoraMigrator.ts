@@ -16,6 +16,7 @@ import {
   sanitizeJsonLayer,
 } from './saveManager/types';
 import { extractZipPreview, parseInkZipBytes } from './saveManager/inkParse';
+import { extractWorkTimeMsFromManifest } from './artworkTimeTracker';
 
 /**
  * Read-only migrator for legacy `.sora` project files (v1 JSON and v2 binary/wrapped containers).
@@ -33,6 +34,7 @@ export interface LegacySoraV1Project {
   layers: LayerItem[];
   canvases: Record<string, string>;
   masks: Record<string, string>;
+  workTimeMs?: number;
 }
 
 export type MigratedSoraProject =
@@ -109,6 +111,7 @@ export function parseLegacySoraV1Json(jsonText: string): LegacySoraV1Project {
     layers,
     canvases: parsed.canvases && typeof parsed.canvases === 'object' ? parsed.canvases : {},
     masks: parsed.masks && typeof parsed.masks === 'object' ? parsed.masks : {},
+    workTimeMs: extractWorkTimeMsFromManifest(parsed),
   };
 }
 
@@ -200,6 +203,7 @@ export async function migrateLegacySoraFile(file: File): Promise<LoadedDocument>
       perspectiveRuler: migrated.perspectiveRuler ?? null,
       animationTimeline: migrated.animationTimeline ?? null,
       timelapse: migrated.timelapse ?? null,
+      workTimeMs: migrated.workTimeMs,
       previewDataUrl: migrated.previewDataUrl,
     };
   }
@@ -299,5 +303,6 @@ export async function migrateLegacySoraFile(file: File): Promise<LoadedDocument>
     colorMode,
     layers,
     tileGrid: grid,
+    workTimeMs: migrated.workTimeMs,
   };
 }

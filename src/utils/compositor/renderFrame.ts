@@ -6,6 +6,7 @@ import { render2DFallback } from './fallback2d';
 import {
   copyFboSurface,
   createFboSurface,
+  disposeFboSurface,
   ensureFboSurfaceSize,
   ensurePingPongTarget,
 } from './fboManager';
@@ -74,11 +75,12 @@ export function renderFrame(
     dimensions.height
   );
 
-  // Dynamic Frustum Culling & Memory Budget Sync
+  // Dynamic Frustum Culling & Memory Budget Sync (reuse persistent Map — zero per-frame allocation)
   const activeLayerId = _options.activeLayerId ?? _options.activeDraftLayerId ?? null;
-  const layerVis = new Map<string, boolean>();
-  for (const l of layers) {
-    layerVis.set(l.id, l.visible);
+  const layerVis = state.layerVisScratch;
+  layerVis.clear();
+  for (let i = 0; i < layers.length; i++) {
+    layerVis.set(layers[i].id, layers[i].visible);
   }
   grid.getMemoryManager()?.updateViewport(frustum, activeLayerId, layerVis);
 
@@ -89,7 +91,18 @@ export function renderFrame(
   const bypassStackCache = Boolean(_options.bypassStackCache);
   let belowCacheReady = false;
   let aboveCacheReady = false;
-  if (scenePP && !bypassStackCache) {
+  if (bypassStackCache) {
+    if (state.belowActiveCacheFbo) {
+      disposeFboSurface(gl, state.belowActiveCacheFbo);
+      state.belowActiveCacheFbo = null;
+      state.stackCache.invalidateAll();
+    }
+    if (state.aboveActiveCacheFbo) {
+      disposeFboSurface(gl, state.aboveActiveCacheFbo);
+      state.aboveActiveCacheFbo = null;
+      state.stackCache.invalidateAll();
+    }
+  } else if (scenePP) {
     if (!state.belowActiveCacheFbo) {
       state.belowActiveCacheFbo = createFboSurface(gl, false);
     }
@@ -395,7 +408,8 @@ export function renderFrame(
   }
 
   // Clean up stale textures if fallback pool exceeded limit
-  if (state.texturePool.length > MAX_TEXTURE_POOL_SIZE) {
+  const maxPool = state.maxTexturePoolSize || MAX_TEXTURE_POOL_SIZE;
+  if (state.texturePool.length > maxPool) {
     evictStaleTextures(state);
   }
 }
