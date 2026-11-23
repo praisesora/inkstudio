@@ -8,12 +8,30 @@ import {
 } from '../changelog';
 
 describe('changelog parser', () => {
-  it('parses bundled CHANGELOG.md including v1.0.2 and v1.0.1 sections', () => {
+  it('parses bundled CHANGELOG.md including v1.0.3, v1.0.2, and v1.0.1 sections', () => {
     const entries = getChangelogEntries();
-    expect(entries.length).toBeGreaterThanOrEqual(2);
+    expect(entries.length).toBeGreaterThanOrEqual(3);
 
     const latest = getChangelogForVersion();
-    expect(latest?.version).toBe('1.0.2');
+    expect(latest?.version).toBe('1.0.3');
+
+    const v103 = getChangelogForVersion('1.0.3');
+    expect(v103).toBeDefined();
+    expect(v103?.version).toBe('1.0.3');
+    expect(v103?.sections.map((s) => s.title)).toEqual([
+      'New',
+      'Improvements',
+      'Bug Fixes',
+    ]);
+    expect(v103?.sections[0].items).toContain(
+      'Added live render engine indicator and one-click memory purge button to the Info Panel'
+    );
+    expect(v103?.sections[1].items).toContain(
+      'Extra fix for importing brushes in the `.sut` extension'
+    );
+    expect(v103?.sections[2].items).toContain(
+      'Fixed `fillLayerSolidColor` failing'
+    );
 
     const v102 = getChangelogForVersion('1.0.2');
     expect(v102).toBeDefined();
