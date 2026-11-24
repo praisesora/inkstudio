@@ -98,6 +98,19 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
     }
   }, [isOpen, updatePreview]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   // Handle clicking on preview canvas to set focal point for saturated lines
@@ -127,21 +140,35 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs select-none">
-      <div className="w-[680px] bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl overflow-hidden flex flex-col text-[#e5e5e5] font-sans">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="manga-effects-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-[680px] max-w-[95vw] bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] overflow-hidden flex flex-col text-[#e5e5e5] font-sans"
+      >
         {/* Header */}
-        <div className="px-4 py-2.5 bg-[#1a1a1a] border-b border-white/[0.06] flex items-center justify-between">
-          <h2 className="text-xs font-medium text-[#e5e5e5]">Manga Effect Lines</h2>
+        <div className="h-9 px-3.5 bg-[#161616] border-b border-[#2c2c2c] flex items-center justify-between">
+          <h2 id="manga-effects-modal-title" className="text-xs font-medium text-[#e5e5e5]">
+            Manga Effect Lines
+          </h2>
           <button
+            type="button"
             onClick={onClose}
-            className="p-1 rounded text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
+            aria-label="Close"
+            title="Cancel (Esc)"
+            className="w-6 h-6 flex items-center justify-center rounded text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         {/* Tab Switcher */}
-        <div className="flex border-b border-white/[0.06] bg-[#1a1a1a] px-4">
+        <div className="flex border-b border-[#2c2c2c] bg-[#161616] px-4">
           <button
             onClick={() => setActiveTab('saturated')}
             className={`px-3 py-1.5 text-xs font-medium border-b-2 transition-colors cursor-pointer ${
@@ -396,7 +423,7 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-between">
+        <div className="px-4 py-2.5 bg-[#161616] border-t border-[#2c2c2c] flex items-center justify-between">
           <button
             onClick={() => {
               if (activeTab === 'saturated') {
@@ -429,16 +456,18 @@ export const MangaEffectsModal: React.FC<MangaEffectsModalProps> = ({
             Reset Defaults
           </button>
 
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={onClose}
-              className="px-3 py-1.5 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs transition-colors cursor-pointer"
+              className="px-3.5 py-1.5 bg-[#2a2a2a] hover:bg-[#363636] text-[#e5e5e5] font-medium rounded text-xs transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleApplyClick}
-              className="px-3.5 py-1.5 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
+              className="px-4 py-1.5 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
             >
               Apply Effect
             </button>

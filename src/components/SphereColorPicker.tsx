@@ -14,6 +14,7 @@ import {
   PinOff,
   Compass,
   Sparkles,
+  Minus,
 } from 'lucide-react';
 import {
   HSV,
@@ -74,6 +75,9 @@ export interface SphereColorPickerProps {
   onSharedStateChange?: (state: SpherePickerSharedState) => void;
   /** Pointer down handler on the titlebar (used by floating draggable wrapper). */
   onHeaderDragStart?: (e: React.PointerEvent<HTMLDivElement>) => void;
+  /** Controlled collapsed/shaded state for floating titlebar-only mode. */
+  isCollapsed?: boolean;
+  onToggleCollapse?: () => void;
   /** Additional container classes. */
   className?: string;
 }
@@ -279,9 +283,17 @@ export const SphereColorPicker: React.FC<SphereColorPickerProps> = ({
   sharedState,
   onSharedStateChange,
   onHeaderDragStart,
+  isCollapsed: isCollapsedProp,
+  onToggleCollapse,
   className = '',
 }) => {
   const isDocked = variant === 'docked';
+  const [internalCollapsed, setInternalCollapsed] = useState(false);
+  const isCollapsed = !isDocked && (isCollapsedProp ?? internalCollapsed);
+  const handleToggleCollapse = useCallback(() => {
+    if (onToggleCollapse) onToggleCollapse();
+    else setInternalCollapsed((c) => !c);
+  }, [onToggleCollapse]);
 
   const [previousColor] = useState<string>(() =>
     isValidHex(initialColor)
@@ -709,12 +721,18 @@ export const SphereColorPicker: React.FC<SphereColorPickerProps> = ({
       }
       onPointerDown={(e) => e.stopPropagation()}
     >
-      {/* Floating Studio Palette Title Bar (matches DockWorkspace h-6 #1a1a1a chrome) */}
+      {/* Floating Studio Palette Title Bar (matches DockWorkspace #1a1a1a chrome) */}
       {!isDocked && (
         <div
           onPointerDown={onHeaderDragStart}
-          title="Drag to move palette"
-          className="h-6 px-2 flex items-center justify-between bg-[#1a1a1a] border-b border-white/[0.06] cursor-grab active:cursor-grabbing shrink-0"
+          onDoubleClick={(e) => {
+            if ((e.target as HTMLElement)?.closest?.('button')) return;
+            handleToggleCollapse();
+          }}
+          title="Drag to move palette — Double-click to collapse/expand"
+          className={`h-7 px-2 flex items-center justify-between bg-[#1a1a1a] cursor-grab active:cursor-grabbing shrink-0 ${
+            isCollapsed ? '' : 'border-b border-white/[0.06]'
+          }`}
         >
           <div className="flex items-center gap-1.5 min-w-0">
             <span
@@ -745,6 +763,21 @@ export const SphereColorPicker: React.FC<SphereColorPickerProps> = ({
                 {isPinned ? <PinOff className="w-3 h-3" /> : <Pin className="w-3 h-3" />}
               </button>
             )}
+            <button
+              type="button"
+              onClick={handleToggleCollapse}
+              data-testid="sphere-collapse-toggle"
+              title={isCollapsed ? 'Expand Panel' : 'Hide / Collapse Panel'}
+              aria-label={isCollapsed ? 'Expand Color Sphere' : 'Hide Color Sphere'}
+              aria-expanded={!isCollapsed}
+              className={`w-5 h-5 rounded flex items-center justify-center transition-colors cursor-pointer ${
+                isCollapsed
+                  ? 'text-[var(--accent)] bg-[#2c2c2c]'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]'
+              }`}
+            >
+              <Minus className="w-3 h-3" />
+            </button>
             {onClose && (
               <button
                 type="button"
@@ -760,6 +793,7 @@ export const SphereColorPicker: React.FC<SphereColorPickerProps> = ({
         </div>
       )}
 
+      <div className={isCollapsed ? 'hidden' : 'flex flex-col flex-1 min-h-0'}>
       {/* Top Controls Bar: Gear + Light Orbit | Split Preview Bar | Eyedropper (+ Unpin when docked) */}
       <div
         className={`${compact ? 'px-2 pt-1.5 pb-1 gap-1.5' : 'px-2.5 pt-2 pb-1.5 gap-2'} flex items-center justify-between border-b border-white/[0.06] shrink-0`}
@@ -1364,6 +1398,7 @@ export const SphereColorPicker: React.FC<SphereColorPickerProps> = ({
           )}
         </button>
       </div>
+      </div>
     </div>
   );
 };
@@ -1423,6 +1458,7 @@ export const SphereColorPickerModal: React.FC<SphereColorPickerModalProps> = ({
 }) => {
   const [panelWidth, setPanelWidth] = useState<number>(() => loadSavedFloatWidth());
   const [pos, setPos] = useState<{ x: number; y: number }>(() => loadSavedFloatPos(panelWidth));
+  const [isCollapsed, setIsCollapsed] = useState(false);
   const dragOriginRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(
     null
   );
@@ -1569,20 +1605,24 @@ export const SphereColorPickerModal: React.FC<SphereColorPickerModalProps> = ({
           {...pickerProps}
           variant="floating"
           isPinned={false}
+          isCollapsed={isCollapsed}
+          onToggleCollapse={() => setIsCollapsed((c) => !c)}
           sphereSize={computedSphereSize}
           onClose={onClose}
           onHeaderDragStart={handleHeaderDragStart}
           className="w-full"
         />
-        <div
-          onPointerDown={handleResizeStart}
-          title="Drag to resize"
-          className="absolute bottom-0.5 right-0.5 w-3 h-3 cursor-nwse-resize opacity-35 hover:opacity-80 transition-opacity"
-          style={{
-            background:
-              'linear-gradient(135deg, transparent 45%, #8a8a8a 45%, #8a8a8a 58%, transparent 58%, transparent 72%, #8a8a8a 72%, #8a8a8a 85%, transparent 85%)',
-          }}
-        />
+        {!isCollapsed && (
+          <div
+            onPointerDown={handleResizeStart}
+            title="Drag to resize"
+            className="absolute bottom-0.5 right-0.5 w-3 h-3 cursor-nwse-resize opacity-35 hover:opacity-80 transition-opacity"
+            style={{
+              background:
+                'linear-gradient(135deg, transparent 45%, #8a8a8a 45%, #8a8a8a 58%, transparent 58%, transparent 72%, #8a8a8a 72%, #8a8a8a 85%, transparent 85%)',
+            }}
+          />
+        )}
       </div>
     </div>
   );

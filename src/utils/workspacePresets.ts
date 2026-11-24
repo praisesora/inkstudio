@@ -8,6 +8,8 @@ import {
   DockGroup,
   DockPanelId,
   DockSide,
+  FloatingPanelLastDock,
+  FloatingPanelState,
   PersistedWorkspaceState,
   QuickAccessItem,
   QuickAccessViewMode,
@@ -271,6 +273,87 @@ export const DEFAULT_COMMAND_BAR_IDS: CommandActionId[] = [
   'toggle-palettes',
 ];
 
+export const FLOATING_MIN_X = 8;
+export const FLOATING_MIN_Y = 38;
+export const FLOATING_MAX_WIDTH = 720;
+export const FLOATING_MAX_HEIGHT = 860;
+
+export function getFloatingSizeBounds(panelIds: DockPanelId[]): {
+  minWidth: number;
+  maxWidth: number;
+  minHeight: number;
+  maxHeight: number;
+} {
+  if (panelIds.length === 1 && panelIds[0] === 'tools') {
+    return {
+      minWidth: 56,
+      maxWidth: 220,
+      minHeight: DOCK_PANEL_META.tools.minFloatHeight,
+      maxHeight: FLOATING_MAX_HEIGHT,
+    };
+  }
+  let minWidth = 176;
+  let minHeight = 140;
+  for (const pid of panelIds) {
+    const meta = DOCK_PANEL_META[pid];
+    if (!meta) continue;
+    if (pid !== 'tools' && meta.minWidth > minWidth) minWidth = meta.minWidth;
+    if (meta.minFloatHeight > minHeight) minHeight = meta.minFloatHeight;
+  }
+  return {
+    minWidth,
+    maxWidth: FLOATING_MAX_WIDTH,
+    minHeight,
+    maxHeight: FLOATING_MAX_HEIGHT,
+  };
+}
+
+export function clampFloatingRect(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  panelIds: DockPanelId[],
+  viewport?: { width: number; height: number }
+): { x: number; y: number; width: number; height: number } {
+  const bounds = getFloatingSizeBounds(panelIds);
+  const vw = viewport?.width ?? (typeof window !== 'undefined' ? window.innerWidth : 1280);
+  const vh = viewport?.height ?? (typeof window !== 'undefined' ? window.innerHeight : 800);
+
+  const clampedW = Math.max(
+    bounds.minWidth,
+    Math.min(bounds.maxWidth, Math.min(Math.max(bounds.minWidth, vw - 16), Math.round(width)))
+  );
+  const clampedH = Math.max(
+    bounds.minHeight,
+    Math.min(
+      bounds.maxHeight,
+      Math.min(Math.max(bounds.minHeight, vh - FLOATING_MIN_Y - 12), Math.round(height))
+    )
+  );
+  const maxX = Math.max(FLOATING_MIN_X, vw - Math.min(clampedW, 120));
+  const maxY = Math.max(FLOATING_MIN_Y, vh - 36);
+  const clampedX = Math.max(FLOATING_MIN_X, Math.min(maxX, Math.round(x)));
+  const clampedY = Math.max(FLOATING_MIN_Y, Math.min(maxY, Math.round(y)));
+
+  return { x: clampedX, y: clampedY, width: clampedW, height: clampedH };
+}
+
+function normalizeFloatingZIndices(panels: FloatingPanelState[]): FloatingPanelState[] {
+  if (panels.length === 0) return [];
+  const order = panels
+    .map((p, idx) => ({ id: p.id, z: p.zIndex, idx }))
+    .sort((a, b) => (a.z !== b.z ? a.z - b.z : a.idx - b.idx));
+  const zMap = new Map<string, number>();
+  order.forEach((item, rank) => {
+    zMap.set(item.id, rank + 1);
+  });
+  return panels.map((p) => ({
+    ...p,
+    zIndex: zMap.get(p.id) ?? 1,
+  }));
+}
+
 export function cloneLayout(layout: WorkspaceLayout): WorkspaceLayout {
   return {
     leftDocks: layout.leftDocks.map((col) => ({
@@ -286,6 +369,11 @@ export function cloneLayout(layout: WorkspaceLayout): WorkspaceLayout {
         ...g,
         panelIds: [...g.panelIds],
       })),
+    })),
+    floatingPanels: (layout.floatingPanels ?? []).map((fp) => ({
+      ...fp,
+      panelIds: [...fp.panelIds],
+      lastDock: fp.lastDock ? { ...fp.lastDock } : undefined,
     })),
   };
 }
@@ -311,6 +399,11 @@ export function listVisiblePanelIds(layout: WorkspaceLayout): Set<DockPanelId> {
       }
     }
   }
+  for (const fp of layout.floatingPanels ?? []) {
+    for (const pid of fp.panelIds) {
+      out.add(pid);
+    }
+  }
   return out;
 }
 
@@ -326,6 +419,18 @@ export function findPanelLocation(
           return { side, colId: col.id, groupId: grp.id };
         }
       }
+    }
+  }
+  return null;
+}
+
+export function findFloatingPanelLocation(
+  layout: WorkspaceLayout,
+  panelId: DockPanelId
+): { floatingId: string } | null {
+  for (const fp of layout.floatingPanels ?? []) {
+    if (fp.panelIds.includes(panelId)) {
+      return { floatingId: fp.id };
     }
   }
   return null;
@@ -353,6 +458,19 @@ function pruneEmptyContainers(columns: DockColumn[]): DockColumn[] {
     .filter((c): c is DockColumn => c !== null);
 }
 
+function pruneEmptyFloatingPanels(panels: FloatingPanelState[]): FloatingPanelState[] {
+  const nonEmpty = panels
+    .map((fp) => {
+      if (fp.panelIds.length === 0) return null;
+      return {
+        ...fp,
+        activePanelId: fp.panelIds.includes(fp.activePanelId) ? fp.activePanelId : fp.panelIds[0],
+      };
+    })
+    .filter((fp): fp is FloatingPanelState => fp !== null);
+  return normalizeFloatingZIndices(nonEmpty);
+}
+
 export function removePanelFromLayout(
   layout: WorkspaceLayout,
   panelId: DockPanelId
@@ -368,9 +486,17 @@ export function removePanelFromLayout(
       }))
     );
 
+  const nextFloating = pruneEmptyFloatingPanels(
+    (layout.floatingPanels ?? []).map((fp) => ({
+      ...fp,
+      panelIds: fp.panelIds.filter((id) => id !== panelId),
+    }))
+  );
+
   return {
     leftDocks: stripCols(layout.leftDocks),
     rightDocks: stripCols(layout.rightDocks),
+    floatingPanels: nextFloating,
   };
 }
 
@@ -496,7 +622,7 @@ export function setGroupActivePanelInLayout(
             groups: col.groups.map((g) =>
               g.id !== groupId || !g.panelIds.includes(panelId)
                 ? g
-                : { ...g, activePanelId: panelId }
+                : { ...g, activePanelId: panelId, collapsed: false }
             ),
           }
     );
@@ -504,6 +630,34 @@ export function setGroupActivePanelInLayout(
   return {
     leftDocks: mapCols(layout.leftDocks),
     rightDocks: mapCols(layout.rightDocks),
+    floatingPanels: layout.floatingPanels ?? [],
+  };
+}
+
+export function toggleGroupCollapsedInLayout(
+  layout: WorkspaceLayout,
+  colId: string,
+  groupId: string,
+  forceValue?: boolean
+): WorkspaceLayout {
+  const mapCols = (cols: DockColumn[]) =>
+    cols.map((col) =>
+      col.id !== colId
+        ? col
+        : {
+            ...col,
+            groups: col.groups.map((g) =>
+              g.id !== groupId
+                ? g
+                : { ...g, collapsed: forceValue !== undefined ? forceValue : !g.collapsed }
+            ),
+          }
+    );
+
+  return {
+    leftDocks: mapCols(layout.leftDocks),
+    rightDocks: mapCols(layout.rightDocks),
+    floatingPanels: layout.floatingPanels ?? [],
   };
 }
 
@@ -522,6 +676,7 @@ export function toggleColumnCollapsedInLayout(
   return {
     leftDocks: mapCols(layout.leftDocks),
     rightDocks: mapCols(layout.rightDocks),
+    floatingPanels: layout.floatingPanels ?? [],
   };
 }
 
@@ -547,18 +702,25 @@ export function resizeColumnInLayout(
   colId: string,
   requestedWidth: number
 ): WorkspaceLayout {
+  let changed = false;
   const mapCols = (cols: DockColumn[]) =>
     cols.map((col) => {
       if (col.id !== colId) return col;
       const { min, max } = getColumnWidthBounds(col);
       const clamped = Math.max(min, Math.min(max, Math.round(requestedWidth)));
       if (clamped === col.width) return col;
+      changed = true;
       return { ...col, width: clamped };
     });
 
+  const leftDocks = mapCols(layout.leftDocks);
+  const rightDocks = mapCols(layout.rightDocks);
+  if (!changed) return layout;
+
   return {
-    leftDocks: mapCols(layout.leftDocks),
-    rightDocks: mapCols(layout.rightDocks),
+    leftDocks,
+    rightDocks,
+    floatingPanels: layout.floatingPanels ?? [],
   };
 }
 
@@ -586,6 +748,325 @@ export function resizeGroupSplitInLayout(
   return {
     leftDocks: mapCols(layout.leftDocks),
     rightDocks: mapCols(layout.rightDocks),
+    floatingPanels: layout.floatingPanels ?? [],
+  };
+}
+
+export interface DetachPanelOptions {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  viewport?: { width: number; height: number };
+}
+
+export function detachPanelToFloatingInLayout(
+  layout: WorkspaceLayout,
+  panelId: DockPanelId,
+  options?: DetachPanelOptions
+): WorkspaceLayout {
+  const dockedLoc = findPanelLocation(layout, panelId);
+  const existingFloatingLoc = findFloatingPanelLocation(layout, panelId);
+  const existingFloating = existingFloatingLoc
+    ? (layout.floatingPanels ?? []).find((f) => f.id === existingFloatingLoc.floatingId)
+    : undefined;
+
+  const lastDock: FloatingPanelLastDock | undefined = dockedLoc
+    ? { side: dockedLoc.side, colId: dockedLoc.colId, groupId: dockedLoc.groupId }
+    : existingFloating?.lastDock
+      ? { ...existingFloating.lastDock }
+      : { side: DOCK_PANEL_META[panelId].defaultSide };
+
+  const cleaned = removePanelFromLayout(layout, panelId);
+  const next = cloneLayout(cleaned);
+  const floatingPanels = next.floatingPanels ?? [];
+  const meta = DOCK_PANEL_META[panelId];
+
+  const vw = options?.viewport?.width ?? (typeof window !== 'undefined' ? window.innerWidth : 1280);
+  const vh = options?.viewport?.height ?? (typeof window !== 'undefined' ? window.innerHeight : 800);
+
+  const cascade = (floatingPanels.length % 6) * 26;
+  const reqW = options?.width ?? meta.defaultFloatWidth;
+  const reqH = options?.height ?? meta.defaultFloatHeight;
+  const defaultX =
+    meta.defaultSide === 'left'
+      ? Math.round(vw * 0.24) + cascade
+      : Math.round(vw * 0.68 - reqW * 0.5) - cascade;
+  const defaultY = Math.round(vh * 0.16) + cascade;
+
+  const rect = clampFloatingRect(
+    options?.x ?? defaultX,
+    options?.y ?? defaultY,
+    reqW,
+    reqH,
+    [panelId],
+    options?.viewport
+  );
+
+  const maxZ = floatingPanels.reduce((acc, p) => Math.max(acc, p.zIndex), 0);
+  const newFloating: FloatingPanelState = {
+    id: makeUid('float'),
+    panelIds: [panelId],
+    activePanelId: panelId,
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
+    collapsed: false,
+    zIndex: maxZ + 1,
+    lastDock,
+  };
+
+  next.floatingPanels = normalizeFloatingZIndices([...floatingPanels, newFloating]);
+  return next;
+}
+
+export function mergePanelIntoFloatingInLayout(
+  layout: WorkspaceLayout,
+  panelId: DockPanelId,
+  targetFloatingId: string
+): WorkspaceLayout {
+  const targetExists = (layout.floatingPanels ?? []).some((fp) => fp.id === targetFloatingId);
+  if (!targetExists) return layout;
+
+  const existingLoc = findFloatingPanelLocation(layout, panelId);
+  if (existingLoc && existingLoc.floatingId === targetFloatingId) {
+    return setFloatingActivePanelInLayout(layout, targetFloatingId, panelId);
+  }
+
+  const cleaned = removePanelFromLayout(layout, panelId);
+  const next = cloneLayout(cleaned);
+  const floatingPanels = next.floatingPanels ?? [];
+  const target = floatingPanels.find((fp) => fp.id === targetFloatingId);
+  if (!target) return layout;
+
+  if (!target.panelIds.includes(panelId)) {
+    target.panelIds.push(panelId);
+  }
+  target.activePanelId = panelId;
+  target.collapsed = false;
+  const bounds = getFloatingSizeBounds(target.panelIds);
+  if (target.width < bounds.minWidth) {
+    target.width = Math.max(bounds.minWidth, DOCK_PANEL_META[panelId].defaultFloatWidth);
+  }
+  if (target.height < bounds.minHeight) {
+    target.height = Math.max(bounds.minHeight, DOCK_PANEL_META[panelId].defaultFloatHeight);
+  }
+
+  const maxZ = floatingPanels.reduce((acc, p) => Math.max(acc, p.zIndex), 0);
+  target.zIndex = maxZ + 1;
+  next.floatingPanels = normalizeFloatingZIndices(floatingPanels);
+  return next;
+}
+
+export function dockFloatingPanelInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string,
+  target?: MovePanelTarget
+): WorkspaceLayout {
+  const fp = (layout.floatingPanels ?? []).find((f) => f.id === floatingId);
+  if (!fp || fp.panelIds.length === 0) return layout;
+
+  const panelsToDock = [...fp.panelIds];
+  const preferredActive = fp.panelIds.includes(fp.activePanelId) ? fp.activePanelId : fp.panelIds[0];
+
+  // Resolve target when 1-click reattaching without explicit drop target
+  let resolvedTarget: MovePanelTarget;
+  if (target) {
+    resolvedTarget = target;
+  } else {
+    const last = fp.lastDock;
+    const fallbackSide = last?.side ?? DOCK_PANEL_META[preferredActive].defaultSide;
+    const sideCols = fallbackSide === 'left' ? layout.leftDocks : layout.rightDocks;
+    const matchedCol = last?.colId ? sideCols.find((c) => c.id === last.colId) : undefined;
+    const matchedGrp =
+      matchedCol && last?.groupId
+        ? matchedCol.groups.find((g) => g.id === last.groupId)
+        : undefined;
+
+    if (matchedCol && matchedGrp) {
+      resolvedTarget = {
+        side: fallbackSide,
+        targetColId: matchedCol.id,
+        targetGroupId: matchedGrp.id,
+      };
+    } else if (matchedCol) {
+      resolvedTarget = {
+        side: fallbackSide,
+        targetColId: matchedCol.id,
+        insertGroupIndex: matchedCol.groups.length,
+      };
+    } else {
+      const preferredCol = sideCols.find(
+        (c) =>
+          !(
+            c.groups.length === 1 &&
+            c.groups[0].panelIds.length === 1 &&
+            c.groups[0].panelIds[0] === 'tools'
+          )
+      );
+      if (preferredCol && preferredActive !== 'tools') {
+        resolvedTarget = {
+          side: fallbackSide,
+          targetColId: preferredCol.id,
+          insertGroupIndex: preferredCol.groups.length,
+        };
+      } else {
+        resolvedTarget = {
+          side: fallbackSide,
+          insertColumnIndex: fallbackSide === 'left' ? 0 : sideCols.length,
+        };
+      }
+    }
+  }
+
+  let current = movePanelInLayout(layout, panelsToDock[0], resolvedTarget);
+  const anchored = findPanelLocation(current, panelsToDock[0]);
+
+  if (anchored && panelsToDock.length > 1) {
+    for (let i = 1; i < panelsToDock.length; i++) {
+      current = movePanelInLayout(current, panelsToDock[i], {
+        side: anchored.side,
+        targetColId: anchored.colId,
+        targetGroupId: anchored.groupId,
+      });
+    }
+    current = setGroupActivePanelInLayout(current, anchored.colId, anchored.groupId, preferredActive);
+  }
+
+  return current;
+}
+
+export function moveFloatingPanelInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string,
+  x: number,
+  y: number,
+  viewport?: { width: number; height: number }
+): WorkspaceLayout {
+  const existing = layout.floatingPanels ?? [];
+  const idx = existing.findIndex((f) => f.id === floatingId);
+  if (idx < 0) return layout;
+
+  const fp = existing[idx];
+  const clamped = clampFloatingRect(x, y, fp.width, fp.height, fp.panelIds, viewport);
+  if (clamped.x === fp.x && clamped.y === fp.y) return layout;
+
+  const nextFloating = existing.map((f) =>
+    f.id === floatingId ? { ...f, x: clamped.x, y: clamped.y } : f
+  );
+  return {
+    leftDocks: layout.leftDocks,
+    rightDocks: layout.rightDocks,
+    floatingPanels: nextFloating,
+  };
+}
+
+export function resizeFloatingPanelInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string,
+  rect: { x?: number; y?: number; width: number; height: number },
+  viewport?: { width: number; height: number }
+): WorkspaceLayout {
+  const existing = layout.floatingPanels ?? [];
+  const fp = existing.find((f) => f.id === floatingId);
+  if (!fp) return layout;
+
+  const clamped = clampFloatingRect(
+    rect.x ?? fp.x,
+    rect.y ?? fp.y,
+    rect.width,
+    rect.height,
+    fp.panelIds,
+    viewport
+  );
+  if (
+    clamped.x === fp.x &&
+    clamped.y === fp.y &&
+    clamped.width === fp.width &&
+    clamped.height === fp.height
+  ) {
+    return layout;
+  }
+
+  return {
+    leftDocks: layout.leftDocks,
+    rightDocks: layout.rightDocks,
+    floatingPanels: existing.map((f) => (f.id === floatingId ? { ...f, ...clamped } : f)),
+  };
+}
+
+export function toggleFloatingCollapsedInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string,
+  forceValue?: boolean
+): WorkspaceLayout {
+  const existing = layout.floatingPanels ?? [];
+  if (!existing.some((f) => f.id === floatingId)) return layout;
+  return {
+    leftDocks: layout.leftDocks,
+    rightDocks: layout.rightDocks,
+    floatingPanels: existing.map((f) =>
+      f.id === floatingId
+        ? { ...f, collapsed: forceValue !== undefined ? forceValue : !f.collapsed }
+        : f
+    ),
+  };
+}
+
+export function setFloatingActivePanelInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string,
+  panelId: DockPanelId
+): WorkspaceLayout {
+  const existing = layout.floatingPanels ?? [];
+  const target = existing.find((f) => f.id === floatingId);
+  if (!target || !target.panelIds.includes(panelId)) return layout;
+  const maxZ = existing.reduce((acc, p) => Math.max(acc, p.zIndex), 0);
+  const nextFloating = normalizeFloatingZIndices(
+    existing.map((f) =>
+      f.id === floatingId
+        ? { ...f, activePanelId: panelId, collapsed: false, zIndex: maxZ + 1 }
+        : f
+    )
+  );
+  return {
+    leftDocks: layout.leftDocks,
+    rightDocks: layout.rightDocks,
+    floatingPanels: nextFloating,
+  };
+}
+
+export function bringFloatingPanelToFrontInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string
+): WorkspaceLayout {
+  const existing = layout.floatingPanels ?? [];
+  const target = existing.find((f) => f.id === floatingId);
+  if (!target) return layout;
+  const maxZ = existing.reduce((acc, p) => Math.max(acc, p.zIndex), 0);
+  if (target.zIndex === maxZ && existing.filter((p) => p.zIndex === maxZ).length === 1) {
+    return layout;
+  }
+  return {
+    leftDocks: layout.leftDocks,
+    rightDocks: layout.rightDocks,
+    floatingPanels: normalizeFloatingZIndices(
+      existing.map((f) => (f.id === floatingId ? { ...f, zIndex: maxZ + 1 } : f))
+    ),
+  };
+}
+
+export function closeFloatingPanelInLayout(
+  layout: WorkspaceLayout,
+  floatingId: string
+): WorkspaceLayout {
+  const existing = layout.floatingPanels ?? [];
+  if (!existing.some((f) => f.id === floatingId)) return layout;
+  return {
+    leftDocks: layout.leftDocks,
+    rightDocks: layout.rightDocks,
+    floatingPanels: normalizeFloatingZIndices(existing.filter((f) => f.id !== floatingId)),
   };
 }
 
@@ -593,8 +1074,9 @@ export function togglePanelInLayout(
   layout: WorkspaceLayout,
   panelId: DockPanelId
 ): WorkspaceLayout {
-  const existing = findPanelLocation(layout, panelId);
-  if (existing) {
+  const existingDocked = findPanelLocation(layout, panelId);
+  const existingFloating = findFloatingPanelLocation(layout, panelId);
+  if (existingDocked || existingFloating) {
     return removePanelFromLayout(layout, panelId);
   }
   const meta = DOCK_PANEL_META[panelId];
@@ -653,6 +1135,7 @@ function sanitizeColumns(raw: unknown, seenPanels: Set<DockPanelId>): DockColumn
         panelIds,
         activePanelId,
         heightRatio,
+        collapsed: Boolean(gRec.collapsed),
       });
     }
     if (groups.length === 0) continue;
@@ -667,14 +1150,80 @@ function sanitizeColumns(raw: unknown, seenPanels: Set<DockPanelId>): DockColumn
   return pruneEmptyContainers(result);
 }
 
+function sanitizeFloatingPanels(raw: unknown, seenPanels: Set<DockPanelId>): FloatingPanelState[] {
+  if (!Array.isArray(raw)) return [];
+  const result: FloatingPanelState[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== 'object') continue;
+    const rec = item as Record<string, unknown>;
+    const rawPids = Array.isArray(rec.panelIds) ? rec.panelIds : [];
+    const panelIds: DockPanelId[] = [];
+    for (const pid of rawPids) {
+      if (typeof pid === 'string' && VALID_PANEL_SET.has(pid)) {
+        const typedPid = pid as DockPanelId;
+        if (!seenPanels.has(typedPid)) {
+          seenPanels.add(typedPid);
+          panelIds.push(typedPid);
+        }
+      }
+    }
+    if (panelIds.length === 0) continue;
+    const activePanelId =
+      typeof rec.activePanelId === 'string' && panelIds.includes(rec.activePanelId as DockPanelId)
+        ? (rec.activePanelId as DockPanelId)
+        : panelIds[0];
+    const meta = DOCK_PANEL_META[activePanelId];
+    const rawX = typeof rec.x === 'number' && Number.isFinite(rec.x) ? rec.x : 180;
+    const rawY = typeof rec.y === 'number' && Number.isFinite(rec.y) ? rec.y : 120;
+    const rawW =
+      typeof rec.width === 'number' && Number.isFinite(rec.width)
+        ? rec.width
+        : meta.defaultFloatWidth;
+    const rawH =
+      typeof rec.height === 'number' && Number.isFinite(rec.height)
+        ? rec.height
+        : meta.defaultFloatHeight;
+    const rect = clampFloatingRect(rawX, rawY, rawW, rawH, panelIds);
+    const zIndex =
+      typeof rec.zIndex === 'number' && Number.isFinite(rec.zIndex) && rec.zIndex > 0
+        ? Math.round(rec.zIndex)
+        : result.length + 1;
+    let lastDock: FloatingPanelLastDock | undefined;
+    if (rec.lastDock && typeof rec.lastDock === 'object') {
+      const ld = rec.lastDock as Record<string, unknown>;
+      if (ld.side === 'left' || ld.side === 'right') {
+        lastDock = {
+          side: ld.side,
+          colId: typeof ld.colId === 'string' ? ld.colId : undefined,
+          groupId: typeof ld.groupId === 'string' ? ld.groupId : undefined,
+        };
+      }
+    }
+    result.push({
+      id: typeof rec.id === 'string' && rec.id.trim() ? rec.id : makeUid('float'),
+      panelIds,
+      activePanelId,
+      x: rect.x,
+      y: rect.y,
+      width: rect.width,
+      height: rect.height,
+      collapsed: Boolean(rec.collapsed),
+      zIndex,
+      lastDock,
+    });
+  }
+  return normalizeFloatingZIndices(result);
+}
+
 export function sanitizeLayout(raw: unknown): WorkspaceLayout | null {
   if (!raw || typeof raw !== 'object') return null;
   const rec = raw as Record<string, unknown>;
   const seen = new Set<DockPanelId>();
   const leftDocks = sanitizeColumns(rec.leftDocks, seen);
   const rightDocks = sanitizeColumns(rec.rightDocks, seen);
-  if (leftDocks.length === 0 && rightDocks.length === 0) return null;
-  return { leftDocks, rightDocks };
+  const floatingPanels = sanitizeFloatingPanels(rec.floatingPanels, seen);
+  if (leftDocks.length === 0 && rightDocks.length === 0 && floatingPanels.length === 0) return null;
+  return { leftDocks, rightDocks, floatingPanels };
 }
 
 function sanitizeQuickAccessItems(raw: unknown): QuickAccessItem[] {
@@ -724,7 +1273,7 @@ function attachMigratedPanelToLayout(
   layout: WorkspaceLayout,
   panelId: DockPanelId
 ): WorkspaceLayout {
-  if (findPanelLocation(layout, panelId)) return layout;
+  if (findPanelLocation(layout, panelId) || findFloatingPanelLocation(layout, panelId)) return layout;
   const anchor =
     findPanelLocation(layout, 'navigator') ?? findPanelLocation(layout, 'sub-view');
   if (anchor) {

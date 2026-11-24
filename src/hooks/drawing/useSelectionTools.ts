@@ -45,6 +45,11 @@ import {
   getMeshSurfaceBounds,
   resolveTransformTargetLayers,
   getTransformPreviewLayerState,
+  extractCanvasPixelBuffer,
+  processAffineTransformChunks,
+  processPerspectiveTransformChunks,
+  processMeshWarpTransformChunks,
+  type PixelBuffer,
 } from '../../utils/transformEngine';
 import { get2DContext, getCanvasCompositeOperation } from '../../utils/canvasUtils';
 import { useToolStore, toolStoreActions } from '../../stores';
@@ -104,15 +109,98 @@ function compositeTransformedIntoTileGrid(
   grid: SparseTileGrid,
   layerId: string,
   sourceCanvas: HTMLCanvasElement,
+  sourcePixels: PixelBuffer | undefined,
   session: TransformSession,
   dimensions: CanvasDimensions,
   targetFormat: TileFormat,
-  beforeSnapshot: Map<string, TileSnapshotEntry>
+  beforeSnapshot: Map<string, TileSnapshotEntry>,
+  monochromeOpts?: {
+    threshold: number;
+    expressBlack: boolean;
+    expressWhite: boolean;
+  }
 ): DirtyRect | null {
   const destRect = computeTransformDestRect(session, dimensions.width, dimensions.height);
   if (!destRect) return null;
 
   const CHUNK = 1024;
+  const commitChunk = (
+    chunkData: Uint8ClampedArray,
+    cx: number,
+    cy: number,
+    cw: number,
+    ch: number
+  ) => {
+    grid.compositeStrokeToTiles({
+      layerId,
+      strokeData: { data: chunkData, width: cw, height: ch },
+      destX: cx,
+      destY: cy,
+      format: targetFormat,
+      compositeOp: 'source-over',
+      opacity: 1.0,
+      monochrome: monochromeOpts,
+      snapshotOut: beforeSnapshot,
+      suppressNotify: true,
+    });
+  };
+
+  const resolvedPixels = sourcePixels ?? extractCanvasPixelBuffer(sourceCanvas);
+
+  if (resolvedPixels) {
+    if (session.mode === 'perspective' && session.perspectiveQuad) {
+      if (
+        processPerspectiveTransformChunks(
+          resolvedPixels,
+          session.perspectiveQuad,
+          destRect,
+          CHUNK,
+          32,
+          commitChunk
+        )
+      ) {
+        return destRect;
+      }
+    } else if (session.mode === 'mesh' && session.meshPoints) {
+      const subPerCell = computeMeshSubdivisions(
+        resolvedPixels.width,
+        resolvedPixels.height,
+        session.meshPoints,
+        true
+      );
+      if (
+        processMeshWarpTransformChunks(
+          resolvedPixels,
+          session.meshPoints,
+          destRect,
+          CHUNK,
+          subPerCell,
+          commitChunk
+        )
+      ) {
+        return destRect;
+      }
+    } else {
+      processAffineTransformChunks(
+        resolvedPixels,
+        {
+          x: session.x,
+          y: session.y,
+          width: session.width,
+          height: session.height,
+          rotation: session.rotation,
+          flipH: session.flipH,
+          flipV: session.flipV,
+        },
+        destRect,
+        CHUNK,
+        commitChunk
+      );
+      return destRect;
+    }
+  }
+
+  // Fallback path (e.g. Mesh Warp when WebGL2 is unavailable)
   const chunkCanvas = document.createElement('canvas');
   chunkCanvas.width = Math.min(CHUNK, destRect.width);
   chunkCanvas.height = Math.min(CHUNK, destRect.height);
@@ -169,17 +257,7 @@ function compositeTransformedIntoTileGrid(
         cCtx.restore();
 
         const img = cCtx.getImageData(0, 0, cw, ch);
-        grid.compositeStrokeToTiles({
-          layerId,
-          strokeData: img,
-          destX: cx,
-          destY: cy,
-          format: targetFormat,
-          compositeOp: 'source-over',
-          opacity: 1.0,
-          snapshotOut: beforeSnapshot,
-          suppressNotify: true,
-        });
+        commitChunk(img.data, cx, cy, cw, ch);
       }
     }
   } finally {
@@ -1208,6 +1286,7 @@ export function useSelectionTools({
 
       const layerBeforeSnapshots = new Map<string, Map<string, TileSnapshotEntry>>();
       const layerSourceCanvases = new Map<string, HTMLCanvasElement>();
+      const layerSourcePixels = new Map<string, { data: Uint8ClampedArray; width: number; height: number }>();
 
       const compositeCanvas = document.createElement('canvas');
       compositeCanvas.width = b.width;
@@ -1219,7 +1298,9 @@ export function useSelectionTools({
         if (!grid.hasLayerTiles(lyr.id)) continue;
         const sCanvas = grid.createRegionCanvas(lyr.id, b);
         if (!sCanvas) continue;
+        const sPixels = grid.readImageData(lyr.id, b.x, b.y, b.width, b.height);
         layerSourceCanvases.set(lyr.id, sCanvas);
+        layerSourcePixels.set(lyr.id, sPixels);
 
         const previewState = getTransformPreviewLayerState(lyr, layerMap, selectedRootIds);
         if (compCtx && previewState.visible && previewState.opacity > 0.001) {
@@ -1254,6 +1335,7 @@ export function useSelectionTools({
         layerId: primaryLayerId,
         layerIds: liftedLayerIds,
         layerSourceCanvases,
+        layerSourcePixels,
         layerBeforeSnapshots,
         sourceCanvas: compositeCanvas,
         beforeTileSnapshot: layerBeforeSnapshots.get(primaryLayerId),
@@ -1288,6 +1370,7 @@ export function useSelectionTools({
 
       const sourceCanvas = grid.createRegionCanvas(targetLayerId, b);
       if (!sourceCanvas) return;
+      const sourcePixels = grid.readImageData(targetLayerId, b.x, b.y, b.width, b.height);
 
       const beforeTileSnapshot = new Map<string, TileSnapshotEntry>();
       grid.clearRectInLayer(targetLayerId, b, isBg, beforeTileSnapshot, false);
@@ -1298,6 +1381,7 @@ export function useSelectionTools({
         active: true,
         layerId: targetLayerId,
         sourceCanvas,
+        sourcePixels,
         beforeTileSnapshot,
         bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
         x: b.x,
@@ -1334,6 +1418,15 @@ export function useSelectionTools({
   const handleApplyTransform = useCallback(() => {
     if (!transformSession) return;
     const grid = getGrid();
+    const resolveMonoOpts = (layerId: string, fmt: TileFormat) => {
+      if (fmt !== 'monochrome-1bit') return undefined;
+      const lyr = layers.find((l) => l.id === layerId);
+      return {
+        threshold: lyr?.monoThreshold ?? 128,
+        expressBlack: lyr?.monoExpressBlack ?? true,
+        expressWhite: lyr?.monoExpressWhite ?? true,
+      };
+    };
 
     if (
       transformSession.layerIds &&
@@ -1346,6 +1439,7 @@ export function useSelectionTools({
       for (const lId of transformSession.layerIds) {
         const sCanvas = transformSession.layerSourceCanvases.get(lId);
         if (!sCanvas) continue;
+        const sPixels = transformSession.layerSourcePixels?.get(lId);
         const targetFormat = resolveLayerFormat(lId);
         const beforeSnap = new Map<string, TileSnapshotEntry>(
           transformSession.layerBeforeSnapshots?.get(lId) ?? []
@@ -1355,10 +1449,12 @@ export function useSelectionTools({
           grid,
           lId,
           sCanvas,
+          sPixels,
           transformSession,
           dimensions,
           targetFormat,
-          beforeSnap
+          beforeSnap,
+          resolveMonoOpts(lId, targetFormat)
         );
 
         if (destRect) {
@@ -1402,7 +1498,7 @@ export function useSelectionTools({
       releaseTemporaryCanvas(transformSession.sourceCanvas);
       grid.notifyChange(true);
       setTransformSession(null);
-      toolStoreActions.setToolRaw('brush');
+      toolStoreActions.selectTool('brush');
       return;
     }
 
@@ -1416,10 +1512,12 @@ export function useSelectionTools({
       grid,
       targetLayerId,
       transformSession.sourceCanvas,
+      transformSession.sourcePixels,
       transformSession,
       dimensions,
       targetFormat,
-      beforeSnap
+      beforeSnap,
+      resolveMonoOpts(targetLayerId, targetFormat)
     );
 
     const tileDeltas = grid.computeDeltasFromSnapshot(beforeSnap, targetLayerId);
@@ -1439,10 +1537,11 @@ export function useSelectionTools({
     grid.notifyChange(true);
     updateLayerThumbnail(targetLayerId, true);
     setTransformSession(null);
-    toolStoreActions.setToolRaw('brush');
+    toolStoreActions.selectTool('brush');
   }, [
     transformSession,
     getGrid,
+    layers,
     resolveLayerFormat,
     dimensions,
     pushHistoryStep,
@@ -1466,7 +1565,7 @@ export function useSelectionTools({
       releaseTemporaryCanvas(transformSession.sourceCanvas);
       grid.notifyChange(true);
       setTransformSession(null);
-      toolStoreActions.setToolRaw('brush');
+      toolStoreActions.selectTool('brush');
       return;
     }
 
@@ -1476,7 +1575,7 @@ export function useSelectionTools({
     }
     releaseTemporaryCanvas(transformSession.sourceCanvas);
     setTransformSession(null);
-    toolStoreActions.setToolRaw('brush');
+    toolStoreActions.selectTool('brush');
   }, [transformSession, getGrid, updateLayerThumbnail]);
 
   const handleSelectionPointerDown = useCallback(

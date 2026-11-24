@@ -2,6 +2,7 @@ import React, { useCallback } from 'react';
 import { CheckCircle2, Loader2 } from 'lucide-react';
 import {
   AdjustmentLayerData,
+  FilterType,
   LayerItem,
   LayerStyles,
   NewCanvasOptions,
@@ -11,7 +12,7 @@ import { CollabPeer, CollabRole, ConnectionStatus, SessionHostInfo } from '../ty
 import { ParsedInviteLink } from '../services/multiplayerService';
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType } from '../utils/tonalEngine';
-import { AnyTonalParams } from '../hooks/useTonalAndFilterActions';
+import { AnyFilterParams, AnyTonalParams } from '../hooks/useTonalAndFilterActions';
 import { SaturatedLinesOptions, StreamLinesOptions } from '../utils/mangaEffectsEngine';
 import { compositeCanvas, createDocumentRegionRenderer } from '../utils/saveManager';
 import { documentStore } from '../utils/documentStore';
@@ -35,6 +36,8 @@ import { UpdateModal } from './UpdateModal';
 import { UpdateToast } from './UpdateToast';
 import { BrushStudioModal } from './BrushStudioModal';
 import { CloseConfirmModal } from './CloseConfirmModal';
+import { ConfirmDialogModal } from './ConfirmDialogModal';
+import { FilterModal } from './FilterModal';
 import { SaveDocumentResult } from '../utils/appCloseFlow';
 
 export type InviteLinkPayload = ParsedInviteLink;
@@ -56,6 +59,7 @@ export interface ModalHostProps {
     params: AnyTonalParams,
     enabled: boolean
   ) => void;
+  handleApplyFilter: (type: FilterType, params?: AnyFilterParams) => void;
   handleApplyAdjustment: (
     type: 'curves' | 'gradient-map' | 'levels' | 'color-balance',
     data: AdjustmentLayerData
@@ -126,6 +130,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     handleTonalCancel,
     handleTonalApply,
     handleTonalPreviewChange,
+    handleApplyFilter,
     handleApplyAdjustment,
     handleApplyLayerStyles,
     handleConfirmTone,
@@ -172,6 +177,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     const isAboutModalOpen = useUiStore((s) => s.isAboutModalOpen);
     const appSettings = useUiStore((s) => s.appSettings);
     const tonalModalState = useUiStore((s) => s.tonalModalState);
+    const filterModalState = useUiStore((s) => s.filterModalState);
     const adjustmentModalState = useUiStore((s) => s.adjustmentModalState);
     const layerStylesModalState = useUiStore((s) => s.layerStylesModalState);
     const isToneModalOpen = useUiStore((s) => s.isToneModalOpen);
@@ -274,6 +280,13 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           onPreviewChange={handleTonalPreviewChange}
         />
 
+        <FilterModal
+          isOpen={filterModalState.isOpen}
+          type={filterModalState.type}
+          onClose={() => uiStoreActions.closeFilterModal()}
+          onApply={handleApplyFilter}
+        />
+
         {adjustmentModalState.isOpen && (
           <AdjustmentModal
             isOpen={adjustmentModalState.isOpen}
@@ -355,7 +368,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
 
         {isLoadingFile && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 select-none">
-            <div className="bg-[#202020] rounded-md shadow-[0_16px_48px_rgba(0,0,0,0.75)] px-5 py-3.5 flex items-center gap-3 text-xs text-[#e5e5e5]">
+            <div className="bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_16px_48px_rgba(0,0,0,0.75)] px-5 py-3.5 flex items-center gap-3 text-xs text-[#e5e5e5]">
               <Loader2 className="w-4 h-4 text-[var(--accent)] animate-spin" />
               <div className="flex flex-col">
                 <span className="font-medium text-xs">
@@ -372,7 +385,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         )}
 
         {toastMessage && (
-          <div className="fixed bottom-5 right-5 z-50 bg-[#202020] text-[#e5e5e5] px-3.5 py-2 rounded-md shadow-[0_12px_32px_rgba(0,0,0,0.65)] flex items-center gap-2 text-xs">
+          <div className="fixed bottom-5 right-5 z-50 bg-[#202020] border border-[#2c2c2c] text-[#e5e5e5] px-3.5 py-2 rounded-lg shadow-[0_12px_32px_rgba(0,0,0,0.65)] flex items-center gap-2 text-xs">
             <CheckCircle2 className="w-3.5 h-3.5 text-[var(--accent)]" />
             <span className="font-medium">{toastMessage}</span>
           </div>
@@ -413,6 +426,8 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         <UpdateToast />
 
         <CloseConfirmModal onSaveDocumentById={handleSaveDocumentById} />
+
+        <ConfirmDialogModal />
       </>
     );
   }

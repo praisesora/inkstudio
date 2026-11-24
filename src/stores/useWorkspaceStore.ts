@@ -10,16 +10,27 @@ import {
 import {
   DEFAULT_COMMAND_BAR_IDS,
   DEFAULT_QUICK_ACCESS_ITEMS,
+  DetachPanelOptions,
   MovePanelTarget,
+  bringFloatingPanelToFrontInLayout,
   cloneLayout,
+  closeFloatingPanelInLayout,
+  detachPanelToFloatingInLayout,
+  dockFloatingPanelInLayout,
   getPresetLayout,
   loadWorkspaceState,
+  mergePanelIntoFloatingInLayout,
+  moveFloatingPanelInLayout,
   movePanelInLayout,
   resizeColumnInLayout,
+  resizeFloatingPanelInLayout,
   resizeGroupSplitInLayout,
   saveWorkspaceState,
+  setFloatingActivePanelInLayout,
   setGroupActivePanelInLayout,
   toggleColumnCollapsedInLayout,
+  toggleFloatingCollapsedInLayout,
+  toggleGroupCollapsedInLayout,
   togglePanelInLayout,
 } from '../utils/workspacePresets';
 import { createStore } from './createStore';
@@ -139,6 +150,136 @@ export const workspaceStoreActions = {
     useWorkspaceStore.setState((prev) => ({
       layout: setGroupActivePanelInLayout(prev.layout, colId, groupId, panelId),
     }));
+    persistCurrentWorkspace();
+  },
+
+  toggleGroupCollapsed(colId: string, groupId: string, forceValue?: boolean): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = toggleGroupCollapsedInLayout(prev.layout, colId, groupId, forceValue);
+      return {
+        layout: nextLayout,
+        activePreset: 'custom',
+        savedCustomLayout: cloneLayout(nextLayout),
+      };
+    });
+    persistCurrentWorkspace();
+  },
+
+  detachPanel(panelId: DockPanelId, options?: DetachPanelOptions): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = detachPanelToFloatingInLayout(prev.layout, panelId, options);
+      return {
+        layout: nextLayout,
+        activePreset: 'custom',
+        savedCustomLayout: cloneLayout(nextLayout),
+        openPopover: prev.openPopover?.panelId === panelId ? null : prev.openPopover,
+      };
+    });
+    persistCurrentWorkspace();
+  },
+
+  dockFloatingPanel(floatingId: string, target?: MovePanelTarget): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = dockFloatingPanelInLayout(prev.layout, floatingId, target);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        activePreset: 'custom',
+        savedCustomLayout: cloneLayout(nextLayout),
+        openPopover: null,
+      };
+    });
+    persistCurrentWorkspace();
+  },
+
+  mergePanelIntoFloating(panelId: DockPanelId, targetFloatingId: string): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = mergePanelIntoFloatingInLayout(prev.layout, panelId, targetFloatingId);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        activePreset: 'custom',
+        savedCustomLayout: cloneLayout(nextLayout),
+        openPopover: prev.openPopover?.panelId === panelId ? null : prev.openPopover,
+      };
+    });
+    persistCurrentWorkspace();
+  },
+
+  moveFloatingPanel(floatingId: string, x: number, y: number, persist = true): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = moveFloatingPanelInLayout(prev.layout, floatingId, x, y);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        savedCustomLayout:
+          prev.activePreset === 'custom' ? cloneLayout(nextLayout) : prev.savedCustomLayout,
+      };
+    });
+    if (persist) persistCurrentWorkspace();
+  },
+
+  resizeFloatingPanel(
+    floatingId: string,
+    rect: { x?: number; y?: number; width: number; height: number },
+    persist = true
+  ): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = resizeFloatingPanelInLayout(prev.layout, floatingId, rect);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        savedCustomLayout:
+          prev.activePreset === 'custom' ? cloneLayout(nextLayout) : prev.savedCustomLayout,
+      };
+    });
+    if (persist) persistCurrentWorkspace();
+  },
+
+  toggleFloatingCollapsed(floatingId: string, forceValue?: boolean): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = toggleFloatingCollapsedInLayout(prev.layout, floatingId, forceValue);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        savedCustomLayout:
+          prev.activePreset === 'custom' ? cloneLayout(nextLayout) : prev.savedCustomLayout,
+      };
+    });
+    persistCurrentWorkspace();
+  },
+
+  setFloatingActivePanel(floatingId: string, panelId: DockPanelId): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = setFloatingActivePanelInLayout(prev.layout, floatingId, panelId);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        savedCustomLayout:
+          prev.activePreset === 'custom' ? cloneLayout(nextLayout) : prev.savedCustomLayout,
+      };
+    });
+    persistCurrentWorkspace();
+  },
+
+  bringFloatingPanelToFront(floatingId: string): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = bringFloatingPanelToFrontInLayout(prev.layout, floatingId);
+      if (nextLayout === prev.layout) return prev;
+      return { layout: nextLayout };
+    });
+  },
+
+  closeFloatingPanel(floatingId: string): void {
+    useWorkspaceStore.setState((prev) => {
+      const nextLayout = closeFloatingPanelInLayout(prev.layout, floatingId);
+      if (nextLayout === prev.layout) return prev;
+      return {
+        layout: nextLayout,
+        activePreset: 'custom',
+        savedCustomLayout: cloneLayout(nextLayout),
+      };
+    });
     persistCurrentWorkspace();
   },
 

@@ -183,7 +183,7 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
     toggleLayerColor,
     handleConvertLayer,
     deleteLayer,
-    handleApplyFilter,
+    handleApplyFilter: _handleApplyFilter,
     zoomIn,
     zoomOut,
     resetZoomAndCenter,
@@ -874,57 +874,28 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
             label: 'Gaussian Blur...',
             disabled:
               !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
-            onClick: () => {
-              const r = window.prompt('Gaussian Blur Radius (px, 1-100):', '5');
-              if (r !== null) {
-                const radius = Math.max(1, Math.min(100, parseFloat(r) || 5));
-                handleApplyFilter('gaussian-blur', { radius });
-              }
-            },
+            onClick: () => uiStoreActions.openFilterModal('gaussian-blur'),
           },
           {
             id: 'filter-motion-blur',
             label: 'Motion Blur...',
             disabled:
               !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
-            onClick: () => {
-              const d = window.prompt('Motion Blur Distance (px, 1-100):', '15');
-              const a =
-                d !== null ? window.prompt('Motion Blur Angle (degrees, 0-360):', '0') : null;
-              if (d !== null && a !== null) {
-                const distance = Math.max(1, Math.min(100, parseFloat(d) || 15));
-                const angle = Math.max(0, Math.min(360, parseFloat(a) || 0));
-                handleApplyFilter('motion-blur', { distance, angle });
-              }
-            },
+            onClick: () => uiStoreActions.openFilterModal('motion-blur'),
           },
           {
             id: 'filter-unsharp-mask',
             label: 'Unsharp Mask...',
             disabled:
               !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
-            onClick: () => {
-              const r = window.prompt('Unsharp Mask Radius (px, 0.5-20):', '2');
-              const a = r !== null ? window.prompt('Amount factor (0.1-5.0):', '1.5') : null;
-              if (r !== null && a !== null) {
-                const radius = Math.max(0.5, Math.min(20, parseFloat(r) || 2));
-                const amount = Math.max(0.1, Math.min(5, parseFloat(a) || 1.5));
-                handleApplyFilter('unsharp-mask', { radius, amount, threshold: 0 });
-              }
-            },
+            onClick: () => uiStoreActions.openFilterModal('unsharp-mask'),
           },
           {
             id: 'filter-film-grain',
             label: 'Film Grain...',
             disabled:
               !hasOpenDocument || !activeLayer || activeLayer.type !== 'raster' || activeLayer.locked,
-            onClick: () => {
-              const i = window.prompt('Film Grain Intensity (% 1-100):', '25');
-              if (i !== null) {
-                const intensity = Math.max(1, Math.min(100, parseFloat(i) || 25));
-                handleApplyFilter('film-grain', { intensity, size: 1, monochromatic: true });
-              }
-            },
+            onClick: () => uiStoreActions.openFilterModal('film-grain'),
           },
         ],
       },
@@ -1465,7 +1436,6 @@ export function useAppMenuSections(params: UseAppMenuSectionsParams): MenuSectio
       handleAddAnimationCel,
       handleAddDefaultFrameFolder,
       handleAddLayer,
-      handleApplyFilter,
       handleApplyReverseGradient,
       handleClearActiveLayer,
       handleClearSelection,

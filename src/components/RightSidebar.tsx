@@ -43,6 +43,7 @@ import { useToolStore, toolStoreActions } from '../stores';
 interface RightSidebarColorSectionProps {
   colorMode: CanvasColorMode;
   containerWidth: number;
+  containerHeight?: number;
   fullHeight?: boolean;
   primaryColor?: string;
   secondaryColor?: string;
@@ -58,6 +59,7 @@ export const RightSidebarColorSection: React.FC<RightSidebarColorSectionProps> =
   ({
     colorMode,
     containerWidth,
+    containerHeight,
     fullHeight = false,
     primaryColor: primaryProp,
     secondaryColor: secondaryProp,
@@ -98,6 +100,7 @@ export const RightSidebarColorSection: React.FC<RightSidebarColorSectionProps> =
           onSelectTool={onSelectTool ?? ((t) => toolStoreActions.selectTool(t))}
           recentColors={recentProp ?? storeRecent}
           containerWidth={containerWidth}
+          containerHeight={containerHeight}
         />
       </section>
     );

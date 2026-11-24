@@ -96,12 +96,12 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
     return (
       <div className="flex flex-col h-full w-full bg-[#202020] text-[#e5e5e5] select-none overflow-hidden">
         {/* Set Selector & Toolbar */}
-        <div className="p-2 border-b border-white/[0.06] space-y-1.5 shrink-0">
+        <div className="p-2 border-b border-[#2c2c2c] space-y-1.5 shrink-0">
           <div className="flex items-center gap-1">
             <select
               value={activeSet?.id ?? ''}
               onChange={(e) => autoActionStoreActions.selectSet(e.target.value)}
-              className="flex-1 bg-[#161616] text-[11px] text-[#e5e5e5] px-1.5 py-1 rounded border border-white/10 min-w-0"
+              className="flex-1 bg-[#161616] text-[11px] text-[#e5e5e5] px-1.5 py-1 rounded border border-[#2c2c2c] min-w-0"
             >
               {sets.map((s) => (
                 <option key={s.id} value={s.id}>
@@ -144,7 +144,7 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
                 if (e.key === 'Enter') handleCreateAction();
               }}
               placeholder="New action name..."
-              className="flex-1 bg-[#161616] text-[11px] text-[#e5e5e5] px-2 py-1 rounded border border-white/10 min-w-0 focus:outline-none focus:border-[var(--accent)]"
+              className="flex-1 bg-[#161616] text-[11px] text-[#e5e5e5] px-2 py-1 rounded border border-[#2c2c2c] min-w-0 focus:outline-none focus:border-[var(--accent-border)]"
             />
             <button
               type="button"
@@ -191,8 +191,8 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
                   key={action.id}
                   className={`rounded border transition-colors ${
                     isSelected
-                      ? 'bg-[#2a2a2d] border-white/15'
-                      : 'bg-[#1a1a1c] border-transparent hover:border-white/10'
+                      ? 'bg-[#2c2c2c] border-[#3a3a3a]'
+                      : 'bg-[#161616] border-[#262626] hover:border-[#2c2c2c]'
                   }`}
                 >
                   <div
@@ -234,7 +234,7 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
                         onPlayAction(action);
                       }}
                       title="Play Auto Action"
-                      className="p-1 rounded bg-[#161616] hover:bg-[var(--accent)] hover:text-black text-[#e5e5e5] disabled:opacity-35 cursor-pointer"
+                      className="p-1 rounded bg-[#161616] hover:bg-[var(--accent)] hover:text-[var(--accent-contrast)] text-[#e5e5e5] disabled:opacity-35 cursor-pointer transition-colors"
                     >
                       <Play className="w-3 h-3" />
                     </button>
@@ -253,16 +253,16 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
                   </div>
 
                   {isExpanded && (
-                    <div className="px-2 pb-1.5 pt-0.5 space-y-1 border-t border-white/[0.05]">
+                    <div className="px-2 pb-1.5 pt-1 space-y-1 border-t border-[#2c2c2c]">
                       {action.steps.length === 0 ? (
-                        <div className="text-[10px] text-[#777777] italic py-1">
+                        <div className="text-[10px] text-[#8a8a8a] italic py-1">
                           Empty. Press Record and perform layer/filter commands.
                         </div>
                       ) : (
                         action.steps.map((step) => (
                           <div
                             key={step.id}
-                            className="flex items-center gap-1.5 text-[10px] text-[#bdbdbd] bg-[#161616] rounded px-1.5 py-1"
+                            className="flex items-center gap-1.5 text-[10px] text-[#d4d4d4] bg-[#202020] rounded px-1.5 py-1"
                           >
                             <input
                               type="checkbox"
@@ -301,15 +301,15 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
         </div>
 
         {/* Bottom Transport Bar */}
-        <div className="p-2 border-t border-white/[0.06] flex items-center justify-between gap-1.5 shrink-0 bg-[#1a1a1a]">
+        <div className="p-2 border-t border-[#2c2c2c] flex items-center justify-between gap-1.5 shrink-0 bg-[#161616]">
           <button
             type="button"
             disabled={!hasOpenDocument || isPlaying}
             onClick={handleToggleRecord}
-            className={`flex-1 py-1 px-2 rounded text-[11px] font-medium flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40 ${
+            className={`flex-1 py-1.5 px-2 rounded text-[11px] font-medium flex items-center justify-center gap-1.5 cursor-pointer transition-colors disabled:opacity-40 ${
               isRecording
-                ? 'bg-rose-600 hover:bg-rose-500 text-white'
-                : 'bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5]'
+                ? 'bg-red-500/90 hover:bg-red-500 text-white'
+                : 'bg-[#2a2a2a] hover:bg-[#363636] text-[#e5e5e5]'
             }`}
           >
             {isRecording ? (
@@ -319,7 +319,7 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
               </>
             ) : (
               <>
-                <Circle className="w-3 h-3 text-rose-500 fill-rose-500" />
+                <Circle className="w-3 h-3 text-red-400 fill-red-400" />
                 <span>Record</span>
               </>
             )}
@@ -329,7 +329,7 @@ export const AutoActionPanel: React.FC<AutoActionPanelProps> = React.memo(
             type="button"
             disabled={!hasOpenDocument || isPlaying || !selectedAction || selectedAction.steps.length === 0}
             onClick={() => selectedAction && onPlayAction(selectedAction)}
-            className="flex-1 py-1 px-2 rounded text-[11px] font-medium bg-[#234b3e] hover:bg-[#2b604f] text-[#55eaab] border border-[#2e6e58] flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-40"
+            className="flex-1 py-1.5 px-2 rounded text-[11px] font-medium bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 flex items-center justify-center gap-1.5 cursor-pointer transition-opacity disabled:opacity-40"
           >
             <Play className="w-3 h-3 fill-current" />
             <span>Play</span>

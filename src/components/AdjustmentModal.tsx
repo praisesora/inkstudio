@@ -435,57 +435,86 @@ export const AdjustmentModal: React.FC<AdjustmentModalProps> = ({
     onClose();
   };
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen, onClose]);
+
   if (!isOpen) return null;
 
   const channelColor =
     curveChannel === 'r' ? '#ef4444' : curveChannel === 'g' ? '#22c55e' : curveChannel === 'b' ? '#3b82f6' : '#ffffff';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs select-none">
-      <div className="bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl w-[480px] max-w-[95vw] overflow-hidden flex flex-col text-[#e5e5e5] text-xs">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="adjustment-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] w-[480px] max-w-[95vw] overflow-hidden flex flex-col text-[#e5e5e5] text-xs"
+      >
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-white/[0.06] bg-[#1a1a1a]">
-          <span className="font-medium text-[#e5e5e5] text-xs">
+        <div className="h-9 flex items-center justify-between px-3.5 border-b border-[#2c2c2c] bg-[#161616]">
+          <span id="adjustment-modal-title" className="font-medium text-[#e5e5e5] text-xs">
             {editingLayerId ? 'Edit Adjustment Layer' : 'New Adjustment Layer'}
           </span>
           <button
+            type="button"
             onClick={onClose}
-            className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] rounded hover:bg-[#2c2c2c] transition-colors cursor-pointer"
+            aria-label="Close"
+            title="Cancel (Esc)"
+            className="w-6 h-6 flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] rounded hover:bg-[#2c2c2c] transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         {/* Tab Selector */}
-        <div className="flex border-b border-white/[0.06] bg-[#161616] p-1 gap-1">
+        <div className="flex border-b border-[#2c2c2c] bg-[#161616] p-1 gap-1">
           <button
+            type="button"
             onClick={() => setActiveTab('curves')}
-            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors ${
-              activeTab === 'curves' ? 'bg-[#2b2b2b] text-white shadow-xs' : 'text-[#888888] hover:text-white'
+            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors cursor-pointer ${
+              activeTab === 'curves' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
             Tone Curves
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('gradient-map')}
-            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors ${
-              activeTab === 'gradient-map' ? 'bg-[#2b2b2b] text-white shadow-xs' : 'text-[#888888] hover:text-white'
+            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors cursor-pointer ${
+              activeTab === 'gradient-map' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
             Gradient Map
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('levels')}
-            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors ${
-              activeTab === 'levels' ? 'bg-[#2b2b2b] text-white shadow-xs' : 'text-[#888888] hover:text-white'
+            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors cursor-pointer ${
+              activeTab === 'levels' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
             Levels
           </button>
           <button
+            type="button"
             onClick={() => setActiveTab('color-balance')}
-            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors ${
-              activeTab === 'color-balance' ? 'bg-[#2b2b2b] text-white shadow-xs' : 'text-[#888888] hover:text-white'
+            className={`flex-1 py-1.5 px-2 rounded font-medium transition-colors cursor-pointer ${
+              activeTab === 'color-balance' ? 'bg-[#2c2c2c] text-[#e5e5e5]' : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
             }`}
           >
             Color Balance
@@ -973,9 +1002,10 @@ export const AdjustmentModal: React.FC<AdjustmentModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-2.5 border-t border-white/[0.06] bg-[#1a1a1a]">
+        <div className="flex items-center justify-between px-4 py-2.5 border-t border-[#2c2c2c] bg-[#161616]">
           <div className="flex items-center space-x-3">
             <button
+              type="button"
               onClick={handleResetCurrent}
               className="px-2.5 py-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
             >
@@ -991,14 +1021,16 @@ export const AdjustmentModal: React.FC<AdjustmentModalProps> = ({
             </label>
           </div>
 
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={onClose}
-              className="px-3 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
+              className="px-3.5 py-1.5 text-xs font-medium text-[#e5e5e5] bg-[#2a2a2a] hover:bg-[#363636] rounded transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleApply}
               className="px-4 py-1.5 text-xs bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium rounded transition-opacity cursor-pointer"
             >

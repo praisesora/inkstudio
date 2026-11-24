@@ -105,7 +105,10 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
       } catch (err: unknown) {
         const msg =
           err instanceof Error ? err.message : 'Failed to import brush file.';
-        alert(msg);
+        void uiStoreActions.alertDialog({
+          title: 'Brush Import Failed',
+          message: msg,
+        });
       } finally {
         setIsImportingSut(false);
       }
@@ -119,16 +122,35 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
         await exportBrushToInkbFile(brush);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : 'Failed to export brush.';
-        alert(msg);
+        void uiStoreActions.alertDialog({
+          title: 'Brush Export Failed',
+          message: msg,
+        });
       }
     };
 
-    const handleDeleteCustomBrush = async (e: React.MouseEvent, brushId: string) => {
+    const handleDeleteCustomBrush = async (e: React.MouseEvent, brush: CspBrush) => {
       e.stopPropagation();
-      if (window.confirm('Delete this imported brush?')) {
-        await deleteCustomBrush(brushId);
-        setCustomBrushes((prev) => prev.filter((b) => b.id !== brushId));
-        if (activePreset === brushId) {
+      const subtitle = brush.badge
+        ? `${brush.badge} brush`
+        : 'Imported custom brush';
+      const confirmed = await uiStoreActions.confirmDialog({
+        variant: 'danger',
+        title: 'Delete Brush',
+        message: 'Are you sure you want to delete this brush?',
+        detail: 'This permanently removes the brush from your library and cannot be undone.',
+        confirmLabel: 'Delete',
+        cancelLabel: 'Cancel',
+        preview: {
+          imageUrl: brush.tipDataUrl,
+          title: brush.name,
+          subtitle,
+        },
+      });
+      if (confirmed) {
+        await deleteCustomBrush(brush.id);
+        setCustomBrushes((prev) => prev.filter((b) => b.id !== brush.id));
+        if (activePreset === brush.id) {
           handleSelectBrushPreset(DEFAULT_BRUSH_PRESET_ID);
         }
       }
@@ -376,7 +398,7 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
                         </button>
                         <button
                           type="button"
-                          onClick={(e) => handleDeleteCustomBrush(e, brush.id)}
+                          onClick={(e) => void handleDeleteCustomBrush(e, brush)}
                           title="Delete brush"
                           className="opacity-0 group-hover:opacity-100 text-[#8a8a8a] hover:text-red-400 shrink-0 cursor-pointer"
                         >

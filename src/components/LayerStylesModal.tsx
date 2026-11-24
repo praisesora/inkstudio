@@ -267,9 +267,16 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs select-none">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="layer-styles-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
+      onClick={onClose}
+    >
       <div
-        className="w-[640px] max-w-[95vw] bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl flex flex-col text-[#e5e5e5] overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+        className="w-[640px] max-w-[95vw] bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] flex flex-col text-[#e5e5e5] overflow-hidden"
         style={{
           transform: `translate(${pos.x}px, ${pos.y}px)`,
         }}
@@ -279,12 +286,17 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          className="flex items-center justify-between px-4 py-2.5 bg-[#1a1a1a] border-b border-white/[0.06] cursor-move text-xs font-medium"
+          className="h-9 flex items-center justify-between px-3.5 bg-[#161616] border-b border-[#2c2c2c] cursor-move text-xs font-medium"
         >
-          <span className="text-[#e5e5e5]">Layer Style — {layerName}</span>
+          <span id="layer-styles-modal-title" className="text-[#e5e5e5]">
+            Layer Style — {layerName}
+          </span>
           <button
+            type="button"
             onClick={onClose}
-            className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
+            aria-label="Close"
+            title="Cancel (Esc)"
+            className="w-6 h-6 flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
@@ -293,7 +305,7 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
         {/* Modal Body: Left category sidebar + Right parameter panel */}
         <div className="flex flex-1 min-h-[380px] text-xs">
           {/* Left Column: Styles Checklist */}
-          <div className="w-48 bg-[#161616] border-r border-white/[0.06] p-2 flex flex-col justify-between">
+          <div className="w-48 bg-[#161616] border-r border-[#2c2c2c] p-2 flex flex-col justify-between">
             <div className="space-y-1">
               <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-[#8a8a8a]">
                 Styles
@@ -673,22 +685,25 @@ export const LayerStylesModal: React.FC<LayerStylesModalProps> = ({
         </div>
 
         {/* Footer Actions */}
-        <div className="flex items-center justify-between px-4 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06]">
+        <div className="flex items-center justify-between px-4 py-2.5 bg-[#161616] border-t border-[#2c2c2c]">
           <button
+            type="button"
             onClick={handleResetDefaults}
-            className="px-3 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] bg-[#161616] hover:bg-[#2c2c2c] rounded border border-white/[0.06] transition-colors cursor-pointer"
+            className="px-3 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] bg-[#202020] hover:bg-[#2c2c2c] rounded border border-[#2c2c2c] transition-colors cursor-pointer"
           >
             Reset Category
           </button>
 
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={onClose}
-              className="px-3.5 py-1.5 text-xs text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
+              className="px-3.5 py-1.5 text-xs font-medium text-[#e5e5e5] bg-[#2a2a2a] hover:bg-[#363636] rounded transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
+              type="button"
               onClick={handleConfirm}
               className="px-4 py-1.5 text-xs font-medium bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded transition-opacity cursor-pointer"
             >

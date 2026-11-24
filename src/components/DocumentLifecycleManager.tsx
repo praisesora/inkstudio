@@ -401,7 +401,10 @@ export function useDocumentLifecycle({
         } catch (err: unknown) {
           console.error('Failed to paste from file:', err);
           const errMsg = err instanceof Error ? err.message : String(err);
-          alert(`Failed to paste image from file: ${errMsg}`);
+          void uiStoreActions.alertDialog({
+            title: 'Paste Image Failed',
+            message: `Failed to paste image from file: ${errMsg}`,
+          });
         } finally {
           if (pasteFileInputRef.current) {
             pasteFileInputRef.current.value = '';
@@ -605,7 +608,11 @@ export function useDocumentLifecycle({
       } catch (err: unknown) {
         console.error('Failed to open file:', err);
         const errMsg = err instanceof Error ? err.message : String(err);
-        alert(`Could not open "${file.name}":\n${errMsg || 'Unsupported or corrupted file.'}`);
+        void uiStoreActions.alertDialog({
+          title: 'Could Not Open File',
+          message: `Could not open "${file.name}".`,
+          detail: errMsg || 'Unsupported or corrupted file.',
+        });
       } finally {
         uiStoreActions.setLoading(false, '');
         if (fileInputRef.current) {
@@ -787,7 +794,11 @@ export function useDocumentLifecycle({
       } catch (err: unknown) {
         console.error('[Recovery] Restore error:', err);
         const msg = err instanceof Error ? err.message : String(err);
-        alert('Failed to restore crashed session: ' + msg);
+        void uiStoreActions.alertDialog({
+          title: 'Recovery Failed',
+          message: 'Failed to restore crashed session.',
+          detail: msg,
+        });
       }
     },
     [loadDocument, resetHistory, resetZoomAndCenter, showToast, pushHistoryStep, setActiveLayerId]
@@ -997,7 +1008,11 @@ export function useDocumentLifecycle({
           if (msg === 'Save canceled') {
             return 'canceled';
           }
-          alert('Failed to save file: ' + msg);
+          void uiStoreActions.alertDialog({
+            title: 'Save Failed',
+            message: 'Failed to save file.',
+            detail: msg,
+          });
           return 'error';
         } finally {
           uiStoreActions.setLoading(false, '');
@@ -1028,7 +1043,11 @@ export function useDocumentLifecycle({
           if (msg === 'Save canceled') {
             return 'canceled';
           }
-          alert('Failed to save file: ' + msg);
+          void uiStoreActions.alertDialog({
+            title: 'Save Failed',
+            message: 'Failed to save file.',
+            detail: msg,
+          });
           return 'error';
         }
       } finally {
@@ -1080,7 +1099,11 @@ export function useDocumentLifecycle({
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg !== 'Save canceled') {
-        alert('Failed to save file: ' + msg);
+        void uiStoreActions.alertDialog({
+          title: 'Save Failed',
+          message: 'Failed to save file.',
+          detail: msg,
+        });
       }
     } finally {
       uiStoreActions.setLoading(false, '');
@@ -1100,7 +1123,11 @@ export function useDocumentLifecycle({
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg !== 'Export canceled') {
-        alert('Failed to export image: ' + msg);
+        void uiStoreActions.alertDialog({
+          title: 'Export Failed',
+          message: 'Failed to export image.',
+          detail: msg,
+        });
       }
     } finally {
       uiStoreActions.setLoading(false, '');

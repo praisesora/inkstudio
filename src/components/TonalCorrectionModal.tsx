@@ -153,11 +153,11 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
     maxCount = Math.max(maxCount, Math.min(counts[0], counts[255]));
 
     // Background gradient / subtle guide grid
-    ctx.fillStyle = '#18181a';
+    ctx.fillStyle = '#161616';
     ctx.fillRect(0, 0, w, h);
 
     // Guide lines
-    ctx.strokeStyle = '#2b2b2e';
+    ctx.strokeStyle = '#2c2c2c';
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(w * 0.25, 0);
@@ -169,7 +169,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
     ctx.stroke();
 
     // Bars
-    let barColor = '#5ce1e6';
+    let barColor = '#b5b5b5';
     if (levels.channel === 'r') barColor = '#ff6b6b';
     if (levels.channel === 'g') barColor = '#51cf66';
     if (levels.channel === 'b') barColor = '#339af0';
@@ -314,13 +314,18 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="tonal-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none"
+    >
       {/* Semi-transparent backdrop that lets canvas stay visible */}
-      <div className="fixed inset-0 bg-black/40 pointer-events-auto" onClick={onClose} />
+      <div className="fixed inset-0 bg-black/50 pointer-events-auto" onClick={onClose} />
 
       {/* Floating Dialog */}
       <div
-        className="relative pointer-events-auto w-[360px] bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl flex flex-col text-xs text-[#e5e5e5] select-none"
+        className="relative pointer-events-auto w-[360px] max-w-[95vw] bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] flex flex-col text-xs text-[#e5e5e5] select-none overflow-hidden"
         style={{
           transform: `translate(${pos.x}px, ${pos.y}px)`,
         }}
@@ -330,13 +335,17 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
           onPointerDown={handleDragPointerDown}
           onPointerMove={handleDragPointerMove}
           onPointerUp={handleDragPointerUp}
-          className="h-9 px-3.5 bg-[#1a1a1a] border-b border-white/[0.06] flex items-center justify-between cursor-move rounded-t-lg"
+          className="h-9 px-3.5 bg-[#161616] border-b border-[#2c2c2c] flex items-center justify-between cursor-move"
         >
-          <span className="font-medium text-[#e5e5e5]">{getTitle()}</span>
+          <span id="tonal-modal-title" className="font-medium text-[#e5e5e5]">
+            {getTitle()}
+          </span>
           <button
             type="button"
             onClick={onClose}
-            className="p-1 rounded hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
+            aria-label="Close"
+            title="Cancel (Esc)"
+            className="w-6 h-6 rounded flex items-center justify-center hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] transition-colors cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
@@ -349,7 +358,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             <div className="space-y-4">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Brightness:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Brightness</span>
                   <input
                     type="number"
                     min={-100}
@@ -361,7 +370,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         brightness: Math.max(-100, Math.min(100, Number(e.target.value) || 0)),
                       }))
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -372,13 +381,13 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   onChange={(e) =>
                     setBc((prev) => ({ ...prev, brightness: Number(e.target.value) }))
                   }
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
               </div>
 
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Contrast:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Contrast</span>
                   <input
                     type="number"
                     min={-100}
@@ -390,7 +399,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         contrast: Math.max(-100, Math.min(100, Number(e.target.value) || 0)),
                       }))
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -401,7 +410,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   onChange={(e) =>
                     setBc((prev) => ({ ...prev, contrast: Number(e.target.value) }))
                   }
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
               </div>
             </div>
@@ -412,7 +421,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             <div className="space-y-4">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Threshold:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Threshold</span>
                   <input
                     type="number"
                     min={1}
@@ -423,7 +432,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         threshold: Math.max(1, Math.min(255, Number(e.target.value) || 1)),
                       })
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -432,9 +441,9 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   max={255}
                   value={bin.threshold}
                   onChange={(e) => setBin({ threshold: Number(e.target.value) })}
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
-                <div className="flex justify-between text-[10px] text-[#777777] mt-1">
+                <div className="flex justify-between text-[10px] text-[#8a8a8a] mt-1">
                   <span>Black (1)</span>
                   <span>Mid (128)</span>
                   <span>White (255)</span>
@@ -448,7 +457,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             <div className="space-y-4">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Hue:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Hue</span>
                   <input
                     type="number"
                     min={-180}
@@ -460,7 +469,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         hue: Math.max(-180, Math.min(180, Number(e.target.value) || 0)),
                       }))
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -471,13 +480,13 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   onChange={(e) =>
                     setHs((prev) => ({ ...prev, hue: Number(e.target.value) }))
                   }
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
               </div>
 
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Saturation:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Saturation</span>
                   <input
                     type="number"
                     min={-100}
@@ -489,7 +498,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         saturation: Math.max(-100, Math.min(100, Number(e.target.value) || 0)),
                       }))
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -500,13 +509,13 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   onChange={(e) =>
                     setHs((prev) => ({ ...prev, saturation: Number(e.target.value) }))
                   }
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
               </div>
 
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Luminosity:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Luminosity</span>
                   <input
                     type="number"
                     min={-100}
@@ -518,7 +527,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         luminosity: Math.max(-100, Math.min(100, Number(e.target.value) || 0)),
                       }))
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -529,7 +538,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   onChange={(e) =>
                     setHs((prev) => ({ ...prev, luminosity: Number(e.target.value) }))
                   }
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
               </div>
             </div>
@@ -540,7 +549,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             <div className="space-y-4">
               <div>
                 <div className="flex items-center justify-between mb-1">
-                  <span className="text-[#a0a0a0]">Gradation Levels:</span>
+                  <span className="text-[11px] text-[#8a8a8a]">Gradation Levels</span>
                   <input
                     type="number"
                     min={2}
@@ -551,7 +560,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                         levels: Math.max(2, Math.min(32, Number(e.target.value) || 2)),
                       })
                     }
-                    className="w-14 bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-right font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                    className="w-14 bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-right font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                   />
                 </div>
                 <input
@@ -560,9 +569,9 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                   max={32}
                   value={post.levels}
                   onChange={(e) => setPost({ levels: Number(e.target.value) })}
-                  className="w-full h-1.5 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer accent-[#5ce1e6]"
+                  className="w-full"
                 />
-                <div className="flex justify-between text-[10px] text-[#777777] mt-1">
+                <div className="flex justify-between text-[10px] text-[#8a8a8a] mt-1">
                   <span>2 (High Contrast)</span>
                   <span>16</span>
                   <span>32 (Smooth)</span>
@@ -576,17 +585,17 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             <div className="space-y-3.5">
               {/* Channel Selector */}
               <div className="flex items-center justify-between">
-                <span className="text-[#a0a0a0]">Channel:</span>
-                <div className="flex space-x-1">
+                <span className="text-[11px] text-[#8a8a8a]">Channel</span>
+                <div className="flex gap-1">
                   {(['rgb', 'r', 'g', 'b'] as const).map((ch) => (
                     <button
                       key={ch}
                       type="button"
                       onClick={() => setLevels((prev) => ({ ...prev, channel: ch }))}
-                      className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors ${
+                      className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors cursor-pointer ${
                         levels.channel === ch
-                          ? 'bg-[#007acc] text-white shadow-sm'
-                          : 'bg-[#1e1e1e] border border-[#3e3e3e] text-[#888888] hover:text-[#cccccc]'
+                          ? 'bg-[var(--accent)] text-[var(--accent-contrast)]'
+                          : 'bg-[#161616] border border-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5]'
                       }`}
                     >
                       {ch.toUpperCase()}
@@ -596,7 +605,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
               </div>
 
               {/* Histogram Display Canvas */}
-              <div className="border border-[#3e3e3e] rounded overflow-hidden">
+              <div className="border border-[#2c2c2c] rounded overflow-hidden">
                 <canvas
                   ref={histogramCanvasRef}
                   width={256}
@@ -607,8 +616,8 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
 
               {/* Input Levels */}
               <div>
-                <div className="flex items-center justify-between text-[11px] text-[#a0a0a0] mb-1">
-                  <span>Input Levels (Shadow / Gamma / Highlight):</span>
+                <div className="flex items-center justify-between text-[11px] text-[#8a8a8a] mb-1">
+                  <span>Input Levels (Shadow / Gamma / Highlight)</span>
                   <button
                     type="button"
                     onClick={handleAutoLevels}
@@ -619,7 +628,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                 </div>
                 <div className="grid grid-cols-3 gap-2">
                   <div>
-                    <label className="text-[10px] text-[#777777] block mb-0.5">Shadow</label>
+                    <label className="text-[10px] text-[#8a8a8a] block mb-0.5">Shadow</label>
                     <input
                       type="number"
                       min={0}
@@ -634,11 +643,11 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                           ),
                         }))
                       }
-                      className="w-full bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-center font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                      className="w-full bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-center font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-[#777777] block mb-0.5">Gamma</label>
+                    <label className="text-[10px] text-[#8a8a8a] block mb-0.5">Gamma</label>
                     <input
                       type="number"
                       step={0.05}
@@ -651,11 +660,11 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                           gamma: Math.max(0.1, Math.min(9.99, Number(e.target.value) || 1.0)),
                         }))
                       }
-                      className="w-full bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-center font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                      className="w-full bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-center font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-[#777777] block mb-0.5">Highlight</label>
+                    <label className="text-[10px] text-[#8a8a8a] block mb-0.5">Highlight</label>
                     <input
                       type="number"
                       min={Math.min(255, levels.inputMin + 2)}
@@ -670,7 +679,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                           ),
                         }))
                       }
-                      className="w-full bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-center font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                      className="w-full bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-center font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                     />
                   </div>
                 </div>
@@ -678,7 +687,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                 {/* Range Slider for Shadows & Highlights */}
                 <div className="mt-2 space-y-1.5">
                   <div className="flex items-center space-x-2">
-                    <span className="text-[10px] text-[#777777] w-12">Shadow:</span>
+                    <span className="text-[10px] text-[#8a8a8a] w-12">Shadow</span>
                     <input
                       type="range"
                       min={0}
@@ -687,11 +696,11 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                       onChange={(e) =>
                         setLevels((prev) => ({ ...prev, inputMin: Number(e.target.value) }))
                       }
-                      className="flex-1 h-1.5 bg-[#1e1e1e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      className="flex-1"
                     />
                   </div>
                   <div className="flex items-center space-x-2">
-                    <span className="text-[10px] text-[#777777] w-12">Highlight:</span>
+                    <span className="text-[10px] text-[#8a8a8a] w-12">Highlight</span>
                     <input
                       type="range"
                       min={Math.min(255, levels.inputMin + 2)}
@@ -700,20 +709,20 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                       onChange={(e) =>
                         setLevels((prev) => ({ ...prev, inputMax: Number(e.target.value) }))
                       }
-                      className="flex-1 h-1.5 bg-[#1e1e1e] rounded appearance-none cursor-pointer accent-[#5ce1e6]"
+                      className="flex-1"
                     />
                   </div>
                 </div>
               </div>
 
               {/* Output Levels */}
-              <div className="pt-2 border-t border-[#333333]">
-                <div className="flex items-center justify-between text-[11px] text-[#a0a0a0] mb-1">
-                  <span>Output Levels:</span>
+              <div className="pt-2 border-t border-[#2c2c2c]">
+                <div className="flex items-center justify-between text-[11px] text-[#8a8a8a] mb-1">
+                  <span>Output Levels</span>
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="text-[10px] text-[#777777] block mb-0.5">Min (Black)</label>
+                    <label className="text-[10px] text-[#8a8a8a] block mb-0.5">Min (Black)</label>
                     <input
                       type="number"
                       min={0}
@@ -725,11 +734,11 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                           outputMin: Math.max(0, Math.min(prev.outputMax, Number(e.target.value) || 0)),
                         }))
                       }
-                      className="w-full bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-center font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                      className="w-full bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-center font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                     />
                   </div>
                   <div>
-                    <label className="text-[10px] text-[#777777] block mb-0.5">Max (White)</label>
+                    <label className="text-[10px] text-[#8a8a8a] block mb-0.5">Max (White)</label>
                     <input
                       type="number"
                       min={levels.outputMin}
@@ -741,7 +750,7 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
                           outputMax: Math.max(prev.outputMin, Math.min(255, Number(e.target.value) || 255)),
                         }))
                       }
-                      className="w-full bg-[#1e1e1e] border border-[#3e3e3e] rounded px-1.5 py-0.5 text-center font-mono text-xs text-white focus:outline-none focus:border-[#007acc]"
+                      className="w-full bg-[#161616] border border-[#2c2c2c] rounded px-1.5 py-0.5 text-center font-mono text-xs text-[#e5e5e5] focus:border-[var(--accent-border)]"
                     />
                   </div>
                 </div>
@@ -751,9 +760,9 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
         </div>
 
         {/* Modal Footer Controls */}
-        <div className="px-3.5 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-between rounded-b-lg">
+        <div className="px-4 py-2.5 bg-[#161616] border-t border-[#2c2c2c] flex items-center justify-between">
           <div className="flex items-center space-x-3">
-            <label className="flex items-center space-x-1.5 cursor-pointer text-[#cccccc] hover:text-[#e5e5e5]">
+            <label className="flex items-center space-x-1.5 cursor-pointer text-[#b5b5b5] hover:text-[#e5e5e5]">
               <input
                 type="checkbox"
                 checked={preview}
@@ -771,18 +780,18 @@ export const TonalCorrectionModal: React.FC<TonalCorrectionModalProps> = ({
             </button>
           </div>
 
-          <div className="flex items-center space-x-2">
+          <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={onClose}
-              className="px-3 py-1 bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] rounded text-xs transition-colors cursor-pointer"
+              className="px-3.5 py-1.5 bg-[#2a2a2a] hover:bg-[#363636] text-[#e5e5e5] rounded text-xs font-medium transition-colors cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="button"
               onClick={() => onApply(type, currentParams)}
-              className="px-3.5 py-1 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
+              className="px-4 py-1.5 bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 rounded text-xs font-medium transition-opacity cursor-pointer"
             >
               OK
             </button>

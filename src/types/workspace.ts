@@ -27,6 +27,8 @@ export interface DockGroup {
   panelIds: DockPanelId[];
   activePanelId: DockPanelId;
   heightRatio: number;
+  /** When true, the docked group collapses to its header bar */
+  collapsed?: boolean;
 }
 
 export interface DockColumn {
@@ -36,9 +38,30 @@ export interface DockColumn {
   groups: DockGroup[];
 }
 
+export interface FloatingPanelLastDock {
+  side: DockSide;
+  colId?: string;
+  groupId?: string;
+}
+
+export interface FloatingPanelState {
+  id: string;
+  panelIds: DockPanelId[];
+  activePanelId: DockPanelId;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** When true, hides the panel body leaving only the floating title bar (CSP shade mode) */
+  collapsed: boolean;
+  zIndex: number;
+  lastDock?: FloatingPanelLastDock;
+}
+
 export interface WorkspaceLayout {
   leftDocks: DockColumn[];
   rightDocks: DockColumn[];
+  floatingPanels?: FloatingPanelState[];
 }
 
 export type CommandActionId =
@@ -96,6 +119,9 @@ export interface DockPanelMeta {
   defaultWidth: number;
   minWidth: number;
   maxWidth: number;
+  defaultFloatWidth: number;
+  defaultFloatHeight: number;
+  minFloatHeight: number;
 }
 
 export const ALL_DOCK_PANEL_IDS: DockPanelId[] = [
@@ -122,6 +148,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 46,
     minWidth: 44,
     maxWidth: 96,
+    defaultFloatWidth: 108,
+    defaultFloatHeight: 380,
+    minFloatHeight: 160,
   },
   subtool: {
     id: 'subtool',
@@ -131,6 +160,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 196,
     minWidth: 140,
     maxWidth: 340,
+    defaultFloatWidth: 240,
+    defaultFloatHeight: 340,
+    minFloatHeight: 160,
   },
   'tool-property': {
     id: 'tool-property',
@@ -140,6 +172,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 196,
     minWidth: 148,
     maxWidth: 340,
+    defaultFloatWidth: 256,
+    defaultFloatHeight: 380,
+    minFloatHeight: 160,
   },
   'brush-size': {
     id: 'brush-size',
@@ -149,6 +184,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 196,
     minWidth: 148,
     maxWidth: 340,
+    defaultFloatWidth: 236,
+    defaultFloatHeight: 280,
+    minFloatHeight: 150,
   },
   navigator: {
     id: 'navigator',
@@ -158,6 +196,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 176,
     maxWidth: 380,
+    defaultFloatWidth: 268,
+    defaultFloatHeight: 250,
+    minFloatHeight: 170,
   },
   'sub-view': {
     id: 'sub-view',
@@ -167,6 +208,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 176,
     maxWidth: 400,
+    defaultFloatWidth: 320,
+    defaultFloatHeight: 340,
+    minFloatHeight: 180,
   },
   info: {
     id: 'info',
@@ -176,6 +220,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 176,
     maxWidth: 380,
+    defaultFloatWidth: 248,
+    defaultFloatHeight: 220,
+    minFloatHeight: 140,
   },
   color: {
     id: 'color',
@@ -185,6 +232,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 168,
     maxWidth: 360,
+    defaultFloatWidth: 264,
+    defaultFloatHeight: 320,
+    minFloatHeight: 200,
   },
   layers: {
     id: 'layers',
@@ -194,6 +244,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 176,
     maxWidth: 380,
+    defaultFloatWidth: 272,
+    defaultFloatHeight: 420,
+    minFloatHeight: 200,
   },
   history: {
     id: 'history',
@@ -203,6 +256,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 160,
     maxWidth: 340,
+    defaultFloatWidth: 248,
+    defaultFloatHeight: 320,
+    minFloatHeight: 160,
   },
   'quick-access': {
     id: 'quick-access',
@@ -212,6 +268,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 184,
     minWidth: 136,
     maxWidth: 320,
+    defaultFloatWidth: 228,
+    defaultFloatHeight: 300,
+    minFloatHeight: 150,
   },
   'auto-actions': {
     id: 'auto-actions',
@@ -221,6 +280,9 @@ export const DOCK_PANEL_META: Record<DockPanelId, DockPanelMeta> = {
     defaultWidth: 224,
     minWidth: 176,
     maxWidth: 360,
+    defaultFloatWidth: 256,
+    defaultFloatHeight: 310,
+    minFloatHeight: 160,
   },
 };
 

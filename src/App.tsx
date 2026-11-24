@@ -1487,6 +1487,7 @@ export function App() {
         handleTonalCancel={tonalActions.handleTonalCancel}
         handleTonalApply={tonalActions.handleTonalApply}
         handleTonalPreviewChange={tonalActions.handleTonalPreviewChange}
+        handleApplyFilter={handleRecordedApplyFilter}
         handleApplyAdjustment={tonalActions.handleApplyAdjustment}
         handleApplyLayerStyles={tonalActions.handleApplyLayerStyles}
         handleConfirmTone={tonalActions.handleConfirmTone}

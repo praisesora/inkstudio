@@ -728,6 +728,7 @@ export interface TransformSession {
   active: boolean;
   layerId: string;
   sourceCanvas: HTMLCanvasElement;
+  sourcePixels?: { data: Uint8ClampedArray; width: number; height: number };
   beforeImageData?: ImageData;
   beforeTileSnapshot?: Map<string, TileSnapshotEntry>;
   bounds: { x: number; y: number; width: number; height: number };
@@ -746,6 +747,7 @@ export interface TransformSession {
   meshPoints?: Point2D[][];
   layerIds?: string[];
   layerSourceCanvases?: Map<string, HTMLCanvasElement>;
+  layerSourcePixels?: Map<string, { data: Uint8ClampedArray; width: number; height: number }>;
   layerBeforeImages?: Map<string, ImageData>;
   layerBeforeSnapshots?: Map<string, Map<string, TileSnapshotEntry>>;
 }

@@ -1,4 +1,22 @@
-import { LayerItem, Point2D, isFolderLikeLayer } from '../types/editor';
+import { DirtyRect, LayerItem, Point2D, isFolderLikeLayer } from '../types/editor';
+import {
+  PixelBuffer,
+  isExactQuadTranslation,
+  lanczos3Weight,
+  renderLosslessAffineChunk,
+} from './transformResampler';
+
+export {
+  type PixelBuffer,
+  type AffineTransformParams,
+  type LosslessAffineSpec,
+  lanczos3Weight,
+  resolveLosslessAffineSpec,
+  renderLosslessAffineChunk,
+  resampleAffineChunkCpu,
+  extractCanvasPixelBuffer,
+  processAffineTransformChunks,
+} from './transformResampler';
 
 /**
  * Computes the 3x3 projective transformation (homography) parameters
@@ -291,16 +309,19 @@ const MESH_FRAGMENT_SHADER_ES1 = `
     );
   }
 
-  vec4 fetchRow(vec2 base, float dy, vec4 wx, vec2 invSize, vec2 maxIdx) {
-    float y = (clamp(base.y + dy, 0.0, maxIdx.y) + 0.5) * invSize.y;
-    float x0 = (clamp(base.x - 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
-    float x1 = (clamp(base.x,       0.0, maxIdx.x) + 0.5) * invSize.x;
-    float x2 = (clamp(base.x + 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
-    float x3 = (clamp(base.x + 2.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
-    return texture2D(u_tex, vec2(x0, y)) * wx.x
-         + texture2D(u_tex, vec2(x1, y)) * wx.y
-         + texture2D(u_tex, vec2(x2, y)) * wx.z
-         + texture2D(u_tex, vec2(x3, y)) * wx.w;
+  vec4 fetchTexel(float x, float y, vec2 invSize) {
+    if (x < 0.0 || x >= u_texSize.x || y < 0.0 || y >= u_texSize.y) {
+      return vec4(0.0);
+    }
+    return texture2D(u_tex, vec2((x + 0.5) * invSize.x, (y + 0.5) * invSize.y));
+  }
+
+  vec4 fetchRow(vec2 base, float dy, vec4 wx, vec2 invSize) {
+    float y = base.y + dy;
+    return fetchTexel(base.x - 1.0, y, invSize) * wx.x
+         + fetchTexel(base.x,       y, invSize) * wx.y
+         + fetchTexel(base.x + 1.0, y, invSize) * wx.z
+         + fetchTexel(base.x + 2.0, y, invSize) * wx.w;
   }
 
   void main() {
@@ -310,12 +331,19 @@ const MESH_FRAGMENT_SHADER_ES1 = `
     vec4 wx = cubicWeights(f.x);
     vec4 wy = cubicWeights(f.y);
     vec2 invSize = 1.0 / u_texSize;
-    vec2 maxIdx = u_texSize - 1.0;
 
-    vec4 c = fetchRow(base, -1.0, wx, invSize, maxIdx) * wy.x
-           + fetchRow(base,  0.0, wx, invSize, maxIdx) * wy.y
-           + fetchRow(base,  1.0, wx, invSize, maxIdx) * wy.z
-           + fetchRow(base,  2.0, wx, invSize, maxIdx) * wy.w;
+    vec4 c = fetchRow(base, -1.0, wx, invSize) * wy.x
+           + fetchRow(base,  0.0, wx, invSize) * wy.y
+           + fetchRow(base,  1.0, wx, invSize) * wy.z
+           + fetchRow(base,  2.0, wx, invSize) * wy.w;
+
+    vec4 n00 = fetchTexel(base.x,       base.y,       invSize);
+    vec4 n10 = fetchTexel(base.x + 1.0, base.y,       invSize);
+    vec4 n01 = fetchTexel(base.x,       base.y + 1.0, invSize);
+    vec4 n11 = fetchTexel(base.x + 1.0, base.y + 1.0, invSize);
+    vec4 lo = min(min(n00, n10), min(n01, n11));
+    vec4 hi = max(max(n00, n10), max(n01, n11));
+    c = clamp(c, lo, hi);
 
     float a = clamp(c.a, 0.0, 1.0);
     vec3 rgb = clamp(c.rgb, vec3(0.0), vec3(a));
@@ -328,10 +356,11 @@ const MESH_VERTEX_SHADER_ES3 = `#version 300 es
   in vec2 a_uv;
   uniform vec2 u_origin;
   uniform vec2 u_size;
+  uniform float u_flipY;
   out vec2 v_uv;
   void main() {
     vec2 norm = (a_pos - u_origin) / u_size;
-    gl_Position = vec4(norm.x * 2.0 - 1.0, 1.0 - norm.y * 2.0, 0.0, 1.0);
+    gl_Position = vec4(norm.x * 2.0 - 1.0, (norm.y * 2.0 - 1.0) * u_flipY, 0.0, 1.0);
     v_uv = a_uv;
   }
 `;
@@ -340,66 +369,136 @@ const MESH_FRAGMENT_SHADER_ES3 = `#version 300 es
   precision highp float;
   uniform sampler2D u_tex;
   uniform vec2 u_texSize;
+  uniform int u_outputStraight;
   in vec2 v_uv;
   out vec4 outColor;
 
-  vec4 cubicWeights(float f) {
-    float f2 = f * f;
-    float f3 = f2 * f;
-    return vec4(
-      -0.5 * f + f2 - 0.5 * f3,
-      1.0 - 2.5 * f2 + 1.5 * f3,
-      0.5 * f + 2.0 * f2 - 1.5 * f3,
-      -0.5 * f2 + 0.5 * f3
-    );
+  const float PI = 3.14159265358979323846;
+
+  float lanczos3(float x) {
+    float ax = abs(x);
+    if (ax < 1e-5) return 1.0;
+    if (ax >= 3.0) return 0.0;
+    float pix = PI * ax;
+    return (3.0 * sin(pix) * sin(pix * (1.0 / 3.0))) / (pix * pix);
   }
 
-  vec4 fetchRow(vec2 base, float dy, vec4 wx, vec2 invSize, vec2 maxIdx) {
-    float y = (clamp(base.y + dy, 0.0, maxIdx.y) + 0.5) * invSize.y;
-    float x0 = (clamp(base.x - 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
-    float x1 = (clamp(base.x,       0.0, maxIdx.x) + 0.5) * invSize.x;
-    float x2 = (clamp(base.x + 1.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
-    float x3 = (clamp(base.x + 2.0, 0.0, maxIdx.x) + 0.5) * invSize.x;
-    return texture(u_tex, vec2(x0, y)) * wx.x
-         + texture(u_tex, vec2(x1, y)) * wx.y
-         + texture(u_tex, vec2(x2, y)) * wx.z
-         + texture(u_tex, vec2(x3, y)) * wx.w;
+  vec4 fetchPremul(int ix, int iy, ivec2 texSizeI) {
+    if (ix < 0 || ix >= texSizeI.x || iy < 0 || iy >= texSizeI.y) {
+      return vec4(0.0);
+    }
+    vec4 s = texelFetch(u_tex, ivec2(ix, iy), 0);
+    return vec4(s.rgb * s.a, s.a);
   }
 
-  vec4 sampleBicubic(vec2 uv, vec2 invSize, vec2 maxIdx) {
+  vec4 sampleBilinearPremul(vec2 texPos, ivec2 texSizeI) {
+    vec2 base = floor(texPos);
+    vec2 f = texPos - base;
+    int bx = int(base.x);
+    int by = int(base.y);
+    vec4 c00 = fetchPremul(bx,     by,     texSizeI);
+    vec4 c10 = fetchPremul(bx + 1, by,     texSizeI);
+    vec4 c01 = fetchPremul(bx,     by + 1, texSizeI);
+    vec4 c11 = fetchPremul(bx + 1, by + 1, texSizeI);
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+  }
+
+  vec4 sampleLanczos3AR(vec2 uv, ivec2 texSizeI, bool antiRing) {
     vec2 texPos = uv * u_texSize - 0.5;
     vec2 base = floor(texPos);
     vec2 f = texPos - base;
-    vec4 wx = cubicWeights(f.x);
-    vec4 wy = cubicWeights(f.y);
+    int bx = int(base.x);
+    int by = int(base.y);
 
-    vec4 c = fetchRow(base, -1.0, wx, invSize, maxIdx) * wy.x
-           + fetchRow(base,  0.0, wx, invSize, maxIdx) * wy.y
-           + fetchRow(base,  1.0, wx, invSize, maxIdx) * wy.z
-           + fetchRow(base,  2.0, wx, invSize, maxIdx) * wy.w;
+    float wx[6];
+    float wy[6];
+    float sumWx = 0.0;
+    float sumWy = 0.0;
+    for (int i = 0; i < 6; i++) {
+      float offset = float(i - 2);
+      float w1 = lanczos3(offset - f.x);
+      float w2 = lanczos3(offset - f.y);
+      wx[i] = w1;
+      wy[i] = w2;
+      sumWx += w1;
+      sumWy += w2;
+    }
+    float invSumWx = abs(sumWx) > 1e-6 ? 1.0 / sumWx : 1.0;
+    float invSumWy = abs(sumWy) > 1e-6 ? 1.0 / sumWy : 1.0;
+
+    vec4 c = vec4(0.0);
+    for (int j = 0; j < 6; j++) {
+      int iy = by + j - 2;
+      vec4 rowAcc = vec4(0.0);
+      for (int i = 0; i < 6; i++) {
+        rowAcc += fetchPremul(bx + i - 2, iy, texSizeI) * (wx[i] * invSumWx);
+      }
+      c += rowAcc * (wy[j] * invSumWy);
+    }
+
+    if (antiRing) {
+      vec4 n00 = fetchPremul(bx,     by,     texSizeI);
+      vec4 n10 = fetchPremul(bx + 1, by,     texSizeI);
+      vec4 n01 = fetchPremul(bx,     by + 1, texSizeI);
+      vec4 n11 = fetchPremul(bx + 1, by + 1, texSizeI);
+      vec4 lo = min(min(n00, n10), min(n01, n11));
+      vec4 hi = max(max(n00, n10), max(n01, n11));
+      c = clamp(c, lo, hi);
+    }
 
     float a = clamp(c.a, 0.0, 1.0);
     return vec4(clamp(c.rgb, vec3(0.0), vec3(a)), a);
   }
 
   void main() {
-    vec2 invSize = 1.0 / u_texSize;
-    vec2 maxIdx = u_texSize - 1.0;
+    ivec2 texSizeI = ivec2(u_texSize + 0.5);
     vec2 du = dFdx(v_uv);
     vec2 dv = dFdy(v_uv);
-    float footprint = max(length(du * u_texSize), length(dv * u_texSize));
+    float footprintX = length(du * u_texSize);
+    float footprintY = length(dv * u_texSize);
+    float footprint = max(footprintX, footprintY);
 
-    if (footprint <= 1.35) {
-      outColor = sampleBicubic(v_uv, invSize, maxIdx);
-    } else {
+    vec4 premul;
+    if (footprint <= 1.25) {
+      premul = sampleLanczos3AR(v_uv, texSizeI, true);
+    } else if (footprint <= 2.25) {
       vec4 acc =
-        sampleBicubic(v_uv + du * -0.375 + dv * -0.125, invSize, maxIdx) +
-        sampleBicubic(v_uv + du *  0.125 + dv * -0.375, invSize, maxIdx) +
-        sampleBicubic(v_uv + du *  0.375 + dv *  0.125, invSize, maxIdx) +
-        sampleBicubic(v_uv + du * -0.125 + dv *  0.375, invSize, maxIdx);
+        sampleLanczos3AR(v_uv + du * -0.375 + dv * -0.125, texSizeI, false) +
+        sampleLanczos3AR(v_uv + du *  0.125 + dv * -0.375, texSizeI, false) +
+        sampleLanczos3AR(v_uv + du *  0.375 + dv *  0.125, texSizeI, false) +
+        sampleLanczos3AR(v_uv + du * -0.125 + dv *  0.375, texSizeI, false);
       vec4 res = acc * 0.25;
       float a = clamp(res.a, 0.0, 1.0);
-      outColor = vec4(clamp(res.rgb, vec3(0.0), vec3(a)), a);
+      premul = vec4(clamp(res.rgb, vec3(0.0), vec3(a)), a);
+    } else {
+      // Adaptive Jacobian-scaled anisotropic supersampling for heavy downscaling (>2.25x)
+      int nx = clamp(int(ceil(footprintX)), 2, 6);
+      int ny = clamp(int(ceil(footprintY)), 2, 6);
+      float invNx = 1.0 / float(nx);
+      float invNy = 1.0 / float(ny);
+      vec4 acc = vec4(0.0);
+      for (int sy = 0; sy < 6; sy++) {
+        if (sy >= ny) break;
+        float fy = (float(sy) + 0.5) * invNy - 0.5;
+        for (int sx = 0; sx < 6; sx++) {
+          if (sx >= nx) break;
+          float fx = (float(sx) + 0.5) * invNx - 0.5;
+          vec2 sampleUv = v_uv + du * fx + dv * fy;
+          acc += sampleBilinearPremul(sampleUv * u_texSize - 0.5, texSizeI);
+        }
+      }
+      vec4 res = acc * (invNx * invNy);
+      float a = clamp(res.a, 0.0, 1.0);
+      premul = vec4(clamp(res.rgb, vec3(0.0), vec3(a)), a);
+    }
+
+    if (u_outputStraight == 1) {
+      if (premul.a <= 1e-4) {
+        discard;
+      }
+      outColor = vec4(clamp(premul.rgb / premul.a, 0.0, 1.0), premul.a);
+    } else {
+      outColor = premul;
     }
   }
 `;
@@ -408,15 +507,22 @@ class WebGlMeshWarpRenderer {
   private static instance: WebGlMeshWarpRenderer | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private gl: WebGLRenderingContext | null = null;
+  private isWebGl2 = false;
   private program: WebGLProgram | null = null;
   private vertexBuffer: WebGLBuffer | null = null;
   private texture: WebGLTexture | null = null;
+  private fbo: WebGLFramebuffer | null = null;
+  private fboTexture: WebGLTexture | null = null;
+  private fboW = 0;
+  private fboH = 0;
   private posLoc = -1;
   private uvLoc = -1;
   private originLoc: WebGLUniformLocation | null = null;
   private sizeLoc: WebGLUniformLocation | null = null;
   private texSizeLoc: WebGLUniformLocation | null = null;
   private texLoc: WebGLUniformLocation | null = null;
+  private flipYLoc: WebGLUniformLocation | null = null;
+  private outputStraightLoc: WebGLUniformLocation | null = null;
   private maxDim = 0;
   private vertexData = new Float32Array(0);
   private ready = false;
@@ -489,9 +595,8 @@ class WebGlMeshWarpRenderer {
       const gl = (gl2 || canvas.getContext('webgl', attrs)) as WebGLRenderingContext | null;
       if (!gl) return;
 
-      const program =
-        (gl2 ? this.compileProgram(gl, MESH_VERTEX_SHADER_ES3, MESH_FRAGMENT_SHADER_ES3) : null) ||
-        this.compileProgram(gl, MESH_VERTEX_SHADER_ES1, MESH_FRAGMENT_SHADER_ES1);
+      const es3Prog = gl2 ? this.compileProgram(gl, MESH_VERTEX_SHADER_ES3, MESH_FRAGMENT_SHADER_ES3) : null;
+      const program = es3Prog || this.compileProgram(gl, MESH_VERTEX_SHADER_ES1, MESH_FRAGMENT_SHADER_ES1);
       if (!program) return;
 
       const vertexBuffer = gl.createBuffer();
@@ -511,20 +616,89 @@ class WebGlMeshWarpRenderer {
 
       this.canvas = canvas;
       this.gl = gl;
+      this.isWebGl2 = Boolean(es3Prog && gl2);
       this.program = program;
       this.vertexBuffer = vertexBuffer;
       this.texture = texture;
+      if (this.isWebGl2) {
+        this.fbo = gl.createFramebuffer();
+        this.fboTexture = gl.createTexture();
+      }
       this.posLoc = posLoc;
       this.uvLoc = uvLoc;
       this.originLoc = gl.getUniformLocation(program, 'u_origin');
       this.sizeLoc = gl.getUniformLocation(program, 'u_size');
       this.texSizeLoc = gl.getUniformLocation(program, 'u_texSize');
       this.texLoc = gl.getUniformLocation(program, 'u_tex');
+      this.flipYLoc = gl.getUniformLocation(program, 'u_flipY');
+      this.outputStraightLoc = gl.getUniformLocation(program, 'u_outputStraight');
       this.maxDim = Math.min(maxTex || 4096, maxVpDim || 4096);
       this.ready = true;
     } catch {
       this.ready = false;
     }
+  }
+
+  private fillGridVertices(grid: Point2D[][], totalRows: number, totalCols: number): number {
+    const vertexCount = totalRows * totalCols * 6;
+    const neededFloats = vertexCount * 4;
+    if (this.vertexData.length < neededFloats) {
+      this.vertexData = new Float32Array(neededFloats);
+    }
+
+    const buf = this.vertexData;
+    let offset = 0;
+    for (let j = 0; j < totalRows; j++) {
+      const v0 = j / totalRows;
+      const v1 = (j + 1) / totalRows;
+      const row0 = grid[j];
+      const row1 = grid[j + 1];
+      for (let i = 0; i < totalCols; i++) {
+        const u0 = i / totalCols;
+        const u1 = (i + 1) / totalCols;
+        const p00 = row0[i];
+        const p10 = row0[i + 1];
+        const p11 = row1[i + 1];
+        const p01 = row1[i];
+
+        // Triangle 1: (0,0) - (1,0) - (0,1)
+        buf[offset++] = p00.x; buf[offset++] = p00.y; buf[offset++] = u0; buf[offset++] = v0;
+        buf[offset++] = p10.x; buf[offset++] = p10.y; buf[offset++] = u1; buf[offset++] = v0;
+        buf[offset++] = p01.x; buf[offset++] = p01.y; buf[offset++] = u0; buf[offset++] = v1;
+
+        // Triangle 2: (1,0) - (1,1) - (0,1)
+        buf[offset++] = p10.x; buf[offset++] = p10.y; buf[offset++] = u1; buf[offset++] = v0;
+        buf[offset++] = p11.x; buf[offset++] = p11.y; buf[offset++] = u1; buf[offset++] = v1;
+        buf[offset++] = p01.x; buf[offset++] = p01.y; buf[offset++] = u0; buf[offset++] = v1;
+      }
+    }
+    return vertexCount;
+  }
+
+  private ensureFbo(gl: WebGL2RenderingContext, w: number, h: number): boolean {
+    if (!this.fbo || !this.fboTexture) return false;
+    if (this.fboW === w && this.fboH === h) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+      return true;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.fboTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.fboTexture, 0);
+    if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      this.fboW = 0;
+      this.fboH = 0;
+      return false;
+    }
+    this.fboW = w;
+    this.fboH = h;
+    return true;
   }
 
   renderGrid(
@@ -588,49 +762,21 @@ class WebGlMeshWarpRenderer {
     if (outW <= 0 || outH <= 0) return true;
     if (outW > this.maxDim || outH > this.maxDim) return false;
 
-    const vertexCount = totalRows * totalCols * 6;
+    const vertexCount = this.fillGridVertices(grid, totalRows, totalCols);
     const neededFloats = vertexCount * 4;
-    if (this.vertexData.length < neededFloats) {
-      this.vertexData = new Float32Array(neededFloats);
-    }
-
-    const buf = this.vertexData;
-    let offset = 0;
-    for (let j = 0; j < totalRows; j++) {
-      const v0 = j / totalRows;
-      const v1 = (j + 1) / totalRows;
-      const row0 = grid[j];
-      const row1 = grid[j + 1];
-      for (let i = 0; i < totalCols; i++) {
-        const u0 = i / totalCols;
-        const u1 = (i + 1) / totalCols;
-        const p00 = row0[i];
-        const p10 = row0[i + 1];
-        const p11 = row1[i + 1];
-        const p01 = row1[i];
-
-        // Triangle 1: (0,0) - (1,0) - (0,1)
-        buf[offset++] = p00.x; buf[offset++] = p00.y; buf[offset++] = u0; buf[offset++] = v0;
-        buf[offset++] = p10.x; buf[offset++] = p10.y; buf[offset++] = u1; buf[offset++] = v0;
-        buf[offset++] = p01.x; buf[offset++] = p01.y; buf[offset++] = u0; buf[offset++] = v1;
-
-        // Triangle 2: (1,0) - (1,1) - (0,1)
-        buf[offset++] = p10.x; buf[offset++] = p10.y; buf[offset++] = u1; buf[offset++] = v0;
-        buf[offset++] = p11.x; buf[offset++] = p11.y; buf[offset++] = u1; buf[offset++] = v1;
-        buf[offset++] = p01.x; buf[offset++] = p01.y; buf[offset++] = u0; buf[offset++] = v1;
-      }
-    }
 
     if (this.canvas.width !== outW) this.canvas.width = outW;
     if (this.canvas.height !== outH) this.canvas.height = outH;
 
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, outW, outH);
     gl.useProgram(this.program);
 
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+    // WebGL2 ES3 shader performs exact float premultiplication; ES1 expects premultiplied upload
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, !this.isWebGl2);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, sourceCanvas);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
@@ -641,9 +787,11 @@ class WebGlMeshWarpRenderer {
     gl.uniform2f(this.originLoc, originX, originY);
     gl.uniform2f(this.sizeLoc, outW, outH);
     gl.uniform2f(this.texSizeLoc, sw, sh);
+    if (this.flipYLoc) gl.uniform1f(this.flipYLoc, -1.0);
+    if (this.outputStraightLoc) gl.uniform1i(this.outputStraightLoc, 0);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
-    gl.bufferData(gl.ARRAY_BUFFER, buf.subarray(0, neededFloats), gl.STREAM_DRAW);
+    gl.bufferData(gl.ARRAY_BUFFER, this.vertexData.subarray(0, neededFloats), gl.STREAM_DRAW);
     gl.enableVertexAttribArray(this.posLoc);
     gl.vertexAttribPointer(this.posLoc, 2, gl.FLOAT, false, 16, 0);
     gl.enableVertexAttribArray(this.uvLoc);
@@ -658,6 +806,122 @@ class WebGlMeshWarpRenderer {
 
     ctx.drawImage(this.canvas, originX, originY);
     return true;
+  }
+
+  /**
+   * Renders a deformed mesh/perspective grid directly from straight-alpha pixels into straight-alpha
+   * RGBA chunks via WebGL2 FBO + readPixels (zero Canvas 2D round-trip, single texture upload).
+   */
+  renderGridToChunks(
+    source: PixelBuffer,
+    grid: Point2D[][],
+    totalRows: number,
+    totalCols: number,
+    destRect: DirtyRect,
+    chunkSize: number,
+    onChunk: (chunkData: Uint8ClampedArray, cx: number, cy: number, cw: number, ch: number) => void
+  ): boolean {
+    if (
+      !this.ready ||
+      !this.isWebGl2 ||
+      !this.gl ||
+      !this.program ||
+      !this.vertexBuffer ||
+      !this.texture ||
+      !this.fbo ||
+      !this.fboTexture
+    ) {
+      return false;
+    }
+    const gl = this.gl as WebGL2RenderingContext;
+    if (gl.isContextLost()) {
+      this.ready = false;
+      return false;
+    }
+
+    const sw = source.width;
+    const sh = source.height;
+    if (sw <= 0 || sh <= 0 || sw > this.maxDim || sh > this.maxDim || chunkSize > this.maxDim) {
+      return false;
+    }
+
+    for (let j = 0; j <= totalRows; j++) {
+      const row = grid[j];
+      for (let i = 0; i <= totalCols; i++) {
+        if (!Number.isFinite(row[i].x) || !Number.isFinite(row[i].y)) return false;
+      }
+    }
+
+    const vertexCount = this.fillGridVertices(grid, totalRows, totalCols);
+    const neededFloats = vertexCount * 4;
+    const srcBytes =
+      source.data instanceof Uint8Array
+        ? source.data
+        : new Uint8Array(source.data.buffer, source.data.byteOffset, source.data.byteLength);
+
+    // Upload source texture ONCE across all chunks (straight alpha, float premul in shader)
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.texture);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, sw, sh, 0, gl.RGBA, gl.UNSIGNED_BYTE, srcBytes);
+
+    gl.useProgram(this.program);
+    gl.uniform1i(this.texLoc, 0);
+    gl.uniform2f(this.texSizeLoc, sw, sh);
+    if (this.flipYLoc) gl.uniform1f(this.flipYLoc, 1.0);
+    if (this.outputStraightLoc) gl.uniform1i(this.outputStraightLoc, 1);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vertexBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, this.vertexData.subarray(0, neededFloats), gl.STREAM_DRAW);
+    gl.enableVertexAttribArray(this.posLoc);
+    gl.vertexAttribPointer(this.posLoc, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(this.uvLoc);
+    gl.vertexAttribPointer(this.uvLoc, 2, gl.FLOAT, false, 16, 8);
+
+    gl.disable(gl.CULL_FACE);
+    gl.disable(gl.BLEND);
+
+    const x1 = destRect.x + destRect.width;
+    const y1 = destRect.y + destRect.height;
+
+    try {
+      for (let cy = destRect.y; cy < y1; cy += chunkSize) {
+        const ch = Math.min(chunkSize, y1 - cy);
+        for (let cx = destRect.x; cx < x1; cx += chunkSize) {
+          const cw = Math.min(chunkSize, x1 - cx);
+          if (!this.ensureFbo(gl, cw, ch)) return false;
+
+          gl.viewport(0, 0, cw, ch);
+          gl.uniform2f(this.originLoc, cx, cy);
+          gl.uniform2f(this.sizeLoc, cw, ch);
+          gl.activeTexture(gl.TEXTURE0);
+          gl.bindTexture(gl.TEXTURE_2D, this.texture);
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+          gl.drawArrays(gl.TRIANGLES, 0, vertexCount);
+
+          const rawBytes = new Uint8Array(cw * ch * 4);
+          gl.readPixels(0, 0, cw, ch, gl.RGBA, gl.UNSIGNED_BYTE, rawBytes);
+          const clamped = new Uint8ClampedArray(
+            rawBytes.buffer,
+            rawBytes.byteOffset,
+            rawBytes.byteLength
+          );
+          onChunk(clamped, cx, cy, cw, ch);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    } finally {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    }
   }
 }
 
@@ -762,6 +1026,348 @@ export function renderMeshWarp(
   }
 
   renderDeformedGrid(ctx, sourceCanvas, grid, totalRows, totalCols);
+}
+
+/**
+ * Checks if a Catmull-Rom mesh lattice is an exact unmodified integer translation of (sw x sh).
+ */
+function isExactMeshTranslation(
+  meshPoints: Point2D[][],
+  sw: number,
+  sh: number
+): { x: number; y: number } | null {
+  const rows = meshPoints.length;
+  const cols = meshPoints[0]?.length || 0;
+  if (rows < 2 || cols < 2) return null;
+  const originX = Math.round(meshPoints[0][0].x);
+  const originY = Math.round(meshPoints[0][0].y);
+  for (let r = 0; r < rows; r++) {
+    const v = r / (rows - 1);
+    const expectedY = originY + v * sh;
+    for (let c = 0; c < cols; c++) {
+      const u = c / (cols - 1);
+      const expectedX = originX + u * sw;
+      const p = meshPoints[r][c];
+      if (Math.abs(p.x - expectedX) > 1e-4 || Math.abs(p.y - expectedY) > 1e-4) {
+        return null;
+      }
+    }
+  }
+  return { x: originX, y: originY };
+}
+
+/**
+ * High-precision CPU inverse-homography perspective chunk resampler using
+ * float-premultiplied Anti-Ringing Lanczos-3 and footprint-scaled downsampling.
+ */
+function resamplePerspectiveChunkCpu(
+  source: PixelBuffer,
+  quad: [Point2D, Point2D, Point2D, Point2D],
+  chunkX: number,
+  chunkY: number,
+  chunkW: number,
+  chunkH: number
+): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(chunkW * chunkH * 4);
+  const sw = source.width;
+  const sh = source.height;
+  if (sw <= 0 || sh <= 0) return out;
+
+  const H = solveUnitSquareToQuad(quad[0], quad[1], quad[2], quad[3]);
+  // Adjugate of 3x3 homography H = [[a,b,c],[d,e,f],[g,h,1]]
+  const ia = H.e - H.f * H.h;
+  const ib = H.c * H.h - H.b;
+  const ic = H.b * H.f - H.c * H.e;
+  const id = H.f * H.g - H.d;
+  const ie = H.a - H.c * H.g;
+  const if_ = H.c * H.d - H.a * H.f;
+  const ig = H.d * H.h - H.e * H.g;
+  const ih = H.b * H.g - H.a * H.h;
+  const ii = H.a * H.e - H.b * H.d;
+
+  const srcData = source.data;
+  const wxBuf = new Float32Array(20);
+  const wyBuf = new Float32Array(20);
+
+  for (let py = 0; py < chunkH; py++) {
+    const docY = chunkY + py + 0.5;
+    let dstOff = py * chunkW * 4;
+    for (let px = 0; px < chunkW; px++, dstOff += 4) {
+      const docX = chunkX + px + 0.5;
+      const denom = ig * docX + ih * docY + ii;
+      if (Math.abs(denom) < 1e-7) continue;
+
+      const invDenom = 1.0 / denom;
+      const numU = ia * docX + ib * docY + ic;
+      const numV = id * docX + ie * docY + if_;
+      const u = numU * invDenom;
+      const v = numV * invDenom;
+      if (u < -0.05 || u > 1.05 || v < -0.05 || v > 1.05) continue;
+
+      const sx = u * sw - 0.5;
+      const sy = v * sh - 0.5;
+
+      // Exact analytical Jacobian of (sx, sy) with respect to (docX, docY)
+      const invD2 = invDenom * invDenom;
+      const dsx_dx = ((ia * denom - numU * ig) * invD2) * sw;
+      const dsx_dy = ((ib * denom - numU * ih) * invD2) * sw;
+      const dsy_dx = ((id * denom - numV * ig) * invD2) * sh;
+      const dsy_dy = ((ie * denom - numV * ih) * invD2) * sh;
+
+      const footX = Math.hypot(dsx_dx, dsx_dy);
+      const footY = Math.hypot(dsy_dx, dsy_dy);
+      const filterScaleX = Math.min(3.0, Math.max(1.0, footX));
+      const filterScaleY = Math.min(3.0, Math.max(1.0, footY));
+      const supportX = 3.0 * filterScaleX;
+      const supportY = 3.0 * filterScaleY;
+
+      if (sx < -supportX || sx > sw - 1 + supportX || sy < -supportY || sy > sh - 1 + supportY) {
+        continue;
+      }
+
+      const invFX = 1.0 / filterScaleX;
+      const invFY = 1.0 / filterScaleY;
+      const xStart = Math.ceil(sx - supportX);
+      const xEnd = Math.floor(sx + supportX);
+      const yStart = Math.ceil(sy - supportY);
+      const yEnd = Math.floor(sy + supportY);
+      const countX = Math.min(20, Math.max(0, xEnd - xStart + 1));
+      const countY = Math.min(20, Math.max(0, yEnd - yStart + 1));
+      if (countX <= 0 || countY <= 0) continue;
+
+      let sumWx = 0;
+      for (let i = 0; i < countX; i++) {
+        const w = lanczos3Weight((xStart + i - sx) * invFX);
+        wxBuf[i] = w;
+        sumWx += w;
+      }
+      if (Math.abs(sumWx) < 1e-6) continue;
+      const invSumWx = 1.0 / sumWx;
+      for (let i = 0; i < countX; i++) wxBuf[i] *= invSumWx;
+
+      let sumWy = 0;
+      for (let j = 0; j < countY; j++) {
+        const w = lanczos3Weight((yStart + j - sy) * invFY);
+        wyBuf[j] = w;
+        sumWy += w;
+      }
+      if (Math.abs(sumWy) < 1e-6) continue;
+      const invSumWy = 1.0 / sumWy;
+      for (let j = 0; j < countY; j++) wyBuf[j] *= invSumWy;
+
+      let accR = 0, accG = 0, accB = 0, accA = 0;
+      for (let j = 0; j < countY; j++) {
+        const iy = yStart + j;
+        if (iy < 0 || iy >= sh) continue;
+        const wy = wyBuf[j];
+        if (wy === 0) continue;
+        const rowBase = iy * sw;
+        let rR = 0, rG = 0, rB = 0, rA = 0;
+        for (let i = 0; i < countX; i++) {
+          const ix = xStart + i;
+          if (ix < 0 || ix >= sw) continue;
+          const off = (rowBase + ix) << 2;
+          const a = srcData[off + 3];
+          if (a === 0) continue;
+          const wa = wxBuf[i] * (a * (1 / 255));
+          rR += srcData[off] * wa;
+          rG += srcData[off + 1] * wa;
+          rB += srcData[off + 2] * wa;
+          rA += wa;
+        }
+        accR += rR * wy;
+        accG += rG * wy;
+        accB += rB * wy;
+        accA += rA * wy;
+      }
+
+      if (filterScaleX <= 1.25 && filterScaleY <= 1.25) {
+        const bx = Math.floor(sx);
+        const by = Math.floor(sy);
+        let loR = Infinity, hiR = -Infinity;
+        let loG = Infinity, hiG = -Infinity;
+        let loB = Infinity, hiB = -Infinity;
+        let loA = Infinity, hiA = -Infinity;
+        for (let ny = by; ny <= by + 1; ny++) {
+          const yOk = ny >= 0 && ny < sh;
+          const rowBase = ny * sw;
+          for (let nx = bx; nx <= bx + 1; nx++) {
+            let nr = 0, ng = 0, nb = 0, na = 0;
+            if (yOk && nx >= 0 && nx < sw) {
+              const o = (rowBase + nx) << 2;
+              na = srcData[o + 3] * (1 / 255);
+              nr = srcData[o] * na;
+              ng = srcData[o + 1] * na;
+              nb = srcData[o + 2] * na;
+            }
+            if (nr < loR) loR = nr; if (nr > hiR) hiR = nr;
+            if (ng < loG) loG = ng; if (ng > hiG) hiG = ng;
+            if (nb < loB) loB = nb; if (nb > hiB) hiB = nb;
+            if (na < loA) loA = na; if (na > hiA) hiA = na;
+          }
+        }
+        if (accR < loR) accR = loR; else if (accR > hiR) accR = hiR;
+        if (accG < loG) accG = loG; else if (accG > hiG) accG = hiG;
+        if (accB < loB) accB = loB; else if (accB > hiB) accB = hiB;
+        if (accA < loA) accA = loA; else if (accA > hiA) accA = hiA;
+      }
+
+      if (accA <= 1e-4) continue;
+      if (accA > 1.0) accA = 1.0;
+      const maxRgb = accA * 255.0;
+      if (accR < 0) accR = 0; else if (accR > maxRgb) accR = maxRgb;
+      if (accG < 0) accG = 0; else if (accG > maxRgb) accG = maxRgb;
+      if (accB < 0) accB = 0; else if (accB > maxRgb) accB = maxRgb;
+      const invA = 1.0 / accA;
+      out[dstOff] = Math.min(255, Math.max(0, Math.round(accR * invA)));
+      out[dstOff + 1] = Math.min(255, Math.max(0, Math.round(accG * invA)));
+      out[dstOff + 2] = Math.min(255, Math.max(0, Math.round(accB * invA)));
+      out[dstOff + 3] = Math.min(255, Math.max(0, Math.round(accA * 255.0)));
+    }
+  }
+
+  return out;
+}
+
+/**
+ * High-precision chunked Perspective Quad commit pipeline (lossless identity -> WebGL2 -> CPU AR-Lanczos3).
+ */
+export function processPerspectiveTransformChunks(
+  source: PixelBuffer,
+  quad: [Point2D, Point2D, Point2D, Point2D],
+  destRect: DirtyRect,
+  chunkSize: number,
+  subdivisions: number,
+  onChunk: (chunkData: Uint8ClampedArray, cx: number, cy: number, cw: number, ch: number) => void
+): boolean {
+  const sw = source.width;
+  const sh = source.height;
+  if (sw <= 0 || sh <= 0 || subdivisions <= 0) return false;
+
+  const x1 = destRect.x + destRect.width;
+  const y1 = destRect.y + destRect.height;
+
+  const exactShift = isExactQuadTranslation(quad, sw, sh);
+  if (exactShift) {
+    const spec = {
+      quarterTurn: 0 as const,
+      flipH: false,
+      flipV: false,
+      destOriginX: exactShift.x,
+      destOriginY: exactShift.y,
+      destWidth: sw,
+      destHeight: sh,
+    };
+    for (let cy = destRect.y; cy < y1; cy += chunkSize) {
+      const ch = Math.min(chunkSize, y1 - cy);
+      for (let cx = destRect.x; cx < x1; cx += chunkSize) {
+        const cw = Math.min(chunkSize, x1 - cx);
+        onChunk(renderLosslessAffineChunk(source, spec, cx, cy, cw, ch), cx, cy, cw, ch);
+      }
+    }
+    return true;
+  }
+
+  const homography = solveUnitSquareToQuad(quad[0], quad[1], quad[2], quad[3]);
+  const grid: Point2D[][] = [];
+  for (let j = 0; j <= subdivisions; j++) {
+    const row: Point2D[] = [];
+    const v = j / subdivisions;
+    for (let i = 0; i <= subdivisions; i++) {
+      const u = i / subdivisions;
+      row.push(evaluateHomography(homography, u, v));
+    }
+    grid.push(row);
+  }
+
+  if (
+    WebGlMeshWarpRenderer.getInstance().renderGridToChunks(
+      source,
+      grid,
+      subdivisions,
+      subdivisions,
+      destRect,
+      chunkSize,
+      onChunk
+    )
+  ) {
+    return true;
+  }
+
+  // Exact CPU inverse-homography Anti-Ringing Lanczos-3 fallback
+  for (let cy = destRect.y; cy < y1; cy += chunkSize) {
+    const ch = Math.min(chunkSize, y1 - cy);
+    for (let cx = destRect.x; cx < x1; cx += chunkSize) {
+      const cw = Math.min(chunkSize, x1 - cx);
+      onChunk(resamplePerspectiveChunkCpu(source, quad, cx, cy, cw, ch), cx, cy, cw, ch);
+    }
+  }
+  return true;
+}
+
+/**
+ * High-precision chunked Mesh Warp commit pipeline (lossless identity -> WebGL2 straight-alpha FBO).
+ * Returns false if WebGL2 is unavailable so caller can fall back to Canvas 2D triangle slicing.
+ */
+export function processMeshWarpTransformChunks(
+  source: PixelBuffer,
+  meshPoints: Point2D[][],
+  destRect: DirtyRect,
+  chunkSize: number,
+  subPerCell: number,
+  onChunk: (chunkData: Uint8ClampedArray, cx: number, cy: number, cw: number, ch: number) => void
+): boolean {
+  const sw = source.width;
+  const sh = source.height;
+  const rows = meshPoints.length;
+  const cols = meshPoints[0]?.length || 0;
+  if (sw <= 0 || sh <= 0 || subPerCell <= 0 || rows < 2 || cols < 2) return false;
+
+  const exactShift = isExactMeshTranslation(meshPoints, sw, sh);
+  if (exactShift) {
+    const spec = {
+      quarterTurn: 0 as const,
+      flipH: false,
+      flipV: false,
+      destOriginX: exactShift.x,
+      destOriginY: exactShift.y,
+      destWidth: sw,
+      destHeight: sh,
+    };
+    const x1 = destRect.x + destRect.width;
+    const y1 = destRect.y + destRect.height;
+    for (let cy = destRect.y; cy < y1; cy += chunkSize) {
+      const ch = Math.min(chunkSize, y1 - cy);
+      for (let cx = destRect.x; cx < x1; cx += chunkSize) {
+        const cw = Math.min(chunkSize, x1 - cx);
+        onChunk(renderLosslessAffineChunk(source, spec, cx, cy, cw, ch), cx, cy, cw, ch);
+      }
+    }
+    return true;
+  }
+
+  const totalCols = (cols - 1) * subPerCell;
+  const totalRows = (rows - 1) * subPerCell;
+  const grid: Point2D[][] = [];
+  for (let j = 0; j <= totalRows; j++) {
+    const row: Point2D[] = [];
+    const v = j / totalRows;
+    for (let i = 0; i <= totalCols; i++) {
+      const u = i / totalCols;
+      row.push(evaluateMeshSurface(meshPoints, u, v));
+    }
+    grid.push(row);
+  }
+
+  return WebGlMeshWarpRenderer.getInstance().renderGridToChunks(
+    source,
+    grid,
+    totalRows,
+    totalCols,
+    destRect,
+    chunkSize,
+    onChunk
+  );
 }
 
 /**

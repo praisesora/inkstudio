@@ -3,15 +3,19 @@ import { createRoot, Root } from 'react-dom/client';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   WORKSPACE_STORAGE_KEY,
+  findFloatingPanelLocation,
   findPanelLocation,
+  listVisiblePanelIds,
   loadWorkspaceState,
+  sanitizeLayout,
 } from '../workspacePresets';
 import { useWorkspaceStore, workspaceStoreActions } from '../../stores/useWorkspaceStore';
 import { useUiStore } from '../../stores/useUiStore';
 import { BrushSizePalette } from '../../components/BrushSizePalette';
 import { StatusBar } from '../../components/StatusBar';
 import { DocumentTabBar } from '../../components/DocumentTabBar';
-import { DockGroupView } from '../../components/DockWorkspace';
+import { DockGroupView, renderPanelIcon } from '../../components/DockWorkspace';
+import { FloatingPanelWindow } from '../../components/FloatingPanelWindow';
 import { BrushSettings, DocumentTab } from '../../types/editor';
 
 function createMemoryStorage(): Storage {
@@ -384,6 +388,125 @@ describe('CSP Dock Workspace, Presets & Persistence', () => {
     expect(safe.layout.leftDocks.length).toBeGreaterThan(0);
     expect(safe.layout.rightDocks.length).toBeGreaterThan(0);
   });
+
+  it('detaches any panel to float freely, moves/resizes/collapses via "-", persists across reload, and reattaches to previous or custom dock location', () => {
+    const origLoc = findPanelLocation(useWorkspaceStore.getState().layout, 'sub-view');
+    expect(origLoc).not.toBeNull();
+    expect(origLoc?.side).toBe('right');
+
+    // Detach Sub View to float freely
+    workspaceStoreActions.detachPanel('sub-view', { x: 420, y: 180, width: 320, height: 340 });
+    const afterDetach = useWorkspaceStore.getState().layout;
+    expect(findPanelLocation(afterDetach, 'sub-view')).toBeNull();
+    const floatLoc = findFloatingPanelLocation(afterDetach, 'sub-view');
+    expect(floatLoc).not.toBeNull();
+    expect(listVisiblePanelIds(afterDetach).has('sub-view')).toBe(true);
+
+    // Move and resize floating panel
+    workspaceStoreActions.moveFloatingPanel(floatLoc!.floatingId, 520, 240, true);
+    workspaceStoreActions.resizeFloatingPanel(
+      floatLoc!.floatingId,
+      { width: 380, height: 400 },
+      true
+    );
+
+    // Collapse floating panel with "-" button
+    workspaceStoreActions.toggleFloatingCollapsed(floatLoc!.floatingId);
+    let fp = (useWorkspaceStore.getState().layout.floatingPanels ?? []).find(
+      (p) => p.id === floatLoc!.floatingId
+    );
+    expect(fp?.x).toBe(520);
+    expect(fp?.y).toBe(240);
+    expect(fp?.width).toBe(380);
+    expect(fp?.height).toBe(400);
+    expect(fp?.collapsed).toBe(true);
+
+    // Persist and reload from localStorage
+    useWorkspaceStore.reset();
+    const reloaded = useWorkspaceStore.getState().layout;
+    const reloadedFp = (reloaded.floatingPanels ?? []).find((p) => p.panelIds.includes('sub-view'));
+    expect(reloadedFp).toBeDefined();
+    expect(reloadedFp?.x).toBe(520);
+    expect(reloadedFp?.y).toBe(240);
+    expect(reloadedFp?.collapsed).toBe(true);
+
+    // Expand and 1-click reattach back to previous dock group
+    workspaceStoreActions.toggleFloatingCollapsed(reloadedFp!.id, false);
+    workspaceStoreActions.dockFloatingPanel(reloadedFp!.id);
+    const afterReattach = useWorkspaceStore.getState().layout;
+    expect(findFloatingPanelLocation(afterReattach, 'sub-view')).toBeNull();
+    const reattachedLoc = findPanelLocation(afterReattach, 'sub-view');
+    expect(reattachedLoc?.side).toBe(origLoc?.side);
+    expect(reattachedLoc?.colId).toBe(origLoc?.colId);
+    expect(reattachedLoc?.groupId).toBe(origLoc?.groupId);
+
+    // Detach again and reattach to a completely different dock location (left dock new column)
+    workspaceStoreActions.detachPanel('sub-view');
+    const secondFloat = findFloatingPanelLocation(useWorkspaceStore.getState().layout, 'sub-view');
+    expect(secondFloat).not.toBeNull();
+    workspaceStoreActions.dockFloatingPanel(secondFloat!.floatingId, {
+      side: 'left',
+      insertColumnIndex: 0,
+    });
+    const movedLeft = findPanelLocation(useWorkspaceStore.getState().layout, 'sub-view');
+    expect(movedLeft?.side).toBe('left');
+    expect(useWorkspaceStore.getState().layout.leftDocks[0].groups[0].panelIds).toContain('sub-view');
+  });
+
+  it('supports grouping floating panels as tabs, closing floating panels, collapsing docked groups, and sanitizing floating-only layouts', () => {
+    workspaceStoreActions.detachPanel('sub-view', { x: 300, y: 120 });
+    workspaceStoreActions.detachPanel('info', { x: 360, y: 150 });
+
+    const subViewFloat = findFloatingPanelLocation(useWorkspaceStore.getState().layout, 'sub-view');
+    expect(subViewFloat).not.toBeNull();
+
+    // Merge 'info' into 'sub-view' floating window as tabs
+    workspaceStoreActions.mergePanelIntoFloating('info', subViewFloat!.floatingId);
+    const mergedFp = (useWorkspaceStore.getState().layout.floatingPanels ?? []).find(
+      (f) => f.id === subViewFloat!.floatingId
+    );
+    expect(mergedFp?.panelIds).toEqual(['sub-view', 'info']);
+    expect(mergedFp?.activePanelId).toBe('info');
+
+    // Bring to front and close floating window
+    workspaceStoreActions.closeFloatingPanel(subViewFloat!.floatingId);
+    expect(listVisiblePanelIds(useWorkspaceStore.getState().layout).has('sub-view')).toBe(false);
+    expect(listVisiblePanelIds(useWorkspaceStore.getState().layout).has('info')).toBe(false);
+
+    // Collapsing a docked group with "-" persists cleanly
+    const layerLoc = findPanelLocation(useWorkspaceStore.getState().layout, 'layers')!;
+    workspaceStoreActions.toggleGroupCollapsed(layerLoc.colId, layerLoc.groupId);
+    const col = useWorkspaceStore
+      .getState()
+      .layout.rightDocks.find((c) => c.id === layerLoc.colId);
+    const grp = col?.groups.find((g) => g.id === layerLoc.groupId);
+    expect(grp?.collapsed).toBe(true);
+
+    // Sanitize handles floating-only layout and deduplicates panels across dock & floating
+    const floatingOnly = sanitizeLayout({
+      leftDocks: [],
+      rightDocks: [],
+      floatingPanels: [
+        {
+          id: 'f-1',
+          panelIds: ['sub-view', 'sub-view'],
+          activePanelId: 'sub-view',
+          x: -999,
+          y: -50,
+          width: 300,
+          height: 300,
+          collapsed: true,
+          zIndex: 5,
+        },
+      ],
+    });
+    expect(floatingOnly).not.toBeNull();
+    expect(floatingOnly?.floatingPanels).toHaveLength(1);
+    expect(floatingOnly?.floatingPanels?.[0].panelIds).toEqual(['sub-view']);
+    expect(floatingOnly?.floatingPanels?.[0].x).toBeGreaterThanOrEqual(8);
+    expect(floatingOnly?.floatingPanels?.[0].y).toBeGreaterThanOrEqual(38);
+    expect(floatingOnly?.floatingPanels?.[0].collapsed).toBe(true);
+  });
 });
 
 describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in Both Themes', () => {
@@ -554,5 +677,106 @@ describe('Activated Components (BrushSizePalette, StatusBar, DocumentTabBar) in 
     expect(popoverInBody!.style.position).toBe('fixed');
     expect(popoverInBody!.style.top).toBe('72px');
     expect(popoverInBody!.style.left).toBe('220px');
+  });
+
+  it('renders FloatingPanelWindow with collapse ("-"), pin/reattach, and close controls that toggle body visibility', () => {
+    const prevStorage = (globalThis as unknown as Record<string, unknown>).localStorage;
+    Object.defineProperty(globalThis, 'localStorage', {
+      value: createMemoryStorage(),
+      configurable: true,
+      writable: true,
+    });
+    useWorkspaceStore.reset();
+
+    try {
+      workspaceStoreActions.detachPanel('sub-view', { x: 260, y: 120, width: 320, height: 340 });
+      const getFp = () =>
+        (useWorkspaceStore.getState().layout.floatingPanels ?? []).find((f) =>
+          f.panelIds.includes('sub-view')
+        )!;
+
+      const renderFloating = () => {
+        const fp = getFp();
+        act(() => {
+          if (!root) root = createRoot(dom.container as unknown as Element);
+          root.render(
+            <FloatingPanelWindow
+              panel={fp}
+              renderPanelIcon={renderPanelIcon}
+              renderPanelBody={(panelId) => (
+                <div data-testid={`floating-inner-${panelId}`}>Sub View Body</div>
+              )}
+              onStartHeaderDrag={() => {}}
+              onStartTabDrag={() => {}}
+            />
+          );
+        });
+      };
+
+      renderFloating();
+
+      const body = document.body as unknown as MiniEl;
+      expect(body.findByAttr('data-testid', 'floating-panel-sub-view')).not.toBeNull();
+      expect(body.findByAttr('data-testid', 'floating-panel-body-sub-view')).not.toBeNull();
+      expect(body.findByAttr('data-testid', 'floating-inner-sub-view')?.textContent).toBe(
+        'Sub View Body'
+      );
+
+      // Tap "-" button in upper-right corner to collapse/hide the panel body
+      const collapseBtn = body.findByAttr('data-testid', 'floating-collapse-btn-sub-view');
+      expect(collapseBtn).not.toBeNull();
+      const reactPropsKey = Object.keys(collapseBtn!).find((k) => k.startsWith('__reactProps'));
+      const reactProps = (
+        collapseBtn as unknown as Record<string, { onClick?: (e: unknown) => void }>
+      )[reactPropsKey!];
+      act(() => {
+        reactProps.onClick?.({ stopPropagation: () => {}, preventDefault: () => {} });
+      });
+
+      expect(getFp().collapsed).toBe(true);
+      renderFloating();
+
+      // Title bar remains floating, body is hidden
+      const collapsedPanel = body.findByAttr('data-testid', 'floating-panel-sub-view');
+      expect(collapsedPanel?.getAttribute('data-collapsed')).toBe('true');
+      expect(body.findByAttr('data-testid', 'floating-panel-body-sub-view')).toBeNull();
+
+      // Tap "-" again to restore body
+      const expandBtn = body.findByAttr('data-testid', 'floating-collapse-btn-sub-view');
+      const expandKey = Object.keys(expandBtn!).find((k) => k.startsWith('__reactProps'));
+      const expandProps = (
+        expandBtn as unknown as Record<string, { onClick?: (e: unknown) => void }>
+      )[expandKey!];
+      act(() => {
+        expandProps.onClick?.({ stopPropagation: () => {}, preventDefault: () => {} });
+      });
+      expect(getFp().collapsed).toBe(false);
+      renderFloating();
+      expect(body.findByAttr('data-testid', 'floating-panel-body-sub-view')).not.toBeNull();
+
+      // Tap Pin button to reattach back to dock
+      const pinBtn = body.findByAttr('data-testid', 'floating-pin-btn-sub-view');
+      expect(pinBtn).not.toBeNull();
+      const pinKey = Object.keys(pinBtn!).find((k) => k.startsWith('__reactProps'));
+      const pinProps = (pinBtn as unknown as Record<string, { onClick?: (e: unknown) => void }>)[
+        pinKey!
+      ];
+      act(() => {
+        pinProps.onClick?.({ stopPropagation: () => {}, preventDefault: () => {} });
+      });
+
+      expect(findFloatingPanelLocation(useWorkspaceStore.getState().layout, 'sub-view')).toBeNull();
+      expect(findPanelLocation(useWorkspaceStore.getState().layout, 'sub-view')).not.toBeNull();
+    } finally {
+      if (prevStorage === undefined) {
+        delete (globalThis as unknown as Record<string, unknown>).localStorage;
+      } else {
+        Object.defineProperty(globalThis, 'localStorage', {
+          value: prevStorage,
+          configurable: true,
+          writable: true,
+        });
+      }
+    }
   });
 });

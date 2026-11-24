@@ -115,6 +115,20 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
     return () => window.clearInterval(timer);
   }, [isPlayingPreview, stats.frameCount]);
 
+  // Escape key closes modal when not exporting
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isExporting) {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [isOpen, isExporting, onClose]);
+
   if (!isOpen) return null;
 
   const handleToggleRecording = () => {
@@ -173,32 +187,45 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
   const memMb = (stats.memoryBytes / (1024 * 1024)).toFixed(2);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 select-none">
-      <div className="w-[540px] max-w-[95vw] bg-[#202020] border border-white/10 rounded-lg shadow-2xl overflow-hidden text-xs text-[#e5e5e5]">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="timelapse-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
+      onClick={() => {
+        if (!isExporting) onClose();
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-[540px] max-w-[95vw] bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] overflow-hidden text-xs text-[#e5e5e5]"
+      >
         {/* Header */}
-        <div className="px-4 py-3 bg-[#181818] border-b border-white/10 flex items-center justify-between">
-          <div className="flex items-center gap-2 font-semibold">
-            <Film className="w-4 h-4 text-[var(--accent)]" />
-            <span>Time-lapse Recording & Export</span>
+        <div className="h-10 px-4 bg-[#161616] border-b border-[#2c2c2c] flex items-center justify-between">
+          <div className="flex items-center gap-2 font-medium">
+            <Film className="w-3.5 h-3.5 text-[var(--accent)]" />
+            <span id="timelapse-modal-title">Time-lapse Recording &amp; Export</span>
           </div>
           <button
             type="button"
             onClick={onClose}
             disabled={isExporting}
-            className="text-[#8a8a8a] hover:text-white cursor-pointer disabled:opacity-40"
+            aria-label="Close"
+            title="Cancel (Esc)"
+            className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] transition-colors cursor-pointer disabled:opacity-40"
           >
-            <X className="w-4 h-4" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
 
         <div className="p-4 space-y-4">
           {/* Status & Record Toggle */}
-          <div className="flex items-center justify-between bg-[#161616] rounded-md px-3 py-2.5 border border-white/[0.06]">
+          <div className="flex items-center justify-between bg-[#161616] rounded-md px-3 py-2.5 border border-[#2c2c2c]">
             <div className="space-y-0.5">
               <div className="flex items-center gap-2 font-medium">
                 <span
                   className={`w-2 h-2 rounded-full ${
-                    stats.enabled ? 'bg-rose-500 animate-pulse' : 'bg-[#555555]'
+                    stats.enabled ? 'bg-red-500 animate-pulse' : 'bg-[#555555]'
                   }`}
                 />
                 <span>{stats.enabled ? 'Recording Keyframes' : 'Recording Paused'}</span>
@@ -214,10 +241,10 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
                 type="button"
                 disabled={!documentId || isExporting}
                 onClick={handleToggleRecording}
-                className={`px-2.5 py-1.5 rounded text-[11px] font-medium flex items-center gap-1.5 cursor-pointer disabled:opacity-40 ${
+                className={`px-2.5 py-1.5 rounded text-[11px] font-medium flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-40 ${
                   stats.enabled
-                    ? 'bg-rose-600 hover:bg-rose-500 text-white'
-                    : 'bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5]'
+                    ? 'bg-red-500/90 hover:bg-red-500 text-white'
+                    : 'bg-[#2a2a2a] hover:bg-[#363636] text-[#e5e5e5]'
                 }`}
               >
                 {stats.enabled ? (
@@ -227,7 +254,7 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
                   </>
                 ) : (
                   <>
-                    <Circle className="w-3 h-3 text-rose-500 fill-rose-500" />
+                    <Circle className="w-3 h-3 text-red-400 fill-red-400" />
                     <span>Record</span>
                   </>
                 )}
@@ -238,7 +265,7 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
                 disabled={!documentId || stats.frameCount === 0 || isExporting}
                 onClick={handleClear}
                 title="Clear recorded keyframes"
-                className="p-1.5 rounded bg-[#2c2c2c] hover:bg-rose-500/20 text-[#8a8a8a] hover:text-rose-400 cursor-pointer disabled:opacity-35"
+                className="p-1.5 rounded bg-[#2a2a2a] hover:bg-red-500/20 text-[#8a8a8a] hover:text-red-400 transition-colors cursor-pointer disabled:opacity-35"
               >
                 <Trash2 className="w-3.5 h-3.5" />
               </button>
@@ -246,8 +273,8 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
           </div>
 
           {/* Preview Player */}
-          <div className="bg-[#121212] rounded-md border border-white/[0.06] p-2 space-y-2">
-            <div className="h-44 flex items-center justify-center overflow-hidden rounded bg-[#0c0c0c]">
+          <div className="bg-[#161616] rounded-md border border-[#2c2c2c] p-2 space-y-2">
+            <div className="h-44 flex items-center justify-center overflow-hidden rounded bg-[#121212]">
               {previewUrl ? (
                 <img
                   src={previewUrl}
@@ -410,12 +437,12 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-3 bg-[#181818] border-t border-white/10 flex items-center justify-end gap-2">
+        <div className="px-4 py-2.5 bg-[#161616] border-t border-[#2c2c2c] flex items-center justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
             disabled={isExporting}
-            className="px-3 py-1.5 rounded bg-[#2c2c2c] hover:bg-[#383838] text-[#cccccc] cursor-pointer disabled:opacity-40"
+            className="px-3.5 py-1.5 rounded bg-[#2a2a2a] hover:bg-[#363636] text-[#e5e5e5] font-medium transition-colors cursor-pointer disabled:opacity-40"
           >
             Close
           </button>
@@ -423,7 +450,7 @@ export const TimelapseExportModal: React.FC<TimelapseExportModalProps> = ({
             type="button"
             disabled={!documentId || stats.frameCount === 0 || isExporting}
             onClick={handleExport}
-            className="px-3.5 py-1.5 rounded bg-[#234b3e] hover:bg-[#2b604f] text-[#55eaab] border border-[#2e6e58] font-semibold flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+            className="px-4 py-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 font-medium flex items-center gap-1.5 transition-opacity cursor-pointer disabled:opacity-40"
           >
             {isExporting ? (
               <>

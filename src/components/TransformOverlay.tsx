@@ -476,7 +476,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
             className="w-full h-full pointer-events-none block"
             style={{
               transform: `scale(${session.flipH ? -1 : 1}, ${session.flipV ? -1 : 1})`,
-              imageRendering: zoom > 1 ? 'pixelated' : 'auto',
+              imageRendering: zoom >= 2 ? 'pixelated' : 'auto',
             }}
           />
 
@@ -558,7 +558,7 @@ export const TransformOverlay: React.FC<TransformOverlayProps> = ({
             <canvas
               ref={previewCanvasRef}
               className="w-full h-full block"
-              style={{ imageRendering: zoom > 1 ? 'pixelated' : 'auto' }}
+              style={{ imageRendering: zoom >= 2 ? 'pixelated' : 'auto' }}
             />
           </div>
 

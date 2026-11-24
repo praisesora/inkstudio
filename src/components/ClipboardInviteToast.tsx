@@ -22,41 +22,51 @@ export const ClipboardInviteToast: React.FC<ClipboardInviteToastProps> = ({
   if (!invite) return null;
 
   return (
-    <div className="fixed top-14 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-top-4 duration-200">
-      <div className="flex items-center space-x-3.5 rounded-lg border border-rose-500/40 bg-[#1e1e1e]/95 backdrop-blur-md px-4 py-3 shadow-[0_10px_35px_rgba(0,0,0,0.65)] text-white">
-        <div className="flex items-center justify-center w-8 h-8 rounded-full bg-rose-600/20 text-rose-400 shrink-0">
-          <Users className="w-4 h-4" />
+    <div
+      role="status"
+      aria-live="polite"
+      className="fixed top-14 left-1/2 -translate-x-1/2 z-50 animate-in fade-in slide-in-from-top-4 duration-200 select-none"
+    >
+      <div className="flex items-center gap-3 rounded-lg border border-[var(--accent-border)] bg-[#202020]/95 backdrop-blur-md px-3.5 py-2.5 shadow-[0_12px_36px_rgba(0,0,0,0.75)] text-[#e5e5e5]">
+        <div className="flex items-center justify-center w-7 h-7 rounded-md bg-[#161616] border border-[#2c2c2c] text-[var(--accent)] shrink-0">
+          <Users className="w-3.5 h-3.5" />
         </div>
 
-        <div className="max-w-xs sm:max-w-sm">
-          <div className="text-[11px] font-semibold text-rose-400 tracking-wide uppercase">
-            Invitation Detected
+        <div className="max-w-xs sm:max-w-sm min-w-0">
+          <div className="flex items-center gap-1.5">
+            <span className="text-[11px] font-semibold text-[#e5e5e5]">
+              Invitation Detected
+            </span>
           </div>
-          <div className="text-xs font-medium text-white truncate">
-            Room: <span className="font-semibold text-amber-300">"{invite.roomName}"</span>
+          <div className="text-[11px] text-[#d4d4d4] truncate">
+            Room: <span className="font-medium text-[#e5e5e5]">"{invite.roomName}"</span>
           </div>
-          <div className="text-[10px] text-[#888888] font-mono mt-0.5">
-            Host: {invite.host}
+          <div className="text-[10px] text-[#8a8a8a] font-mono truncate">
+            {invite.host}
             {invite.port && invite.port !== 443 && invite.port !== 80 ? `:${invite.port}` : ''}
           </div>
         </div>
 
-        <div className="flex items-center space-x-2 pl-2">
+        <div className="flex items-center gap-1.5 pl-1 shrink-0">
           <button
+            type="button"
             onClick={() =>
               onJoin(invite.host, invite.port, invite.roomName, invite.token, invite.isSecure)
             }
-            className="flex items-center space-x-1.5 rounded-md bg-rose-600 hover:bg-rose-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors shadow-sm cursor-pointer"
+            className="flex items-center gap-1 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 px-2.5 py-1.5 text-[11px] font-medium transition-opacity cursor-pointer"
           >
             <span>Connect</span>
-            <ArrowRight className="w-3.5 h-3.5" />
+            <ArrowRight className="w-3 h-3" />
           </button>
 
           <button
+            type="button"
             onClick={onDismiss}
-            className="p-1 rounded text-[#777777] hover:bg-[#333333] hover:text-white transition-colors cursor-pointer"
+            aria-label="Dismiss invitation"
+            title="Dismiss"
+            className="w-6 h-6 rounded flex items-center justify-center text-[#8a8a8a] hover:bg-[#2c2c2c] hover:text-[#e5e5e5] transition-colors cursor-pointer"
           >
-            <X className="w-4 h-4" />
+            <X className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>

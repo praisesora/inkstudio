@@ -111,16 +111,27 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-xs select-none"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="simple-tone-modal-title"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 select-none"
       onPointerDown={(e) => e.stopPropagation()}
+      onClick={onClose}
     >
-      <div className="bg-[#202020] border border-white/[0.1] rounded-lg shadow-2xl w-96 flex flex-col overflow-hidden text-[#e5e5e5]">
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-[#202020] border border-[#2c2c2c] rounded-lg shadow-[0_24px_64px_rgba(0,0,0,0.85)] w-96 max-w-[95vw] flex flex-col overflow-hidden text-[#e5e5e5]"
+      >
         {/* Header */}
-        <div className="px-4 py-2.5 bg-[#1a1a1a] border-b border-white/[0.06] flex items-center justify-between">
-          <h2 className="text-xs font-medium text-[#e5e5e5]">Simple Tone Settings</h2>
+        <div className="h-9 px-3.5 bg-[#161616] border-b border-[#2c2c2c] flex items-center justify-between">
+          <h2 id="simple-tone-modal-title" className="text-xs font-medium text-[#e5e5e5]">
+            Simple Tone Settings
+          </h2>
           <button
+            type="button"
             onClick={onClose}
-            className="text-[#8a8a8a] hover:text-[#e5e5e5] p-1 rounded hover:bg-[#2c2c2c] transition-colors cursor-pointer"
+            aria-label="Close"
+            className="w-6 h-6 flex items-center justify-center text-[#8a8a8a] hover:text-[#e5e5e5] rounded hover:bg-[#2c2c2c] transition-colors cursor-pointer"
             title="Cancel (Esc)"
           >
             <X className="w-3.5 h-3.5" />
@@ -283,11 +294,11 @@ export const SimpleToneModal: React.FC<SimpleToneModalProps> = ({
         </div>
 
         {/* Footer */}
-        <div className="px-4 py-2.5 bg-[#1a1a1a] border-t border-white/[0.06] flex items-center justify-end space-x-2">
+        <div className="px-4 py-2.5 bg-[#161616] border-t border-[#2c2c2c] flex items-center justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="px-3 py-1.5 rounded bg-[#2c2c2c] hover:bg-[#383838] text-[#e5e5e5] transition-colors cursor-pointer text-xs"
+            className="px-3.5 py-1.5 rounded bg-[#2a2a2a] hover:bg-[#363636] text-[#e5e5e5] font-medium transition-colors cursor-pointer text-xs"
           >
             Cancel
           </button>

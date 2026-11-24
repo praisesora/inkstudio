@@ -21,14 +21,21 @@ export {
   uiStoreActions,
   selectIsAnyModalOpen,
   INITIAL_APP_CLOSE_PROMPT_STATE,
+  INITIAL_APP_DIALOG_STATE,
+  INITIAL_FILTER_MODAL_STATE,
 } from './useUiStore';
 export type {
   UiStoreState,
   TonalModalState,
+  FilterModalState,
   AdjustmentModalState,
   LayerStylesModalState,
   AppClosePromptStep,
   AppClosePromptState,
+  AppDialogVariant,
+  AppDialogPreview,
+  AppDialogOptions,
+  AppDialogState,
 } from './useUiStore';
 
 export { useWorkspaceStore, workspaceStoreActions } from './useWorkspaceStore';

@@ -368,23 +368,24 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
   };
 
   return (
-    <div ref={containerRef} className="flex flex-col select-none text-[#cccccc] text-xs h-full justify-between">
+    <div ref={containerRef} className="flex flex-col select-none text-[#e5e5e5] text-xs h-full justify-between">
       {/* Optional Standalone Header if rendered outside ColorPanel */}
       {!hideHeader && (
-        <div className="bg-[#2a2a2a] px-3 py-1.5 border-b border-[#333333] flex items-center justify-between shrink-0">
-          <div className="flex items-center space-x-2 text-xs font-medium text-[#cccccc]">
-            <Menu className="w-3.5 h-3.5 text-[#888888] cursor-pointer hover:text-white transition-colors" />
+        <div className="bg-[#161616] px-3 py-1.5 border-b border-[#2c2c2c] flex items-center justify-between shrink-0">
+          <div className="flex items-center space-x-2 text-xs font-medium text-[#e5e5e5]">
+            <Menu className="w-3.5 h-3.5 text-[#8a8a8a] cursor-pointer hover:text-[#e5e5e5] transition-colors" />
             <div className="flex items-center space-x-1.5">
-              <Sliders className="w-3.5 h-3.5 text-[#5ce1e6]" />
-              <span className="font-semibold tracking-wide">Color Slider</span>
+              <Sliders className="w-3.5 h-3.5 text-[var(--accent)]" />
+              <span className="font-medium tracking-wide">Color Slider</span>
             </div>
           </div>
 
           {onSwapColors && (
             <button
+              type="button"
               onClick={onSwapColors}
               title="Swap Primary & Secondary Colors (X)"
-              className="flex items-center space-x-1 px-1.5 py-0.5 bg-[#1e1e1e] hover:bg-[#333333] text-[#888888] hover:text-[#cccccc] rounded-[2px] border border-[#3a3a3a] transition-colors cursor-pointer"
+              className="flex items-center space-x-1 px-1.5 py-0.5 bg-[#202020] hover:bg-[#2c2c2c] text-[#8a8a8a] hover:text-[#e5e5e5] rounded border border-[#2c2c2c] transition-colors cursor-pointer"
             >
               <ArrowLeftRight className="w-3 h-3" />
               <span className="text-[10px] font-mono">X</span>
@@ -393,20 +394,21 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
         </div>
       )}
 
-      {/* Main Slider Area matching Clip Studio Paint Photo 2 */}
-      <div className="p-2.5 flex-1 flex flex-col justify-between space-y-2">
+      {/* Main Slider Area */}
+      <div className="p-2 flex-1 flex flex-col justify-between space-y-2">
         {/* Sliders Container with Left Vertical Mode Selector Strip */}
         <div className="flex items-stretch">
-          {/* Vertical Color Model Selector (CMYK, HSV, RGB rotated -90deg matching screenshot) */}
-          <div className="flex flex-col w-[22px] shrink-0 border border-[#3e3e42] border-r-0 rounded-l-[3px] bg-[#222224] overflow-hidden">
+          {/* Vertical Color Model Selector */}
+          <div className="flex flex-col w-[22px] shrink-0 border border-[#2c2c2c] border-r-0 rounded-l bg-[#161616] overflow-hidden">
             {/* RGB Mode */}
             <button
+              type="button"
               onClick={() => setMode('rgb')}
               title="RGB Color Model"
               className={`flex-1 py-1 flex items-center justify-center cursor-pointer transition-colors relative ${
                 mode === 'rgb'
-                  ? 'bg-[#2b2b2e] text-[#f0f0f0] font-bold border-r border-[#2b2b2e]'
-                  : 'text-[#777777] hover:text-[#bbbbbb] hover:bg-[#28282b]'
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-semibold'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#202020]'
               }`}
             >
               <span className="-rotate-90 whitespace-nowrap text-[9px] font-mono tracking-wider">
@@ -416,12 +418,13 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
 
             {/* HSV Mode */}
             <button
+              type="button"
               onClick={() => setMode('hsv')}
               title="HSV Color Model"
-              className={`flex-1 py-1 flex items-center justify-center cursor-pointer transition-colors border-t border-[#343438] relative ${
+              className={`flex-1 py-1 flex items-center justify-center cursor-pointer transition-colors border-t border-[#2c2c2c] relative ${
                 mode === 'hsv'
-                  ? 'bg-[#2b2b2e] text-[#f0f0f0] font-bold border-r border-[#2b2b2e]'
-                  : 'text-[#777777] hover:text-[#bbbbbb] hover:bg-[#28282b]'
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-semibold'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#202020]'
               }`}
             >
               <span className="-rotate-90 whitespace-nowrap text-[9px] font-mono tracking-wider">
@@ -431,12 +434,13 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
 
             {/* CMYK Mode */}
             <button
+              type="button"
               onClick={() => setMode('cmyk')}
               title="CMYK Color Model"
-              className={`flex-1 py-1 flex items-center justify-center cursor-pointer transition-colors border-t border-[#343438] relative ${
+              className={`flex-1 py-1 flex items-center justify-center cursor-pointer transition-colors border-t border-[#2c2c2c] relative ${
                 mode === 'cmyk'
-                  ? 'bg-[#2b2b2e] text-[#f0f0f0] font-bold border-r border-[#2b2b2e]'
-                  : 'text-[#777777] hover:text-[#bbbbbb] hover:bg-[#28282b]'
+                  ? 'bg-[#2c2c2c] text-[#e5e5e5] font-semibold'
+                  : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#202020]'
               }`}
             >
               <span className="-rotate-90 whitespace-nowrap text-[8.5px] font-mono tracking-wider">
@@ -446,11 +450,11 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
           </div>
 
           {/* Main Slider Box */}
-          <div className={`flex-1 bg-[#2b2b2e] border border-[#3e3e42] rounded-r-[3px] p-2.5 ${spacingClass}`}>
+          <div className={`flex-1 bg-[#161616] border border-[#2c2c2c] rounded-r p-2.5 ${spacingClass}`}>
             {channels.map((channel) => (
               <div key={channel.id} className="flex items-center space-x-2">
                 {/* Channel Label (R, G, B, H, S, V, C, M, Y, K) */}
-                <span className="w-3 text-xs font-semibold text-[#dddddd] text-center shrink-0">
+                <span className="w-3 text-[11px] font-medium text-[#b5b5b5] text-center shrink-0">
                   {channel.label}
                 </span>
 
@@ -462,16 +466,16 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
                   onPointerUp={(e) => handlePointerUp(channel.id, e)}
                   onPointerCancel={(e) => handlePointerUp(channel.id, e)}
                 >
-                  {/* Track Bar (dynamic height, rounded-[1px], dynamic gradient) */}
+                  {/* Track Bar */}
                   <div
                     ref={(el) => {
                       trackRefs.current[channel.id] = el;
                     }}
                     style={{ background: channel.gradient, height: trackHeight }}
-                    className="relative w-full rounded-[1px] border border-[#1b1b1b] shadow-inner"
+                    className="relative w-full rounded-[2px] border border-black/40"
                   />
 
-                  {/* Caret Row (triangle pointing straight UP into the track matching Photo 2) */}
+                  {/* Caret Row */}
                   <div className="relative h-2 w-full pointer-events-none overflow-visible">
                     <div
                       className="absolute top-0 -translate-x-1/2"
@@ -481,7 +485,7 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
                         width="9"
                         height="5"
                         viewBox="0 0 9 5"
-                        className="fill-[#cccccc] stroke-[#111111] stroke-[0.5] filter drop-shadow-[0_1px_1px_rgba(0,0,0,0.6)]"
+                        className="fill-[#e5e5e5] stroke-[#161616] stroke-[0.5]"
                       >
                         <polygon points="4.5,0 9,5 0,5" />
                       </svg>
@@ -502,21 +506,23 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
                         handleChannelChange(channel.id, val, true);
                       }
                     }}
-                    className="w-7 bg-transparent text-right font-mono text-[11px] text-[#dddddd] outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                    className="w-7 bg-transparent text-right font-mono text-[11px] text-[#e5e5e5] outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
                   />
-                  {/* Clip Studio Paint Up/Down Stepper Chevrons */}
+                  {/* Stepper Chevrons */}
                   <div className="flex flex-col justify-center -space-y-1">
                     <button
+                      type="button"
                       onClick={() => handleStep(channel.id, 1)}
                       title="Increment (+1)"
-                      className="p-0 text-[#777777] hover:text-[#5ce1e6] active:text-white cursor-pointer transition-colors"
+                      className="p-0 text-[#8a8a8a] hover:text-[var(--accent)] active:text-white cursor-pointer transition-colors"
                     >
                       <ChevronUp className="w-2.5 h-2.5" />
                     </button>
                     <button
+                      type="button"
                       onClick={() => handleStep(channel.id, -1)}
                       title="Decrement (-1)"
-                      className="p-0 text-[#777777] hover:text-[#5ce1e6] active:text-white cursor-pointer transition-colors"
+                      className="p-0 text-[#8a8a8a] hover:text-[var(--accent)] active:text-white cursor-pointer transition-colors"
                     >
                       <ChevronDown className="w-2.5 h-2.5" />
                     </button>
@@ -527,46 +533,46 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
           </div>
         </div>
 
-        {/* Clip Studio Paint Bottom 3 Rounded Swatches (Matching Photo 2 Reference) */}
+        {/* Bottom 3 Swatches */}
         <div className="flex items-center space-x-2 pt-0.5">
-          {/* Swatch 1: Primary Color (Black in Photo 2 with Slate Blue Selection Ring) */}
           <button
+            type="button"
             onClick={() => {
               setActiveTarget('primary');
               if (currentTool === 'eraser' && onSelectTool) onSelectTool('brush');
             }}
             title={`Primary Color: ${primaryColor} (Click to select & edit)`}
-            className={`flex-1 ${swatchHeight} rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
+            className={`flex-1 ${swatchHeight} rounded cursor-pointer transition-all relative overflow-hidden ${
               activeTarget === 'primary' && !isTransparentActive
-                ? 'ring-2 ring-[#7c91c0] ring-offset-1 ring-offset-[#252526] border border-black/80 shadow-sm z-10 scale-[1.02]'
-                : 'border border-[#555555] hover:border-[#888888]'
+                ? 'ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-[#202020] border border-black/80 z-10'
+                : 'border border-[#2c2c2c] hover:border-[#4a4a4a]'
             }`}
             style={{ backgroundColor: primaryColor }}
           />
 
-          {/* Swatch 2: Secondary Color (White in Photo 2) */}
           <button
+            type="button"
             onClick={() => {
               setActiveTarget('secondary');
               if (currentTool === 'eraser' && onSelectTool) onSelectTool('brush');
             }}
             title={`Secondary Color: ${secondaryColor} (Click to select & edit)`}
-            className={`flex-1 ${swatchHeight} rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
+            className={`flex-1 ${swatchHeight} rounded cursor-pointer transition-all relative overflow-hidden ${
               activeTarget === 'secondary' && !isTransparentActive
-                ? 'ring-2 ring-[#7c91c0] ring-offset-1 ring-offset-[#252526] border border-black/80 shadow-sm z-10 scale-[1.02]'
-                : 'border border-[#555555] hover:border-[#888888]'
+                ? 'ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-[#202020] border border-black/80 z-10'
+                : 'border border-[#2c2c2c] hover:border-[#4a4a4a]'
             }`}
             style={{ backgroundColor: secondaryColor }}
           />
 
-          {/* Swatch 3: Transparent Color (Checkerboard pattern in Photo 2) */}
           <button
+            type="button"
             onClick={handleToggleTransparent}
             title="Transparent Color / Eraser Mode (C)"
-            className={`flex-1 ${swatchHeight} rounded-[3px] cursor-pointer transition-all relative overflow-hidden ${
+            className={`flex-1 ${swatchHeight} rounded cursor-pointer transition-all relative overflow-hidden ${
               isTransparentActive
-                ? 'ring-2 ring-[#7c91c0] ring-offset-1 ring-offset-[#252526] border border-black/80 shadow-sm z-10 scale-[1.02]'
-                : 'border border-[#555555] hover:border-[#888888]'
+                ? 'ring-1 ring-[var(--accent)] ring-offset-1 ring-offset-[#202020] border border-black/80 z-10'
+                : 'border border-[#2c2c2c] hover:border-[#4a4a4a]'
             }`}
             style={{
               backgroundImage: 'repeating-conic-gradient(#888888 0% 25%, #444444 0% 50%)',
@@ -576,21 +582,22 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
         </div>
 
         {/* Hex Input & Copy Shortcut */}
-        <div className="pt-1">
+        <div className="pt-0.5">
           <div className="relative flex items-center">
-            <span className="absolute left-2 text-[#777777] font-mono text-[11px]">#</span>
+            <span className="absolute left-2 text-[#8a8a8a] font-mono text-[11px]">#</span>
             <input
               type="text"
               value={activeColor.replace('#', '').toUpperCase()}
               onChange={(e) => handleHexInput(e.target.value)}
-              className="w-full bg-[#1e1e1e] border border-[#333333] focus:border-[#5ce1e6] rounded-[2px] pl-5 pr-7 py-1 text-[#dddddd] font-mono text-xs outline-none"
+              className="w-full bg-[#161616] border border-[#2c2c2c] focus:border-[var(--accent-border)] rounded pl-5 pr-7 py-1 text-[#e5e5e5] font-mono text-xs outline-none"
               maxLength={6}
               placeholder="000000"
             />
             <button
+              type="button"
               onClick={copyHexToClipboard}
               title="Copy Hex Code"
-              className="absolute right-1.5 p-1 text-[#777777] hover:text-white rounded transition-colors"
+              className="absolute right-1.5 p-1 text-[#8a8a8a] hover:text-[#e5e5e5] rounded transition-colors cursor-pointer"
             >
               {copiedHex ? (
                 <Check className="w-3 h-3 text-emerald-400" />
@@ -603,23 +610,24 @@ export const ColorSlider: React.FC<ColorSliderProps> = ({
 
         {/* Recent Color History Swatches */}
         {recentColors && recentColors.length > 0 && (
-          <div className="pt-1.5 border-t border-[#2e2e30]">
-            <div className="flex items-center justify-between text-[10px] text-[#777777] mb-1 font-medium">
+          <div className="pt-1.5 border-t border-[#2c2c2c]">
+            <div className="flex items-center justify-between text-[10px] text-[#8a8a8a] mb-1 font-medium">
               <span>Recent Colors</span>
-              <span className="text-[9px] text-[#555555]">{recentColors.length} items</span>
+              <span className="text-[9px] text-[#6e6e6e]">{recentColors.length} items</span>
             </div>
-            <div className="flex items-center space-x-1 overflow-x-auto py-0.5 scrollbar-thin">
+            <div className="flex items-center space-x-1 overflow-x-auto py-0.5 no-scrollbar">
               {recentColors.map((color, idx) => (
                 <button
                   key={`${color}-${idx}`}
+                  type="button"
                   onClick={() => {
                     commitHexColor(color, false);
                   }}
                   title={`Recent: ${color}`}
-                  className={`w-5 h-5 rounded-[2px] border shrink-0 cursor-pointer transition-transform hover:scale-110 ${
+                  className={`w-5 h-5 rounded border shrink-0 cursor-pointer transition-transform hover:scale-110 ${
                     activeColor.toLowerCase() === color.toLowerCase()
-                      ? 'border-white ring-1 ring-[#5ce1e6]'
-                      : 'border-[#383838] hover:border-[#777777]'
+                      ? 'border-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+                      : 'border-[#2c2c2c] hover:border-[#6e6e6e]'
                   }`}
                   style={{ backgroundColor: color }}
                 />

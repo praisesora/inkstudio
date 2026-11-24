@@ -52,84 +52,88 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   }, [onSelectTool, onSwapColors, onToggleTransparentColor]);
 
   return (
-    <aside className="w-14 bg-[#252526] border-r border-[#333333] flex flex-col items-center py-3 select-none z-10 shrink-0">
+    <aside className="w-14 bg-[#202020] border-r border-[#2c2c2c] flex flex-col items-center py-3 select-none z-10 shrink-0">
       <div className="flex flex-col items-center space-y-2">
         {/* Brush Button */}
         <button
+          type="button"
           onClick={() => onSelectTool('brush')}
           title="Brush Tool (B)"
-          className={`w-10 h-10 rounded-[2px] flex items-center justify-center transition-colors relative group ${
+          className={`w-10 h-10 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
             currentTool === 'brush'
-              ? 'bg-[#383838] border border-[#4a4a4a] text-white shadow-sm'
-              : 'text-[#999999] hover:text-[#cccccc] hover:bg-[#2d2d2d] border border-transparent'
+              ? 'bg-[#2c2c2c] border border-[#3a3a3a] text-[#e5e5e5]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 border border-transparent'
           }`}
         >
           <Paintbrush className="w-5 h-5" />
           {/* Tooltip */}
-          <div className="absolute left-12 bg-[#252526] text-[#cccccc] text-xs px-2 py-1 rounded-[2px] border border-[#3a3a3a] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
+          <div className="absolute left-12 bg-[#161616] text-[#e5e5e5] text-xs px-2 py-1 rounded border border-[#2c2c2c] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
             Brush (B)
           </div>
         </button>
 
         {/* Eraser Button */}
         <button
+          type="button"
           onClick={() => onSelectTool('eraser')}
           title="Eraser Tool (E)"
-          className={`w-10 h-10 rounded-[2px] flex items-center justify-center transition-colors relative group ${
+          className={`w-10 h-10 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
             currentTool === 'eraser'
-              ? 'bg-[#383838] border border-[#4a4a4a] text-white shadow-sm'
-              : 'text-[#999999] hover:text-[#cccccc] hover:bg-[#2d2d2d] border border-transparent'
+              ? 'bg-[#2c2c2c] border border-[#3a3a3a] text-[#e5e5e5]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 border border-transparent'
           }`}
         >
           <Eraser className="w-5 h-5" />
-          <div className="absolute left-12 bg-[#252526] text-[#cccccc] text-xs px-2 py-1 rounded-[2px] border border-[#3a3a3a] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
+          <div className="absolute left-12 bg-[#161616] text-[#e5e5e5] text-xs px-2 py-1 rounded border border-[#2c2c2c] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
             Eraser (E)
           </div>
         </button>
 
         {/* Pipette Button */}
         <button
+          type="button"
           onClick={() => onSelectTool('pipette')}
           title="Pipette Tool (I / Hold Alt)"
-          className={`w-10 h-10 rounded-[2px] flex items-center justify-center transition-colors relative group ${
+          className={`w-10 h-10 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
             currentTool === 'pipette'
-              ? 'bg-[#383838] border border-[#4a4a4a] text-white shadow-sm'
-              : 'text-[#999999] hover:text-[#cccccc] hover:bg-[#2d2d2d] border border-transparent'
+              ? 'bg-[#2c2c2c] border border-[#3a3a3a] text-[#e5e5e5]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 border border-transparent'
           }`}
         >
           <Pipette className="w-5 h-5" />
-          <div className="absolute left-12 bg-[#252526] text-[#cccccc] text-xs px-2 py-1 rounded-[2px] border border-[#3a3a3a] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
+          <div className="absolute left-12 bg-[#161616] text-[#e5e5e5] text-xs px-2 py-1 rounded border border-[#2c2c2c] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
             Pipette (I / Hold Alt)
           </div>
         </button>
 
         {/* Liquify Button */}
         <button
+          type="button"
           onClick={() => onSelectTool('liquify')}
           title="Liquify Tool (J)"
-          className={`w-10 h-10 rounded-[2px] flex items-center justify-center transition-colors relative group ${
+          className={`w-10 h-10 rounded flex items-center justify-center transition-colors relative group cursor-pointer ${
             currentTool === 'liquify'
-              ? 'bg-[#383838] border border-[#4a4a4a] text-white shadow-sm'
-              : 'text-[#999999] hover:text-[#cccccc] hover:bg-[#2d2d2d] border border-transparent'
+              ? 'bg-[#2c2c2c] border border-[#3a3a3a] text-[#e5e5e5]'
+              : 'text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c]/60 border border-transparent'
           }`}
         >
           <LiquifyIcon className="w-5 h-5" />
-          <div className="absolute left-12 bg-[#252526] text-[#cccccc] text-xs px-2 py-1 rounded-[2px] border border-[#3a3a3a] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
+          <div className="absolute left-12 bg-[#161616] text-[#e5e5e5] text-xs px-2 py-1 rounded border border-[#2c2c2c] opacity-0 pointer-events-none group-hover:opacity-100 transition-opacity whitespace-nowrap z-50">
             Liquify (J)
           </div>
         </button>
       </div>
 
-      <div className="my-3 w-8 h-px bg-[#333333]" />
+      <div className="my-3 w-8 h-px bg-[#2c2c2c]" />
 
-      {/* Primary & Secondary Color Indicator Swatches (Clip Studio Paint style) */}
+      {/* Primary & Secondary Color Indicator Swatches */}
       <div className="mt-auto flex flex-col items-center space-y-2 pb-1">
         <div className="relative w-9 h-9">
           {/* Secondary Color Swatch (bottom-right) */}
           <div
             onClick={onSwapColors}
             title={`Secondary Color: ${secondaryColor} (Click or press X to swap)`}
-            className="absolute bottom-0 right-0 w-6 h-6 rounded-[2px] border border-[#555555] cursor-pointer hover:border-white shadow-sm z-0"
+            className="absolute bottom-0 right-0 w-6 h-6 rounded border border-[#3a3a3a] cursor-pointer hover:border-[#8a8a8a] shadow-sm z-0"
             style={{ backgroundColor: secondaryColor }}
           />
 
@@ -143,23 +147,23 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
               }
             }}
             title={`Primary Active Color: ${primaryColor} (Click to select/swap)`}
-            className={`absolute top-0 left-0 w-6 h-6 rounded-[2px] cursor-pointer transition-all z-10 ${
+            className={`absolute top-0 left-0 w-6 h-6 rounded cursor-pointer transition-all z-10 ${
               !isTransparentColor
-                ? 'border border-white shadow-md ring-1 ring-white/40'
-                : 'border border-[#555555] hover:border-white opacity-80'
+                ? 'border border-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+                : 'border border-[#3a3a3a] hover:border-[#8a8a8a] opacity-80'
             }`}
             style={{ backgroundColor: primaryColor }}
           />
         </div>
 
-        {/* Transparent Color Swatch (Clip Studio Paint 'C' key toggle) */}
+        {/* Transparent Color Swatch */}
         <div
           onClick={onToggleTransparentColor}
           title="Transparent Ink / Color (C) - Brush as textured eraser"
-          className={`w-7 h-3.5 rounded-[2px] border cursor-pointer relative overflow-hidden transition-all ${
+          className={`w-7 h-3.5 rounded border cursor-pointer relative overflow-hidden transition-all ${
             isTransparentColor
-              ? 'border-[#38bdf8] ring-2 ring-[#38bdf8] shadow-md scale-105'
-              : 'border-[#555555] hover:border-white opacity-80 hover:opacity-100'
+              ? 'border-[var(--accent)] ring-1 ring-[var(--accent-border)]'
+              : 'border-[#3a3a3a] hover:border-[#8a8a8a] opacity-80 hover:opacity-100'
           }`}
           style={{
             backgroundImage:
@@ -172,14 +176,15 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
 
         {/* Swap button */}
         <button
+          type="button"
           onClick={onSwapColors}
           title="Swap Colors (X)"
-          className="p-1 text-[#888888] hover:text-[#cccccc] hover:bg-[#333333] rounded-[2px] transition-colors"
+          className="p-1 text-[#8a8a8a] hover:text-[#e5e5e5] hover:bg-[#2c2c2c] rounded transition-colors cursor-pointer"
         >
           <ArrowLeftRight className="w-3.5 h-3.5" />
         </button>
 
-        <span className="text-[9px] text-[#777777] font-mono">
+        <span className="text-[9px] text-[#6e6e6e] font-mono">
           X / C
         </span>
       </div>

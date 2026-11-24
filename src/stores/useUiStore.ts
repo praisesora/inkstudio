@@ -1,4 +1,5 @@
 import { AppSettings, loadAppSettings, saveAppSettings } from '../types/settings';
+import { FilterType } from '../types/editor';
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType, ProcessingBounds, TileHistogramMap } from '../utils/tonalEngine';
 import type { TileSnapshotEntry } from '../utils/tileEngine';
@@ -6,6 +7,56 @@ import { performanceManager } from '../utils/performanceManager';
 import { safeLocalStorageSetItem, setStorageQuotaNotifier } from '../utils/safeStorage';
 import { createStore } from './createStore';
 import { useUpdaterStore } from './useUpdaterStore';
+
+export type AppDialogVariant = 'confirm' | 'danger' | 'alert';
+
+export interface AppDialogPreview {
+  imageUrl?: string | null;
+  title: string;
+  subtitle?: string;
+}
+
+export interface AppDialogOptions {
+  variant?: AppDialogVariant;
+  title: string;
+  message: string;
+  detail?: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  preview?: AppDialogPreview | null;
+}
+
+export interface AppDialogState {
+  isOpen: boolean;
+  variant: AppDialogVariant;
+  title: string;
+  message: string;
+  detail?: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  preview?: AppDialogPreview | null;
+}
+
+export const INITIAL_APP_DIALOG_STATE: AppDialogState = {
+  isOpen: false,
+  variant: 'confirm',
+  title: 'Ink Studio',
+  message: '',
+  detail: undefined,
+  confirmLabel: 'OK',
+  cancelLabel: 'Cancel',
+  preview: null,
+};
+
+export interface FilterModalState {
+  isOpen: boolean;
+  type: FilterType;
+}
+
+export const INITIAL_FILTER_MODAL_STATE: FilterModalState = {
+  isOpen: false,
+  type: 'gaussian-blur',
+};
 
 export interface TonalModalState {
   isOpen: boolean;
@@ -70,9 +121,11 @@ export interface UiStoreState {
   isRecoveryModalOpen: boolean;
   crashedSessions: CrashedSessionInfo[];
   tonalModalState: TonalModalState;
+  filterModalState: FilterModalState;
   adjustmentModalState: AdjustmentModalState;
   layerStylesModalState: LayerStylesModalState;
   appClosePrompt: AppClosePromptState;
+  appDialog: AppDialogState;
 
   // Transient feedback
   isLoadingFile: boolean;
@@ -131,9 +184,11 @@ const createInitialUiState = (): UiStoreState => {
     isRecoveryModalOpen: false,
     crashedSessions: [],
     tonalModalState: { ...DEFAULT_TONAL_MODAL_STATE },
+    filterModalState: { ...INITIAL_FILTER_MODAL_STATE },
     adjustmentModalState: { isOpen: false },
     layerStylesModalState: { isOpen: false },
     appClosePrompt: { ...INITIAL_APP_CLOSE_PROMPT_STATE },
+    appDialog: { ...INITIAL_APP_DIALOG_STATE },
 
     isLoadingFile: false,
     loadingStatus: '',
@@ -144,6 +199,7 @@ const createInitialUiState = (): UiStoreState => {
 export const useUiStore = createStore<UiStoreState>(createInitialUiState);
 
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingDialogResolve: ((confirmed: boolean) => void) | null = null;
 
 export const uiStoreActions = {
   setAppView(appView: 'home' | 'workspace'): void {
@@ -288,6 +344,57 @@ export const uiStoreActions = {
     useUiStore.setState({ appClosePrompt: { ...INITIAL_APP_CLOSE_PROMPT_STATE } });
   },
 
+  openFilterModal(type: FilterType): void {
+    useUiStore.setState({ filterModalState: { isOpen: true, type } });
+  },
+
+  closeFilterModal(): void {
+    useUiStore.setState((prev) => ({
+      filterModalState: { ...prev.filterModalState, isOpen: false },
+    }));
+  },
+
+  confirmDialog(options: AppDialogOptions): Promise<boolean> {
+    if (pendingDialogResolve) {
+      const prevResolve = pendingDialogResolve;
+      pendingDialogResolve = null;
+      prevResolve(false);
+    }
+    const variant: AppDialogVariant = options.variant ?? 'confirm';
+    return new Promise<boolean>((resolve) => {
+      pendingDialogResolve = resolve;
+      useUiStore.setState({
+        appDialog: {
+          isOpen: true,
+          variant,
+          title: options.title,
+          message: options.message,
+          detail: options.detail,
+          confirmLabel: options.confirmLabel ?? (variant === 'danger' ? 'Delete' : 'OK'),
+          cancelLabel: options.cancelLabel ?? 'Cancel',
+          preview: options.preview ?? null,
+        },
+      });
+    });
+  },
+
+  alertDialog(options: Omit<AppDialogOptions, 'variant' | 'cancelLabel'>): Promise<void> {
+    return uiStoreActions
+      .confirmDialog({
+        ...options,
+        variant: 'alert',
+        confirmLabel: options.confirmLabel ?? 'OK',
+      })
+      .then(() => undefined);
+  },
+
+  resolveAppDialog(confirmed: boolean): void {
+    const resolver = pendingDialogResolve;
+    pendingDialogResolve = null;
+    useUiStore.setState({ appDialog: { ...INITIAL_APP_DIALOG_STATE } });
+    resolver?.(confirmed);
+  },
+
   setLoading(isLoadingFile: boolean, loadingStatus = ''): void {
     useUiStore.setState({ isLoadingFile, loadingStatus });
   },
@@ -328,9 +435,11 @@ export function selectIsAnyModalOpen(
     state.isTimelapseExportModalOpen ||
     state.isRecoveryModalOpen ||
     state.tonalModalState.isOpen ||
+    state.filterModalState.isOpen ||
     state.adjustmentModalState.isOpen ||
     state.layerStylesModalState.isOpen ||
     state.appClosePrompt.isOpen ||
+    state.appDialog.isOpen ||
     isHostModalOpen ||
     isUpdateModalOpen
   );
