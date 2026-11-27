@@ -1550,6 +1550,136 @@ describe('Unified GPU Viewport Compositor', () => {
       expect(t00.dirty).toBe(true);
       expect(glSpecErrors).toEqual([]);
     });
+
+    it('forces full texImage2D upload on first frame after stroke end / undo even with small __draftFrameDirtyRect (no ghost stroke in draftTexture)', () => {
+      const { canvas, calls, glSpecErrors } = createMockWebGL2Context();
+      const compositor = new ViewportCompositor(canvas);
+      const grid = new SparseTileGrid();
+      const dims = { width: 1024, height: 1024, dpi: 300 };
+
+      const layers: LayerItem[] = [
+        {
+          id: 'layer-1',
+          name: 'Sketch',
+          type: 'raster',
+          visible: true,
+          opacity: 1,
+          blendMode: 'normal',
+          locked: false,
+          parentId: null,
+        },
+      ];
+
+      const mockDraftCanvas = {
+        width: 1024,
+        height: 1024,
+        __draftHasContent: true,
+        __draftVersion: 1,
+        __draftSpace: 'document',
+        __draftDocRect: { x: 0, y: 0, width: 1024, height: 1024 },
+        __draftFrameDirtyRect: null as { x: number; y: number; width: number; height: number } | null,
+        __draftForceFullUpload: true,
+      } as unknown as HTMLCanvasElement;
+
+      const transform: ViewportTransform = { pan: { x: 400, y: 300 }, zoom: 1.0, rotation: 0 };
+
+      // 1. Stroke 1 live render (populates state.draftTexture)
+      compositor.render(layers, transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-1',
+        activeDraftLayerId: 'layer-1',
+        activeDraftCanvas: mockDraftCanvas,
+        activeDraftVersion: 1,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+      expect((mockDraftCanvas as any).__draftForceFullUpload).toBe(false);
+
+      // 2. PointerUp + Ctrl+Z: draft becomes inactive (state.draftTexture still holds Stroke 1 on GPU)
+      (mockDraftCanvas as any).__draftHasContent = false;
+      (mockDraftCanvas as any).__draftVersion = 2;
+      compositor.render(layers, transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-1',
+        activeDraftLayerId: 'layer-1',
+        activeDraftCanvas: mockDraftCanvas,
+        activeDraftVersion: 2,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+
+      // 3. Stroke 2 starts with deferred pen initial dot -> first rendered frame ALREADY has a small __draftFrameDirtyRect!
+      //    Must bypass partial texSubImage2D and perform a full texImage2D replacement so Stroke 1 cannot ghost.
+      calls.length = 0;
+      (mockDraftCanvas as any).__draftHasContent = true;
+      (mockDraftCanvas as any).__draftVersion = 3;
+      (mockDraftCanvas as any).__draftFrameDirtyRect = { x: 100, y: 100, width: 48, height: 48 };
+      compositor.render(layers, transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-1',
+        activeDraftLayerId: 'layer-1',
+        activeDraftCanvas: mockDraftCanvas,
+        activeDraftVersion: 3,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+
+      const fullUploadsOnStroke2Start = calls.filter(
+        (c) => c.name === 'texImage2D' && c.args[c.args.length - 1] === mockDraftCanvas
+      );
+      const subUploadsOnStroke2Start = calls.filter((c) => c.name === 'texSubImage2D');
+      expect(fullUploadsOnStroke2Start.length).toBe(1);
+      expect(subUploadsOnStroke2Start.length).toBe(0);
+      expect((mockDraftCanvas as any).__draftFrameDirtyRect).toBeNull();
+
+      // 4. Subsequent live frame within Stroke 2 uses fast texSubImage2D (zero texImage2D reallocation)
+      calls.length = 0;
+      (mockDraftCanvas as any).__draftVersion = 4;
+      (mockDraftCanvas as any).__draftFrameDirtyRect = { x: 120, y: 120, width: 32, height: 32 };
+      compositor.render(layers, transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-1',
+        activeDraftLayerId: 'layer-1',
+        activeDraftCanvas: mockDraftCanvas,
+        activeDraftVersion: 4,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+
+      expect(
+        calls.filter((c) => c.name === 'texImage2D' && c.args[c.args.length - 1] === mockDraftCanvas)
+          .length
+      ).toBe(0);
+      expect(calls.filter((c) => c.name === 'texSubImage2D').length).toBe(1);
+
+      // 5. Explicit __draftForceFullUpload flag forces full texImage2D even without an intermediate inactive frame
+      calls.length = 0;
+      (mockDraftCanvas as any).__draftVersion = 5;
+      (mockDraftCanvas as any).__draftForceFullUpload = true;
+      (mockDraftCanvas as any).__draftFrameDirtyRect = { x: 200, y: 200, width: 24, height: 24 };
+      compositor.render(layers, transform, dims, grid, {
+        dimensions: dims,
+        devicePixelRatio: 1,
+        activeLayerId: 'layer-1',
+        activeDraftLayerId: 'layer-1',
+        activeDraftCanvas: mockDraftCanvas,
+        activeDraftVersion: 5,
+        activeDraftSpace: 'document',
+        activeDraftOpacity: 1.0,
+      });
+
+      expect(
+        calls.filter((c) => c.name === 'texImage2D' && c.args[c.args.length - 1] === mockDraftCanvas)
+          .length
+      ).toBe(1);
+      expect(calls.filter((c) => c.name === 'texSubImage2D').length).toBe(0);
+      expect((mockDraftCanvas as any).__draftForceFullUpload).toBe(false);
+      expect(glSpecErrors).toEqual([]);
+    });
   });
 });
 

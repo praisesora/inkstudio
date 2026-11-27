@@ -29,9 +29,16 @@ describe('Clip Studio Paint Drawing Engine Refactor Tests', () => {
       const cornerSample = stabilizer.process(30, 20, 0.5, t);
 
       expect(cornerSample.isCorner).toBe(true);
-      // Coordinates should snap sharply to raw corner coordinate rather than lagging behind
+      // Smoothly pulls toward the corner vertex without hard-teleporting across large lag
       expect(cornerSample.x).toBeCloseTo(30, 0);
-      expect(cornerSample.y).toBeCloseTo(20, 0);
+      expect(cornerSample.y).toBeGreaterThan(0);
+      expect(cornerSample.y).toBeLessThanOrEqual(20);
+      const plan = stabilizer.consumeCornerPlan();
+      expect(plan).not.toBeNull();
+      expect(plan!.apexX).toBeCloseTo(30, 0);
+      expect(plan!.apexY).toBeCloseTo(0, 0);
+      expect(plan!.targetX).toBeCloseTo(30, 0);
+      expect(plan!.targetY).toBeCloseTo(20, 0);
     });
 
     it('maintains continuous smoothing for gentle curves (< 45 deg deflection)', () => {

@@ -1,10 +1,11 @@
 [package]
 name = "ink-studio"
-version = "1.0.3"
+version = "1.0.4"
 description = "Collaborative Drawing Studio"
 authors = ["Sora"]
 license = "GPL-3.0"
 edition = "2021"
+default-run = "ink-studio"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

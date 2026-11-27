@@ -339,6 +339,10 @@ export function App() {
   flushPendingHistoryTasksRef.current = drawing.flushPendingHistoryTasks;
 
   const handleUndo = useCallback(() => {
+    if ((collab.isConnected || collab.isReconnecting) && collab.myRole === 'viewer') {
+      showToast('Viewers have read-only access');
+      return;
+    }
     if (
       useUiStore.getState().is3DLayerOpen &&
       useToolStore.getState().tool === '3d' &&
@@ -366,9 +370,13 @@ export function App() {
     } else {
       drawing.undo();
     }
-  }, [collab.isConnected, collab.myPeer.id, drawing, selectionTools]);
+  }, [collab.isConnected, collab.isReconnecting, collab.myPeer.id, collab.myRole, drawing, selectionTools, showToast]);
 
   const handleRedo = useCallback(() => {
+    if ((collab.isConnected || collab.isReconnecting) && collab.myRole === 'viewer') {
+      showToast('Viewers have read-only access');
+      return;
+    }
     if (
       useUiStore.getState().is3DLayerOpen &&
       useToolStore.getState().tool === '3d' &&
@@ -379,7 +387,7 @@ export function App() {
       }
     }
     drawing.redo();
-  }, [drawing]);
+  }, [collab.isConnected, collab.isReconnecting, collab.myRole, drawing, showToast]);
 
   const getCanvasCoords = useCallback(
     (e: React.PointerEvent<HTMLElement> | PointerEvent) => {
@@ -572,7 +580,44 @@ export function App() {
     [layerMgr.toggleTone, selectionTools]
   );
 
+  const checkCollabLayerEdit = useCallback(
+    (layerId: string): boolean => {
+      if (!collab.isConnected && !collab.isReconnecting) return true;
+      if (collab.myRole === 'viewer') {
+        showToast('Viewers have read-only access');
+        return false;
+      }
+      const perm = collab.canEditLayerById(layerId);
+      if (!perm.allowed) {
+        showToast(perm.reason || 'Layer is locked by its owner');
+        return false;
+      }
+      return true;
+    },
+    [collab.isConnected, collab.isReconnecting, collab.myRole, collab.canEditLayerById, showToast]
+  );
+
   const handleMergeDown = useCallback(() => {
+    if (collab.isConnected || collab.isReconnecting) {
+      if (collab.myRole === 'viewer') {
+        showToast('Viewers have read-only access');
+        return;
+      }
+      const delPerm = collab.canDeleteLayerById(layerMgr.activeLayerId);
+      if (!delPerm.allowed) {
+        showToast(delPerm.reason || 'Cannot merge a protected layer');
+        return;
+      }
+      const activeIdx = layerMgr.layers.findIndex((l) => l.id === layerMgr.activeLayerId);
+      const belowLayer = activeIdx >= 0 ? layerMgr.layers[activeIdx + 1] : undefined;
+      if (belowLayer) {
+        const belowPerm = collab.canEditLayerById(belowLayer.id);
+        if (!belowPerm.allowed) {
+          showToast(belowPerm.reason || 'Target layer below is locked by its owner');
+          return;
+        }
+      }
+    }
     const res = layerMgr.mergeDown();
     if (res) {
       documentStoreActions.markDocumentDirty(activeDocumentId, true);
@@ -581,7 +626,18 @@ export function App() {
     } else {
       showToast('Cannot merge down: need an unlocked raster layer below');
     }
-  }, [layerMgr.mergeDown, activeDocumentId, showToast]);
+  }, [
+    collab.isConnected,
+    collab.isReconnecting,
+    collab.myRole,
+    collab.canDeleteLayerById,
+    collab.canEditLayerById,
+    layerMgr.activeLayerId,
+    layerMgr.layers,
+    layerMgr.mergeDown,
+    activeDocumentId,
+    showToast,
+  ]);
 
   const handleMergeFolder = useCallback(
     (folderId?: string) => {
@@ -653,18 +709,23 @@ export function App() {
 
   const handleRecordedDuplicateLayer = useCallback(
     (id: string) => {
+      if ((collab.isConnected || collab.isReconnecting) && collab.myRole === 'viewer') {
+        showToast('Viewers have read-only access');
+        return;
+      }
       layerMgr.duplicateLayer(id);
       autoActionStoreActions.recordStep('duplicate-layer', 'Duplicate Layer');
     },
-    [layerMgr.duplicateLayer]
+    [collab.isConnected, collab.isReconnecting, collab.myRole, layerMgr.duplicateLayer, showToast]
   );
 
   const handleRecordedSetBlendMode = useCallback(
     (id: string, blendMode: BlendMode) => {
+      if (!checkCollabLayerEdit(id)) return;
       layerMgr.setBlendMode(id, blendMode);
       autoActionStoreActions.recordStep('set-blend-mode', `Blend Mode: ${blendMode}`, { blendMode });
     },
-    [layerMgr.setBlendMode]
+    [checkCollabLayerEdit, layerMgr.setBlendMode]
   );
 
   const handleRecordedSetOpacity = useCallback(
@@ -679,10 +740,83 @@ export function App() {
 
   const handleRecordedToggleClipping = useCallback(
     (id: string) => {
+      if (!checkCollabLayerEdit(id)) return;
       layerMgr.toggleClipping(id);
       autoActionStoreActions.recordStep('toggle-clipping', 'Toggle Clipping Mask');
     },
-    [layerMgr.toggleClipping]
+    [checkCollabLayerEdit, layerMgr.toggleClipping]
+  );
+
+  const handleGuardedToggleAlphaLock = useCallback(
+    (id: string) => {
+      if (!checkCollabLayerEdit(id)) return;
+      layerMgr.toggleAlphaLock(id);
+    },
+    [checkCollabLayerEdit, layerMgr.toggleAlphaLock]
+  );
+
+  const handleGuardedMoveLayer = useCallback(
+    (id: string, direction: 'up' | 'down') => {
+      if (!checkCollabLayerEdit(id)) return;
+      layerMgr.moveLayer(id, direction);
+    },
+    [checkCollabLayerEdit, layerMgr.moveLayer]
+  );
+
+  const handleGuardedMoveLayerToFolder = useCallback(
+    (layerId: string, targetFolderId: string | null) => {
+      if (!checkCollabLayerEdit(layerId)) return;
+      layerMgr.moveLayerToFolder(layerId, targetFolderId);
+    },
+    [checkCollabLayerEdit, layerMgr.moveLayerToFolder]
+  );
+
+  const handleGuardedReorderLayers = useCallback(
+    (sourceId: string, targetId: string, position: 'above' | 'below' | 'inside') => {
+      if (!checkCollabLayerEdit(sourceId)) return;
+      layerMgr.reorderLayers(sourceId, targetId, position);
+    },
+    [checkCollabLayerEdit, layerMgr.reorderLayers]
+  );
+
+  const handleGuardedToggleLayerColor = useCallback(
+    (id: string) => {
+      if (!checkCollabLayerEdit(id)) return;
+      layerMgr.toggleLayerColor(id);
+    },
+    [checkCollabLayerEdit, layerMgr.toggleLayerColor]
+  );
+
+  const handleGuardedAddLayerMask = useCallback(
+    (...args: Parameters<typeof layerMgr.addLayerMask>) => {
+      if (!checkCollabLayerEdit(args[0])) return;
+      layerMgr.addLayerMask(...args);
+    },
+    [checkCollabLayerEdit, layerMgr.addLayerMask]
+  );
+
+  const handleGuardedRemoveLayerMask = useCallback(
+    (...args: Parameters<typeof layerMgr.removeLayerMask>) => {
+      if (!checkCollabLayerEdit(args[0])) return;
+      layerMgr.removeLayerMask(...args);
+    },
+    [checkCollabLayerEdit, layerMgr.removeLayerMask]
+  );
+
+  const handleGuardedToggleLayerMask = useCallback(
+    (layerId: string) => {
+      if (!checkCollabLayerEdit(layerId)) return;
+      layerMgr.toggleLayerMask(layerId);
+    },
+    [checkCollabLayerEdit, layerMgr.toggleLayerMask]
+  );
+
+  const handleGuardedToggleMaskLinked = useCallback(
+    (layerId: string) => {
+      if (!checkCollabLayerEdit(layerId)) return;
+      layerMgr.toggleMaskLinked(layerId);
+    },
+    [checkCollabLayerEdit, layerMgr.toggleMaskLinked]
   );
 
   const handleRecordedApplyFilter = useCallback(
@@ -1377,13 +1511,13 @@ export function App() {
       setBlendMode={handleRecordedSetBlendMode}
       toggleLock={collab.handleToggleLock}
       toggleOwnerLock={collab.handleToggleOwnerLock}
-      toggleAlphaLock={layerMgr.toggleAlphaLock}
+      toggleAlphaLock={handleGuardedToggleAlphaLock}
       toggleClipping={handleRecordedToggleClipping}
       toggleCollapse={layerMgr.toggleCollapse}
       handleRenameLayer={collab.handleRenameLayer}
-      moveLayer={layerMgr.moveLayer}
-      moveLayerToFolder={layerMgr.moveLayerToFolder}
-      reorderLayers={layerMgr.reorderLayers}
+      moveLayer={handleGuardedMoveLayer}
+      moveLayerToFolder={handleGuardedMoveLayerToFolder}
+      reorderLayers={handleGuardedReorderLayers}
       handleToggleReferenceLayer={handleToggleReferenceLayer}
       toggleTone={handleToggleTone}
       setToneFrequency={layerMgr.setToneFrequency}
@@ -1391,7 +1525,7 @@ export function App() {
       setToneDotShape={layerMgr.setToneDotShape}
       setToneDensity={layerMgr.setToneDensity}
       setToneDensityType={layerMgr.setToneDensityType}
-      toggleLayerColor={layerMgr.toggleLayerColor}
+      toggleLayerColor={handleGuardedToggleLayerColor}
       setLayerColor={layerMgr.setLayerColor}
       setLayerSubColor={layerMgr.setLayerSubColor}
       setLayerExpressionColor={handleRecordedSetExpressionColor}
@@ -1399,10 +1533,10 @@ export function App() {
       setLayerMonoExpressMode={layerMgr.setLayerMonoExpressMode}
       handleApplyExpressionColor={tonalActions.handleApplyExpressionColor}
       handleApplyLayerColor={tonalActions.handleApplyLayerColor}
-      addLayerMask={layerMgr.addLayerMask}
-      removeLayerMask={layerMgr.removeLayerMask}
-      toggleLayerMask={layerMgr.toggleLayerMask}
-      toggleMaskLinked={layerMgr.toggleMaskLinked}
+      addLayerMask={handleGuardedAddLayerMask}
+      removeLayerMask={handleGuardedRemoveLayerMask}
+      toggleLayerMask={handleGuardedToggleLayerMask}
+      toggleMaskLinked={handleGuardedToggleMaskLinked}
       handleOpenAdjustmentModal={tonalActions.handleOpenAdjustmentModal}
       handleOpenLayerStylesModal={tonalActions.handleOpenLayerStylesModal}
       onEditVectorLayer={shapeFillTools.openLayerForEditing}
@@ -1505,6 +1639,7 @@ export function App() {
         collabMyPeer={collab.myPeer}
         updateMyName={collab.updateMyName}
         handleStartHosting={collab.handleStartHosting}
+        handleStartWebRtcHosting={collab.handleStartWebRtcHosting}
         stopHosting={collab.stopHosting}
         joinByInviteUrl={collab.joinByInviteUrl}
         leaveRoom={collab.leaveRoom}

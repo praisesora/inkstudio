@@ -2063,6 +2063,16 @@ fn is_valid_port_suffix(rest: &str) -> bool {
         && port_str.parse::<u16>().is_ok()
 }
 
+fn is_private_lan_ipv4(host: &str) -> bool {
+    let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let octets = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64) // Tailscale / CGNAT 100.64.0.0/10
+}
+
 fn is_allowed_origin(
     origin: &str,
     local_ip: &str,
@@ -2087,6 +2097,15 @@ fn is_allowed_origin(
     if let Some(rest) = origin.strip_prefix("http://127.0.0.1") {
         if is_valid_port_suffix(rest) {
             return true;
+        }
+    }
+    // Allow local private-network Vite dev origins (:1420) for LAN tablet browser testing
+    // without opening arbitrary LAN ports (e.g. :9999 remains blocked against CSWSH).
+    if let Some(host_and_port) = origin.strip_prefix("http://") {
+        if let Some(host_part) = host_and_port.strip_suffix(":1420") {
+            if is_private_lan_ipv4(host_part) {
+                return true;
+            }
         }
     }
     let local_origin_with_port = format!("http://{}:{}", local_ip, port);

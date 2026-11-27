@@ -1,11 +1,17 @@
 import { BrushSettings, CanvasDimensions, LayerItem, Point } from '../../../types/editor';
-import { getVisibleCanvasBounds } from '../../../utils/canvasUtils';
+import { get2DContext, getVisibleCanvasBounds } from '../../../utils/canvasUtils';
 import {
   drawBrushDot,
   canUseWebGlForBrush,
   flushGpuDabs,
+  buildSecondaryBrushSettings,
+  resolveDualBrushConfig,
+  scalePointForSecondaryBrush,
 } from '../../../engine/BrushEngine';
+import { isRibbonBrush } from '../../../engine/RibbonBrushEngine';
 import { DraftCanvasElement, applySelectionCanvasClip } from '../types';
+import { buildLiveSecondaryBrushOptions } from './strokeHelpers';
+import { flushLiveDualSecondaryGpuBatch } from './liveSegmentEmitter';
 import {
   StrokeSessionHelpers,
   StrokeSessionState,
@@ -19,7 +25,8 @@ export function setupDraftCanvasSurface(
   vRect: DOMRect,
   dims: CanvasDimensions,
   draftCompositeOp: GlobalCompositeOperation,
-  isMonochrome: boolean
+  isMonochrome: boolean,
+  preferNativeScale: boolean = false
 ): number {
   const rawVis = getVisibleCanvasBounds(
     vRect,
@@ -31,19 +38,34 @@ export function setupDraftCanvasSurface(
     params.flipXRef.current,
     params.flipYRef.current
   );
-  const visMinX = rawVis.maxX > rawVis.minX ? rawVis.minX : 0;
-  const visMinY = rawVis.maxY > rawVis.minY ? rawVis.minY : 0;
-  const visW = Math.max(1, rawVis.maxX > rawVis.minX ? rawVis.maxX - rawVis.minX : dims.width);
-  const visH = Math.max(1, rawVis.maxY > rawVis.minY ? rawVis.maxY - rawVis.minY : dims.height);
+  const visMinX = rawVis.maxX > rawVis.minX ? Math.floor(rawVis.minX) : 0;
+  const visMinY = rawVis.maxY > rawVis.minY ? Math.floor(rawVis.minY) : 0;
+  const visW = Math.max(1, rawVis.maxX > rawVis.minX ? Math.ceil(rawVis.maxX) - visMinX : dims.width);
+  const visH = Math.max(1, rawVis.maxY > rawVis.minY ? Math.ceil(rawVis.maxY) - visMinY : dims.height);
   const MAX_DRAFT_DIM = 3072;
   const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
   const screenMatchedScale = Math.max(0.05, (params.zoomRef.current || 1) * dpr * 1.25);
-  const draftScale = Math.min(1.0, screenMatchedScale, MAX_DRAFT_DIM / Math.max(visW, visH));
+  const maxDimScale = MAX_DRAFT_DIM / Math.max(visW, visH);
+  // Keep 1:1 native document resolution for textured custom tips and SpatialTipMixer color-mixing
+  // brushes whenever the visible canvas fits within MAX_DRAFT_DIM, avoiding bilinear dilution of
+  // porous 1px tip pores during live drawing and enabling zero-pop direct draft commit on pointerUp.
+  const draftScale = preferNativeScale
+    ? Math.min(1.0, maxDimScale)
+    : Math.min(1.0, screenMatchedScale, maxDimScale);
   const surfaceW = Math.max(1, Math.ceil(visW * draftScale));
   const surfaceH = Math.max(1, Math.ceil(visH * draftScale));
-  if (draftCanvas.width !== surfaceW || draftCanvas.height !== surfaceH) {
+  const resized = draftCanvas.width !== surfaceW || draftCanvas.height !== surfaceH;
+  if (resized) {
     draftCanvas.width = surfaceW;
     draftCanvas.height = surfaceH;
+    draftCanvas.__clipSaved = false;
+  } else if (draftCanvas.__clipSaved) {
+    try {
+      draftCtx.restore();
+    } catch {
+      // Ignore restore underflow
+    }
+    draftCanvas.__clipSaved = false;
   }
 
   draftCtx.resetTransform();
@@ -60,6 +82,8 @@ export function setupDraftCanvasSurface(
   draftCanvas.__draftScale = draftScale;
   draftCanvas.__draftMonochrome = isMonochrome;
   draftCanvas.__draftVersion = (draftCanvas.__draftVersion || 0) + 1;
+  draftCanvas.__draftFrameDirtyRect = null;
+  draftCanvas.__draftForceFullUpload = true;
 
   draftCtx.setTransform(
     draftScale,
@@ -70,6 +94,7 @@ export function setupDraftCanvasSurface(
     -visMinY * draftScale
   );
   draftCtx.save();
+  draftCanvas.__clipSaved = true;
   draftCtx.beginPath();
   draftCtx.rect(0, 0, dims.width, dims.height);
   draftCtx.clip();
@@ -180,6 +205,33 @@ export function renderInitialStrokeDot(
     }
     gpuBatch.length = 0;
   }
+
+  if (state.isDualBrushStroke && state.dualSecondaryCanvas) {
+    const dualCfg = resolveDualBrushConfig(bs);
+    const secCtx = get2DContext(state.dualSecondaryCanvas);
+    if (dualCfg && secCtx) {
+      const secInfo = buildSecondaryBrushSettings(bs, dualCfg);
+      if (!isRibbonBrush(secInfo.settings)) {
+        const secPt = scalePointForSecondaryBrush(
+          firstDotPoint,
+          secInfo.sizeRatio,
+          secInfo.settings.size
+        );
+        const secAA = helpers.resolveLiveAntiAlias(secInfo.settings, isMonochrome, draftScale);
+        const secOpts = buildLiveSecondaryBrushOptions(secInfo.settings, isMonochrome, secAA, 0);
+        const useSecGpu = canUseWebGlForBrush(secOpts);
+        const secBatch = state.dualFrameSecondaryGpuDabs;
+        secBatch.length = 0;
+        drawBrushDot(secCtx, secPt, '#ffffff', secOpts, useSecGpu ? secBatch : undefined);
+        if (useSecGpu && secBatch.length > 0) {
+          if (!flushGpuDabs(secCtx, secBatch, '#ffffff', secOpts)) {
+            drawBrushDot(secCtx, secPt, '#ffffff', secOpts);
+          }
+          secBatch.length = 0;
+        }
+      }
+    }
+  }
 }
 
 export interface ShiftLineSegmentParams extends Omit<InitialStampParams, 'firstDotPoint' | 'zoom'> {
@@ -256,6 +308,9 @@ export function renderShiftLineInitialSegment(
       (isEraser && !isBgEraser) || bs.isTransparentInk ? '#000000' : strokeColor;
     flushGpuDabs(draftCtx, gpuBatch, liveColor, liveOpts);
     gpuBatch.length = 0;
+  }
+  if (state.isDualBrushStroke) {
+    flushLiveDualSecondaryGpuBatch(state, helpers, bs, isMonochrome, draftScale);
   }
 
   pipeline.seedKnot(

@@ -1,6 +1,44 @@
-import { Point, BrushSettings, ToolType, SurfaceTextureId, ImpastoSettings } from '../types/editor';
+import {
+  Point,
+  BrushSettings,
+  ToolType,
+  SurfaceTextureId,
+  ImpastoSettings,
+  DualBrushCompositeMode,
+  CspPaperTextureMode,
+} from '../types/editor';
 import { getSurfaceTextureHeightField, SURFACE_TEXTURE_SIZE } from '../utils/proceduralBrushTips';
 import { performanceManager } from '../utils/performanceManager';
+import {
+  PIGMENT_GLSL_WEBGL1,
+  getPigmentLutTexture,
+  invalidatePigmentLutTexture,
+} from '../utils/pigmentEngine';
+import { dualBrushCompositeModeToIndex } from './DualBrushEngine';
+
+export function paperTextureModeToIndex(mode?: CspPaperTextureMode): number {
+  switch (mode) {
+    case 'multiply':
+      return 1;
+    case 'compare':
+      return 2;
+    case 'overlay':
+      return 3;
+    case 'outline':
+      return 4;
+    case 'normal':
+      return 5;
+    case 'color-burn':
+      return 6;
+    case 'linear-burn':
+      return 7;
+    case 'height':
+      return 8;
+    case 'subtract':
+    default:
+      return 0;
+  }
+}
 
 export interface GpuInfo {
   isSupported: boolean;
@@ -24,6 +62,16 @@ export interface GpuDab {
   flipX?: number;
   flipY?: number;
   tipIndex?: number;
+  /** Optional per-dab paper texture density override (0..1) from CSP TextureDensityEffector. */
+  grainDensity?: number;
+}
+
+export const RIBBON_VERTEX_STRIDE = 9;
+
+export interface TexturedRibbonMeshInput {
+  vertices: Float32Array;
+  vertexCount: number;
+  bounds: { minX: number; minY: number; maxX: number; maxY: number };
 }
 
 const VERTEX_SHADER_SRC = `
@@ -100,15 +148,10 @@ varying float v_tipIndex;
 
 uniform bool u_hasTipTexture;
 uniform bool u_isColorTip;
+uniform bool u_isDualToneTip;
+uniform vec3 u_secondaryColor;
 uniform sampler2D u_tipTexture;
 uniform vec2 u_tipAtlasGrid;
-
-uniform bool u_hasDualTipTexture;
-uniform sampler2D u_dualTipTexture;
-uniform int u_dualBlendMode;
-uniform float u_dualScale;
-uniform float u_dualRotRad;
-uniform float u_dualScatter;
 
 uniform int u_antiAlias;
 uniform float u_hardness;
@@ -125,6 +168,8 @@ uniform int u_paperMode;
 uniform float u_paperBrightness;
 uniform float u_paperContrast;
 uniform bool u_paperInvert;
+uniform bool u_paperPreserveDensity;
+uniform bool u_paperEmphasizeDensity;
 uniform bool u_hasPaperTex;
 uniform sampler2D u_paperTexture;
 uniform vec2 u_paperTexSize;
@@ -132,6 +177,7 @@ uniform vec2 u_paperTexSize;
 uniform bool u_colorMixing;
 uniform bool u_perceptualMixing;
 uniform float u_pigmentStrength;
+uniform sampler2D u_pigmentLut;
 uniform bool u_hasCanvasTexture;
 uniform sampler2D u_canvasTexture;
 uniform vec2 u_canvasResolution;
@@ -167,7 +213,9 @@ float samplePaperTooth(vec2 worldPos) {
     vec2 uv = fract(rotP / max(vec2(1.0), u_paperTexSize));
     vec4 pSample = texture2D(u_paperTexture, uv);
     float lum = dot(pSample.rgb, vec3(0.299, 0.587, 0.114));
-    g = pSample.a < 0.98 ? (1.0 - pSample.a) : lum;
+    // Composite over white: handles both CSP black-on-transparent paper textures (RGB=0, A=density)
+    // and opaque grayscale heightmaps seamlessly without alpha-threshold cliffs.
+    g = mix(1.0, lum, pSample.a);
   } else {
     vec2 coord = rotP * 0.09;
     float n1 = sin(coord.x * 3.1415 + coord.y * 1.7) * cos(coord.y * 2.718 - coord.x * 0.9);
@@ -177,6 +225,9 @@ float samplePaperTooth(vec2 worldPos) {
 
   if (u_paperInvert) {
     g = 1.0 - g;
+  }
+  if (u_paperEmphasizeDensity) {
+    g = clamp((g - 0.5) * 2.2 + 0.35, 0.0, 1.0);
   }
   if (abs(u_paperBrightness) > 0.001) {
     g += u_paperBrightness;
@@ -188,143 +239,7 @@ float samplePaperTooth(vec2 worldPos) {
   return clamp(g, 0.0, 1.0);
 }
 
-// 7-band Spectral Kubelka-Munk + OKLab Pigment Mixing (WebGL1-safe unrolled bands)
-float kmReflectanceBand(vec3 c, float bR, float bG, float bB, float bC, float bM, float bY) {
-  float rr = 0.025 + c.r * 0.97;
-  float gg = 0.025 + c.g * 0.97;
-  float bb = 0.025 + c.b * 0.97;
-  if (rr <= gg && rr <= bb) {
-    if (gg <= bb) {
-      return rr + (gg - rr) * bC + (bb - gg) * bB;
-    }
-    return rr + (bb - rr) * bC + (gg - bb) * bG;
-  } else if (gg <= rr && gg <= bb) {
-    if (rr <= bb) {
-      return gg + (rr - gg) * bM + (bb - rr) * bB;
-    }
-    return gg + (bb - gg) * bM + (rr - bb) * bR;
-  } else {
-    if (rr <= gg) {
-      return bb + (rr - bb) * bY + (gg - rr) * bG;
-    }
-    return bb + (gg - bb) * bY + (rr - gg) * bR;
-  }
-}
-
-float kmMixBand(float s1, float s2, float w1, float w2) {
-  float a = clamp(s1, 0.02, 0.998);
-  float b = clamp(s2, 0.02, 0.998);
-  float ks1 = pow(((1.0 - a) * (1.0 - a)) / (2.0 * a), 0.72);
-  float ks2 = pow(((1.0 - b) * (1.0 - b)) / (2.0 * b), 0.72);
-  float ks = pow(max(0.0, ks1 * w1 + ks2 * w2), 1.3888889);
-  return 1.0 + ks - sqrt(ks * ks + 2.0 * ks);
-}
-
-vec3 linRgbToOklabGpu(vec3 c) {
-  float l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
-  float m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
-  float s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
-  float l_ = pow(max(0.0, l), 0.33333333);
-  float m_ = pow(max(0.0, m), 0.33333333);
-  float s_ = pow(max(0.0, s), 0.33333333);
-  return vec3(
-    0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
-    1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
-    0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
-  );
-}
-
-vec3 oklabToLinRgbGpu(vec3 lab) {
-  float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
-  float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
-  float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
-  float l = l_ * l_ * l_;
-  float m = m_ * m_ * m_;
-  float s = s_ * s_ * s_;
-  return vec3(
-     4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
-    -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
-    -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
-  );
-}
-
-vec3 mixPigmentsGpu(vec3 c1, vec3 c2, float t) {
-  float invT = 1.0 - t;
-  vec3 l1 = pow(max(c1, vec3(0.0)), vec3(2.2));
-  vec3 l2 = pow(max(c2, vec3(0.0)), vec3(2.2));
-
-  float Y1 = dot(l1, vec3(0.2126, 0.7152, 0.0722));
-  float Y2 = dot(l2, vec3(0.2126, 0.7152, 0.0722));
-  float conc1 = pow(0.06 + Y1, 0.36);
-  float conc2 = pow(0.06 + Y2, 0.36);
-  float w1 = (invT * conc1) / max(1e-5, invT * conc1 + t * conc2);
-  float w2 = 1.0 - w1;
-
-  vec3 b1 = vec3(0.0);
-  vec3 b2 = vec3(0.0);
-  vec3 mBase = vec3(0.0);
-
-  // Band 0 (420nm)
-  float s1 = kmReflectanceBand(l1, 0.025, 0.020, 0.880, 0.720, 0.780, 0.018);
-  float s2 = kmReflectanceBand(l2, 0.025, 0.020, 0.880, 0.720, 0.780, 0.018);
-  vec3 wv = vec3(0.140, -0.050, 0.340);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  // Band 1 (460nm)
-  s1 = kmReflectanceBand(l1, 0.018, 0.040, 0.990, 0.980, 0.500, 0.022);
-  s2 = kmReflectanceBand(l2, 0.018, 0.040, 0.990, 0.980, 0.500, 0.022);
-  wv = vec3(0.030, 0.045, 0.550);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  // Band 2 (500nm)
-  s1 = kmReflectanceBand(l1, 0.020, 0.420, 0.780, 0.990, 0.055, 0.280);
-  s2 = kmReflectanceBand(l2, 0.020, 0.420, 0.780, 0.990, 0.055, 0.280);
-  wv = vec3(-0.145, 0.250, 0.145);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  // Band 3 (540nm)
-  s1 = kmReflectanceBand(l1, 0.035, 0.980, 0.340, 0.840, 0.025, 0.930);
-  s2 = kmReflectanceBand(l2, 0.035, 0.980, 0.340, 0.840, 0.025, 0.930);
-  wv = vec3(-0.080, 0.500, -0.028);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  // Band 4 (580nm)
-  s1 = kmReflectanceBand(l1, 0.360, 0.900, 0.025, 0.140, 0.640, 0.995);
-  s2 = kmReflectanceBand(l2, 0.360, 0.900, 0.025, 0.140, 0.640, 0.995);
-  wv = vec3(0.365, 0.300, -0.007);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  // Band 5 (620nm)
-  s1 = kmReflectanceBand(l1, 0.965, 0.420, 0.020, 0.025, 0.975, 0.990);
-  s2 = kmReflectanceBand(l2, 0.965, 0.420, 0.020, 0.025, 0.975, 0.990);
-  wv = vec3(0.465, -0.018, 0.000);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  // Band 6 (660nm)
-  s1 = kmReflectanceBand(l1, 0.990, 0.060, 0.055, 0.025, 0.990, 0.980);
-  s2 = kmReflectanceBand(l2, 0.990, 0.060, 0.055, 0.025, 0.990, 0.980);
-  wv = vec3(0.225, -0.027, 0.000);
-  b1 += s1 * wv; b2 += s2 * wv; mBase += kmMixBand(s1, s2, w1, w2) * wv;
-
-  vec3 res1 = l1 - (b1 - vec3(0.025)) * 1.0309278;
-  vec3 res2 = l2 - (b2 - vec3(0.025)) * 1.0309278;
-  vec3 mixLin = max(vec3(0.0), (mBase - vec3(0.025)) * 1.0309278 + res1 * invT + res2 * t);
-
-  vec3 lab1 = linRgbToOklabGpu(l1);
-  vec3 lab2 = linRgbToOklabGpu(l2);
-  vec3 labM = linRgbToOklabGpu(mixLin);
-
-  float tunedL = clamp(labM.x * 0.40 + (lab1.x * invT + lab2.x * t) * 0.60, 0.0, 1.0);
-  float c1Ch = length(lab1.yz);
-  float c2Ch = length(lab2.yz);
-  float mCh = length(labM.yz);
-  float linCh = c1Ch * invT + c2Ch * t;
-  float boost = (mCh > 0.008 && linCh > mCh) ? min(1.65, (mCh + (linCh - mCh) * 0.50) / mCh) : 1.0;
-  vec2 ab = labM.yz * boost;
-
-  vec3 fin = oklabToLinRgbGpu(vec3(tunedL, ab));
-  return clamp(pow(max(fin, vec3(0.0)), vec3(1.0 / 2.2)), 0.0, 1.0);
-}
+${PIGMENT_GLSL_WEBGL1}
 
 void main() {
   float dist = length(v_localPos);
@@ -347,6 +262,9 @@ void main() {
     tipAlpha = tex.a;
     if (u_isColorTip) {
       rgb = tex.rgb;
+    } else if (u_isDualToneTip) {
+      float lum = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
+      rgb = mix(v_color.rgb, u_secondaryColor, lum);
     }
     if (u_antiAlias == 0) {
       tipAlpha = tipAlpha >= 0.5 ? 1.0 : 0.0;
@@ -371,63 +289,63 @@ void main() {
     }
   }
 
-  if (u_hasDualTipTexture) {
-    vec2 centered = (v_uv - 0.5) / max(0.1, u_dualScale);
-    float dc = cos(u_dualRotRad);
-    float ds = sin(u_dualRotRad);
-    vec2 dRot = vec2(centered.x * dc - centered.y * ds, centered.x * ds + centered.y * dc);
-    if (u_dualScatter > 0.001) {
-      float sHash = fract(sin(v_strokeDist * 0.137 + v_angle * 12.9898) * 43758.5453);
-      float sHash2 = fract(sin(v_strokeDist * 0.271 + v_angle * 78.233) * 24634.6345);
-      dRot += (vec2(sHash, sHash2) - 0.5) * u_dualScatter * 0.5;
-    }
-    vec2 dualUv = dRot + 0.5;
-    float dualA = (dualUv.x >= 0.0 && dualUv.x <= 1.0 && dualUv.y >= 0.0 && dualUv.y <= 1.0)
-      ? texture2D(u_dualTipTexture, dualUv).a
-      : 0.0;
-    if (u_dualBlendMode == 1) {
-      tipAlpha = max(0.0, tipAlpha - (1.0 - dualA));
-    } else if (u_dualBlendMode == 2) {
-      tipAlpha = min(tipAlpha, dualA);
-    } else if (u_dualBlendMode == 3) {
-      tipAlpha = tipAlpha < 0.5 ? (2.0 * tipAlpha * dualA) : (1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - dualA));
-    } else if (u_dualBlendMode == 4) {
-      tipAlpha = tipAlpha + dualA - tipAlpha * dualA;
-    } else {
-      tipAlpha *= dualA;
-    }
-  }
-
   if (tipAlpha <= 0.002) {
     discard;
   }
 
-  if (u_paperGrain > 0.001 || u_dryBrush > 0.001) {
+  // Modulate brush tip profile (0..1) BEFORE scaling by per-dab flow (matching CSP TextureForPlot=1 & CPU/SpatialTipMixer)
+  float dabPaperGrain = v_color.a >= 0.0 ? v_color.a : u_paperGrain;
+  if (dabPaperGrain > 0.001 || u_dryBrush > 0.001) {
     float g = samplePaperTooth(v_worldPos);
     float p = clamp(v_pressure, 0.0, 1.0);
     float heavyExcess = max(0.0, (p - 0.52) / 0.48);
     float penetration = min(0.92, (p * 0.28 + heavyExcess * heavyExcess * 0.64) * (0.45 + 0.55 * clamp(u_paintLoad, 0.0, 1.0)));
-    float effDensity = max(u_paperGrain, u_dryBrush * 0.85) * (1.0 - penetration * 0.85);
+    float effDensity = u_paperPreserveDensity
+      ? max(dabPaperGrain, u_dryBrush * 0.85)
+      : max(dabPaperGrain, u_dryBrush * 0.85) * (1.0 - penetration * 0.85);
 
     if (u_dryBrush > 0.01) {
       float cutoff = u_dryBrush * (1.0 - penetration * 0.86) * 0.78;
       float tooth = smoothstep(cutoff - 0.06, cutoff + 0.14, g);
-      tipAlpha *= mix(1.0, tooth, clamp(u_dryBrush + u_paperGrain * 0.5, 0.0, 1.0));
+      tipAlpha *= mix(1.0, tooth, clamp(u_dryBrush + dabPaperGrain * 0.5, 0.0, 1.0));
     } else if (u_paperMode == 1) {
+      // multiply
       tipAlpha *= (1.0 - effDensity * (1.0 - g));
     } else if (u_paperMode == 2) {
+      // compare
       float contactHeight = g * (0.22 + 0.78 * tipAlpha);
       float cutoff = effDensity * 0.68;
       float tooth = smoothstep(cutoff - 0.05, cutoff + 0.16, contactHeight);
       tipAlpha *= tooth;
     } else if (u_paperMode == 3) {
-      float ov = tipAlpha < 0.5 ? (2.0 * tipAlpha * g) : (1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - g));
-      tipAlpha = mix(tipAlpha, ov, effDensity);
+      // overlay
+      float dMod = tipAlpha * (1.0 - effDensity * 0.32 * (1.0 - g));
+      float ov = dMod < 0.5 ? (2.0 * dMod * g) : (1.0 - 2.0 * (1.0 - dMod) * (1.0 - g));
+      tipAlpha = clamp(mix(tipAlpha, ov, effDensity), 0.0, 1.0);
     } else if (u_paperMode == 4) {
+      // outline
       float edgeFactor = 4.0 * tipAlpha * (1.0 - tipAlpha);
       tipAlpha *= (1.0 - effDensity * (1.0 - g) * (0.35 + 0.65 * edgeFactor));
+    } else if (u_paperMode == 5) {
+      // normal
+      float sil = min(1.0, tipAlpha * 4.0);
+      tipAlpha = clamp(tipAlpha * (1.0 - effDensity) + g * sil * effDensity, 0.0, 1.0);
+    } else if (u_paperMode == 6) {
+      // color-burn
+      float burned = g <= 0.001 ? 0.0 : max(0.0, 1.0 - (1.0 - tipAlpha) / g);
+      tipAlpha = clamp(mix(tipAlpha, burned, effDensity), 0.0, 1.0);
+    } else if (u_paperMode == 7) {
+      // linear-burn
+      float burned = max(0.0, tipAlpha + g - 1.0);
+      tipAlpha = clamp(mix(tipAlpha, burned, effDensity), 0.0, 1.0);
+    } else if (u_paperMode == 8) {
+      // height
+      float sil = min(1.0, tipAlpha * 4.0);
+      float relief = clamp((tipAlpha + g - 0.5) * 1.6, 0.0, 1.0) * sil;
+      tipAlpha = clamp(tipAlpha * (1.0 - effDensity) + relief * effDensity, 0.0, 1.0);
     } else {
-      float sub = (1.0 - g) * effDensity * (1.0 - penetration * 0.5);
+      // 0: subtract
+      float sub = (1.0 - g) * effDensity * (u_paperPreserveDensity ? 1.0 : (1.0 - penetration * 0.5));
       tipAlpha = max(0.0, tipAlpha - sub);
     }
 
@@ -435,6 +353,8 @@ void main() {
       discard;
     }
   }
+
+  float finalAlpha = clamp(tipAlpha * v_alpha, 0.0, 1.0);
 
   if (u_colorMixing && u_hasCanvasTexture && !u_isEraser) {
     vec2 docRes = max(vec2(1.0), u_docResolution);
@@ -448,17 +368,15 @@ void main() {
         ? 1.0
         : clamp(mix(u_amountOfPaint, 1.0, (1.0 - stretchDecay) * 0.35), 0.02, 1.0);
       if (u_perceptualMixing && u_pigmentStrength > 0.005) {
-        vec3 pig = mixPigmentsGpu(canvasColor.rgb, rgb, effectiveAmount);
-        vec3 lin = mix(canvasColor.rgb, rgb, effectiveAmount);
-        rgb = mix(lin, pig, clamp(u_pigmentStrength, 0.0, 1.0));
+        rgb = mixPigmentsGpu(canvasColor.rgb, rgb, effectiveAmount, u_pigmentStrength);
       } else {
         rgb = mix(canvasColor.rgb, rgb, effectiveAmount);
       }
-      tipAlpha *= mix(0.65, 1.0, u_densityOfPaint);
+      finalAlpha *= mix(0.65, 1.0, u_densityOfPaint);
     }
   }
 
-  float finalAlpha = clamp(tipAlpha * v_alpha, 0.0, 1.0);
+  finalAlpha = clamp(finalAlpha, 0.0, 1.0);
   if (u_antiAlias == 0) {
     finalAlpha = finalAlpha >= 0.5 ? 1.0 : 0.0;
     if (finalAlpha <= 0.0) discard;
@@ -481,6 +399,83 @@ varying vec2 v_uv;
 void main() {
   v_uv = a_pos * 0.5 + 0.5;
   gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+`;
+
+const DUAL_COMBINE_FRAGMENT_SHADER_SRC = `
+precision highp float;
+
+varying vec2 v_uv;
+
+uniform sampler2D u_primaryTex;
+uniform sampler2D u_secondaryTex;
+uniform vec2 u_uvScale;
+uniform int u_combineMode;
+
+float combineDualAlpha(float a1, float a2, int mode) {
+  if (a1 <= 0.0001) return 0.0;
+  float p1 = clamp(a1, 0.0, 1.0);
+  float p2 = clamp(a2, 0.0, 1.0);
+  if (mode == 0) {
+    // multiply
+    return p1 * p2;
+  } else if (mode == 1) {
+    // darken
+    return min(p1, p2);
+  } else if (mode == 2) {
+    // subtract
+    return max(0.0, p1 - p2);
+  } else if (mode == 3) {
+    // compare-density
+    float sil = min(1.0, p1 * 4.0);
+    return max(p1, p2 * sil);
+  } else if (mode == 4) {
+    // linear-burn
+    return max(0.0, p1 + p2 - 1.0);
+  } else if (mode == 5) {
+    // color-burn
+    return p2 <= 0.0001 ? 0.0 : max(0.0, 1.0 - (1.0 - p1) / p2);
+  } else if (mode == 6) {
+    // height
+    float h = p1 + p2 - 1.0;
+    float t = clamp(h * 4.0, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+  } else if (mode == 7) {
+    // overlay
+    return p1 < 0.5 ? (2.0 * p1 * p2) : (1.0 - 2.0 * (1.0 - p1) * (1.0 - p2));
+  } else if (mode == 8) {
+    // screen
+    float sil = min(1.0, p1 * 4.0);
+    float eff2 = p2 * sil;
+    return p1 + eff2 - p1 * eff2;
+  } else if (mode == 9) {
+    // lighten
+    float sil = min(1.0, p1 * 4.0);
+    return max(p1, p2 * sil);
+  } else if (mode == 10) {
+    // hard-mix
+    return (p1 + p2 >= 1.0) ? 1.0 : 0.0;
+  } else if (mode == 11) {
+    // normal
+    float sil = min(1.0, p1 * 4.0);
+    float eff2 = p2 * sil;
+    return p1 + eff2 * (1.0 - p1);
+  }
+  return p1 * p2;
+}
+
+void main() {
+  vec2 uv = v_uv * u_uvScale;
+  vec4 p = texture2D(u_primaryTex, uv);
+  float a1 = clamp(p.a, 0.0, 1.0);
+  if (a1 <= 0.0001) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+  vec3 rgb = clamp(p.rgb / a1, 0.0, 1.0);
+  float a2 = clamp(texture2D(u_secondaryTex, uv).a, 0.0, 1.0);
+  float outA = clamp(combineDualAlpha(a1, a2, u_combineMode), 0.0, 1.0);
+  gl_FragColor = vec4(rgb * outA, outA);
 }
 `;
 
@@ -630,6 +625,225 @@ void main() {
 }
 `;
 
+const TEXTURED_RIBBON_VERTEX_SHADER_SRC = `
+precision highp float;
+
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+attribute float a_alpha;
+attribute float a_pressure;
+attribute float a_tipIndex;
+attribute vec2 a_edgeInfo;
+
+uniform vec2 u_canvasResolution;
+uniform vec2 u_dirtyOffset;
+
+varying vec2 v_uv;
+varying float v_alpha;
+varying float v_pressure;
+varying float v_tipIndex;
+varying vec2 v_edgeInfo;
+varying vec2 v_worldPos;
+
+void main() {
+  v_uv = a_uv;
+  v_alpha = a_alpha;
+  v_pressure = a_pressure;
+  v_tipIndex = a_tipIndex;
+  v_edgeInfo = a_edgeInfo;
+  v_worldPos = a_pos;
+
+  vec2 clipPos = ((a_pos - u_dirtyOffset) / u_canvasResolution) * 2.0 - 1.0;
+  clipPos.y = -clipPos.y;
+
+  gl_Position = vec4(clipPos, 0.0, 1.0);
+}
+`;
+
+const TEXTURED_RIBBON_FRAGMENT_SHADER_SRC = `
+precision highp float;
+
+varying vec2 v_uv;
+varying float v_alpha;
+varying float v_pressure;
+varying float v_tipIndex;
+varying vec2 v_edgeInfo;
+varying vec2 v_worldPos;
+
+uniform bool u_hasTipTexture;
+uniform sampler2D u_tipTexture;
+uniform vec2 u_tipAtlasGrid;
+uniform bool u_isColorTip;
+uniform bool u_isDualToneTip;
+uniform vec3 u_primaryColor;
+uniform vec3 u_secondaryColor;
+uniform int u_antiAlias;
+
+uniform float u_paperGrain;
+uniform float u_grainScale;
+uniform float u_grainRotateRad;
+uniform int u_paperMode;
+uniform float u_paperBrightness;
+uniform float u_paperContrast;
+uniform bool u_paperInvert;
+uniform bool u_paperPreserveDensity;
+uniform bool u_paperEmphasizeDensity;
+uniform bool u_hasPaperTex;
+uniform sampler2D u_paperTexture;
+uniform vec2 u_paperTexSize;
+
+uniform bool u_isEraser;
+uniform bool u_isBgEraser;
+
+float sampleRibbonPaperTooth(vec2 worldPos) {
+  float invScale = 1.0 / max(0.05, u_grainScale);
+  float c = cos(u_grainRotateRad);
+  float s = sin(u_grainRotateRad);
+  vec2 rotP = vec2(worldPos.x * c - worldPos.y * s, worldPos.x * s + worldPos.y * c) * invScale;
+
+  float g = 0.5;
+  if (u_hasPaperTex) {
+    vec2 uv = fract(rotP / max(vec2(1.0), u_paperTexSize));
+    vec4 pSample = texture2D(u_paperTexture, uv);
+    float lum = dot(pSample.rgb, vec3(0.299, 0.587, 0.114));
+    g = mix(1.0, lum, pSample.a);
+  } else {
+    vec2 coord = rotP * 0.09;
+    float n1 = sin(coord.x * 3.1415 + coord.y * 1.7) * cos(coord.y * 2.718 - coord.x * 0.9);
+    float n2 = sin(coord.x * 7.3 - coord.y * 5.1) * cos(coord.x * 4.2 + coord.y * 8.3);
+    g = clamp((n1 * 0.6 + n2 * 0.4) * 0.5 + 0.5, 0.0, 1.0);
+  }
+
+  if (u_paperInvert) {
+    g = 1.0 - g;
+  }
+  if (u_paperEmphasizeDensity) {
+    g = clamp((g - 0.5) * 2.2 + 0.35, 0.0, 1.0);
+  }
+  if (abs(u_paperBrightness) > 0.001) {
+    g += u_paperBrightness;
+  }
+  if (abs(u_paperContrast) > 0.001) {
+    float cf = pow(max(0.05, 1.0 + u_paperContrast), 2.0);
+    g = (g - 0.5) * cf + 0.5;
+  }
+  return clamp(g, 0.0, 1.0);
+}
+
+void main() {
+  if (v_uv.x < 0.0 || v_uv.x > 1.0 || v_uv.y < 0.0 || v_uv.y > 1.0) {
+    discard;
+  }
+
+  vec3 rgb = u_primaryColor;
+  float tipAlpha = 1.0;
+
+  if (u_hasTipTexture) {
+    vec2 sampleUv = v_uv;
+    if (u_tipAtlasGrid.x > 1.0 || u_tipAtlasGrid.y > 1.0) {
+      float cols = max(1.0, u_tipAtlasGrid.x);
+      float rows = max(1.0, u_tipAtlasGrid.y);
+      float idx = floor(max(0.0, v_tipIndex) + 0.5);
+      float col = mod(idx, cols);
+      float row = floor(idx / cols);
+      vec2 cellSize = vec2(1.0 / cols, 1.0 / rows);
+      vec2 inset = cellSize * 0.004;
+      sampleUv = vec2(col, row) * cellSize + inset + clamp(v_uv, 0.0, 1.0) * (cellSize - inset * 2.0);
+    }
+    vec4 tex = texture2D(u_tipTexture, sampleUv);
+    tipAlpha = tex.a;
+    if (!u_isEraser && !u_isBgEraser) {
+      if (u_isColorTip) {
+        rgb = tex.rgb;
+      } else if (u_isDualToneTip) {
+        float lum = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
+        rgb = mix(u_primaryColor, u_secondaryColor, lum);
+      }
+    }
+  } else {
+    tipAlpha = 1.0 - smoothstep(0.85, 1.0, abs(v_edgeInfo.x));
+  }
+
+  if (u_antiAlias == 0) {
+    tipAlpha = tipAlpha >= 0.5 ? 1.0 : 0.0;
+  } else {
+    float edgePx = u_antiAlias == 1 ? 0.65 : (u_antiAlias == 3 ? 1.85 : 1.15);
+    float edgeUv = clamp(edgePx / max(1.0, v_edgeInfo.y), 0.0, 0.45);
+    if (edgeUv > 0.0001) {
+      float edgeMask = 1.0 - smoothstep(1.0 - edgeUv * 2.0, 1.0, abs(v_edgeInfo.x));
+      tipAlpha *= edgeMask;
+    }
+  }
+
+  if (tipAlpha <= 0.002) {
+    discard;
+  }
+
+  // Modulate ribbon tip profile (0..1) BEFORE scaling by per-vertex flow (matching CSP TextureForPlot=1 & CPU)
+  if (u_paperGrain > 0.005) {
+    float g = sampleRibbonPaperTooth(v_worldPos);
+    float p = clamp(v_pressure, 0.0, 1.0);
+    float heavyExcess = max(0.0, (p - 0.52) / 0.48);
+    float penetration = min(0.92, p * 0.28 + heavyExcess * heavyExcess * 0.64);
+    float effDensity = u_paperPreserveDensity
+      ? u_paperGrain
+      : u_paperGrain * (1.0 - penetration * 0.85);
+
+    if (u_paperMode == 1) {
+      tipAlpha *= (1.0 - effDensity * (1.0 - g));
+    } else if (u_paperMode == 2) {
+      float contactHeight = g * (0.22 + 0.78 * tipAlpha);
+      float cutoff = effDensity * 0.68;
+      float tooth = smoothstep(cutoff - 0.05, cutoff + 0.16, contactHeight);
+      tipAlpha *= tooth;
+    } else if (u_paperMode == 3) {
+      float dMod = tipAlpha * (1.0 - effDensity * 0.32 * (1.0 - g));
+      float ov = dMod < 0.5 ? (2.0 * dMod * g) : (1.0 - 2.0 * (1.0 - dMod) * (1.0 - g));
+      tipAlpha = clamp(mix(tipAlpha, ov, effDensity), 0.0, 1.0);
+    } else if (u_paperMode == 4) {
+      float edgeFactor = 4.0 * tipAlpha * (1.0 - tipAlpha);
+      tipAlpha *= (1.0 - effDensity * (1.0 - g) * (0.35 + 0.65 * edgeFactor));
+    } else if (u_paperMode == 5) {
+      float sil = min(1.0, tipAlpha * 4.0);
+      tipAlpha = clamp(tipAlpha * (1.0 - effDensity) + g * sil * effDensity, 0.0, 1.0);
+    } else if (u_paperMode == 6) {
+      float burned = g <= 0.001 ? 0.0 : max(0.0, 1.0 - (1.0 - tipAlpha) / g);
+      tipAlpha = clamp(mix(tipAlpha, burned, effDensity), 0.0, 1.0);
+    } else if (u_paperMode == 7) {
+      float burned = max(0.0, tipAlpha + g - 1.0);
+      tipAlpha = clamp(mix(tipAlpha, burned, effDensity), 0.0, 1.0);
+    } else if (u_paperMode == 8) {
+      float sil = min(1.0, tipAlpha * 4.0);
+      float relief = clamp((tipAlpha + g - 0.5) * 1.6, 0.0, 1.0) * sil;
+      tipAlpha = clamp(tipAlpha * (1.0 - effDensity) + relief * effDensity, 0.0, 1.0);
+    } else {
+      float sub = (1.0 - g) * effDensity * (u_paperPreserveDensity ? 1.0 : (1.0 - penetration * 0.5));
+      tipAlpha = max(0.0, tipAlpha - sub);
+    }
+
+    if (tipAlpha <= 0.002) {
+      discard;
+    }
+  }
+
+  float finalAlpha = clamp(tipAlpha * v_alpha, 0.0, 1.0);
+
+  finalAlpha = clamp(finalAlpha, 0.0, 1.0);
+  if (u_antiAlias == 0) {
+    finalAlpha = finalAlpha >= 0.5 ? 1.0 : 0.0;
+    if (finalAlpha <= 0.0) discard;
+  }
+
+  if (u_isBgEraser) {
+    gl_FragColor = vec4(finalAlpha, finalAlpha, finalAlpha, finalAlpha);
+  } else if (u_isEraser) {
+    gl_FragColor = vec4(0.0, 0.0, 0.0, finalAlpha);
+  } else {
+    gl_FragColor = vec4(rgb * finalAlpha, finalAlpha);
+  }
+}
+`;
+
 const MAX_TILE_CHUNK = 2048;
 
 /**
@@ -645,7 +859,9 @@ export class WebGlBrushEngine {
   private gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
   private program: WebGLProgram | null = null;
   private ribbonProgram: WebGLProgram | null = null;
+  private texturedRibbonProgram: WebGLProgram | null = null;
   private impastoProgram: WebGLProgram | null = null;
+  private dualCombineProgram: WebGLProgram | null = null;
   private isGpuAvailable = false;
   private gpuInfo: GpuInfo = {
     isSupported: false,
@@ -670,14 +886,10 @@ export class WebGlBrushEngine {
   private uDirtyOffsetLoc: WebGLUniformLocation | null = null;
   private uHasTipTextureLoc: WebGLUniformLocation | null = null;
   private uIsColorTipLoc: WebGLUniformLocation | null = null;
+  private uIsDualToneTipLoc: WebGLUniformLocation | null = null;
+  private uSecondaryColorLoc: WebGLUniformLocation | null = null;
   private uTipTextureLoc: WebGLUniformLocation | null = null;
   private uTipAtlasGridLoc: WebGLUniformLocation | null = null;
-  private uHasDualTipTextureLoc: WebGLUniformLocation | null = null;
-  private uDualTipTextureLoc: WebGLUniformLocation | null = null;
-  private uDualBlendModeLoc: WebGLUniformLocation | null = null;
-  private uDualScaleLoc: WebGLUniformLocation | null = null;
-  private uDualRotRadLoc: WebGLUniformLocation | null = null;
-  private uDualScatterLoc: WebGLUniformLocation | null = null;
   private uAntiAliasLoc: WebGLUniformLocation | null = null;
   private uHardnessLoc: WebGLUniformLocation | null = null;
   private uWetEdgeLoc: WebGLUniformLocation | null = null;
@@ -693,12 +905,15 @@ export class WebGlBrushEngine {
   private uPaperBrightnessLoc: WebGLUniformLocation | null = null;
   private uPaperContrastLoc: WebGLUniformLocation | null = null;
   private uPaperInvertLoc: WebGLUniformLocation | null = null;
+  private uPaperPreserveDensityLoc: WebGLUniformLocation | null = null;
+  private uPaperEmphasizeDensityLoc: WebGLUniformLocation | null = null;
   private uHasPaperTexLoc: WebGLUniformLocation | null = null;
   private uPaperTextureLoc: WebGLUniformLocation | null = null;
   private uPaperTexSizeLoc: WebGLUniformLocation | null = null;
   private uColorMixingLoc: WebGLUniformLocation | null = null;
   private uPerceptualMixingLoc: WebGLUniformLocation | null = null;
   private uPigmentStrengthLoc: WebGLUniformLocation | null = null;
+  private uPigmentLutLoc: WebGLUniformLocation | null = null;
   private uHasCanvasTextureLoc: WebGLUniformLocation | null = null;
   private uCanvasTextureLoc: WebGLUniformLocation | null = null;
   private uAmountOfPaintLoc: WebGLUniformLocation | null = null;
@@ -713,6 +928,39 @@ export class WebGlBrushEngine {
   private aRibbonNormalDistLoc = -1;
   private aRibbonColorLoc = -1;
   private aRibbonWidthLoc = -1;
+
+  // Textured CSP Ribbon Program locations & buffer
+  private aTexRibPosLoc = -1;
+  private aTexRibUvLoc = -1;
+  private aTexRibAlphaLoc = -1;
+  private aTexRibPressureLoc = -1;
+  private aTexRibTipIndexLoc = -1;
+  private aTexRibEdgeInfoLoc = -1;
+  private uTexRibCanvasResolutionLoc: WebGLUniformLocation | null = null;
+  private uTexRibDirtyOffsetLoc: WebGLUniformLocation | null = null;
+  private uTexRibHasTipTextureLoc: WebGLUniformLocation | null = null;
+  private uTexRibTipTextureLoc: WebGLUniformLocation | null = null;
+  private uTexRibTipAtlasGridLoc: WebGLUniformLocation | null = null;
+  private uTexRibIsColorTipLoc: WebGLUniformLocation | null = null;
+  private uTexRibIsDualToneTipLoc: WebGLUniformLocation | null = null;
+  private uTexRibPrimaryColorLoc: WebGLUniformLocation | null = null;
+  private uTexRibSecondaryColorLoc: WebGLUniformLocation | null = null;
+  private uTexRibAntiAliasLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperGrainLoc: WebGLUniformLocation | null = null;
+  private uTexRibGrainScaleLoc: WebGLUniformLocation | null = null;
+  private uTexRibGrainRotateRadLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperModeLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperBrightnessLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperContrastLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperInvertLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperPreserveDensityLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperEmphasizeDensityLoc: WebGLUniformLocation | null = null;
+  private uTexRibHasPaperTexLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperTextureLoc: WebGLUniformLocation | null = null;
+  private uTexRibPaperTexSizeLoc: WebGLUniformLocation | null = null;
+  private uTexRibIsEraserLoc: WebGLUniformLocation | null = null;
+  private uTexRibIsBgEraserLoc: WebGLUniformLocation | null = null;
+  private texturedRibbonBuffer: WebGLBuffer | null = null;
 
   // Impasto Relief Post-Pass locations & resources
   private aImpastoPosLoc = -1;
@@ -743,6 +991,19 @@ export class WebGlBrushEngine {
   private dabFboWidth = 0;
   private dabFboHeight = 0;
 
+  // Dual Brush two-pass FBO & fullscreen combine shader locations
+  private aDualCombinePosLoc = -1;
+  private uDualCombinePrimaryTexLoc: WebGLUniformLocation | null = null;
+  private uDualCombineSecondaryTexLoc: WebGLUniformLocation | null = null;
+  private uDualCombineUvScaleLoc: WebGLUniformLocation | null = null;
+  private uDualCombineModeLoc: WebGLUniformLocation | null = null;
+  private dualPrimaryFbo: WebGLFramebuffer | null = null;
+  private dualPrimaryTex: WebGLTexture | null = null;
+  private dualSecondaryFbo: WebGLFramebuffer | null = null;
+  private dualSecondaryTex: WebGLTexture | null = null;
+  private dualFboWidth = 0;
+  private dualFboHeight = 0;
+
   private quadVertexBuffer: WebGLBuffer | null = null;
   private extInstanced: {
     drawArraysInstanced: (mode: number, first: number, count: number, instanceCount: number) => void;
@@ -750,6 +1011,9 @@ export class WebGlBrushEngine {
   } | null = null;
   private instanceBuffer: WebGLBuffer | null = null;
   private instanceArray: Float32Array = new Float32Array(4096 * 15);
+  private secondaryInstanceBuffer: WebGLBuffer | null = null;
+  private secondaryInstanceArray: Float32Array = new Float32Array(2048 * 15);
+  private blendMaxEnum: number | null = null;
 
   private ribbonBuffer: WebGLBuffer | null = null;
   private ribbonArray: Float32Array = new Float32Array(1024 * 8);
@@ -802,6 +1066,7 @@ export class WebGlBrushEngine {
   }
 
   private clearTextureMapsState() {
+    invalidatePigmentLutTexture(this.gl, false);
     this.tipTexturesMap.clear();
     this.multiTipAtlasCache.clear();
     this.surfaceTexturesMap.clear();
@@ -816,6 +1081,12 @@ export class WebGlBrushEngine {
     this.dabFboTex = null;
     this.dabFboWidth = 0;
     this.dabFboHeight = 0;
+    this.dualPrimaryFbo = null;
+    this.dualPrimaryTex = null;
+    this.dualSecondaryFbo = null;
+    this.dualSecondaryTex = null;
+    this.dualFboWidth = 0;
+    this.dualFboHeight = 0;
   }
 
   /**
@@ -830,6 +1101,10 @@ export class WebGlBrushEngine {
       if (this.canvasLayerTexture) gl.deleteTexture(this.canvasLayerTexture);
       if (this.impastoColorTex) gl.deleteTexture(this.impastoColorTex);
       if (this.impastoHeightTex) gl.deleteTexture(this.impastoHeightTex);
+      if (this.dualPrimaryTex) gl.deleteTexture(this.dualPrimaryTex);
+      if (this.dualSecondaryTex) gl.deleteTexture(this.dualSecondaryTex);
+      if (this.dualPrimaryFbo) gl.deleteFramebuffer(this.dualPrimaryFbo);
+      if (this.dualSecondaryFbo) gl.deleteFramebuffer(this.dualSecondaryFbo);
     }
     this.tipTexturesMap.clear();
     this.multiTipAtlasCache.clear();
@@ -840,6 +1115,12 @@ export class WebGlBrushEngine {
     this.canvasLayerSource = null;
     this.impastoColorTex = null;
     this.impastoHeightTex = null;
+    this.dualPrimaryTex = null;
+    this.dualSecondaryTex = null;
+    this.dualPrimaryFbo = null;
+    this.dualSecondaryFbo = null;
+    this.dualFboWidth = 0;
+    this.dualFboHeight = 0;
   }
 
   /**
@@ -858,7 +1139,10 @@ export class WebGlBrushEngine {
       this.gl = null;
       this.program = null;
       this.ribbonProgram = null;
+      this.texturedRibbonProgram = null;
+      this.texturedRibbonBuffer = null;
       this.impastoProgram = null;
+      this.dualCombineProgram = null;
       this.canvas = null;
       this.isGpuAvailable = false;
       this.clearTextureMapsState();
@@ -882,7 +1166,10 @@ export class WebGlBrushEngine {
     this.gl = null;
     this.program = null;
     this.ribbonProgram = null;
+    this.texturedRibbonProgram = null;
+    this.texturedRibbonBuffer = null;
     this.impastoProgram = null;
+    this.dualCombineProgram = null;
     this.canvas = null;
     this.isGpuAvailable = false;
     this.clearTextureMapsState();
@@ -964,14 +1251,10 @@ export class WebGlBrushEngine {
             this.uDirtyOffsetLoc = gl.getUniformLocation(program, 'u_dirtyOffset');
             this.uHasTipTextureLoc = gl.getUniformLocation(program, 'u_hasTipTexture');
             this.uIsColorTipLoc = gl.getUniformLocation(program, 'u_isColorTip');
+            this.uIsDualToneTipLoc = gl.getUniformLocation(program, 'u_isDualToneTip');
+            this.uSecondaryColorLoc = gl.getUniformLocation(program, 'u_secondaryColor');
             this.uTipTextureLoc = gl.getUniformLocation(program, 'u_tipTexture');
             this.uTipAtlasGridLoc = gl.getUniformLocation(program, 'u_tipAtlasGrid');
-            this.uHasDualTipTextureLoc = gl.getUniformLocation(program, 'u_hasDualTipTexture');
-            this.uDualTipTextureLoc = gl.getUniformLocation(program, 'u_dualTipTexture');
-            this.uDualBlendModeLoc = gl.getUniformLocation(program, 'u_dualBlendMode');
-            this.uDualScaleLoc = gl.getUniformLocation(program, 'u_dualScale');
-            this.uDualRotRadLoc = gl.getUniformLocation(program, 'u_dualRotRad');
-            this.uDualScatterLoc = gl.getUniformLocation(program, 'u_dualScatter');
             this.uAntiAliasLoc = gl.getUniformLocation(program, 'u_antiAlias');
             this.uHardnessLoc = gl.getUniformLocation(program, 'u_hardness');
             this.uWetEdgeLoc = gl.getUniformLocation(program, 'u_wetEdge');
@@ -987,12 +1270,15 @@ export class WebGlBrushEngine {
             this.uPaperBrightnessLoc = gl.getUniformLocation(program, 'u_paperBrightness');
             this.uPaperContrastLoc = gl.getUniformLocation(program, 'u_paperContrast');
             this.uPaperInvertLoc = gl.getUniformLocation(program, 'u_paperInvert');
+            this.uPaperPreserveDensityLoc = gl.getUniformLocation(program, 'u_paperPreserveDensity');
+            this.uPaperEmphasizeDensityLoc = gl.getUniformLocation(program, 'u_paperEmphasizeDensity');
             this.uHasPaperTexLoc = gl.getUniformLocation(program, 'u_hasPaperTex');
             this.uPaperTextureLoc = gl.getUniformLocation(program, 'u_paperTexture');
             this.uPaperTexSizeLoc = gl.getUniformLocation(program, 'u_paperTexSize');
             this.uColorMixingLoc = gl.getUniformLocation(program, 'u_colorMixing');
             this.uPerceptualMixingLoc = gl.getUniformLocation(program, 'u_perceptualMixing');
             this.uPigmentStrengthLoc = gl.getUniformLocation(program, 'u_pigmentStrength');
+            this.uPigmentLutLoc = gl.getUniformLocation(program, 'u_pigmentLut');
             this.uHasCanvasTextureLoc = gl.getUniformLocation(program, 'u_hasCanvasTexture');
             this.uCanvasTextureLoc = gl.getUniformLocation(program, 'u_canvasTexture');
             this.uAmountOfPaintLoc = gl.getUniformLocation(program, 'u_amountOfPaint');
@@ -1020,6 +1306,51 @@ export class WebGlBrushEngine {
             this.aRibbonNormalDistLoc = gl.getAttribLocation(rProgram, 'a_normalDist');
             this.aRibbonColorLoc = gl.getAttribLocation(rProgram, 'a_color');
             this.aRibbonWidthLoc = gl.getAttribLocation(rProgram, 'a_width');
+          }
+        }
+      }
+
+      const trVs = this.compileShader(gl.VERTEX_SHADER, TEXTURED_RIBBON_VERTEX_SHADER_SRC);
+      const trFs = this.compileShader(gl.FRAGMENT_SHADER, TEXTURED_RIBBON_FRAGMENT_SHADER_SRC);
+      if (trVs && trFs) {
+        const trProgram = gl.createProgram();
+        if (trProgram) {
+          gl.attachShader(trProgram, trVs);
+          gl.attachShader(trProgram, trFs);
+          gl.linkProgram(trProgram);
+          if (gl.getProgramParameter(trProgram, gl.LINK_STATUS)) {
+            this.texturedRibbonProgram = trProgram;
+            this.aTexRibPosLoc = gl.getAttribLocation(trProgram, 'a_pos');
+            this.aTexRibUvLoc = gl.getAttribLocation(trProgram, 'a_uv');
+            this.aTexRibAlphaLoc = gl.getAttribLocation(trProgram, 'a_alpha');
+            this.aTexRibPressureLoc = gl.getAttribLocation(trProgram, 'a_pressure');
+            this.aTexRibTipIndexLoc = gl.getAttribLocation(trProgram, 'a_tipIndex');
+            this.aTexRibEdgeInfoLoc = gl.getAttribLocation(trProgram, 'a_edgeInfo');
+
+            this.uTexRibCanvasResolutionLoc = gl.getUniformLocation(trProgram, 'u_canvasResolution');
+            this.uTexRibDirtyOffsetLoc = gl.getUniformLocation(trProgram, 'u_dirtyOffset');
+            this.uTexRibHasTipTextureLoc = gl.getUniformLocation(trProgram, 'u_hasTipTexture');
+            this.uTexRibTipTextureLoc = gl.getUniformLocation(trProgram, 'u_tipTexture');
+            this.uTexRibTipAtlasGridLoc = gl.getUniformLocation(trProgram, 'u_tipAtlasGrid');
+            this.uTexRibIsColorTipLoc = gl.getUniformLocation(trProgram, 'u_isColorTip');
+            this.uTexRibIsDualToneTipLoc = gl.getUniformLocation(trProgram, 'u_isDualToneTip');
+            this.uTexRibPrimaryColorLoc = gl.getUniformLocation(trProgram, 'u_primaryColor');
+            this.uTexRibSecondaryColorLoc = gl.getUniformLocation(trProgram, 'u_secondaryColor');
+            this.uTexRibAntiAliasLoc = gl.getUniformLocation(trProgram, 'u_antiAlias');
+            this.uTexRibPaperGrainLoc = gl.getUniformLocation(trProgram, 'u_paperGrain');
+            this.uTexRibGrainScaleLoc = gl.getUniformLocation(trProgram, 'u_grainScale');
+            this.uTexRibGrainRotateRadLoc = gl.getUniformLocation(trProgram, 'u_grainRotateRad');
+            this.uTexRibPaperModeLoc = gl.getUniformLocation(trProgram, 'u_paperMode');
+            this.uTexRibPaperBrightnessLoc = gl.getUniformLocation(trProgram, 'u_paperBrightness');
+            this.uTexRibPaperContrastLoc = gl.getUniformLocation(trProgram, 'u_paperContrast');
+            this.uTexRibPaperInvertLoc = gl.getUniformLocation(trProgram, 'u_paperInvert');
+            this.uTexRibPaperPreserveDensityLoc = gl.getUniformLocation(trProgram, 'u_paperPreserveDensity');
+            this.uTexRibPaperEmphasizeDensityLoc = gl.getUniformLocation(trProgram, 'u_paperEmphasizeDensity');
+            this.uTexRibHasPaperTexLoc = gl.getUniformLocation(trProgram, 'u_hasPaperTex');
+            this.uTexRibPaperTextureLoc = gl.getUniformLocation(trProgram, 'u_paperTexture');
+            this.uTexRibPaperTexSizeLoc = gl.getUniformLocation(trProgram, 'u_paperTexSize');
+            this.uTexRibIsEraserLoc = gl.getUniformLocation(trProgram, 'u_isEraser');
+            this.uTexRibIsBgEraserLoc = gl.getUniformLocation(trProgram, 'u_isBgEraser');
           }
         }
       }
@@ -1068,7 +1399,27 @@ export class WebGlBrushEngine {
         gl.STATIC_DRAW
       );
 
+      const dcVs = this.compileShader(gl.VERTEX_SHADER, IMPASTO_VERTEX_SHADER_SRC);
+      const dcFs = this.compileShader(gl.FRAGMENT_SHADER, DUAL_COMBINE_FRAGMENT_SHADER_SRC);
+      if (dcVs && dcFs) {
+        const dcProgram = gl.createProgram();
+        if (dcProgram) {
+          gl.attachShader(dcProgram, dcVs);
+          gl.attachShader(dcProgram, dcFs);
+          gl.linkProgram(dcProgram);
+          if (gl.getProgramParameter(dcProgram, gl.LINK_STATUS)) {
+            this.dualCombineProgram = dcProgram;
+            this.aDualCombinePosLoc = gl.getAttribLocation(dcProgram, 'a_pos');
+            this.uDualCombinePrimaryTexLoc = gl.getUniformLocation(dcProgram, 'u_primaryTex');
+            this.uDualCombineSecondaryTexLoc = gl.getUniformLocation(dcProgram, 'u_secondaryTex');
+            this.uDualCombineUvScaleLoc = gl.getUniformLocation(dcProgram, 'u_uvScale');
+            this.uDualCombineModeLoc = gl.getUniformLocation(dcProgram, 'u_combineMode');
+          }
+        }
+      }
+
       this.ribbonBuffer = gl.createBuffer();
+      this.texturedRibbonBuffer = gl.createBuffer();
 
       if ('drawArraysInstanced' in gl) {
         this.extInstanced = {
@@ -1093,15 +1444,27 @@ export class WebGlBrushEngine {
         }
       }
       this.instanceBuffer = gl.createBuffer();
+      this.secondaryInstanceBuffer = gl.createBuffer();
 
       if (WebGlBrushEngine.builtinGrainTable) {
         this.uploadBuiltinPaperTexture(gl);
       }
 
+      this.blendMaxEnum = null;
+      if ('MAX' in gl && typeof (gl as WebGL2RenderingContext).MAX === 'number') {
+        this.blendMaxEnum = (gl as WebGL2RenderingContext).MAX;
+      } else if (typeof gl.getExtension === 'function') {
+        const minMaxExt = gl.getExtension('EXT_blend_minmax');
+        if (minMaxExt && typeof minMaxExt.MAX_EXT === 'number') {
+          this.blendMaxEnum = minMaxExt.MAX_EXT;
+        }
+      }
+
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
-      this.isGpuAvailable = this.program !== null || this.ribbonProgram !== null;
+      this.isGpuAvailable =
+        this.program !== null || this.ribbonProgram !== null || this.texturedRibbonProgram !== null;
     } catch {
       this.isGpuAvailable = false;
     }
@@ -1155,6 +1518,14 @@ export class WebGlBrushEngine {
     return true;
   }
 
+  public isTexturedRibbonAvailable(): boolean {
+    return this.isAvailable() && this.texturedRibbonProgram !== null && this.texturedRibbonBuffer !== null;
+  }
+
+  public supportsBlendMax(): boolean {
+    return this.isAvailable() && this.blendMaxEnum !== null;
+  }
+
   private ensureDabFbo(width: number, height: number): boolean {
     const gl = this.gl;
     if (!gl || !('blitFramebuffer' in gl)) return false;
@@ -1189,6 +1560,64 @@ export class WebGlBrushEngine {
     return true;
   }
 
+  private ensureDualFbos(width: number, height: number): boolean {
+    const gl = this.gl;
+    if (!gl || !this.dualCombineProgram || !this.fullQuadBuffer) return false;
+    if (
+      this.dualPrimaryFbo &&
+      this.dualPrimaryTex &&
+      this.dualSecondaryFbo &&
+      this.dualSecondaryTex &&
+      this.dualFboWidth >= width &&
+      this.dualFboHeight >= height
+    ) {
+      return true;
+    }
+
+    const targetW = Math.max(width, this.dualFboWidth, 256);
+    const targetH = Math.max(height, this.dualFboHeight, 256);
+
+    if (!this.dualPrimaryFbo) this.dualPrimaryFbo = gl.createFramebuffer();
+    if (!this.dualPrimaryTex) this.dualPrimaryTex = gl.createTexture();
+    if (!this.dualSecondaryFbo) this.dualSecondaryFbo = gl.createFramebuffer();
+    if (!this.dualSecondaryTex) this.dualSecondaryTex = gl.createTexture();
+    if (
+      !this.dualPrimaryFbo ||
+      !this.dualPrimaryTex ||
+      !this.dualSecondaryFbo ||
+      !this.dualSecondaryTex
+    ) {
+      return false;
+    }
+
+    const setupTarget = (fbo: WebGLFramebuffer, tex: WebGLTexture): boolean => {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, targetW, targetH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+      return gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    };
+
+    const ok1 = setupTarget(this.dualPrimaryFbo, this.dualPrimaryTex);
+    const ok2 = ok1 && setupTarget(this.dualSecondaryFbo, this.dualSecondaryTex);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    if (!ok2) {
+      this.dualFboWidth = 0;
+      this.dualFboHeight = 0;
+      return false;
+    }
+    this.dualFboWidth = targetW;
+    this.dualFboHeight = targetH;
+    return true;
+  }
+
   public getOrCreateTipTexture(image: HTMLImageElement, repeatWrap: boolean = false): WebGLTexture | null {
     if (!this.gl || !image || !image.src) return null;
     if (image.complete === false || (image.naturalWidth || image.width || 0) <= 0) return null;
@@ -1212,12 +1641,13 @@ export class WebGlBrushEngine {
     gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-    const wrap = repeatWrap ? gl.REPEAT : gl.CLAMP_TO_EDGE;
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
     const texW = image.naturalWidth || image.width || 0;
     const texH = image.naturalHeight || image.height || 0;
     const isPow2 = texW > 0 && texH > 0 && (texW & (texW - 1)) === 0 && (texH & (texH - 1)) === 0;
+    const isWebGL2 = 'blitFramebuffer' in gl;
+    const wrap = repeatWrap && (isPow2 || isWebGL2) ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
     if (!repeatWrap && isPow2 && typeof gl.generateMipmap === 'function') {
       gl.generateMipmap(gl.TEXTURE_2D);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
@@ -1684,6 +2114,271 @@ export class WebGlBrushEngine {
     return true;
   }
 
+  /**
+   * Renders a CSP textured ribbon triangle mesh (`BrushRibbon = 1`) via the dedicated
+   * textured ribbon WebGL program with multi-tip atlas, dual-tone tinting, world-space
+   * paper grain modulation, and tiled chunking for arbitrarily large canvases.
+   */
+  public renderTexturedRibbonMesh(
+    targetCtx: CanvasRenderingContext2D,
+    mesh: TexturedRibbonMeshInput,
+    settings: BrushSettings & { alphaLocked?: boolean; isBgEraser?: boolean },
+    primaryColor: string,
+    tool: ToolType
+  ): boolean {
+    const canvas = this.canvas;
+    const gl = this.gl;
+    if (
+      !this.isTexturedRibbonAvailable() ||
+      !gl ||
+      !canvas ||
+      !this.texturedRibbonProgram ||
+      !this.texturedRibbonBuffer ||
+      mesh.vertexCount < 3
+    ) {
+      return false;
+    }
+
+    const pad = 2;
+    const fullDirtyX = Math.floor(mesh.bounds.minX - pad);
+    const fullDirtyY = Math.floor(mesh.bounds.minY - pad);
+    const fullDirtyMaxX = Math.ceil(mesh.bounds.maxX + pad);
+    const fullDirtyMaxY = Math.ceil(mesh.bounds.maxY + pad);
+    const totalW = Math.max(0, fullDirtyMaxX - fullDirtyX);
+    const totalH = Math.max(0, fullDirtyMaxY - fullDirtyY);
+    if (totalW <= 0 || totalH <= 0) return false;
+
+    const chunkWMax = Math.min(MAX_TILE_CHUNK, totalW);
+    const chunkHMax = Math.min(MAX_TILE_CHUNK, totalH);
+    if (canvas.width < chunkWMax || canvas.height < chunkHMax) {
+      canvas.width = Math.max(canvas.width, chunkWMax, 512);
+      canvas.height = Math.max(canvas.height, chunkHMax, 512);
+    }
+
+    const useOffscreenFbo = this.ensureDabFbo(canvas.width, canvas.height);
+
+    const isTransparentInk = Boolean(settings.isTransparentInk);
+    const isBgEraser = Boolean(settings.isBgEraser);
+    const isEraser = (tool === 'eraser' || isTransparentInk) && !isBgEraser;
+    const isAlphaLocked = Boolean(settings.alphaLocked);
+    const aaMode = Math.max(0, Math.min(3, Math.round(settings.antiAlias ?? 2)));
+
+    const primRgb = this.parseColor(isBgEraser ? '#ffffff' : primaryColor);
+    const secRgb = this.parseColor(settings.secondaryColor ?? '#ffffff');
+
+    gl.useProgram(this.texturedRibbonProgram);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+    gl.uniform3f(this.uTexRibPrimaryColorLoc, primRgb.r, primRgb.g, primRgb.b);
+    gl.uniform3f(this.uTexRibSecondaryColorLoc, secRgb.r, secRgb.g, secRgb.b);
+    gl.uniform1i(this.uTexRibAntiAliasLoc, aaMode);
+    gl.uniform1i(this.uTexRibIsEraserLoc, isEraser ? 1 : 0);
+    gl.uniform1i(this.uTexRibIsBgEraserLoc, isBgEraser ? 1 : 0);
+
+    // Bind tip texture or multi-tip atlas
+    let tipTex: WebGLTexture | null = null;
+    let atlasCols = 1;
+    let atlasRows = 1;
+    if (settings.subTipImages && settings.subTipImages.length > 1) {
+      const atlas = this.getOrCreateMultiTipAtlas(settings.subTipImages);
+      if (atlas) {
+        tipTex = atlas.tex;
+        atlasCols = atlas.cols;
+        atlasRows = atlas.rows;
+      }
+    }
+    if (!tipTex && settings.customTipImage) {
+      tipTex = this.getOrCreateTipTexture(settings.customTipImage, false);
+    }
+    const isColorTip = Boolean(settings.isColorTip || settings.subTips?.[0]?.isColor);
+    const isDualToneTip = !isColorTip && Boolean(settings.isDualToneTip || settings.subTips?.[0]?.isDualToneTip);
+
+    gl.uniform2f(this.uTexRibTipAtlasGridLoc, atlasCols, atlasRows);
+    if (tipTex) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tipTex);
+      if (aaMode === 0) {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      } else {
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      }
+      gl.uniform1i(this.uTexRibTipTextureLoc, 0);
+      gl.uniform1i(this.uTexRibHasTipTextureLoc, 1);
+      gl.uniform1i(this.uTexRibIsColorTipLoc, isColorTip ? 1 : 0);
+      gl.uniform1i(this.uTexRibIsDualToneTipLoc, isDualToneTip ? 1 : 0);
+    } else {
+      gl.uniform1i(this.uTexRibHasTipTextureLoc, 0);
+      gl.uniform1i(this.uTexRibIsColorTipLoc, 0);
+      gl.uniform1i(this.uTexRibIsDualToneTipLoc, 0);
+    }
+
+    // Paper texture uniforms
+    const paperDensity = Math.max(0, Math.min(1, settings.grain ?? settings.textureDensity ?? 0));
+    gl.uniform1f(this.uTexRibPaperGrainLoc, paperDensity);
+    gl.uniform1f(this.uTexRibGrainScaleLoc, settings.paperTextureScale ?? 1.0);
+    gl.uniform1f(this.uTexRibGrainRotateRadLoc, ((settings.paperTextureRotate ?? 0) * Math.PI) / 180);
+
+    const pMode = paperTextureModeToIndex(settings.paperTextureMode);
+    gl.uniform1i(this.uTexRibPaperModeLoc, pMode);
+    gl.uniform1f(this.uTexRibPaperBrightnessLoc, (settings.paperTextureBrightness ?? 0) / 100.0);
+    gl.uniform1f(this.uTexRibPaperContrastLoc, (settings.paperTextureContrast ?? 0) / 100.0);
+    gl.uniform1i(this.uTexRibPaperInvertLoc, settings.paperTextureInverted ? 1 : 0);
+    const preserveDensity =
+      settings.paperTextureApplyEachPlot !== undefined && !settings.grainPenetrationSensor?.usePressure;
+    gl.uniform1i(this.uTexRibPaperPreserveDensityLoc, preserveDensity ? 1 : 0);
+    gl.uniform1i(this.uTexRibPaperEmphasizeDensityLoc, settings.paperTextureEmphasizeDensity ? 1 : 0);
+
+    if (paperDensity > 0.005) {
+      if (!this.builtinPaperTexture && WebGlBrushEngine.builtinGrainTable) {
+        this.uploadBuiltinPaperTexture(gl);
+      }
+      let paperTex: WebGLTexture | null = null;
+      let paperW = WebGlBrushEngine.builtinGrainSize;
+      let paperH = WebGlBrushEngine.builtinGrainSize;
+      if (settings.paperTextureImage && (settings.paperTextureImage.naturalWidth || settings.paperTextureImage.width)) {
+        paperTex = this.getOrCreateTipTexture(settings.paperTextureImage, true);
+        paperW = settings.paperTextureImage.naturalWidth || settings.paperTextureImage.width || paperW;
+        paperH = settings.paperTextureImage.naturalHeight || settings.paperTextureImage.height || paperH;
+      } else if (settings.surfaceTextureId) {
+        paperTex = this.getOrCreateSurfaceTexture(settings.surfaceTextureId);
+        paperW = SURFACE_TEXTURE_SIZE;
+        paperH = SURFACE_TEXTURE_SIZE;
+      } else {
+        paperTex = this.builtinPaperTexture;
+      }
+      if (paperTex) {
+        gl.activeTexture(gl.TEXTURE3);
+        gl.bindTexture(gl.TEXTURE_2D, paperTex);
+        gl.uniform1i(this.uTexRibPaperTextureLoc, 3);
+        gl.uniform1i(this.uTexRibHasPaperTexLoc, 1);
+        gl.uniform2f(this.uTexRibPaperTexSizeLoc, paperW, paperH);
+      } else {
+        gl.uniform1i(this.uTexRibHasPaperTexLoc, 0);
+      }
+    } else {
+      gl.uniform1i(this.uTexRibHasPaperTexLoc, 0);
+    }
+
+    // Upload triangle mesh vertices
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.texturedRibbonBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      mesh.vertices.subarray(0, mesh.vertexCount * RIBBON_VERTEX_STRIDE),
+      gl.DYNAMIC_DRAW
+    );
+
+    const byteStride = RIBBON_VERTEX_STRIDE * 4;
+    if (this.aTexRibPosLoc >= 0) {
+      gl.enableVertexAttribArray(this.aTexRibPosLoc);
+      gl.vertexAttribPointer(this.aTexRibPosLoc, 2, gl.FLOAT, false, byteStride, 0);
+    }
+    if (this.aTexRibUvLoc >= 0) {
+      gl.enableVertexAttribArray(this.aTexRibUvLoc);
+      gl.vertexAttribPointer(this.aTexRibUvLoc, 2, gl.FLOAT, false, byteStride, 2 * 4);
+    }
+    if (this.aTexRibAlphaLoc >= 0) {
+      gl.enableVertexAttribArray(this.aTexRibAlphaLoc);
+      gl.vertexAttribPointer(this.aTexRibAlphaLoc, 1, gl.FLOAT, false, byteStride, 4 * 4);
+    }
+    if (this.aTexRibPressureLoc >= 0) {
+      gl.enableVertexAttribArray(this.aTexRibPressureLoc);
+      gl.vertexAttribPointer(this.aTexRibPressureLoc, 1, gl.FLOAT, false, byteStride, 5 * 4);
+    }
+    if (this.aTexRibTipIndexLoc >= 0) {
+      gl.enableVertexAttribArray(this.aTexRibTipIndexLoc);
+      gl.vertexAttribPointer(this.aTexRibTipIndexLoc, 1, gl.FLOAT, false, byteStride, 6 * 4);
+    }
+    if (this.aTexRibEdgeInfoLoc >= 0) {
+      gl.enableVertexAttribArray(this.aTexRibEdgeInfoLoc);
+      gl.vertexAttribPointer(this.aTexRibEdgeInfoLoc, 2, gl.FLOAT, false, byteStride, 7 * 4);
+    }
+
+    const compositeOp: GlobalCompositeOperation = isBgEraser
+      ? 'source-over'
+      : isEraser
+      ? 'destination-out'
+      : isAlphaLocked
+      ? 'source-atop'
+      : 'source-over';
+
+    targetCtx.save();
+    targetCtx.globalCompositeOperation = compositeOp;
+    targetCtx.globalAlpha = Math.max(0, Math.min(1, settings.opacity ?? 1.0));
+    if (aaMode === 0) {
+      targetCtx.imageSmoothingEnabled = false;
+    }
+
+    const chunkCols = Math.ceil(totalW / MAX_TILE_CHUNK);
+    const chunkRows = Math.ceil(totalH / MAX_TILE_CHUNK);
+
+    for (let row = 0; row < chunkRows; row++) {
+      const cy = fullDirtyY + row * MAX_TILE_CHUNK;
+      const dh = Math.min(MAX_TILE_CHUNK, fullDirtyMaxY - cy);
+      if (dh <= 0) continue;
+      for (let col = 0; col < chunkCols; col++) {
+        const cx = fullDirtyX + col * MAX_TILE_CHUNK;
+        const dw = Math.min(MAX_TILE_CHUNK, fullDirtyMaxX - cx);
+        if (dw <= 0) continue;
+
+        const viewY = Math.max(0, canvas.height - dh);
+
+        if (useOffscreenFbo && this.dabFbo) {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, this.dabFbo);
+        }
+
+        gl.viewport(0, viewY, dw, dh);
+        if (typeof gl.scissor === 'function') {
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(0, viewY, dw, dh);
+        }
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        gl.uniform2f(this.uTexRibCanvasResolutionLoc, dw, dh);
+        if (this.uTexRibDirtyOffsetLoc) {
+          gl.uniform2f(this.uTexRibDirtyOffsetLoc, cx, cy);
+        }
+
+        gl.drawArrays(gl.TRIANGLES, 0, mesh.vertexCount);
+
+        if (typeof gl.scissor === 'function') {
+          gl.disable(gl.SCISSOR_TEST);
+        }
+
+        if (useOffscreenFbo && this.dabFbo) {
+          const gl2 = gl as WebGL2RenderingContext;
+          gl2.bindFramebuffer(gl2.READ_FRAMEBUFFER, this.dabFbo);
+          gl2.bindFramebuffer(gl2.DRAW_FRAMEBUFFER, null);
+          gl2.blitFramebuffer(0, viewY, dw, viewY + dh, 0, viewY, dw, viewY + dh, gl2.COLOR_BUFFER_BIT, gl2.NEAREST);
+          gl2.bindFramebuffer(gl2.FRAMEBUFFER, null);
+        }
+
+        targetCtx.drawImage(canvas, 0, 0, dw, dh, cx, cy, dw, dh);
+      }
+    }
+
+    targetCtx.restore();
+
+    if (this.aTexRibPosLoc >= 0) gl.disableVertexAttribArray(this.aTexRibPosLoc);
+    if (this.aTexRibUvLoc >= 0) gl.disableVertexAttribArray(this.aTexRibUvLoc);
+    if (this.aTexRibAlphaLoc >= 0) gl.disableVertexAttribArray(this.aTexRibAlphaLoc);
+    if (this.aTexRibPressureLoc >= 0) gl.disableVertexAttribArray(this.aTexRibPressureLoc);
+    if (this.aTexRibTipIndexLoc >= 0) gl.disableVertexAttribArray(this.aTexRibTipIndexLoc);
+    if (this.aTexRibEdgeInfoLoc >= 0) gl.disableVertexAttribArray(this.aTexRibEdgeInfoLoc);
+
+    if (tipTex && aaMode === 0) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tipTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    return true;
+  }
+
   public renderDabsToContext(
     targetCtx: CanvasRenderingContext2D,
     dabs: GpuDab[],
@@ -1767,7 +2462,7 @@ export class WebGlBrushEngine {
       arr[offset + 5] = d.r;
       arr[offset + 6] = d.g;
       arr[offset + 7] = d.b;
-      arr[offset + 8] = 1.0;
+      arr[offset + 8] = d.grainDensity !== undefined ? d.grainDensity : -1.0;
       arr[offset + 9] = effAlpha;
       arr[offset + 10] = d.pressure;
       arr[offset + 11] = d.strokeDist;
@@ -1782,8 +2477,25 @@ export class WebGlBrushEngine {
     }
 
     gl.useProgram(this.program);
-    gl.blendEquation(gl.FUNC_ADD);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    const isColorTip = Boolean(settings.isColorTip || (settings.subTips && settings.subTips[0]?.isColor));
+    const isDualToneTip = !isColorTip && Boolean(settings.isDualToneTip || (settings.subTips && settings.subTips[0]?.isDualToneTip));
+    const useMaxBlend =
+      this.blendMaxEnum !== null &&
+      !isEraser &&
+      !isBgEraser &&
+      !settings.colorMixing &&
+      !isColorTip &&
+      !isDualToneTip &&
+      !settings.dynamics?.colorJitterEnabled &&
+      (settings.blendTipsMode === 'compare' ||
+        (settings.paperTextureApplyEachPlot === false && Boolean(settings.opacitySensor?.usePressure)));
+    if (useMaxBlend && this.blendMaxEnum !== null) {
+      gl.blendEquation(this.blendMaxEnum);
+      gl.blendFunc(gl.ONE, gl.ONE);
+    } else {
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
 
     if (this.uDocResolutionLoc) {
       const docW = underlyingCanvas ? underlyingCanvas.width : Math.max(1, _canvasWidth);
@@ -1821,24 +2533,24 @@ export class WebGlBrushEngine {
     if (this.uDryBrushLoc) gl.uniform1f(this.uDryBrushLoc, dryBrush);
     if (this.uPaintLoadLoc) gl.uniform1f(this.uPaintLoadLoc, paintLoad);
 
-    const pMode =
-      settings.paperTextureMode === 'multiply'
-        ? 1
-        : settings.paperTextureMode === 'compare'
-        ? 2
-        : settings.paperTextureMode === 'overlay'
-        ? 3
-        : settings.paperTextureMode === 'outline'
-        ? 4
-        : 0;
+    const pMode = paperTextureModeToIndex(settings.paperTextureMode);
     gl.uniform1i(this.uPaperModeLoc, pMode);
     gl.uniform1f(this.uPaperBrightnessLoc, (settings.paperTextureBrightness ?? 0) / 100.0);
     gl.uniform1f(this.uPaperContrastLoc, (settings.paperTextureContrast ?? 0) / 100.0);
     gl.uniform1i(this.uPaperInvertLoc, settings.paperTextureInverted ? 1 : 0);
+    const preserveDensity =
+      Boolean(settings.textureDensitySensor) ||
+      (settings.paperTextureApplyEachPlot !== undefined && !settings.grainPenetrationSensor?.usePressure);
+    if (this.uPaperPreserveDensityLoc) {
+      gl.uniform1i(this.uPaperPreserveDensityLoc, preserveDensity ? 1 : 0);
+    }
+    if (this.uPaperEmphasizeDensityLoc) {
+      gl.uniform1i(this.uPaperEmphasizeDensityLoc, settings.paperTextureEmphasizeDensity ? 1 : 0);
+    }
     gl.uniform1i(this.uIsEraserLoc, isEraser ? 1 : 0);
     gl.uniform1i(this.uIsBgEraserLoc, isBgEraser ? 1 : 0);
 
-    if (paperDensity > 0.001 || dryBrush > 0.001) {
+    if (paperDensity > 0.001 || dryBrush > 0.001 || Boolean(settings.textureDensitySensor)) {
       if (!this.builtinPaperTexture && WebGlBrushEngine.builtinGrainTable) {
         this.uploadBuiltinPaperTexture(gl);
       }
@@ -1883,7 +2595,10 @@ export class WebGlBrushEngine {
     if (!tipTex && settings.customTipImage) {
       tipTex = this.getOrCreateTipTexture(settings.customTipImage, false);
     }
-    const isColorTip = Boolean(settings.isColorTip || (settings.subTips && settings.subTips[0]?.isColor));
+    const secRgb = this.parseColor(settings.secondaryColor ?? '#ffffff');
+    if (this.uSecondaryColorLoc) {
+      gl.uniform3f(this.uSecondaryColorLoc, secRgb.r, secRgb.g, secRgb.b);
+    }
     if (this.uTipAtlasGridLoc) {
       gl.uniform2f(this.uTipAtlasGridLoc, atlasCols, atlasRows);
     }
@@ -1893,36 +2608,15 @@ export class WebGlBrushEngine {
       gl.uniform1i(this.uTipTextureLoc, 0);
       gl.uniform1i(this.uHasTipTextureLoc, 1);
       gl.uniform1i(this.uIsColorTipLoc, isColorTip ? 1 : 0);
+      if (this.uIsDualToneTipLoc) {
+        gl.uniform1i(this.uIsDualToneTipLoc, isDualToneTip ? 1 : 0);
+      }
     } else {
       gl.uniform1i(this.uHasTipTextureLoc, 0);
       gl.uniform1i(this.uIsColorTipLoc, 0);
-    }
-
-    let dualTipTex: WebGLTexture | null = null;
-    if (settings.dualBrush && settings.dualTipImage) {
-      dualTipTex = this.getOrCreateTipTexture(settings.dualTipImage, false);
-    }
-    if (dualTipTex) {
-      gl.activeTexture(gl.TEXTURE2);
-      gl.bindTexture(gl.TEXTURE_2D, dualTipTex);
-      gl.uniform1i(this.uDualTipTextureLoc, 2);
-      gl.uniform1i(this.uHasDualTipTextureLoc, 1);
-      const dualMode =
-        settings.dualBrushCompositeMode === 'subtract'
-          ? 1
-          : settings.dualBrushCompositeMode === 'darken'
-          ? 2
-          : settings.dualBrushCompositeMode === 'overlay'
-          ? 3
-          : settings.dualBrushCompositeMode === 'screen'
-          ? 4
-          : 0;
-      gl.uniform1i(this.uDualBlendModeLoc, dualMode);
-      if (this.uDualScaleLoc) gl.uniform1f(this.uDualScaleLoc, settings.dualScale ?? 1.0);
-      if (this.uDualRotRadLoc) gl.uniform1f(this.uDualRotRadLoc, ((settings.dualAngle ?? 0) * Math.PI) / 180);
-      if (this.uDualScatterLoc) gl.uniform1f(this.uDualScatterLoc, settings.dualScatter ?? 0.0);
-    } else {
-      gl.uniform1i(this.uHasDualTipTextureLoc, 0);
+      if (this.uIsDualToneTipLoc) {
+        gl.uniform1i(this.uIsDualToneTipLoc, 0);
+      }
     }
 
     const enableColorMix = Boolean(settings.colorMixing) && underlyingCanvas !== undefined;
@@ -1931,6 +2625,14 @@ export class WebGlBrushEngine {
     if (this.uPigmentStrengthLoc) {
       const pStr = settings.perceptualMixing === false ? 0.0 : (settings.naturalPaint?.pigmentMixingStrength ?? 1.0);
       gl.uniform1f(this.uPigmentStrengthLoc, Math.max(0, Math.min(1, pStr)));
+    }
+    if (this.uPigmentLutLoc) {
+      const lutTex = getPigmentLutTexture(gl);
+      if (lutTex) {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, lutTex);
+        gl.uniform1i(this.uPigmentLutLoc, 2);
+      }
     }
 
     if (enableColorMix && underlyingCanvas) {
@@ -2113,7 +2815,7 @@ export class WebGlBrushEngine {
             gl.vertexAttrib2f(this.aCenterLoc, arr[offset], arr[offset + 1]);
             gl.vertexAttrib2f(this.aSizeLoc, arr[offset + 2], arr[offset + 3]);
             gl.vertexAttrib1f(this.aAngleLoc, arr[offset + 4]);
-            gl.vertexAttrib4f(this.aColorLoc, arr[offset + 5], arr[offset + 6], arr[offset + 7], 1.0);
+            gl.vertexAttrib4f(this.aColorLoc, arr[offset + 5], arr[offset + 6], arr[offset + 7], arr[offset + 8]);
             gl.vertexAttrib1f(this.aAlphaLoc, arr[offset + 9]);
             gl.vertexAttrib1f(this.aPressureLoc, arr[offset + 10]);
             gl.vertexAttrib1f(this.aStrokeDistLoc, arr[offset + 11]);
@@ -2170,6 +2872,614 @@ export class WebGlBrushEngine {
       gl.disableVertexAttribArray(this.aStrokeDistLoc);
     }
 
+    if (useMaxBlend) {
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
+
+    return true;
+  }
+
+  private packDabsIntoFloatArray(
+    dabs: GpuDab[],
+    aaMode: number,
+    existing: Float32Array
+  ): { array: Float32Array; floatCount: number } {
+    const stride = 15;
+    const requiredFloats = dabs.length * stride;
+    let arr = existing;
+    if (arr.length < requiredFloats) {
+      arr = new Float32Array(Math.max(requiredFloats, arr.length * 2));
+    }
+    const minRenderDim = aaMode === 0 ? 1.0 : 0.75;
+    for (let i = 0; i < dabs.length; i++) {
+      const d = dabs[i];
+      const renderW = Math.max(minRenderDim, d.width);
+      const renderH = Math.max(minRenderDim, d.height);
+      const scaleW = d.width < minRenderDim ? Math.max(0.04, d.width / renderW) : 1.0;
+      const scaleH = d.height < minRenderDim ? Math.max(0.04, d.height / renderH) : 1.0;
+      const effAlpha =
+        d.width >= minRenderDim && d.height >= minRenderDim
+          ? d.alpha
+          : Math.max(0.003, Math.min(1.0, d.alpha * scaleW * scaleH));
+
+      const offset = i * stride;
+      arr[offset + 0] = d.x;
+      arr[offset + 1] = d.y;
+      arr[offset + 2] = renderW;
+      arr[offset + 3] = renderH;
+      arr[offset + 4] = d.angle;
+      arr[offset + 5] = d.r;
+      arr[offset + 6] = d.g;
+      arr[offset + 7] = d.b;
+      arr[offset + 8] = d.grainDensity !== undefined ? d.grainDensity : -1.0;
+      arr[offset + 9] = effAlpha;
+      arr[offset + 10] = d.pressure;
+      arr[offset + 11] = d.strokeDist;
+      arr[offset + 12] = d.flipX ?? 1.0;
+      arr[offset + 13] = d.flipY ?? 1.0;
+      arr[offset + 14] = d.tipIndex ?? 0.0;
+    }
+    return { array: arr, floatCount: requiredFloats };
+  }
+
+  private configureDabPassUniforms(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    dabs: GpuDab[],
+    settings: BrushSettings & { alphaLocked?: boolean; isBgEraser?: boolean },
+    isEraser: boolean,
+    isBgEraser: boolean,
+    canvasWidth: number,
+    canvasHeight: number,
+    fullDirtyX: number,
+    fullDirtyY: number,
+    totalW: number,
+    totalH: number,
+    underlyingCanvas?: HTMLCanvasElement
+  ): boolean {
+    const aaMode = settings.antiAlias ?? 2;
+    const isColorTip = Boolean(settings.isColorTip || (settings.subTips && settings.subTips[0]?.isColor));
+    const isDualToneTip = !isColorTip && Boolean(settings.isDualToneTip || (settings.subTips && settings.subTips[0]?.isDualToneTip));
+    const useMaxBlend =
+      this.blendMaxEnum !== null &&
+      !isEraser &&
+      !isBgEraser &&
+      !settings.colorMixing &&
+      !isColorTip &&
+      !isDualToneTip &&
+      !settings.dynamics?.colorJitterEnabled &&
+      (settings.blendTipsMode === 'compare' ||
+        (settings.paperTextureApplyEachPlot === false && Boolean(settings.opacitySensor?.usePressure)));
+    gl.enable(gl.BLEND);
+    if (useMaxBlend && this.blendMaxEnum !== null) {
+      gl.blendEquation(this.blendMaxEnum);
+      gl.blendFunc(gl.ONE, gl.ONE);
+    } else {
+      gl.blendEquation(gl.FUNC_ADD);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    }
+
+    if (this.uDocResolutionLoc) {
+      const docW = underlyingCanvas ? underlyingCanvas.width : Math.max(1, canvasWidth);
+      const docH = underlyingCanvas ? underlyingCanvas.height : Math.max(1, canvasHeight);
+      gl.uniform2f(this.uDocResolutionLoc, docW, docH);
+    }
+
+    gl.uniform1i(this.uAntiAliasLoc, aaMode);
+    gl.uniform1f(this.uHardnessLoc, settings.hardness ?? 1.0);
+    gl.uniform1f(this.uWetEdgeLoc, settings.wetEdge ?? 0.0);
+
+    const paperDensity = settings.grain ?? (settings.textureDensity ?? 0.0);
+    const dryBrush = settings.naturalPaint?.dryBrush ?? 0.0;
+    const paintLoad = settings.naturalPaint?.paintLoad ?? 1.0;
+    gl.uniform1f(this.uPaperGrainLoc, paperDensity);
+    gl.uniform1f(this.uGrainScaleLoc, settings.paperTextureScale ?? 1.0);
+    gl.uniform1f(this.uGrainRotateRadLoc, ((settings.paperTextureRotate ?? 0) * Math.PI) / 180);
+    const gmMode =
+      settings.grainMappingMode === 'brush-aligned'
+        ? 1
+        : settings.grainMappingMode === 'stroke-flow'
+        ? 2
+        : settings.grainMappingMode === 'random-per-stroke'
+        ? 3
+        : 0;
+    if (this.uGrainMappingModeLoc) gl.uniform1i(this.uGrainMappingModeLoc, gmMode);
+    if (this.uGrainRandomOffsetLoc) {
+      const seed = dabs.length > 0 ? Math.abs(Math.sin(dabs[0].x * 12.9898 + dabs[0].y * 78.233)) : 0;
+      gl.uniform2f(this.uGrainRandomOffsetLoc, seed * 256, ((seed * 397) % 1) * 256);
+    }
+    if (this.uGrainRandomRotLoc) {
+      const seedR = dabs.length > 0 ? Math.abs(Math.cos(dabs[0].x * 39.346 + dabs[0].y * 11.135)) * Math.PI * 2 : 0;
+      gl.uniform1f(this.uGrainRandomRotLoc, seedR);
+    }
+    if (this.uDryBrushLoc) gl.uniform1f(this.uDryBrushLoc, dryBrush);
+    if (this.uPaintLoadLoc) gl.uniform1f(this.uPaintLoadLoc, paintLoad);
+
+    const pMode = paperTextureModeToIndex(settings.paperTextureMode);
+    gl.uniform1i(this.uPaperModeLoc, pMode);
+    gl.uniform1f(this.uPaperBrightnessLoc, (settings.paperTextureBrightness ?? 0) / 100.0);
+    gl.uniform1f(this.uPaperContrastLoc, (settings.paperTextureContrast ?? 0) / 100.0);
+    gl.uniform1i(this.uPaperInvertLoc, settings.paperTextureInverted ? 1 : 0);
+    const preserveDensity =
+      Boolean(settings.textureDensitySensor) ||
+      (settings.paperTextureApplyEachPlot !== undefined && !settings.grainPenetrationSensor?.usePressure);
+    if (this.uPaperPreserveDensityLoc) {
+      gl.uniform1i(this.uPaperPreserveDensityLoc, preserveDensity ? 1 : 0);
+    }
+    if (this.uPaperEmphasizeDensityLoc) {
+      gl.uniform1i(this.uPaperEmphasizeDensityLoc, settings.paperTextureEmphasizeDensity ? 1 : 0);
+    }
+    gl.uniform1i(this.uIsEraserLoc, isEraser ? 1 : 0);
+    gl.uniform1i(this.uIsBgEraserLoc, isBgEraser ? 1 : 0);
+
+    if (paperDensity > 0.001 || dryBrush > 0.001 || Boolean(settings.textureDensitySensor)) {
+      if (!this.builtinPaperTexture && WebGlBrushEngine.builtinGrainTable) {
+        this.uploadBuiltinPaperTexture(gl);
+      }
+      let paperTex: WebGLTexture | null = null;
+      let paperW = WebGlBrushEngine.builtinGrainSize;
+      let paperH = WebGlBrushEngine.builtinGrainSize;
+      if (settings.paperTextureImage && (settings.paperTextureImage.naturalWidth || settings.paperTextureImage.width)) {
+        paperTex = this.getOrCreateTipTexture(settings.paperTextureImage, true);
+        paperW = settings.paperTextureImage.naturalWidth || settings.paperTextureImage.width || paperW;
+        paperH = settings.paperTextureImage.naturalHeight || settings.paperTextureImage.height || paperH;
+      } else if (settings.surfaceTextureId) {
+        paperTex = this.getOrCreateSurfaceTexture(settings.surfaceTextureId);
+        paperW = SURFACE_TEXTURE_SIZE;
+        paperH = SURFACE_TEXTURE_SIZE;
+      } else {
+        paperTex = this.builtinPaperTexture;
+      }
+      if (paperTex) {
+        gl.activeTexture(gl.TEXTURE3);
+        gl.bindTexture(gl.TEXTURE_2D, paperTex);
+        gl.uniform1i(this.uPaperTextureLoc, 3);
+        gl.uniform1i(this.uHasPaperTexLoc, 1);
+        gl.uniform2f(this.uPaperTexSizeLoc, paperW, paperH);
+      } else {
+        gl.uniform1i(this.uHasPaperTexLoc, 0);
+      }
+    } else {
+      gl.uniform1i(this.uHasPaperTexLoc, 0);
+    }
+
+    let tipTex: WebGLTexture | null = null;
+    let atlasCols = 1;
+    let atlasRows = 1;
+    if (settings.subTipImages && settings.subTipImages.length > 1) {
+      const atlas = this.getOrCreateMultiTipAtlas(settings.subTipImages);
+      if (atlas) {
+        tipTex = atlas.tex;
+        atlasCols = atlas.cols;
+        atlasRows = atlas.rows;
+      }
+    }
+    if (!tipTex && settings.customTipImage) {
+      tipTex = this.getOrCreateTipTexture(settings.customTipImage, false);
+    }
+    const secRgb = this.parseColor(settings.secondaryColor ?? '#ffffff');
+    if (this.uSecondaryColorLoc) {
+      gl.uniform3f(this.uSecondaryColorLoc, secRgb.r, secRgb.g, secRgb.b);
+    }
+    if (this.uTipAtlasGridLoc) {
+      gl.uniform2f(this.uTipAtlasGridLoc, atlasCols, atlasRows);
+    }
+    if (tipTex) {
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, tipTex);
+      gl.uniform1i(this.uTipTextureLoc, 0);
+      gl.uniform1i(this.uHasTipTextureLoc, 1);
+      gl.uniform1i(this.uIsColorTipLoc, isColorTip ? 1 : 0);
+      if (this.uIsDualToneTipLoc) {
+        gl.uniform1i(this.uIsDualToneTipLoc, isDualToneTip ? 1 : 0);
+      }
+    } else {
+      gl.uniform1i(this.uHasTipTextureLoc, 0);
+      gl.uniform1i(this.uIsColorTipLoc, 0);
+      if (this.uIsDualToneTipLoc) {
+        gl.uniform1i(this.uIsDualToneTipLoc, 0);
+      }
+    }
+
+    const enableColorMix = Boolean(settings.colorMixing) && underlyingCanvas !== undefined;
+    gl.uniform1i(this.uColorMixingLoc, enableColorMix ? 1 : 0);
+    gl.uniform1i(this.uPerceptualMixingLoc, settings.perceptualMixing !== false ? 1 : 0);
+    if (this.uPigmentStrengthLoc) {
+      const pStr = settings.perceptualMixing === false ? 0.0 : (settings.naturalPaint?.pigmentMixingStrength ?? 1.0);
+      gl.uniform1f(this.uPigmentStrengthLoc, Math.max(0, Math.min(1, pStr)));
+    }
+    if (this.uPigmentLutLoc) {
+      const lutTex = getPigmentLutTexture(gl);
+      if (lutTex) {
+        gl.activeTexture(gl.TEXTURE2);
+        gl.bindTexture(gl.TEXTURE_2D, lutTex);
+        gl.uniform1i(this.uPigmentLutLoc, 2);
+      }
+    }
+
+    if (enableColorMix && underlyingCanvas) {
+      const canvasTex = this.uploadCanvasTexture(underlyingCanvas, {
+        x: fullDirtyX,
+        y: fullDirtyY,
+        width: totalW,
+        height: totalH,
+      });
+      if (canvasTex) {
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, canvasTex);
+        gl.uniform1i(this.uCanvasTextureLoc, 1);
+        gl.uniform1i(this.uHasCanvasTextureLoc, 1);
+        gl.uniform1f(this.uAmountOfPaintLoc, settings.amountOfPaint ?? 0.7);
+        gl.uniform1f(this.uDensityOfPaintLoc, settings.densityOfPaint ?? 0.8);
+        gl.uniform1f(this.uColorStretchLoc, settings.colorStretch ?? 0.6);
+      } else {
+        gl.uniform1i(this.uHasCanvasTextureLoc, 0);
+      }
+    } else {
+      gl.uniform1i(this.uHasCanvasTextureLoc, 0);
+    }
+
+    return useMaxBlend;
+  }
+
+  private bindDabAttributes(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    instanceBuf: WebGLBuffer | null,
+    useInstanced: boolean
+  ): void {
+    const stride = 15;
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadVertexBuffer);
+    gl.enableVertexAttribArray(this.aQuadVertexLoc);
+    gl.vertexAttribPointer(this.aQuadVertexLoc, 2, gl.FLOAT, false, 0, 0);
+
+    if (useInstanced && this.extInstanced && instanceBuf) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, instanceBuf);
+      const byteStride = stride * 4;
+
+      gl.enableVertexAttribArray(this.aCenterLoc);
+      gl.vertexAttribPointer(this.aCenterLoc, 2, gl.FLOAT, false, byteStride, 0);
+      this.extInstanced.vertexAttribDivisor(this.aCenterLoc, 1);
+
+      gl.enableVertexAttribArray(this.aSizeLoc);
+      gl.vertexAttribPointer(this.aSizeLoc, 2, gl.FLOAT, false, byteStride, 2 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aSizeLoc, 1);
+
+      gl.enableVertexAttribArray(this.aAngleLoc);
+      gl.vertexAttribPointer(this.aAngleLoc, 1, gl.FLOAT, false, byteStride, 4 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aAngleLoc, 1);
+
+      gl.enableVertexAttribArray(this.aColorLoc);
+      gl.vertexAttribPointer(this.aColorLoc, 4, gl.FLOAT, false, byteStride, 5 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aColorLoc, 1);
+
+      gl.enableVertexAttribArray(this.aAlphaLoc);
+      gl.vertexAttribPointer(this.aAlphaLoc, 1, gl.FLOAT, false, byteStride, 9 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aAlphaLoc, 1);
+
+      gl.enableVertexAttribArray(this.aPressureLoc);
+      gl.vertexAttribPointer(this.aPressureLoc, 1, gl.FLOAT, false, byteStride, 10 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aPressureLoc, 1);
+
+      gl.enableVertexAttribArray(this.aStrokeDistLoc);
+      gl.vertexAttribPointer(this.aStrokeDistLoc, 1, gl.FLOAT, false, byteStride, 11 * 4);
+      this.extInstanced.vertexAttribDivisor(this.aStrokeDistLoc, 1);
+
+      if (this.aFlipLoc >= 0) {
+        gl.enableVertexAttribArray(this.aFlipLoc);
+        gl.vertexAttribPointer(this.aFlipLoc, 2, gl.FLOAT, false, byteStride, 12 * 4);
+        this.extInstanced.vertexAttribDivisor(this.aFlipLoc, 1);
+      }
+      if (this.aTipIndexLoc >= 0) {
+        gl.enableVertexAttribArray(this.aTipIndexLoc);
+        gl.vertexAttribPointer(this.aTipIndexLoc, 1, gl.FLOAT, false, byteStride, 14 * 4);
+        this.extInstanced.vertexAttribDivisor(this.aTipIndexLoc, 1);
+      }
+    }
+  }
+
+  private unbindDabAttributes(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    useInstanced: boolean
+  ): void {
+    gl.disableVertexAttribArray(this.aQuadVertexLoc);
+    if (useInstanced && this.extInstanced) {
+      this.extInstanced.vertexAttribDivisor(this.aCenterLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aSizeLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aAngleLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aColorLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aAlphaLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aPressureLoc, 0);
+      this.extInstanced.vertexAttribDivisor(this.aStrokeDistLoc, 0);
+      if (this.aFlipLoc >= 0) {
+        this.extInstanced.vertexAttribDivisor(this.aFlipLoc, 0);
+        gl.disableVertexAttribArray(this.aFlipLoc);
+      }
+      if (this.aTipIndexLoc >= 0) {
+        this.extInstanced.vertexAttribDivisor(this.aTipIndexLoc, 0);
+        gl.disableVertexAttribArray(this.aTipIndexLoc);
+      }
+      gl.disableVertexAttribArray(this.aCenterLoc);
+      gl.disableVertexAttribArray(this.aSizeLoc);
+      gl.disableVertexAttribArray(this.aAngleLoc);
+      gl.disableVertexAttribArray(this.aColorLoc);
+      gl.disableVertexAttribArray(this.aAlphaLoc);
+      gl.disableVertexAttribArray(this.aPressureLoc);
+      gl.disableVertexAttribArray(this.aStrokeDistLoc);
+    }
+  }
+
+  private drawBoundDabs(
+    gl: WebGLRenderingContext | WebGL2RenderingContext,
+    dabCount: number,
+    arr: Float32Array,
+    useInstanced: boolean
+  ): void {
+    if (dabCount <= 0) return;
+    if (useInstanced && this.extInstanced) {
+      this.extInstanced.drawArraysInstanced(gl.TRIANGLES, 0, 6, dabCount);
+      return;
+    }
+    const stride = 15;
+    for (let i = 0; i < dabCount; i++) {
+      const offset = i * stride;
+      gl.vertexAttrib2f(this.aCenterLoc, arr[offset], arr[offset + 1]);
+      gl.vertexAttrib2f(this.aSizeLoc, arr[offset + 2], arr[offset + 3]);
+      gl.vertexAttrib1f(this.aAngleLoc, arr[offset + 4]);
+      gl.vertexAttrib4f(this.aColorLoc, arr[offset + 5], arr[offset + 6], arr[offset + 7], arr[offset + 8]);
+      gl.vertexAttrib1f(this.aAlphaLoc, arr[offset + 9]);
+      gl.vertexAttrib1f(this.aPressureLoc, arr[offset + 10]);
+      gl.vertexAttrib1f(this.aStrokeDistLoc, arr[offset + 11]);
+      if (this.aFlipLoc >= 0) {
+        gl.vertexAttrib2f(this.aFlipLoc, arr[offset + 12], arr[offset + 13]);
+      }
+      if (this.aTipIndexLoc >= 0) {
+        gl.vertexAttrib1f(this.aTipIndexLoc, arr[offset + 14]);
+      }
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+  }
+
+  /**
+   * True two-pass Clip Studio Paint Dual Brush GPU renderer:
+   * - Pass 1 renders `primaryDabs` into `dualPrimaryFbo`
+   * - Pass 2 renders `secondaryDabs` into `dualSecondaryFbo`
+   * - Combine Pass executes a single fullscreen FBO shader combining primary RGBA
+   *   and secondary density `a2` with `compositeMode` and composites onto `targetCtx`.
+   */
+  public renderDualBrushDabsToContext(
+    targetCtx: CanvasRenderingContext2D,
+    primaryDabs: GpuDab[],
+    primarySettings: BrushSettings & { alphaLocked?: boolean; isBgEraser?: boolean },
+    secondaryDabs: GpuDab[],
+    secondarySettings: BrushSettings,
+    compositeMode: DualBrushCompositeMode,
+    tool: ToolType,
+    canvasWidth: number,
+    canvasHeight: number,
+    underlyingCanvas?: HTMLCanvasElement
+  ): boolean {
+    const canvas = this.canvas;
+    const gl = this.gl;
+    if (
+      !this.isAvailable() ||
+      !gl ||
+      !canvas ||
+      !this.program ||
+      !this.dualCombineProgram ||
+      !this.fullQuadBuffer ||
+      primaryDabs.length === 0
+    ) {
+      return false;
+    }
+
+    const isTransparentInk = Boolean(primarySettings.isTransparentInk);
+    const isEraser = tool === 'eraser' || isTransparentInk;
+    const isBgEraser =
+      Boolean(primarySettings.isBgEraser) || (tool === 'eraser' && targetCtx.fillStyle === '#ffffff');
+    const isAlphaLocked = Boolean(primarySettings.alphaLocked);
+
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < primaryDabs.length; i++) {
+      const d = primaryDabs[i];
+      const rad = Math.max(d.width, d.height) * 0.75 + 4;
+      if (d.x - rad < minX) minX = d.x - rad;
+      if (d.y - rad < minY) minY = d.y - rad;
+      if (d.x + rad > maxX) maxX = d.x + rad;
+      if (d.y + rad > maxY) maxY = d.y + rad;
+    }
+
+    const fullDirtyX = Math.floor(minX);
+    const fullDirtyY = Math.floor(minY);
+    const fullDirtyMaxX = Math.ceil(maxX);
+    const fullDirtyMaxY = Math.ceil(maxY);
+    const totalW = Math.max(0, fullDirtyMaxX - fullDirtyX);
+    const totalH = Math.max(0, fullDirtyMaxY - fullDirtyY);
+    if (totalW <= 0 || totalH <= 0) return false;
+
+    const chunkWMax = Math.min(MAX_TILE_CHUNK, totalW);
+    const chunkHMax = Math.min(MAX_TILE_CHUNK, totalH);
+    if (canvas.width < chunkWMax || canvas.height < chunkHMax) {
+      canvas.width = Math.max(canvas.width, chunkWMax, 512);
+      canvas.height = Math.max(canvas.height, chunkHMax, 512);
+    }
+
+    if (!this.ensureDualFbos(chunkWMax, chunkHMax)) {
+      return false;
+    }
+
+    const aaMode = primarySettings.antiAlias ?? 2;
+    const packedPrimary = this.packDabsIntoFloatArray(primaryDabs, aaMode, this.instanceArray);
+    this.instanceArray = packedPrimary.array;
+    if (this.instanceBuffer) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.instanceBuffer);
+      gl.bufferData(gl.ARRAY_BUFFER, this.instanceArray.subarray(0, packedPrimary.floatCount), gl.DYNAMIC_DRAW);
+    }
+
+    const secAaMode = secondarySettings.antiAlias ?? aaMode;
+    const packedSecondary = this.packDabsIntoFloatArray(
+      secondaryDabs,
+      secAaMode,
+      this.secondaryInstanceArray
+    );
+    this.secondaryInstanceArray = packedSecondary.array;
+    if (this.secondaryInstanceBuffer && secondaryDabs.length > 0) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.secondaryInstanceBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        this.secondaryInstanceArray.subarray(0, packedSecondary.floatCount),
+        gl.DYNAMIC_DRAW
+      );
+    }
+
+    const useInstancedPrimary = Boolean(this.extInstanced && this.instanceBuffer);
+    const useInstancedSecondary = Boolean(this.extInstanced && this.secondaryInstanceBuffer);
+    const modeIdx = dualBrushCompositeModeToIndex(compositeMode);
+
+    const compositeOp: GlobalCompositeOperation = isBgEraser
+      ? 'source-over'
+      : isEraser
+      ? 'destination-out'
+      : isAlphaLocked
+      ? 'source-atop'
+      : 'source-over';
+
+    targetCtx.save();
+    targetCtx.globalCompositeOperation = compositeOp;
+    targetCtx.globalAlpha = Math.max(0, Math.min(1, primarySettings.opacity ?? 1.0));
+    if (aaMode === 0) {
+      targetCtx.imageSmoothingEnabled = false;
+    }
+
+    const chunkCols = Math.ceil(totalW / MAX_TILE_CHUNK);
+    const chunkRows = Math.ceil(totalH / MAX_TILE_CHUNK);
+
+    for (let row = 0; row < chunkRows; row++) {
+      const cy = fullDirtyY + row * MAX_TILE_CHUNK;
+      const dh = Math.min(MAX_TILE_CHUNK, fullDirtyMaxY - cy);
+      if (dh <= 0) continue;
+      for (let col = 0; col < chunkCols; col++) {
+        const cx = fullDirtyX + col * MAX_TILE_CHUNK;
+        const dw = Math.min(MAX_TILE_CHUNK, fullDirtyMaxX - cx);
+        if (dw <= 0) continue;
+
+        // Pass 1: Primary stroke into dualPrimaryFbo at (0, 0, dw, dh)
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.dualPrimaryFbo);
+        gl.viewport(0, 0, dw, dh);
+        if (typeof gl.scissor === 'function') {
+          gl.enable(gl.SCISSOR_TEST);
+          gl.scissor(0, 0, dw, dh);
+        }
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        gl.useProgram(this.program);
+        this.configureDabPassUniforms(
+          gl,
+          primaryDabs,
+          primarySettings,
+          isEraser,
+          isBgEraser,
+          canvasWidth,
+          canvasHeight,
+          fullDirtyX,
+          fullDirtyY,
+          totalW,
+          totalH,
+          underlyingCanvas
+        );
+        gl.uniform2f(this.uCanvasResolutionLoc, dw, dh);
+        if (this.uDirtyOffsetLoc) {
+          gl.uniform2f(this.uDirtyOffsetLoc, cx, cy);
+        }
+        this.bindDabAttributes(gl, this.instanceBuffer, useInstancedPrimary);
+        this.drawBoundDabs(gl, primaryDabs.length, this.instanceArray, useInstancedPrimary);
+        this.unbindDabAttributes(gl, useInstancedPrimary);
+
+        // Pass 2: Secondary stroke into dualSecondaryFbo at (0, 0, dw, dh)
+        gl.bindFramebuffer(gl.FRAMEBUFFER, this.dualSecondaryFbo);
+        gl.viewport(0, 0, dw, dh);
+        if (typeof gl.scissor === 'function') {
+          gl.scissor(0, 0, dw, dh);
+        }
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        if (secondaryDabs.length > 0) {
+          gl.useProgram(this.program);
+          this.configureDabPassUniforms(
+            gl,
+            secondaryDabs,
+            secondarySettings,
+            false,
+            false,
+            canvasWidth,
+            canvasHeight,
+            fullDirtyX,
+            fullDirtyY,
+            totalW,
+            totalH,
+            undefined
+          );
+          gl.uniform2f(this.uCanvasResolutionLoc, dw, dh);
+          if (this.uDirtyOffsetLoc) {
+            gl.uniform2f(this.uDirtyOffsetLoc, cx, cy);
+          }
+          this.bindDabAttributes(gl, this.secondaryInstanceBuffer, useInstancedSecondary);
+          this.drawBoundDabs(
+            gl,
+            secondaryDabs.length,
+            this.secondaryInstanceArray,
+            useInstancedSecondary
+          );
+          this.unbindDabAttributes(gl, useInstancedSecondary);
+        }
+
+        // Combine Pass: single fullscreen quad shader combining dualPrimaryTex + dualSecondaryTex
+        const viewY = Math.max(0, canvas.height - dh);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        gl.viewport(0, viewY, dw, dh);
+        if (typeof gl.scissor === 'function') {
+          gl.scissor(0, viewY, dw, dh);
+        }
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        gl.disable(gl.BLEND);
+        gl.useProgram(this.dualCombineProgram);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, this.dualPrimaryTex);
+        gl.uniform1i(this.uDualCombinePrimaryTexLoc, 0);
+        gl.activeTexture(gl.TEXTURE1);
+        gl.bindTexture(gl.TEXTURE_2D, this.dualSecondaryTex);
+        gl.uniform1i(this.uDualCombineSecondaryTexLoc, 1);
+        gl.uniform2f(
+          this.uDualCombineUvScaleLoc,
+          dw / Math.max(1, this.dualFboWidth),
+          dh / Math.max(1, this.dualFboHeight)
+        );
+        gl.uniform1i(this.uDualCombineModeLoc, modeIdx);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, this.fullQuadBuffer);
+        gl.enableVertexAttribArray(this.aDualCombinePosLoc);
+        gl.vertexAttribPointer(this.aDualCombinePosLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+        gl.disableVertexAttribArray(this.aDualCombinePosLoc);
+
+        if (typeof gl.scissor === 'function') {
+          gl.disable(gl.SCISSOR_TEST);
+        }
+        gl.enable(gl.BLEND);
+        gl.blendEquation(gl.FUNC_ADD);
+        gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+        targetCtx.drawImage(canvas, 0, 0, dw, dh, cx, cy, dw, dh);
+      }
+    }
+
+    targetCtx.restore();
     return true;
   }
 }

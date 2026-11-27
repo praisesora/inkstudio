@@ -142,4 +142,37 @@ describe('settings theme & accent system', () => {
     expect(NICKNAME_STORAGE_KEY).toBe('ink_studio_nickname');
     expect(loadAppSettings().userName).toBe('InkArtist');
   });
+
+  it('persists and sanitizes WebRTC collaboration signaling and TURN settings', () => {
+    const defaults = loadAppSettings();
+    expect(defaults.collabSignalingUrl).toBe('');
+    expect(defaults.collabTurnUrl).toBe('');
+    expect(defaults.collabTurnUsername).toBe('');
+    expect(defaults.collabTurnCredential).toBe('');
+
+    saveAppSettings({
+      ...DEFAULT_APP_SETTINGS,
+      collabSignalingUrl: ' wss://sig.example.workers.dev/signal ',
+      collabTurnUrl: ' turns:turn.example.com:5349 ',
+      collabTurnUsername: ' artist ',
+      collabTurnCredential: ' secret-token ',
+    });
+    const loaded = loadAppSettings();
+    expect(loaded.collabSignalingUrl).toBe('wss://sig.example.workers.dev/signal');
+    expect(loaded.collabTurnUrl).toBe('turns:turn.example.com:5349');
+    expect(loaded.collabTurnUsername).toBe('artist');
+    expect(loaded.collabTurnCredential).toBe('secret-token');
+
+    // Null-byte / non-string corruption falls back safely
+    localStorage.setItem(
+      'ink_studio_app_settings',
+      JSON.stringify({
+        collabSignalingUrl: 'wss://bad\0url',
+        collabTurnUrl: 12345,
+      })
+    );
+    const sanitized = loadAppSettings();
+    expect(sanitized.collabSignalingUrl).toBe('');
+    expect(sanitized.collabTurnUrl).toBe('');
+  });
 });

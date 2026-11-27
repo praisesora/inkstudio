@@ -181,7 +181,16 @@ export const BrushStudioModal: React.FC<BrushStudioModalProps> = ({
     try {
       const parsed = await importBrushFile(file);
       saveActivePresetId(parsed.id);
-      showToast?.(`Imported "${parsed.name}"`);
+      if (parsed.importWarnings && parsed.importWarnings.length > 0) {
+        const count = parsed.importWarnings.length;
+        showToast?.(
+          count === 1
+            ? `Imported "${parsed.name}" (Notice: ${parsed.importWarnings[0]})`
+            : `Imported "${parsed.name}" with ${count} CSP import notices`
+        );
+      } else {
+        showToast?.(`Imported "${parsed.name}"`);
+      }
     } catch (err) {
       showToast?.(err instanceof Error ? err.message : 'Import failed');
     }

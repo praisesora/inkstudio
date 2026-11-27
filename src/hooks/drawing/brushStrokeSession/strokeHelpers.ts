@@ -9,12 +9,19 @@ import {
 import { TILE_SIZE } from '../../../utils/tileEngine';
 import { calculateStrokeWidth, screenToCanvas, get2DContext } from '../../../utils/canvasUtils';
 import { enforceColorMode } from '../../../utils/colorUtils';
-import { BrushRenderOptions, buildBrushRenderOptions } from '../../../engine/BrushEngine';
+import {
+  BrushRenderOptions,
+  applyStrokePaperTextureToImageData,
+  buildBrushRenderOptions,
+  combineDualBrushImageData,
+  resolveDualBrushConfig,
+} from '../../../engine/BrushEngine';
 import { ConstraintAxis } from '../../../types/perspective';
 import { useUiStore } from '../../../stores';
 import { recoveryService } from '../../../services/recoveryService';
 import { evaluateGlobalPressureCurve } from '../../../utils/pressureCurve';
-import { DraftCanvasElement } from '../types';
+import { isPigmentCompatibleCombineMode } from '../../../utils/pigmentEngine';
+import { DraftCanvasElement, applySelectionCanvasClip } from '../types';
 import { StrokeSessionState, TouchedTileSpan, UseBrushStrokeSessionParams } from './types';
 
 export function getPredictedCanvasElement(
@@ -130,6 +137,27 @@ export function dispatchPointerStatThrottled(
   }
 }
 
+export function resetAndClearOffscreenDraftCanvas(
+  canvas: DraftCanvasElement | null | undefined
+): void {
+  if (!canvas) return;
+  const ctx = get2DContext(canvas);
+  if (ctx) {
+    if (canvas.__clipSaved) {
+      try {
+        ctx.restore();
+      } catch {
+        // Ignore restore underflow
+      }
+      canvas.__clipSaved = false;
+    }
+    ctx.resetTransform();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  } else {
+    canvas.__clipSaved = false;
+  }
+}
+
 export function abortActiveStrokeSession(
   params: Pick<
     UseBrushStrokeSessionParams,
@@ -152,13 +180,18 @@ export function abortActiveStrokeSession(
   if (draftCanvas) {
     const dCtx = get2DContext(draftCanvas);
     if (dCtx) {
-      try {
-        dCtx.restore();
-      } catch {
-        // Ignore restore underflow
+      if (draftCanvas.__clipSaved) {
+        try {
+          dCtx.restore();
+        } catch {
+          // Ignore restore underflow
+        }
+        draftCanvas.__clipSaved = false;
       }
       dCtx.resetTransform();
       dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
+    } else {
+      draftCanvas.__clipSaved = false;
     }
     if (draftCanvas.__draftHasContent) {
       clearedActiveDraft = true;
@@ -166,8 +199,16 @@ export function abortActiveStrokeSession(
     draftCanvas.__draftHasContent = false;
     draftCanvas.__draftCompositeOp = 'source-over';
     draftCanvas.__draftMonochrome = false;
+    draftCanvas.__draftPigmentStrength = 0;
+    draftCanvas.__draftPigmentWhiteGround = false;
+    draftCanvas.__draftCombineMode = undefined;
+    draftCanvas.__draftFrameDirtyRect = null;
+    draftCanvas.__draftForceFullUpload = true;
     draftCanvas.__draftVersion = (draftCanvas.__draftVersion || 0) + 1;
   }
+  resetAndClearOffscreenDraftCanvas(state.rawDraftCanvas as DraftCanvasElement | null);
+  resetAndClearOffscreenDraftCanvas(state.dualPrimaryCanvas as DraftCanvasElement | null);
+  resetAndClearOffscreenDraftCanvas(state.dualSecondaryCanvas as DraftCanvasElement | null);
   clearPredictedCanvas();
   if (clearedActiveDraft) {
     params.activeTileGridRef.current.notifyChange(true);
@@ -191,12 +232,23 @@ export function abortActiveStrokeSession(
   state.touchedTiles.clear();
   state.liveNeedsNotify = false;
   state.isShiftLineStroke = false;
+  state.deferredInitialDot = false;
+  state.deferredStartRawPressure = 0;
   state.layerPixelSampler = null;
   state.activeReservoir = null;
+  state.isStrokePaperTextureActive = false;
+  state.isDualBrushStroke = false;
+  state.dualSecondaryRemainderDist = 0;
+  state.dualSecondaryDabCounter.count = 0;
+  state.dualSecondaryDabCounter.lastAngle = undefined;
+  state.dualSecondaryDabCounter.lastStepDist = undefined;
+  state.dualSecondaryRibbonSession = null;
+  state.dualFrameSecondaryGpuDabs.length = 0;
   if (state.naturalPaintSession) {
     state.naturalPaintSession.finishAndDispose();
     state.naturalPaintSession = null;
   }
+  state.ribbonSession = null;
   state.snapSession.endStroke();
   state.straightSnapSession.endStroke();
   emitConstraintAxisChange(null);
@@ -259,6 +311,26 @@ export function computeCanvasPoint(
     twist: e.twist ?? 0,
     timestamp: e.timeStamp,
   };
+}
+
+export function resolveStrokePigmentStrength(
+  bs: BrushSettings,
+  isEraser: boolean,
+  isBgEraser: boolean,
+  isMonochrome: boolean
+): number {
+  if (
+    isEraser ||
+    isBgEraser ||
+    isMonochrome ||
+    bs.isTransparentInk ||
+    bs.perceptualMixing === false ||
+    !isPigmentCompatibleCombineMode(bs.brushCombineMode)
+  ) {
+    return 0;
+  }
+  const raw = bs.naturalPaint?.pigmentMixingStrength ?? 1.0;
+  return raw <= 0.005 ? 0 : raw >= 1 ? 1 : raw;
 }
 
 export function resolveEffectiveOpacitySensorValue(
@@ -372,7 +444,246 @@ export function createLiveBrushOptions(
     alphaLocked: isolatedPass ? false : Boolean(activeLayer?.alphaLocked),
     isTransparentInk: isolatedPass ? false : Boolean(bs.isTransparentInk),
     currentStrokeDist: state.strokeTotalDistance,
+    skipPerDabPaperGrain: state.isStrokePaperTextureActive ? true : undefined,
+    ...(state.isDualBrushStroke ? { dualBrush: false, dualBrushConfig: undefined } : {}),
   });
+}
+
+function configureMatchedOffscreenCanvas(
+  canvas: DraftCanvasElement,
+  draftCanvas: DraftCanvasElement,
+  dims: CanvasDimensions,
+  selection: UseBrushStrokeSessionParams['selectionRef']['current']
+): CanvasRenderingContext2D | null {
+  const resized = canvas.width !== draftCanvas.width || canvas.height !== draftCanvas.height;
+  if (resized) {
+    canvas.width = draftCanvas.width;
+    canvas.height = draftCanvas.height;
+    canvas.__clipSaved = false;
+  }
+  const ctx = get2DContext(canvas);
+  if (!ctx) return null;
+
+  if (!resized && canvas.__clipSaved) {
+    try {
+      ctx.restore();
+    } catch {
+      // Ignore restore underflow
+    }
+    canvas.__clipSaved = false;
+  }
+
+  const draftScale = draftCanvas.__draftScale ?? 1.0;
+  const docRect = draftCanvas.__draftDocRect;
+  const visMinX = docRect ? docRect.x : 0;
+  const visMinY = docRect ? docRect.y : 0;
+
+  ctx.resetTransform();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.setTransform(
+    draftScale,
+    0,
+    0,
+    draftScale,
+    -visMinX * draftScale,
+    -visMinY * draftScale
+  );
+  ctx.save();
+  canvas.__clipSaved = true;
+  ctx.beginPath();
+  ctx.rect(0, 0, dims.width, dims.height);
+  ctx.clip();
+  applySelectionCanvasClip(ctx, selection);
+  return ctx;
+}
+
+/**
+ * Prepares paired primary and secondary draft surfaces for live two-pass Dual Brush rendering,
+ * matching draftCanvas's exact dimensions, transform, and selection clip.
+ */
+export function prepareDualDraftCanvases(
+  state: StrokeSessionState,
+  draftCanvas: DraftCanvasElement,
+  dims: CanvasDimensions,
+  selection: UseBrushStrokeSessionParams['selectionRef']['current']
+): { primaryCtx: CanvasRenderingContext2D; secondaryCtx: CanvasRenderingContext2D } | null {
+  if (typeof document === 'undefined') return null;
+  if (!state.dualPrimaryCanvas) {
+    state.dualPrimaryCanvas = document.createElement('canvas');
+  }
+  if (!state.dualSecondaryCanvas) {
+    state.dualSecondaryCanvas = document.createElement('canvas');
+  }
+  const primaryCtx = configureMatchedOffscreenCanvas(
+    state.dualPrimaryCanvas,
+    draftCanvas,
+    dims,
+    selection
+  );
+  const secondaryCtx = configureMatchedOffscreenCanvas(
+    state.dualSecondaryCanvas,
+    draftCanvas,
+    dims,
+    selection
+  );
+  if (!primaryCtx || !secondaryCtx) return null;
+  return { primaryCtx, secondaryCtx };
+}
+
+/**
+ * Builds BrushRenderOptions for the live secondary Dual Brush pass.
+ */
+export function buildLiveSecondaryBrushOptions(
+  secSettings: BrushSettings,
+  isMonochrome: boolean,
+  effectiveAntiAlias: number | undefined,
+  currentStrokeDist: number
+): BrushRenderOptions {
+  return buildBrushRenderOptions(secSettings, {
+    opacity: 1.0,
+    flow: secSettings.flow ?? 1.0,
+    spacing: secSettings.spacing ?? 0.1,
+    hardness: secSettings.hardness ?? 1.0,
+    antiAlias:
+      effectiveAntiAlias !== undefined ? effectiveAntiAlias : isMonochrome ? 0 : secSettings.antiAlias,
+    wetEdge: 0,
+    grain: 0,
+    textureDensity: 0,
+    colorMixing: false,
+    dualBrush: false,
+    dualBrushConfig: undefined,
+    isEraser: false,
+    isBgEraser: false,
+    alphaLocked: false,
+    isTransparentInk: false,
+    currentStrokeDist,
+  });
+}
+
+/**
+ * Combines the newly-updated document-space dirty rect from paired
+ * (dualPrimaryCanvas, dualSecondaryCanvas) -> draftCanvas using CSP Dual Brush semantics
+ * (plus per-stroke paper texture if active).
+ */
+export function syncDualBrushRegionToDraft(
+  state: StrokeSessionState,
+  draftCanvas: DraftCanvasElement,
+  draftCtx: CanvasRenderingContext2D,
+  bs: BrushSettings,
+  minDocX: number,
+  minDocY: number,
+  maxDocX: number,
+  maxDocY: number
+): void {
+  const dualCfg = resolveDualBrushConfig(bs);
+  if (!dualCfg) return;
+  const primary = state.dualPrimaryCanvas;
+  const secondary = state.dualSecondaryCanvas;
+  if (!primary || !secondary || primary.width <= 0 || primary.height <= 0) return;
+  const pCtx = get2DContext(primary);
+  const sCtx = get2DContext(secondary);
+  if (
+    !pCtx ||
+    !sCtx ||
+    typeof pCtx.getImageData !== 'function' ||
+    typeof sCtx.getImageData !== 'function' ||
+    typeof draftCtx.putImageData !== 'function'
+  ) {
+    return;
+  }
+
+  const draftScale = draftCanvas.__draftScale ?? 1.0;
+  const docRect = draftCanvas.__draftDocRect;
+  const originX = docRect ? docRect.x : 0;
+  const originY = docRect ? docRect.y : 0;
+
+  const px0 = Math.max(0, Math.floor((minDocX - originX) * draftScale));
+  const py0 = Math.max(0, Math.floor((minDocY - originY) * draftScale));
+  const px1 = Math.min(primary.width, Math.ceil((maxDocX - originX) * draftScale));
+  const py1 = Math.min(primary.height, Math.ceil((maxDocY - originY) * draftScale));
+  const pw = px1 - px0;
+  const ph = py1 - py0;
+  if (pw <= 0 || ph <= 0) return;
+
+  const primaryImg = pCtx.getImageData(px0, py0, pw, ph);
+  const secondaryImg = sCtx.getImageData(px0, py0, pw, ph);
+  combineDualBrushImageData(
+    primaryImg.data,
+    secondaryImg.data,
+    primaryImg.data,
+    dualCfg.compositeMode
+  );
+
+  if (state.isStrokePaperTextureActive) {
+    const worldStartX = originX + px0 / Math.max(1e-4, draftScale);
+    const worldStartY = originY + py0 / Math.max(1e-4, draftScale);
+    applyStrokePaperTextureToImageData(primaryImg, worldStartX, worldStartY, bs, draftScale);
+  }
+
+  draftCtx.putImageData(primaryImg, px0, py0);
+}
+
+/**
+ * Prepares the untextured raw stroke accumulation canvas for CSP per-stroke paper texture
+ * (TextureForPlot = 0), matching draftCanvas's exact dimensions, transform, and clip.
+ */
+export function prepareRawDraftCanvasForStrokeTexture(
+  state: StrokeSessionState,
+  draftCanvas: DraftCanvasElement,
+  dims: CanvasDimensions,
+  selection: UseBrushStrokeSessionParams['selectionRef']['current']
+): CanvasRenderingContext2D | null {
+  if (typeof document === 'undefined') return null;
+  if (!state.rawDraftCanvas) {
+    state.rawDraftCanvas = document.createElement('canvas');
+  }
+  return configureMatchedOffscreenCanvas(
+    state.rawDraftCanvas as DraftCanvasElement,
+    draftCanvas,
+    dims,
+    selection
+  );
+}
+
+/**
+ * Copies a newly-updated document-space dirty rect from rawDraftCanvas -> draftCanvas
+ * while applying CSP per-stroke paper texture ONCE over the accumulated stroke alpha.
+ */
+export function syncStrokePaperTextureRegionToDraft(
+  state: StrokeSessionState,
+  draftCanvas: DraftCanvasElement,
+  draftCtx: CanvasRenderingContext2D,
+  bs: BrushSettings,
+  minDocX: number,
+  minDocY: number,
+  maxDocX: number,
+  maxDocY: number
+): void {
+  const raw = state.rawDraftCanvas;
+  if (!raw || raw.width <= 0 || raw.height <= 0) return;
+  const rCtx = get2DContext(raw);
+  if (!rCtx || typeof rCtx.getImageData !== 'function' || typeof draftCtx.putImageData !== 'function') {
+    return;
+  }
+
+  const draftScale = draftCanvas.__draftScale ?? 1.0;
+  const docRect = draftCanvas.__draftDocRect;
+  const originX = docRect ? docRect.x : 0;
+  const originY = docRect ? docRect.y : 0;
+
+  const px0 = Math.max(0, Math.floor((minDocX - originX) * draftScale));
+  const py0 = Math.max(0, Math.floor((minDocY - originY) * draftScale));
+  const px1 = Math.min(raw.width, Math.ceil((maxDocX - originX) * draftScale));
+  const py1 = Math.min(raw.height, Math.ceil((maxDocY - originY) * draftScale));
+  const pw = px1 - px0;
+  const ph = py1 - py0;
+  if (pw <= 0 || ph <= 0) return;
+
+  const imgData = rCtx.getImageData(px0, py0, pw, ph);
+  const worldStartX = originX + px0 / Math.max(1e-4, draftScale);
+  const worldStartY = originY + py0 / Math.max(1e-4, draftScale);
+  applyStrokePaperTextureToImageData(imgData, worldStartX, worldStartY, bs, draftScale);
+  draftCtx.putImageData(imgData, px0, py0);
 }
 
 export function resolveStrokeColorValue(

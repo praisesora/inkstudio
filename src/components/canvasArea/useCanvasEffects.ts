@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { BrushSettings, LiquifySettings, RetouchSettings, ToolType } from '../../types/editor';
 import { ModifierAction } from '../../types/settings';
 import { getBrushTipOutline, resolveBrushTipImage, TipOutline } from '../../utils/brushOutline';
+import { computeTipStampDimensions } from '../../engine/BrushEngine';
 import { preloadTipImage } from '../../utils/brushStorage';
 import { subscribeNativeTablet } from '../../utils/nativeTabletInput';
 import { CursorConfig, formatCursorRingTransform } from './types';
@@ -110,9 +111,10 @@ export function useCanvasEffects({
     setTipOutline(null);
   }, [activeTipImage, brushSettings.customTipDataUrl, brushSettings.preset]);
 
-  const isCustomTip = Boolean(tipOutline && (tool === 'brush' || tool === 'eraser'));
+  const isCustomTip = Boolean(
+    tipOutline && !brushSettings.isRibbon && (tool === 'brush' || tool === 'eraser')
+  );
   const isSquare = brushSettings.preset === 'square-digital' && !tipOutline;
-  const tipAspect = isCustomTip && tipOutline ? tipOutline.height / tipOutline.width : 1.0;
 
   const activeToolSize =
     tool === 'liquify' && liquifySettings
@@ -129,12 +131,17 @@ export function useCanvasEffects({
     (brushSettings.customTipAngleDynamics === 'direction' ||
       brushSettings.customTipAngleDynamics === 'direction-random');
 
-  const cursorWidth = thicknessVertical
-    ? Math.max(2, cursorBaseWidth * thicknessRatio)
-    : cursorBaseWidth;
-  const cursorHeight = thicknessVertical
-    ? Math.max(2, cursorBaseWidth * tipAspect)
-    : Math.max(2, cursorBaseWidth * tipAspect * thicknessRatio);
+  const tipAspect =
+    isCustomTip && tipOutline ? tipOutline.height / Math.max(1, tipOutline.width) : 1;
+  const tipCursorDims = computeTipStampDimensions(
+    cursorBaseWidth,
+    thicknessRatio,
+    thicknessVertical,
+    isCustomTip && tipOutline ? tipOutline.width : 1,
+    isCustomTip && tipOutline ? tipOutline.height : 1
+  );
+  const cursorWidth = Math.max(2, tipCursorDims.width);
+  const cursorHeight = Math.max(2, tipCursorDims.height);
 
   // Brush tip rotation: tip angle relative to canvas + viewport canvas rotation
   const totalAngleDeg = tipAngleDeg + liveRotation;

@@ -770,19 +770,8 @@ export function useCollabSync({
     ? true
     : canEditLayer(activeLayerObj, mp.myPeer.id, mp.myRole).allowed;
 
-  const handleStartHosting = useCallback(
-    async (
-      roomName: string,
-      port: number,
-      hostNickname?: string,
-      isGlobal?: boolean,
-      onStatus?: (status: string) => void
-    ) => {
-      if (!hasOpenDocument) {
-        showToast('Please create or open a canvas before hosting a session.');
-        return false;
-      }
-      const finalHostName = (hostNickname || mp.myPeer.name || 'Artist').trim();
+  const prepareHostLayers = useCallback(
+    (finalHostName: string) => {
       const hostPeerId = mp.myPeer.id;
 
       // Stamp ownership on host's existing non-background layers to protect them from accidental guest deletion
@@ -812,18 +801,44 @@ export function useCollabSync({
         );
         renameLayer(defaultLayer.id, hostLayerName);
       }
+    },
+    [mp.myPeer.id, activeLayerId, renameLayer, setLayers]
+  );
+
+  const handleStartHosting = useCallback(
+    async (
+      roomName: string,
+      port: number,
+      hostNickname?: string,
+      isGlobal?: boolean,
+      onStatus?: (status: string) => void
+    ) => {
+      if (!hasOpenDocument) {
+        showToast('Please create or open a canvas before hosting a session.');
+        return false;
+      }
+      const finalHostName = (hostNickname || mp.myPeer.name || 'Artist').trim();
+      prepareHostLayers(finalHostName);
       return await mp.startHosting(roomName, port, finalHostName, isGlobal, onStatus);
     },
-    [
-      hasOpenDocument,
-      showToast,
-      mp.myPeer.id,
-      mp.myPeer.name,
-      activeLayerId,
-      renameLayer,
-      setLayers,
-      mp.startHosting,
-    ]
+    [hasOpenDocument, showToast, mp.myPeer.name, prepareHostLayers, mp.startHosting]
+  );
+
+  const handleStartWebRtcHosting = useCallback(
+    async (
+      roomName: string,
+      hostNickname?: string,
+      onStatus?: (status: string) => void
+    ) => {
+      if (!hasOpenDocument) {
+        showToast('Please create or open a canvas before hosting a session.');
+        return false;
+      }
+      const finalHostName = (hostNickname || mp.myPeer.name || 'Artist').trim();
+      prepareHostLayers(finalHostName);
+      return await mp.startWebRtcHosting(roomName, finalHostName, onStatus);
+    },
+    [hasOpenDocument, showToast, mp.myPeer.name, prepareHostLayers, mp.startWebRtcHosting]
   );
 
   const handleAddLayer = useCallback(
@@ -1052,6 +1067,7 @@ export function useCollabSync({
     canDeleteLayerById,
     canToggleOwnerLockById,
     handleStartHosting,
+    handleStartWebRtcHosting,
     handleAddLayer,
     handleDeleteLayer,
     handleDeleteSelectedLayers,

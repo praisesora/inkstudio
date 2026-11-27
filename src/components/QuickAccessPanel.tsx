@@ -28,7 +28,12 @@ import { ToolType } from '../types/editor';
 import { ThemePreset } from '../types/settings';
 import { COMMAND_CATALOG, CommandActionId, QuickAccessItem } from '../types/workspace';
 import { BUILTIN_BRUSHES } from '../utils/presetBrushes';
-import { getEffectiveBrushSettings, saveActivePresetId } from '../utils/brushPresetManager';
+import {
+  NEUTRAL_BRUSH_DEFAULTS,
+  getEffectiveBrushSettings,
+  migrateLegacyPresetId,
+  saveActivePresetId,
+} from '../utils/brushPresetManager';
 import {
   toolStoreActions,
   useToolStore,
@@ -137,10 +142,15 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
       return;
     }
     if (item.kind === 'brush' && item.brushPresetId) {
+      const resolvedPresetId = migrateLegacyPresetId(item.brushPresetId);
       toolStoreActions.selectTool('brush');
-      saveActivePresetId(item.brushPresetId);
-      const effective = getEffectiveBrushSettings(item.brushPresetId);
-      toolStoreActions.updateBrushSettings({ ...effective, preset: item.brushPresetId });
+      saveActivePresetId(resolvedPresetId);
+      const effective = getEffectiveBrushSettings(resolvedPresetId);
+      toolStoreActions.updateBrushSettings({
+        ...NEUTRAL_BRUSH_DEFAULTS,
+        ...effective,
+        preset: resolvedPresetId,
+      });
     }
   };
 
@@ -264,7 +274,10 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
                   item.commandId &&
                   isCommandActive(item.commandId, handlers, palettesHidden)) ||
                 (item.kind === 'tool' && item.toolId === activeTool) ||
-                (item.kind === 'brush' && item.brushPresetId === activePresetId && activeTool === 'brush') ||
+                (item.kind === 'brush' &&
+                  item.brushPresetId &&
+                  migrateLegacyPresetId(item.brushPresetId) === activePresetId &&
+                  activeTool === 'brush') ||
                 (item.kind === 'color' && item.color?.toLowerCase() === primaryColor.toLowerCase());
 
               return (
@@ -311,7 +324,10 @@ export const QuickAccessPanel: React.FC<QuickAccessPanelProps> = React.memo(({
                   item.commandId &&
                   isCommandActive(item.commandId, handlers, palettesHidden)) ||
                   (item.kind === 'tool' && item.toolId === activeTool) ||
-                  (item.kind === 'brush' && item.brushPresetId === activePresetId && activeTool === 'brush') ||
+                  (item.kind === 'brush' &&
+                  item.brushPresetId &&
+                  migrateLegacyPresetId(item.brushPresetId) === activePresetId &&
+                  activeTool === 'brush') ||
                   (item.kind === 'color' && item.color?.toLowerCase() === primaryColor.toLowerCase()));
 
               return (

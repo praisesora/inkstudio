@@ -1,7 +1,14 @@
 /**
  * In-place brush stroke compositing directly onto LOD 0 sparse tiles.
+ * Supports all 28+ CSP/Photoshop BrushCombineMode blend modes, behind (destination-over),
+ * clear (destination-out), compare-density, alpha-lock (source-atop), and selection masks.
  */
 
+import type { CspBrushCombineMode } from '../../types/editor';
+import {
+  compositePigmentOverPixelInto,
+  isPigmentCompatibleCombineMode,
+} from '../pigmentEngine';
 import { packRGBATo1Bit, packRGBATo8Bit, unpack8BitToRGBA } from './pixelCodec';
 import {
   ISparseTileGridHost,
@@ -20,7 +27,12 @@ export interface CompositeStrokeOptions {
   destY: number;
   format: TileFormat;
   compositeOp: 'source-over' | 'destination-out' | 'source-atop';
+  brushCombineMode?: CspBrushCombineMode;
   opacity: number;
+  /** Physical Kubelka-Munk pigment compositing strength [0..1]. 0 = standard RGB compositing. */
+  pigmentStrength?: number;
+  /** True when painting on a layer over a visible white/light paper ground (enables optical pigment dilution on transparent pixels). */
+  pigmentWhiteGround?: boolean;
   monochrome?: {
     threshold: number;
     expressBlack: boolean;
@@ -32,6 +44,448 @@ export interface CompositeStrokeOptions {
   } | null;
   snapshotOut?: Map<string, { format: TileFormat; data: Uint8Array | null }>;
   suppressNotify?: boolean;
+}
+
+// ============================================================================
+// Exact CPU implementation of all CSP / Photoshop / W3C Blend Modes
+// Matches `src/utils/compositor/shaders/blendModesGlsl.ts` 1-to-1.
+// ============================================================================
+
+function clamp01(v: number): number {
+  return v <= 0 ? 0 : v >= 1 ? 1 : v;
+}
+
+function blendLum(r: number, g: number, b: number): number {
+  return 0.3 * r + 0.59 * g + 0.11 * b;
+}
+
+function blendSat(r: number, g: number, b: number): number {
+  const mx = r > g ? (r > b ? r : b) : g > b ? g : b;
+  const mn = r < g ? (r < b ? r : b) : g < b ? g : b;
+  return mx - mn;
+}
+
+function clipColorInto(r: number, g: number, b: number, out: [number, number, number]): void {
+  const l = clamp01(blendLum(r, g, b));
+  const n = r < g ? (r < b ? r : b) : g < b ? g : b;
+  const x = r > g ? (r > b ? r : b) : g > b ? g : b;
+  let cr = r;
+  let cg = g;
+  let cb = b;
+  if (n < 0) {
+    const denom = Math.max(0.0001, l - n);
+    cr = l + ((cr - l) * l) / denom;
+    cg = l + ((cg - l) * l) / denom;
+    cb = l + ((cb - l) * l) / denom;
+  }
+  if (x > 1) {
+    const denom = Math.max(0.0001, x - l);
+    cr = l + ((cr - l) * (1 - l)) / denom;
+    cg = l + ((cg - l) * (1 - l)) / denom;
+    cb = l + ((cb - l) * (1 - l)) / denom;
+  }
+  out[0] = clamp01(cr);
+  out[1] = clamp01(cg);
+  out[2] = clamp01(cb);
+}
+
+function setLumInto(
+  r: number,
+  g: number,
+  b: number,
+  l: number,
+  out: [number, number, number]
+): void {
+  const d = l - blendLum(r, g, b);
+  clipColorInto(r + d, g + d, b + d, out);
+}
+
+function setSatInto(
+  r: number,
+  g: number,
+  b: number,
+  s: number,
+  out: [number, number, number]
+): void {
+  const cMin = r < g ? (r < b ? r : b) : g < b ? g : b;
+  const cMax = r > g ? (r > b ? r : b) : g > b ? g : b;
+  const delta = cMax - cMin;
+  if (delta <= 0.0001) {
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    return;
+  }
+  const scale = s / delta;
+  out[0] = (r - cMin) * scale;
+  out[1] = (g - cMin) * scale;
+  out[2] = (b - cMin) * scale;
+}
+
+function blendChannel(b: number, s: number, mode: CspBrushCombineMode): number {
+  switch (mode) {
+    case 'multiply':
+      return b * s;
+    case 'screen':
+      return b + s - b * s;
+    case 'overlay':
+      return b < 0.5 ? 2.0 * b * s : 1.0 - 2.0 * (1.0 - b) * (1.0 - s);
+    case 'darken':
+      return b < s ? b : s;
+    case 'lighten':
+      return b > s ? b : s;
+    case 'color-dodge':
+      return b <= 0 ? 0 : s >= 1 ? 1 : Math.min(1.0, b / Math.max(0.0001, 1.0 - s));
+    case 'color-burn':
+      return b >= 1 ? 1 : s <= 0 ? 0 : 1.0 - Math.min(1.0, (1.0 - b) / Math.max(0.0001, s));
+    case 'hard-light':
+      return s < 0.5 ? 2.0 * b * s : 1.0 - 2.0 * (1.0 - b) * (1.0 - s);
+    case 'soft-light': {
+      const d = b <= 0.25 ? ((16.0 * b - 12.0) * b + 4.0) * b : Math.sqrt(Math.max(0, b));
+      return s <= 0.5 ? b - (1.0 - 2.0 * s) * b * (1.0 - b) : b + (2.0 * s - 1.0) * (d - b);
+    }
+    case 'difference':
+      return Math.abs(b - s);
+    case 'exclusion':
+      return b + s - 2.0 * b * s;
+    case 'linear-burn':
+      return Math.max(0, b + s - 1.0);
+    case 'add':
+    case 'add-glow':
+      return Math.min(1.0, b + s);
+    case 'color-dodge-glow':
+      return s >= 1 ? 1 : Math.min(1.0, b / Math.max(0.0001, 1.0 - s));
+    case 'divide':
+      return s <= 0.0001 ? 1.0 : clamp01(b / s);
+    case 'vivid-light':
+      if (s <= 0.5) {
+        const s2 = 2.0 * s;
+        return s2 <= 0 ? 0 : b >= 1 ? 1 : 1.0 - Math.min(1.0, (1.0 - b) / Math.max(0.0001, s2));
+      } else {
+        const s2 = 2.0 * (s - 0.5);
+        return s2 >= 1 ? 1 : b <= 0 ? 0 : Math.min(1.0, b / Math.max(0.0001, 1.0 - s2));
+      }
+    case 'linear-light':
+      return clamp01(b + 2.0 * s - 1.0);
+    case 'pin-light':
+      return s <= 0.5 ? Math.min(b, 2.0 * s) : Math.max(b, 2.0 * (s - 0.5));
+    case 'hard-mix':
+      return b + s >= 1.0 ? 1.0 : 0.0;
+    case 'subtract':
+      return Math.max(0, b - s);
+    default:
+      return s;
+  }
+}
+
+const _blendScratchSat: [number, number, number] = [0, 0, 0];
+
+/**
+ * Evaluates any CSP/Photoshop color blend mode in normalized [0..1] RGB space.
+ */
+export function evaluateCpuBlendModeInto(
+  br: number,
+  bg: number,
+  bb: number,
+  sr: number,
+  sg: number,
+  sb: number,
+  mode: CspBrushCombineMode,
+  out: [number, number, number]
+): void {
+  switch (mode) {
+    case 'darker-color':
+      if (blendLum(sr, sg, sb) < blendLum(br, bg, bb)) {
+        out[0] = sr;
+        out[1] = sg;
+        out[2] = sb;
+      } else {
+        out[0] = br;
+        out[1] = bg;
+        out[2] = bb;
+      }
+      return;
+    case 'lighter-color':
+      if (blendLum(sr, sg, sb) > blendLum(br, bg, bb)) {
+        out[0] = sr;
+        out[1] = sg;
+        out[2] = sb;
+      } else {
+        out[0] = br;
+        out[1] = bg;
+        out[2] = bb;
+      }
+      return;
+    case 'hue':
+      setSatInto(sr, sg, sb, blendSat(br, bg, bb), _blendScratchSat);
+      setLumInto(_blendScratchSat[0], _blendScratchSat[1], _blendScratchSat[2], blendLum(br, bg, bb), out);
+      return;
+    case 'saturation':
+      setSatInto(br, bg, bb, blendSat(sr, sg, sb), _blendScratchSat);
+      setLumInto(_blendScratchSat[0], _blendScratchSat[1], _blendScratchSat[2], blendLum(br, bg, bb), out);
+      return;
+    case 'color':
+      setLumInto(sr, sg, sb, blendLum(br, bg, bb), out);
+      return;
+    case 'luminosity':
+      setLumInto(br, bg, bb, blendLum(sr, sg, sb), out);
+      return;
+    default:
+      out[0] = blendChannel(br, sr, mode);
+      out[1] = blendChannel(bg, sg, mode);
+      out[2] = blendChannel(bb, sb, mode);
+  }
+}
+
+export function isCustomBrushCombineMode(mode?: CspBrushCombineMode): boolean {
+  return Boolean(mode && mode !== 'normal' && mode !== 'pass-through');
+}
+
+const _blendRgbOut: [number, number, number] = [0, 0, 0];
+
+/**
+ * Composites a single RGBA pixel with full CSP `BrushCombineMode` + Porter-Duff semantics.
+ * Writes [outR, outG, outB, outA] (0..255) into `out`.
+ */
+export function compositeBrushPixelInto(
+  dr: number,
+  dg: number,
+  db: number,
+  da: number,
+  sr: number,
+  sg: number,
+  sb: number,
+  effA: number,
+  compositeOp: 'source-over' | 'destination-out' | 'source-atop',
+  combineMode: CspBrushCombineMode | undefined,
+  out: [number, number, number, number]
+): void {
+  const mode: CspBrushCombineMode = combineMode ?? 'normal';
+
+  if (compositeOp === 'destination-out' || mode === 'clear') {
+    if (da === 0) {
+      out[0] = dr;
+      out[1] = dg;
+      out[2] = db;
+      out[3] = 0;
+      return;
+    }
+    if (effA >= 255) {
+      out[0] = 0;
+      out[1] = 0;
+      out[2] = 0;
+      out[3] = 0;
+    } else {
+      const outA = Math.round(da * (1 - effA / 255));
+      if (outA <= 0) {
+        out[0] = 0;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+      } else {
+        out[0] = dr;
+        out[1] = dg;
+        out[2] = db;
+        out[3] = outA;
+      }
+    }
+    return;
+  }
+
+  if (mode === 'behind') {
+    // CSP Behind = Porter-Duff destination-over
+    if (compositeOp === 'source-atop') {
+      // Alpha-locked behind cannot paint onto transparent pixels and cannot change opaque front pixels
+      if (da === 0 || da >= 255) {
+        out[0] = dr;
+        out[1] = dg;
+        out[2] = db;
+        out[3] = da;
+        return;
+      }
+      const dA = da / 255;
+      const sA = effA / 255;
+      const rem = (1 - dA) * sA;
+      const denom = dA + rem;
+      if (denom > 0) {
+        const inv = 1 / denom;
+        out[0] = Math.round((dr * dA + sr * rem) * inv);
+        out[1] = Math.round((dg * dA + sg * rem) * inv);
+        out[2] = Math.round((db * dA + sb * rem) * inv);
+      } else {
+        out[0] = dr;
+        out[1] = dg;
+        out[2] = db;
+      }
+      out[3] = da;
+      return;
+    }
+    if (da >= 255) {
+      out[0] = dr;
+      out[1] = dg;
+      out[2] = db;
+      out[3] = da;
+      return;
+    }
+    if (da === 0) {
+      out[0] = sr;
+      out[1] = sg;
+      out[2] = sb;
+      out[3] = effA;
+      return;
+    }
+    const dA = da / 255;
+    const sA = effA / 255;
+    const invDA = 1 - dA;
+    const compA = dA + sA * invDA;
+    const invOut = 1 / compA;
+    out[0] = Math.round((dr * dA + sr * sA * invDA) * invOut);
+    out[1] = Math.round((dg * dA + sg * sA * invDA) * invOut);
+    out[2] = Math.round((db * dA + sb * sA * invDA) * invOut);
+    out[3] = Math.round(compA * 255);
+    return;
+  }
+
+  if (mode === 'compare-density') {
+    if (compositeOp === 'source-atop' && da === 0) {
+      out[0] = 0;
+      out[1] = 0;
+      out[2] = 0;
+      out[3] = 0;
+      return;
+    }
+    if (da === 0) {
+      out[0] = sr;
+      out[1] = sg;
+      out[2] = sb;
+      out[3] = effA;
+      return;
+    }
+    const sA = effA / 255;
+    const dA = da / 255;
+    const dstWeight = dA * (1 - sA);
+    const denom = sA + dstWeight;
+    if (denom <= 1e-6) {
+      out[0] = dr;
+      out[1] = dg;
+      out[2] = db;
+      out[3] = da;
+      return;
+    }
+    const invDenom = 1 / denom;
+    out[0] = Math.round((sr * sA + dr * dstWeight) * invDenom);
+    out[1] = Math.round((sg * sA + dg * dstWeight) * invDenom);
+    out[2] = Math.round((sb * sA + db * dstWeight) * invDenom);
+    out[3] = compositeOp === 'source-atop' ? da : Math.max(effA, da);
+    return;
+  }
+
+  const isStandardNormal = mode === 'normal' || mode === 'pass-through';
+
+  if (compositeOp === 'source-atop') {
+    if (da === 0) {
+      out[0] = dr;
+      out[1] = dg;
+      out[2] = db;
+      out[3] = 0;
+      return;
+    }
+    const sA = effA / 255;
+    if (isStandardNormal) {
+      if (effA >= 255) {
+        out[0] = sr;
+        out[1] = sg;
+        out[2] = sb;
+        out[3] = da;
+      } else {
+        const inv = 1 - sA;
+        out[0] = Math.round(sr * sA + dr * inv);
+        out[1] = Math.round(sg * sA + dg * inv);
+        out[2] = Math.round(sb * sA + db * inv);
+        out[3] = da;
+      }
+      return;
+    }
+    evaluateCpuBlendModeInto(dr / 255, dg / 255, db / 255, sr / 255, sg / 255, sb / 255, mode, _blendRgbOut);
+    const inv = 1 - sA;
+    out[0] = Math.round(_blendRgbOut[0] * 255 * sA + dr * inv);
+    out[1] = Math.round(_blendRgbOut[1] * 255 * sA + dg * inv);
+    out[2] = Math.round(_blendRgbOut[2] * 255 * sA + db * inv);
+    out[3] = da;
+    return;
+  }
+
+  // Standard source-over with optional CSP color blend mode
+  if (da === 0) {
+    out[0] = sr;
+    out[1] = sg;
+    out[2] = sb;
+    out[3] = effA;
+    return;
+  }
+
+  if (isStandardNormal) {
+    if (effA >= 255) {
+      out[0] = sr;
+      out[1] = sg;
+      out[2] = sb;
+      out[3] = 255;
+      return;
+    }
+    const sA = effA / 255;
+    const dA = da / 255;
+    const invSA = 1 - sA;
+    const compA = sA + dA * invSA;
+    if (compA > 0) {
+      const invOut = 1 / compA;
+      out[0] = Math.round((sr * sA + dr * dA * invSA) * invOut);
+      out[1] = Math.round((sg * sA + dg * dA * invSA) * invOut);
+      out[2] = Math.round((sb * sA + db * dA * invSA) * invOut);
+      out[3] = Math.round(compA * 255);
+    } else {
+      out[0] = dr;
+      out[1] = dg;
+      out[2] = db;
+      out[3] = da;
+    }
+    return;
+  }
+
+  // W3C Compositing & Blending Level 1 formula for non-normal blend modes:
+  // Cr = (1 - dA) * Cs + dA * B(Cb, Cs)
+  // Co * Ao = sA * Cr + (1 - sA) * dA * Cb
+  // Ao = sA + dA * (1 - sA)
+  const sA = effA / 255;
+  const dA = da / 255;
+  const invSA = 1 - sA;
+  const invDA = 1 - dA;
+  const compA = sA + dA * invSA;
+  const inv255 = 1 / 255;
+  const srN = sr * inv255;
+  const sgN = sg * inv255;
+  const sbN = sb * inv255;
+  const drN = dr * inv255;
+  const dgN = dg * inv255;
+  const dbN = db * inv255;
+
+  evaluateCpuBlendModeInto(drN, dgN, dbN, srN, sgN, sbN, mode, _blendRgbOut);
+
+  const crR = invDA * srN + dA * _blendRgbOut[0];
+  const crG = invDA * sgN + dA * _blendRgbOut[1];
+  const crB = invDA * sbN + dA * _blendRgbOut[2];
+
+  if (compA > 0) {
+    const invOut = 255 / compA;
+    out[0] = Math.max(0, Math.min(255, Math.round((sA * crR + invSA * dA * drN) * invOut)));
+    out[1] = Math.max(0, Math.min(255, Math.round((sA * crG + invSA * dA * dgN) * invOut)));
+    out[2] = Math.max(0, Math.min(255, Math.round((sA * crB + invSA * dA * dbN) * invOut)));
+    out[3] = Math.max(0, Math.min(255, Math.round(compA * 255)));
+  } else {
+    out[0] = dr;
+    out[1] = dg;
+    out[2] = db;
+    out[3] = da;
+  }
 }
 
 /**
@@ -51,6 +505,7 @@ export function compositeStrokeToTiles(
     destY,
     format: targetFormat,
     compositeOp,
+    brushCombineMode,
     monochrome,
     selectionMask,
     snapshotOut,
@@ -60,6 +515,15 @@ export function compositeStrokeToTiles(
   const w = strokeData.width;
   const h = strokeData.height;
   if (w <= 0 || h <= 0 || opacity <= 0.001) return false;
+
+  const effectiveCombineMode: CspBrushCombineMode =
+    compositeOp === 'destination-out' ? 'clear' : brushCombineMode ?? 'normal';
+  const useCustomBlend = isCustomBrushCombineMode(effectiveCombineMode);
+  const isEraseOp = compositeOp === 'destination-out' || effectiveCombineMode === 'clear';
+  const pigmentStrength = Math.max(0, Math.min(1, options.pigmentStrength ?? 0));
+  const pigmentWhiteGround = Boolean(options.pigmentWhiteGround);
+  const usePigmentComposite =
+    pigmentStrength > 0.005 && !isEraseOp && isPigmentCompatibleCombineMode(effectiveCombineMode);
 
   host.ingestedLayers.add(layerId);
   host.setLayerFormat(layerId, targetFormat);
@@ -85,6 +549,7 @@ export function compositeStrokeToTiles(
   const selBh = selectionMask ? Math.ceil(selectionMask.bounds.height) : 0;
   const fullOpacity = opacity >= 0.999;
   const memoryManager = host.getMemoryManager();
+  const pxOut: [number, number, number, number] = [0, 0, 0, 0];
 
   let anyModified = false;
 
@@ -102,7 +567,7 @@ export function compositeStrokeToTiles(
       let existingTile = host.getTile(layerId, tx, ty, 0);
 
       // Erasing or alpha-locking against an empty tile is a no-op
-      if ((compositeOp === 'destination-out' || compositeOp === 'source-atop') && (!existingTile || !existingTile.data)) {
+      if ((isEraseOp || compositeOp === 'source-atop') && (!existingTile || !existingTile.data)) {
         if (existingTile && existingTile.data === null && existingTile.isPagedToDisk && memoryManager) {
           void memoryManager.requestTileData(existingTile);
         }
@@ -201,9 +666,20 @@ export function compositeStrokeToTiles(
             const byteIdx = rowByteBase + (lx >> 3);
             const mask = 1 << (7 - (lx & 7));
 
-            if (compositeOp === 'destination-out') {
+            if (isEraseOp) {
               if (effA >= 128) {
                 dst[byteIdx] &= ~mask;
+              }
+            } else if (effectiveCombineMode === 'behind') {
+              const hadInk = (dst[byteIdx] & mask) !== 0;
+              if (!hadInk && compositeOp !== 'source-atop') {
+                const r = srcData[srcOff];
+                const g = srcData[srcOff + 1];
+                const b = srcData[srcOff + 2];
+                const lum = (19595 * r + 38470 * g + 7471 * b + 32768) >> 16;
+                if (effA >= 128 && lum < monoThresh && monoExpressBlack) {
+                  dst[byteIdx] |= mask;
+                }
               }
             } else if (compositeOp === 'source-atop') {
               if ((dst[byteIdx] & mask) === 0) continue;
@@ -272,7 +748,45 @@ export function compositeStrokeToTiles(
             let outB = dst[dstOff + 2];
             let outA = da;
 
-            if (compositeOp === 'destination-out') {
+            if (usePigmentComposite) {
+              compositePigmentOverPixelInto(
+                outR,
+                outG,
+                outB,
+                da,
+                sr,
+                sg,
+                sb,
+                effA,
+                pigmentStrength,
+                pigmentWhiteGround,
+                compositeOp,
+                effectiveCombineMode,
+                pxOut
+              );
+              outR = pxOut[0];
+              outG = pxOut[1];
+              outB = pxOut[2];
+              outA = pxOut[3];
+            } else if (useCustomBlend) {
+              compositeBrushPixelInto(
+                outR,
+                outG,
+                outB,
+                da,
+                sr,
+                sg,
+                sb,
+                effA,
+                compositeOp,
+                effectiveCombineMode,
+                pxOut
+              );
+              outR = pxOut[0];
+              outG = pxOut[1];
+              outB = pxOut[2];
+              outA = pxOut[3];
+            } else if (compositeOp === 'destination-out') {
               if (da === 0) continue;
               if (effA === 255) {
                 outR = 0;
@@ -358,16 +872,24 @@ export function compositeStrokeToTiles(
             const sa = srcData[srcOff + 3];
             if (sa === 0) continue;
             const effA = fullOpacity ? sa : Math.round(sa * opacity);
-            if (compositeOp === 'destination-out') {
-              tileScratch[dstOff + 3] = Math.round(tileScratch[dstOff + 3] * (1 - effA / 255));
-            } else if (effA > 0) {
-              const sA = effA / 255;
-              const inv = 1 - sA;
-              tileScratch[dstOff] = Math.round(srcData[srcOff] * sA + tileScratch[dstOff] * inv);
-              tileScratch[dstOff + 1] = Math.round(srcData[srcOff + 1] * sA + tileScratch[dstOff + 1] * inv);
-              tileScratch[dstOff + 2] = Math.round(srcData[srcOff + 2] * sA + tileScratch[dstOff + 2] * inv);
-              tileScratch[dstOff + 3] = Math.min(255, Math.round(tileScratch[dstOff + 3] * inv + effA));
-            }
+            if (effA <= 0) continue;
+            compositeBrushPixelInto(
+              tileScratch[dstOff],
+              tileScratch[dstOff + 1],
+              tileScratch[dstOff + 2],
+              tileScratch[dstOff + 3],
+              srcData[srcOff],
+              srcData[srcOff + 1],
+              srcData[srcOff + 2],
+              effA,
+              compositeOp,
+              effectiveCombineMode,
+              pxOut
+            );
+            tileScratch[dstOff] = pxOut[0];
+            tileScratch[dstOff + 1] = pxOut[1];
+            tileScratch[dstOff + 2] = pxOut[2];
+            tileScratch[dstOff + 3] = pxOut[3];
           }
         }
         packRGBATo8Bit(tileScratch, tile.data);

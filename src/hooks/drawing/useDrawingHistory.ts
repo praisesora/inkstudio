@@ -119,6 +119,8 @@ export function useDrawingHistory({
   const historyRef = useRef<HistoryItem[]>(initialSession ? initialSession.history : []);
   const historyIndexRef = useRef<number>(initialSession ? initialSession.historyIndex : -1);
   const historyQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const inFlightHistoryOpsRef = useRef<number>(0);
+  const pendingTargetIndexRef = useRef<number | null>(null);
 
   const [historyList, setHistoryList] = useState<HistoryItemMeta[]>([]);
   const [historyIndex, setHistoryIndex] = useState<number>(-1);
@@ -337,6 +339,7 @@ export function useDrawingHistory({
 
       historyRef.current = newHistory;
       historyIndexRef.current = newHistory.length - 1;
+      pendingTargetIndexRef.current = null;
       persistSessionHistory(docId);
 
       if (dims.width > 0 && dims.height > 0) {
@@ -457,12 +460,251 @@ export function useDrawingHistory({
     [isDrawingRef]
   );
 
+  const applySingleHistoryStep = useCallback(
+    (
+      item: HistoryItem,
+      deltas: TileDelta[] | null,
+      direction: 'undo' | 'redo',
+      grid: SparseTileGrid,
+      dims: CanvasDimensions
+    ) => {
+      const targetLayerId = item.layerId || activeLayerId;
+      const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
+      const dataToApply =
+        direction === 'undo' ? item.beforeImageData : item.afterImageData || item.imageData;
+
+      if (item.layerTreeDelta) {
+        const applied = onApplyLayerTreeDeltaRef?.current?.(item.layerTreeDelta, direction);
+        if (applied) {
+          layersRef.current = applied.nextLayers;
+          if (applied.nextActiveLayerId !== null) {
+            activeLayerIdRef.current = applied.nextActiveLayerId;
+          }
+        }
+        if (deltas && deltas.length > 0) {
+          grid.applyTileDeltas(deltas, direction);
+          if (multiplayerService.isConnected()) {
+            multiplayerService.sendTileDeltas(deltas, grid, { force: true });
+          }
+        }
+        const liveLayerIds = new Set((layersRef.current ?? []).map((l) => l.id));
+        const affectedLayerIds = new Set<string>();
+        if (deltas) {
+          for (const d of deltas) {
+            affectedLayerIds.add(parseTileKey(d.key).layerId);
+          }
+        }
+        if (applied) {
+          for (const added of applied.addedLayers) {
+            affectedLayerIds.add(added.id);
+          }
+        }
+        for (const lid of affectedLayerIds) {
+          if (lid !== targetLayerId && liveLayerIds.has(lid)) {
+            onUpdateLayerThumbnail(lid, true);
+          }
+        }
+        grid.notifyChange(true);
+      } else if (item.isMaskEdit && targetLayer?.maskCanvas) {
+        const mCtx = get2DContext(targetLayer.maskCanvas);
+        if (mCtx && dataToApply) {
+          const mx =
+            item.dirtyRect && dataToApply.width === item.dirtyRect.width ? item.dirtyRect.x : 0;
+          const my =
+            item.dirtyRect && dataToApply.height === item.dirtyRect.height ? item.dirtyRect.y : 0;
+          mCtx.putImageData(dataToApply, mx, my);
+          targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
+          onUpdateMaskThumbnailRef.current?.(targetLayerId);
+          if (multiplayerService.isConnected()) {
+            multiplayerService.sendLayerMaskData(
+              targetLayerId,
+              targetLayer.maskCanvas,
+              item.dirtyRect
+            );
+          }
+        }
+      } else if (item.vectorStrokesDelta && targetLayer) {
+        targetLayer.vectorStrokes =
+          direction === 'undo' ? item.vectorStrokesDelta.before : item.vectorStrokesDelta.after;
+        const isMono = targetLayer.expressionColor === 'monochrome';
+        grid.clearLayer(targetLayerId);
+        if (targetLayer.vectorStrokes.length > 0) {
+          let minX = dims.width;
+          let minY = dims.height;
+          let maxX = 0;
+          let maxY = 0;
+          for (const st of targetLayer.vectorStrokes) {
+            if (st.deleted || !st.bounds) continue;
+            const pad = Math.ceil(Math.max(16, st.baseWidth || 10));
+            if (st.bounds.minX - pad < minX) minX = st.bounds.minX - pad;
+            if (st.bounds.minY - pad < minY) minY = st.bounds.minY - pad;
+            if (st.bounds.maxX + pad > maxX) maxX = st.bounds.maxX + pad;
+            if (st.bounds.maxY + pad > maxY) maxY = st.bounds.maxY + pad;
+          }
+          const vx = Math.max(0, Math.floor(minX));
+          const vy = Math.max(0, Math.floor(minY));
+          const vw = Math.max(0, Math.min(dims.width, Math.ceil(maxX)) - vx);
+          const vh = Math.max(0, Math.min(dims.height, Math.ceil(maxY)) - vy);
+          if (vw > 0 && vh > 0) {
+            const tempVec = document.createElement('canvas');
+            tempVec.width = vw;
+            tempVec.height = vh;
+            const cCtx = get2DContext(tempVec);
+            if (cCtx) {
+              cCtx.save();
+              cCtx.translate(-vx, -vy);
+              renderVectorLayer(cCtx, targetLayer.vectorStrokes);
+              cCtx.restore();
+              const subData = cCtx.getImageData(0, 0, vw, vh);
+              grid.writeImageData(
+                targetLayerId,
+                subData,
+                vx,
+                vy,
+                isMono ? 'monochrome-1bit' : 'color-32bit'
+              );
+            }
+            releaseTemporaryCanvas(tempVec);
+          }
+        }
+        if (multiplayerService.isConnected()) {
+          multiplayerService.sendLayerUpdate(targetLayerId, {
+            vectorStrokes: targetLayer.vectorStrokes,
+          });
+        }
+      } else if (deltas && deltas.length > 0) {
+        grid.applyTileDeltas(deltas, direction);
+        if (multiplayerService.isConnected()) {
+          multiplayerService.sendTileDeltas(deltas, grid, { force: true });
+        }
+
+        const affectedLayerIds = new Set<string>();
+        for (const d of deltas) {
+          affectedLayerIds.add(parseTileKey(d.key).layerId);
+        }
+        for (const lid of affectedLayerIds) {
+          if (lid !== targetLayerId) {
+            onUpdateLayerThumbnail(lid, true);
+          }
+        }
+      } else {
+        const isMono =
+          !isBackgroundLayerId(targetLayerId) &&
+          (targetLayer?.expressionColor === 'monochrome' ||
+            colorModeRef.current === 'monochrome');
+        const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
+
+        if (dataToApply) {
+          const ax =
+            item.dirtyRect &&
+            dataToApply.width === item.dirtyRect.width &&
+            dataToApply.height === item.dirtyRect.height
+              ? item.dirtyRect.x
+              : 0;
+          const ay =
+            item.dirtyRect &&
+            dataToApply.width === item.dirtyRect.width &&
+            dataToApply.height === item.dirtyRect.height
+              ? item.dirtyRect.y
+              : 0;
+          grid.writeImageData(targetLayerId, dataToApply, ax, ay, targetFormat);
+        } else if (item.type === 'initial') {
+          if (isBackgroundLayerId(targetLayerId)) {
+            grid.fillLayerSolidWhite(targetLayerId, dims.width, dims.height, 'color-32bit');
+          } else {
+            grid.clearLayer(targetLayerId);
+          }
+        }
+      }
+
+      if (
+        !item.layerTreeDelta ||
+        (layersRef.current ?? []).some((l) => l.id === targetLayerId)
+      ) {
+        onUpdateLayerThumbnail(targetLayerId, true);
+      }
+    },
+    [
+      activeLayerId,
+      activeLayerIdRef,
+      colorModeRef,
+      layersRef,
+      onApplyLayerTreeDeltaRef,
+      onUpdateLayerThumbnail,
+      onUpdateMaskThumbnailRef,
+    ]
+  );
+
   const jumpToHistoryIndex = useCallback(
     (targetIndex: number): Promise<void> => {
       flushPendingHistoryTasks();
       if (isDrawingRef.current) {
         abortActiveStrokeRef.current();
       }
+      lastStrokeEndRef.current = null;
+
+      // Fast synchronous path when no async history job is in flight and every touched step is
+      // already resident in RAM (eliminates Ctrl+Z -> quick-draw race conditions).
+      if (inFlightHistoryOpsRef.current === 0) {
+        if (targetIndex < 0 || targetIndex >= historyRef.current.length) {
+          return Promise.resolve();
+        }
+        const currentIndex = historyIndexRef.current;
+        if (targetIndex === currentIndex) {
+          return Promise.resolve();
+        }
+
+        const undoCache = activeUndoCacheRef.current;
+        let canRunSync = true;
+        if (targetIndex < currentIndex) {
+          for (let i = currentIndex; i > targetIndex; i--) {
+            const item = historyRef.current[i];
+            if (item && !undoCache.canResolveDeltasSync(item)) {
+              canRunSync = false;
+              break;
+            }
+          }
+        } else {
+          for (let i = currentIndex + 1; i <= targetIndex; i++) {
+            const item = historyRef.current[i];
+            if (item && !undoCache.canResolveDeltasSync(item)) {
+              canRunSync = false;
+              break;
+            }
+          }
+        }
+
+        if (canRunSync) {
+          const grid = activeTileGridRef.current;
+          const dims = dimensionsRef.current;
+          if (targetIndex < currentIndex) {
+            for (let i = currentIndex; i > targetIndex; i--) {
+              const item = historyRef.current[i];
+              if (item) {
+                const deltas = undoCache.resolveDeltasSync(item);
+                applySingleHistoryStep(item, deltas, 'undo', grid, dims);
+              }
+            }
+          } else {
+            for (let i = currentIndex + 1; i <= targetIndex; i++) {
+              const item = historyRef.current[i];
+              if (item) {
+                const deltas = undoCache.resolveDeltasSync(item);
+                applySingleHistoryStep(item, deltas, 'redo', grid, dims);
+              }
+            }
+          }
+          historyIndexRef.current = targetIndex;
+          pendingTargetIndexRef.current = null;
+          persistSessionHistory();
+          syncHistoryState();
+          grid.notifyChange(true);
+          return Promise.resolve();
+        }
+      }
+
+      pendingTargetIndexRef.current = targetIndex;
+      inFlightHistoryOpsRef.current++;
       const nextOp = historyQueueRef.current.then(async () => {
         if (targetIndex < 0 || targetIndex >= historyRef.current.length) return;
         const currentIndex = historyIndexRef.current;
@@ -476,337 +718,16 @@ export function useDrawingHistory({
           for (let i = currentIndex; i > targetIndex; i--) {
             const item = historyRef.current[i];
             if (item) {
-              const targetLayerId = item.layerId || activeLayerId;
-              const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
               const deltas = await undoCache.resolveDeltas(item);
-
-              if (item.layerTreeDelta) {
-                const applied = onApplyLayerTreeDeltaRef?.current?.(item.layerTreeDelta, 'undo');
-                if (applied) {
-                  layersRef.current = applied.nextLayers;
-                  if (applied.nextActiveLayerId !== null) {
-                    activeLayerIdRef.current = applied.nextActiveLayerId;
-                  }
-                }
-                if (deltas && deltas.length > 0) {
-                  grid.applyTileDeltas(deltas, 'undo');
-                  if (multiplayerService.isConnected()) {
-                    multiplayerService.sendTileDeltas(deltas, grid, { force: true });
-                  }
-                }
-                const liveLayerIds = new Set((layersRef.current ?? []).map((l) => l.id));
-                const affectedLayerIds = new Set<string>();
-                if (deltas) {
-                  for (const d of deltas) {
-                    affectedLayerIds.add(parseTileKey(d.key).layerId);
-                  }
-                }
-                if (applied) {
-                  for (const added of applied.addedLayers) {
-                    affectedLayerIds.add(added.id);
-                  }
-                }
-                for (const lid of affectedLayerIds) {
-                  if (lid !== targetLayerId && liveLayerIds.has(lid)) {
-                    onUpdateLayerThumbnail(lid, true);
-                  }
-                }
-                grid.notifyChange(true);
-              } else if (item.isMaskEdit && targetLayer?.maskCanvas) {
-                const mCtx = get2DContext(targetLayer.maskCanvas);
-                if (mCtx && item.beforeImageData) {
-                  const mx =
-                    item.dirtyRect && item.beforeImageData.width === item.dirtyRect.width
-                      ? item.dirtyRect.x
-                      : 0;
-                  const my =
-                    item.dirtyRect && item.beforeImageData.height === item.dirtyRect.height
-                      ? item.dirtyRect.y
-                      : 0;
-                  mCtx.putImageData(item.beforeImageData, mx, my);
-                  targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
-                  onUpdateMaskThumbnailRef.current?.(targetLayerId);
-                  if (multiplayerService.isConnected()) {
-                    multiplayerService.sendLayerMaskData(
-                      targetLayerId,
-                      targetLayer.maskCanvas,
-                      item.dirtyRect
-                    );
-                  }
-                }
-              } else if (item.vectorStrokesDelta && targetLayer) {
-                targetLayer.vectorStrokes = item.vectorStrokesDelta.before;
-                const isMono = targetLayer.expressionColor === 'monochrome';
-                grid.clearLayer(targetLayerId);
-                if (targetLayer.vectorStrokes.length > 0) {
-                  let minX = dims.width;
-                  let minY = dims.height;
-                  let maxX = 0;
-                  let maxY = 0;
-                  for (const st of targetLayer.vectorStrokes) {
-                    if (st.deleted || !st.bounds) continue;
-                    const pad = Math.ceil(Math.max(16, st.baseWidth || 10));
-                    if (st.bounds.minX - pad < minX) minX = st.bounds.minX - pad;
-                    if (st.bounds.minY - pad < minY) minY = st.bounds.minY - pad;
-                    if (st.bounds.maxX + pad > maxX) maxX = st.bounds.maxX + pad;
-                    if (st.bounds.maxY + pad > maxY) maxY = st.bounds.maxY + pad;
-                  }
-                  const vx = Math.max(0, Math.floor(minX));
-                  const vy = Math.max(0, Math.floor(minY));
-                  const vw = Math.max(0, Math.min(dims.width, Math.ceil(maxX)) - vx);
-                  const vh = Math.max(0, Math.min(dims.height, Math.ceil(maxY)) - vy);
-                  if (vw > 0 && vh > 0) {
-                    const tempVec = document.createElement('canvas');
-                    tempVec.width = vw;
-                    tempVec.height = vh;
-                    const cCtx = get2DContext(tempVec);
-                    if (cCtx) {
-                      cCtx.save();
-                      cCtx.translate(-vx, -vy);
-                      renderVectorLayer(cCtx, targetLayer.vectorStrokes);
-                      cCtx.restore();
-                      const subData = cCtx.getImageData(0, 0, vw, vh);
-                      grid.writeImageData(
-                        targetLayerId,
-                        subData,
-                        vx,
-                        vy,
-                        isMono ? 'monochrome-1bit' : 'color-32bit'
-                      );
-                    }
-                    releaseTemporaryCanvas(tempVec);
-                  }
-                }
-                if (multiplayerService.isConnected()) {
-                  multiplayerService.sendLayerUpdate(targetLayerId, {
-                    vectorStrokes: targetLayer.vectorStrokes,
-                  });
-                }
-              } else if (deltas && deltas.length > 0) {
-                grid.applyTileDeltas(deltas, 'undo');
-                if (multiplayerService.isConnected()) {
-                  multiplayerService.sendTileDeltas(deltas, grid, { force: true });
-                }
-
-                const affectedLayerIds = new Set<string>();
-                for (const d of deltas) {
-                  affectedLayerIds.add(parseTileKey(d.key).layerId);
-                }
-                for (const lid of affectedLayerIds) {
-                  if (lid !== targetLayerId) {
-                    onUpdateLayerThumbnail(lid, true);
-                  }
-                }
-              } else {
-                const isMono =
-                  !isBackgroundLayerId(targetLayerId) &&
-                  (targetLayer?.expressionColor === 'monochrome' ||
-                    colorModeRef.current === 'monochrome');
-                const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
-
-                if (item.beforeImageData) {
-                  const bx =
-                    item.dirtyRect &&
-                    item.beforeImageData.width === item.dirtyRect.width &&
-                    item.beforeImageData.height === item.dirtyRect.height
-                      ? item.dirtyRect.x
-                      : 0;
-                  const by =
-                    item.dirtyRect &&
-                    item.beforeImageData.width === item.dirtyRect.width &&
-                    item.beforeImageData.height === item.dirtyRect.height
-                      ? item.dirtyRect.y
-                      : 0;
-                  grid.writeImageData(targetLayerId, item.beforeImageData, bx, by, targetFormat);
-                } else if (item.type === 'initial') {
-                  if (isBackgroundLayerId(targetLayerId)) {
-                    grid.fillLayerSolidWhite(
-                      targetLayerId,
-                      dims.width,
-                      dims.height,
-                      'color-32bit'
-                    );
-                  } else {
-                    grid.clearLayer(targetLayerId);
-                  }
-                }
-              }
-
-              if (
-                !item.layerTreeDelta ||
-                (layersRef.current ?? []).some((l) => l.id === targetLayerId)
-              ) {
-                onUpdateLayerThumbnail(targetLayerId, true);
-              }
+              applySingleHistoryStep(item, deltas, 'undo', grid, dims);
             }
           }
         } else {
           for (let i = currentIndex + 1; i <= targetIndex; i++) {
             const item = historyRef.current[i];
-            const dataToApply = item?.afterImageData || item?.imageData;
             if (item) {
-              const targetLayerId = item.layerId || activeLayerId;
-              const targetLayer = layersRef.current?.find((l) => l.id === targetLayerId);
               const deltas = await undoCache.resolveDeltas(item);
-
-              if (item.layerTreeDelta) {
-                const applied = onApplyLayerTreeDeltaRef?.current?.(item.layerTreeDelta, 'redo');
-                if (applied) {
-                  layersRef.current = applied.nextLayers;
-                  if (applied.nextActiveLayerId !== null) {
-                    activeLayerIdRef.current = applied.nextActiveLayerId;
-                  }
-                }
-                if (deltas && deltas.length > 0) {
-                  grid.applyTileDeltas(deltas, 'redo');
-                  if (multiplayerService.isConnected()) {
-                    multiplayerService.sendTileDeltas(deltas, grid, { force: true });
-                  }
-                }
-                const liveLayerIds = new Set((layersRef.current ?? []).map((l) => l.id));
-                const affectedLayerIds = new Set<string>();
-                if (deltas) {
-                  for (const d of deltas) {
-                    affectedLayerIds.add(parseTileKey(d.key).layerId);
-                  }
-                }
-                if (applied) {
-                  for (const added of applied.addedLayers) {
-                    affectedLayerIds.add(added.id);
-                  }
-                }
-                for (const lid of affectedLayerIds) {
-                  if (lid !== targetLayerId && liveLayerIds.has(lid)) {
-                    onUpdateLayerThumbnail(lid, true);
-                  }
-                }
-                grid.notifyChange(true);
-              } else if (item.isMaskEdit && targetLayer?.maskCanvas) {
-                const mCtx = get2DContext(targetLayer.maskCanvas);
-                if (mCtx && dataToApply) {
-                  const mx =
-                    item.dirtyRect && dataToApply.width === item.dirtyRect.width
-                      ? item.dirtyRect.x
-                      : 0;
-                  const my =
-                    item.dirtyRect && dataToApply.height === item.dirtyRect.height
-                      ? item.dirtyRect.y
-                      : 0;
-                  mCtx.putImageData(dataToApply, mx, my);
-                  targetLayer.maskVersion = (targetLayer.maskVersion || 0) + 1;
-                  onUpdateMaskThumbnailRef.current?.(targetLayerId);
-                  if (multiplayerService.isConnected()) {
-                    multiplayerService.sendLayerMaskData(
-                      targetLayerId,
-                      targetLayer.maskCanvas,
-                      item.dirtyRect
-                    );
-                  }
-                }
-              } else if (item.vectorStrokesDelta && targetLayer) {
-                targetLayer.vectorStrokes = item.vectorStrokesDelta.after;
-                const isMono = targetLayer.expressionColor === 'monochrome';
-                grid.clearLayer(targetLayerId);
-                if (targetLayer.vectorStrokes.length > 0) {
-                  let minX = dims.width;
-                  let minY = dims.height;
-                  let maxX = 0;
-                  let maxY = 0;
-                  for (const st of targetLayer.vectorStrokes) {
-                    if (st.deleted || !st.bounds) continue;
-                    const pad = Math.ceil(Math.max(16, st.baseWidth || 10));
-                    if (st.bounds.minX - pad < minX) minX = st.bounds.minX - pad;
-                    if (st.bounds.minY - pad < minY) minY = st.bounds.minY - pad;
-                    if (st.bounds.maxX + pad > maxX) maxX = st.bounds.maxX + pad;
-                    if (st.bounds.maxY + pad > maxY) maxY = st.bounds.maxY + pad;
-                  }
-                  const vx = Math.max(0, Math.floor(minX));
-                  const vy = Math.max(0, Math.floor(minY));
-                  const vw = Math.max(0, Math.min(dims.width, Math.ceil(maxX)) - vx);
-                  const vh = Math.max(0, Math.min(dims.height, Math.ceil(maxY)) - vy);
-                  if (vw > 0 && vh > 0) {
-                    const tempVec = document.createElement('canvas');
-                    tempVec.width = vw;
-                    tempVec.height = vh;
-                    const cCtx = get2DContext(tempVec);
-                    if (cCtx) {
-                      cCtx.save();
-                      cCtx.translate(-vx, -vy);
-                      renderVectorLayer(cCtx, targetLayer.vectorStrokes);
-                      cCtx.restore();
-                      const subData = cCtx.getImageData(0, 0, vw, vh);
-                      grid.writeImageData(
-                        targetLayerId,
-                        subData,
-                        vx,
-                        vy,
-                        isMono ? 'monochrome-1bit' : 'color-32bit'
-                      );
-                    }
-                    releaseTemporaryCanvas(tempVec);
-                  }
-                }
-                if (multiplayerService.isConnected()) {
-                  multiplayerService.sendLayerUpdate(targetLayerId, {
-                    vectorStrokes: targetLayer.vectorStrokes,
-                  });
-                }
-              } else if (deltas && deltas.length > 0) {
-                grid.applyTileDeltas(deltas, 'redo');
-                if (multiplayerService.isConnected()) {
-                  multiplayerService.sendTileDeltas(deltas, grid, { force: true });
-                }
-
-                const affectedLayerIds = new Set<string>();
-                for (const d of deltas) {
-                  affectedLayerIds.add(parseTileKey(d.key).layerId);
-                }
-                for (const lid of affectedLayerIds) {
-                  if (lid !== targetLayerId) {
-                    onUpdateLayerThumbnail(lid, true);
-                  }
-                }
-              } else {
-                const isMono =
-                  !isBackgroundLayerId(targetLayerId) &&
-                  (targetLayer?.expressionColor === 'monochrome' ||
-                    colorModeRef.current === 'monochrome');
-                const targetFormat = isMono ? 'monochrome-1bit' : 'color-32bit';
-
-                if (dataToApply) {
-                  const ax =
-                    item.dirtyRect &&
-                    dataToApply.width === item.dirtyRect.width &&
-                    dataToApply.height === item.dirtyRect.height
-                      ? item.dirtyRect.x
-                      : 0;
-                  const ay =
-                    item.dirtyRect &&
-                    dataToApply.width === item.dirtyRect.width &&
-                    dataToApply.height === item.dirtyRect.height
-                      ? item.dirtyRect.y
-                      : 0;
-                  grid.writeImageData(targetLayerId, dataToApply, ax, ay, targetFormat);
-                } else if (item.type === 'initial') {
-                  if (isBackgroundLayerId(targetLayerId)) {
-                    grid.fillLayerSolidWhite(
-                      targetLayerId,
-                      dims.width,
-                      dims.height,
-                      'color-32bit'
-                    );
-                  } else {
-                    grid.clearLayer(targetLayerId);
-                  }
-                }
-              }
-
-              if (
-                !item.layerTreeDelta ||
-                (layersRef.current ?? []).some((l) => l.id === targetLayerId)
-              ) {
-                onUpdateLayerThumbnail(targetLayerId, true);
-              }
+              applySingleHistoryStep(item, deltas, 'redo', grid, dims);
             }
           }
         }
@@ -816,44 +737,64 @@ export function useDrawingHistory({
         syncHistoryState();
         grid.notifyChange(true);
       });
-      historyQueueRef.current = nextOp.catch((err) => {
-        console.warn('[History] Error during jumpToHistoryIndex:', err);
-      });
+      historyQueueRef.current = nextOp
+        .catch((err) => {
+          console.warn('[History] Error during jumpToHistoryIndex:', err);
+        })
+        .finally(() => {
+          inFlightHistoryOpsRef.current = Math.max(0, inFlightHistoryOpsRef.current - 1);
+          if (inFlightHistoryOpsRef.current === 0) {
+            pendingTargetIndexRef.current = null;
+          }
+        });
       return historyQueueRef.current;
     },
     [
       abortActiveStrokeRef,
-      activeLayerId,
-      activeLayerIdRef,
-      colorModeRef,
+      applySingleHistoryStep,
       dimensionsRef,
       flushPendingHistoryTasks,
       isDrawingRef,
-      layersRef,
-      onApplyLayerTreeDeltaRef,
-      onUpdateLayerThumbnail,
-      onUpdateMaskThumbnailRef,
+      lastStrokeEndRef,
       persistSessionHistory,
       syncHistoryState,
     ]
   );
 
   const undo = useCallback(() => {
+    if (multiplayerService.isConnected() && multiplayerService.getLocalRole() === 'viewer') return;
     flushPendingHistoryTasks();
     if (isDrawingRef.current) {
       abortActiveStrokeRef.current();
     }
-    if (historyIndexRef.current <= 0) return;
-    jumpToHistoryIndex(historyIndexRef.current - 1);
+    const baseIndex =
+      pendingTargetIndexRef.current !== null
+        ? pendingTargetIndexRef.current
+        : historyIndexRef.current;
+    if (baseIndex <= 0) return;
+    jumpToHistoryIndex(baseIndex - 1);
   }, [abortActiveStrokeRef, flushPendingHistoryTasks, isDrawingRef, jumpToHistoryIndex]);
 
   const redo = useCallback(() => {
+    if (multiplayerService.isConnected() && multiplayerService.getLocalRole() === 'viewer') return;
     flushPendingHistoryTasks();
     if (isDrawingRef.current) {
       abortActiveStrokeRef.current();
     }
-    if (historyIndexRef.current >= historyRef.current.length - 1) return;
-    jumpToHistoryIndex(historyIndexRef.current + 1);
+    const baseIndex =
+      pendingTargetIndexRef.current !== null
+        ? pendingTargetIndexRef.current
+        : historyIndexRef.current;
+    if (baseIndex >= historyRef.current.length - 1) return;
+    const nextItem = historyRef.current[baseIndex + 1];
+    if (
+      multiplayerService.isConnected() &&
+      nextItem?.peerId !== undefined &&
+      nextItem.peerId !== 'local'
+    ) {
+      return;
+    }
+    jumpToHistoryIndex(baseIndex + 1);
   }, [abortActiveStrokeRef, flushPendingHistoryTasks, isDrawingRef, jumpToHistoryIndex]);
 
   const selectiveUndo = useCallback(
@@ -1146,6 +1087,7 @@ export function useDrawingHistory({
       if (!targetDocumentId || targetDocumentId === activeSessionIdRef.current) {
         historyRef.current = [];
         historyIndexRef.current = -1;
+        pendingTargetIndexRef.current = null;
         lastStrokeEndRef.current = null;
         setHistoryList([]);
         setHistoryIndex(-1);
@@ -1211,6 +1153,7 @@ export function useDrawingHistory({
     }
 
     activeSessionIdRef.current = nextDocId;
+    pendingTargetIndexRef.current = null;
     lastStrokeEndRef.current = null;
 
     if (nextDocId) {

@@ -1,6 +1,10 @@
 import { CanvasDimensions, LayerItem, isFolderLikeLayer, resolveToneDensityType } from '../../types/editor';
 import { getCanvasCompositeOperation } from '../canvasUtils';
 import { applyMultiFrameClip, renderFrameBorder } from '../frameEngine';
+import {
+  compositePigmentOverPixelInto,
+  isPigmentCompatibleCombineMode,
+} from '../pigmentEngine';
 import { applyScreentoneCPU } from '../screentoneEngine';
 import { SparseTileGrid, TILE_SIZE, TileBuffer } from '../tileEngine';
 import { applyAdjustment } from '../tonalEngine';
@@ -226,6 +230,120 @@ export function render2DSingleLayer(
   const draftOp2D = has2DDraft && opts?.activeDraftCanvas
     ? ((opts.activeDraftCanvas as any).__draftCompositeOp as GlobalCompositeOperation | undefined)
     : undefined;
+  const draftPigmentStrength2D = has2DDraft ? (opts?.activeDraftPigmentStrength ?? 0) : 0;
+  const usePigment2DDraft =
+    has2DDraft &&
+    Boolean(opts?.activeDraftCanvas) &&
+    draftOp2D !== 'destination-out' &&
+    draftPigmentStrength2D > 0.005 &&
+    !toneEnabled &&
+    layer.expressionColor !== 'monochrome' &&
+    layer.expressionColor !== 'gray' &&
+    isPigmentCompatibleCombineMode(opts?.activeDraftCombineMode) &&
+    typeof document !== 'undefined' &&
+    Boolean(targetCtx.canvas);
+
+  if (usePigment2DDraft && opts?.activeDraftCanvas && targetCtx.canvas) {
+    if (!state.fallbackIsoCanvas) {
+      state.fallbackIsoCanvas = document.createElement('canvas');
+    }
+    if (!state.fallbackDraftCanvas) {
+      state.fallbackDraftCanvas = document.createElement('canvas');
+    }
+    const iso = state.fallbackIsoCanvas;
+    const dSurf = state.fallbackDraftCanvas;
+    const cw = targetCtx.canvas.width;
+    const ch = targetCtx.canvas.height;
+    if (iso.width !== cw || iso.height !== ch) {
+      iso.width = cw;
+      iso.height = ch;
+    }
+    if (dSurf.width !== cw || dSurf.height !== ch) {
+      dSurf.width = cw;
+      dSurf.height = ch;
+    }
+    const isoCtx = iso.getContext('2d', { willReadFrequently: true });
+    const dSurfCtx = dSurf.getContext('2d', { willReadFrequently: true });
+    if (isoCtx && dSurfCtx && cw > 0 && ch > 0) {
+      if (typeof isoCtx.setTransform === 'function') isoCtx.setTransform(1, 0, 0, 1, 0, 0);
+      if (typeof dSurfCtx.setTransform === 'function') dSurfCtx.setTransform(1, 0, 0, 1, 0, 0);
+      isoCtx.clearRect(0, 0, cw, ch);
+      dSurfCtx.clearRect(0, 0, cw, ch);
+      if (typeof targetCtx.getTransform === 'function') {
+        const xf = targetCtx.getTransform();
+        if (typeof isoCtx.setTransform === 'function') isoCtx.setTransform(xf);
+        if (typeof dSurfCtx.setTransform === 'function') dSurfCtx.setTransform(xf);
+      }
+      drawTiles(isoCtx);
+      dSurfCtx.save();
+      dSurfCtx.globalAlpha = 1.0;
+      if (opts.activeDraftSpace === 'viewport' && typeof dSurfCtx.setTransform === 'function') {
+        dSurfCtx.setTransform(1, 0, 0, 1, 0, 0);
+        dSurfCtx.drawImage(opts.activeDraftCanvas, 0, 0);
+      } else if (opts.activeDraftDirtyRect) {
+        const dr = opts.activeDraftDirtyRect;
+        dSurfCtx.drawImage(opts.activeDraftCanvas, dr.x, dr.y, dr.width, dr.height);
+      } else {
+        dSurfCtx.drawImage(
+          opts.activeDraftCanvas,
+          0,
+          0,
+          opts.dimensions?.width ?? opts.activeDraftCanvas.width,
+          opts.dimensions?.height ?? opts.activeDraftCanvas.height
+        );
+      }
+      dSurfCtx.restore();
+
+      const dstImg = isoCtx.getImageData(0, 0, cw, ch);
+      const srcImg = dSurfCtx.getImageData(0, 0, cw, ch);
+      const dd = dstImg.data;
+      const sd = srcImg.data;
+      const draftOpVal = opts.activeDraftOpacity ?? 1.0;
+      const whiteGround = Boolean(opts.activeDraftPigmentWhiteGround);
+      const compOp2D: 'source-over' | 'source-atop' =
+        draftOp2D === 'source-atop' ? 'source-atop' : 'source-over';
+      const combineMode2D =
+        opts.activeDraftCombineMode ??
+        (draftOp2D === 'destination-over' ? 'behind' : 'normal');
+      const pxOut: [number, number, number, number] = [0, 0, 0, 0];
+
+      for (let i = 0; i < dd.length; i += 4) {
+        const sa = sd[i + 3];
+        if (sa === 0) continue;
+        const effA = draftOpVal >= 0.999 ? sa : Math.round(sa * draftOpVal);
+        if (effA <= 0) continue;
+        compositePigmentOverPixelInto(
+          dd[i],
+          dd[i + 1],
+          dd[i + 2],
+          dd[i + 3],
+          sd[i],
+          sd[i + 1],
+          sd[i + 2],
+          effA,
+          draftPigmentStrength2D,
+          whiteGround,
+          compOp2D,
+          combineMode2D,
+          pxOut
+        );
+        dd[i] = pxOut[0];
+        dd[i + 1] = pxOut[1];
+        dd[i + 2] = pxOut[2];
+        dd[i + 3] = pxOut[3];
+      }
+      isoCtx.putImageData(dstImg, 0, 0);
+
+      targetCtx.save();
+      if (typeof targetCtx.setTransform === 'function') {
+        targetCtx.setTransform(1, 0, 0, 1, 0, 0);
+      }
+      targetCtx.drawImage(iso, 0, 0);
+      targetCtx.restore();
+      targetCtx.restore();
+      return;
+    }
+  }
 
   if (
     has2DDraft &&

@@ -1,5 +1,6 @@
 import { buildBlendModeGlsl } from './blendModesGlsl';
 import { buildScreentoneGlsl } from './screentoneGlsl';
+import { PIGMENT_GLSL_WEBGL2 } from '../../pigmentEngine';
 
 // Document-Space Solid Polygon Shaders for Frame Border Folder Stencil Clipping & Borders
 export const FRAME_POLY_VERTEX_SHADER = `#version 300 es
@@ -328,5 +329,191 @@ void main() {
 
   v_docCoord = unrotated * u_flip + u_docDimensions * 0.5;
   gl_Position = vec4(clipPos, 0.0, 1.0);
+}
+`;
+
+// Live Physical Pigment Draft Compositing Fragment Shader (WebGL2)
+// Composites the active layer's existing pixels (u_layerTex) with the active stroke draft (u_draftTex)
+// in 7-channel Kubelka-Munk pigment latent space — matching CPU compositePigmentOverPixelInto 1-to-1
+// for zero-pop live/commit parity.
+export const PIGMENT_DRAFT_FRAGMENT_SHADER = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+
+uniform sampler2D u_layerTex;
+uniform sampler2D u_draftTex;
+uniform sampler2D u_maskTex;
+uniform sampler2D u_pigmentLut;
+
+uniform vec2 u_docDimensions;
+uniform vec2 u_viewportSize;
+uniform vec2 u_pan;
+uniform float u_zoom;
+uniform float u_rotationRad;
+uniform vec2 u_flip;
+uniform float u_dpr;
+
+uniform vec4 u_draftRect;
+uniform int u_draftSpace;
+uniform float u_draftOpacity;
+uniform float u_pigmentStrength;
+uniform int u_whiteGround;
+uniform int u_compositeOp; // 0: source-over, 1: source-atop
+uniform int u_combineMode; // 0: normal, 1: compare-density, 2: behind
+uniform int u_maskEnabled;
+uniform int u_layerColorEnabled;
+uniform vec3 u_layerColor;
+uniform vec3 u_layerSubColor;
+
+out vec4 fragColor;
+
+${PIGMENT_GLSL_WEBGL2}
+
+vec4 encodePigmentOverWhiteGpu(vec3 srcRgb, float sA, float strength) {
+  if (sA <= 0.0001) return vec4(0.0);
+  if (sA >= 0.996 || strength <= 0.005) return vec4(srcRgb, sA);
+  vec3 pig = mixPigmentsGpu(vec3(1.0), srcRgb, sA, strength);
+  float minC = min(min(pig.r, pig.g), pig.b);
+  float outA = max(sA, 1.0 - minC);
+  if (outA <= 0.0001) return vec4(0.0);
+  vec3 outRgb = clamp((pig - vec3(1.0 - outA)) / outA, 0.0, 1.0);
+  return vec4(outRgb, outA);
+}
+
+void main() {
+  vec4 dstPremul = texture(u_layerTex, v_uv);
+  float dstA = dstPremul.a;
+  vec3 dstRgb = dstA > 0.001 ? clamp(dstPremul.rgb / dstA, 0.0, 1.0) : vec3(0.0);
+
+  vec2 screenPos = vec2(v_uv.x * u_viewportSize.x, (1.0 - v_uv.y) * u_viewportSize.y);
+  vec2 cssScreen = screenPos / max(0.0001, u_dpr);
+  vec2 unscaled = (cssScreen - u_pan) / max(0.0001, u_zoom);
+  float cosR = cos(u_rotationRad);
+  float sinR = sin(u_rotationRad);
+  vec2 unrotated = vec2(
+    unscaled.x * cosR + unscaled.y * sinR,
+    -unscaled.x * sinR + unscaled.y * cosR
+  );
+  vec2 docCoord = unrotated * u_flip + u_docDimensions * 0.5;
+
+  vec3 outRgb = dstRgb;
+  float outA = dstA;
+
+  vec2 draftUv;
+  bool inDraft = false;
+  if (u_draftSpace == 1) {
+    draftUv = vec2(v_uv.x, 1.0 - v_uv.y);
+    inDraft = true;
+  } else {
+    draftUv = (docCoord - u_draftRect.xy) / max(vec2(1.0), u_draftRect.zw);
+    inDraft =
+      draftUv.x >= 0.0 && draftUv.x <= 1.0 &&
+      draftUv.y >= 0.0 && draftUv.y <= 1.0 &&
+      docCoord.x >= 0.0 && docCoord.x <= u_docDimensions.x &&
+      docCoord.y >= 0.0 && docCoord.y <= u_docDimensions.y;
+  }
+
+  if (inDraft) {
+    vec4 srcPremul = texture(u_draftTex, draftUv);
+    float effA = clamp(srcPremul.a * u_draftOpacity, 0.0, 1.0);
+    if (effA > 0.001) {
+      vec3 srcRgb = srcPremul.a > 0.001 ? clamp(srcPremul.rgb / srcPremul.a, 0.0, 1.0) : vec3(0.0);
+      if (u_compositeOp == 1) {
+        // source-atop (Alpha Lock)
+        if (dstA > 0.001) {
+          if (u_combineMode == 2) {
+            if (dstA < 0.996) {
+              float rem = (1.0 - dstA) * effA;
+              float denom = dstA + rem;
+              if (denom > 0.00001) {
+                outRgb = mixPigmentsGpu(dstRgb, srcRgb, rem / denom, u_pigmentStrength);
+              }
+            }
+          } else if (effA >= 0.996) {
+            outRgb = srcRgb;
+          } else {
+            outRgb = mixPigmentsGpu(dstRgb, srcRgb, effA, u_pigmentStrength);
+          }
+          outA = dstA;
+        }
+      } else if (u_combineMode == 2) {
+        // behind (destination-over)
+        if (dstA < 0.996) {
+          if (dstA <= 0.001) {
+            if (u_whiteGround == 1 && effA < 0.996) {
+              vec4 enc = encodePigmentOverWhiteGpu(srcRgb, effA, u_pigmentStrength);
+              outRgb = enc.rgb;
+              outA = enc.a;
+            } else {
+              outRgb = srcRgb;
+              outA = effA;
+            }
+          } else {
+            float rem = effA * (1.0 - dstA);
+            float compA = dstA + rem;
+            if (compA > 0.00001) {
+              outRgb = mixPigmentsGpu(dstRgb, srcRgb, rem / compA, u_pigmentStrength);
+              outA = compA;
+            }
+          }
+        }
+      } else if (dstA <= 0.001) {
+        if (u_whiteGround == 1 && effA < 0.996) {
+          vec4 enc = encodePigmentOverWhiteGpu(srcRgb, effA, u_pigmentStrength);
+          outRgb = enc.rgb;
+          outA = enc.a;
+        } else {
+          outRgb = srcRgb;
+          outA = effA;
+        }
+      } else if (u_combineMode == 1) {
+        // compare-density
+        float denom = effA + dstA * (1.0 - effA);
+        if (denom > 0.00001) {
+          outRgb = mixPigmentsGpu(dstRgb, srcRgb, effA / denom, u_pigmentStrength);
+        }
+        outA = max(effA, dstA);
+      } else {
+        // standard source-over in Kubelka-Munk pigment space
+        if (effA >= 0.996) {
+          outRgb = srcRgb;
+          outA = 1.0;
+        } else {
+          float compA = effA + dstA * (1.0 - effA);
+          if (compA > 0.00001) {
+            if (u_whiteGround == 1 && dstA < 0.996) {
+              vec3 visDst = dstRgb * dstA + vec3(1.0 - dstA);
+              vec3 pig = mixPigmentsGpu(visDst, srcRgb, effA, u_pigmentStrength);
+              float minC = min(min(pig.r, pig.g), pig.b);
+              outA = max(compA, 1.0 - minC);
+              outRgb = clamp((pig - vec3(1.0 - outA)) / max(0.0001, outA), 0.0, 1.0);
+            } else {
+              outRgb = mixPigmentsGpu(dstRgb, srcRgb, effA / compA, u_pigmentStrength);
+              outA = compA;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (u_layerColorEnabled == 1 && outA > 0.001) {
+    float lum = dot(outRgb, vec3(0.299, 0.587, 0.114));
+    outRgb = mix(u_layerColor, u_layerSubColor, lum);
+  }
+
+  if (u_maskEnabled == 1 && outA > 0.001) {
+    vec2 maskCoord = clamp(docCoord / max(vec2(1.0), u_docDimensions), 0.0, 1.0);
+    vec4 maskPixel = texture(u_maskTex, maskCoord);
+    float maskLum = dot(maskPixel.rgb, vec3(0.299, 0.587, 0.114)) * maskPixel.a;
+    outA *= maskLum;
+  }
+
+  if (outA < 0.002) {
+    fragColor = vec4(0.0);
+    return;
+  }
+  fragColor = vec4(outRgb * outA, outA);
 }
 `;

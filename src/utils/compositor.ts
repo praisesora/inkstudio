@@ -21,6 +21,7 @@ import {
   performanceManager,
 } from './performanceManager';
 import { SparseTileGrid, TILE_SIZE, globalTileGrid } from './tileEngine';
+import { invalidatePigmentLutTexture } from './pigmentEngine';
 import { calculateVisibleDocumentBounds } from './compositor/bounds';
 import { disposeFboSurface, disposePingPongTarget } from './compositor/fboManager';
 import { initGL, resetGLStateOnContextLost } from './compositor/glInit';
@@ -69,6 +70,7 @@ export {
   COMPOSITOR_VERTEX_SHADER,
   COMPOSITOR_FRAGMENT_SHADER,
   VIEWPORT_DRAFT_VERTEX_SHADER,
+  PIGMENT_DRAFT_FRAGMENT_SHADER,
 } from './compositor/shaders/coreShaders';
 
 export {
@@ -153,6 +155,30 @@ function createInitialCompositorState(
     uViewportDraftTileTexLoc: null,
     uViewportDraftIsBgLoc: null,
     aViewportDraftQuadPosLoc: -1,
+    pigmentDraftProgram: null,
+    aPigmentDraftQuadPosLoc: -1,
+    uPigmentDraftLayerTexLoc: null,
+    uPigmentDraftDraftTexLoc: null,
+    uPigmentDraftMaskTexLoc: null,
+    uPigmentDraftLutTexLoc: null,
+    uPigmentDraftDocDimensionsLoc: null,
+    uPigmentDraftViewportSizeLoc: null,
+    uPigmentDraftPanLoc: null,
+    uPigmentDraftZoomLoc: null,
+    uPigmentDraftRotationRadLoc: null,
+    uPigmentDraftFlipLoc: null,
+    uPigmentDraftDprLoc: null,
+    uPigmentDraftRectLoc: null,
+    uPigmentDraftSpaceLoc: null,
+    uPigmentDraftOpacityLoc: null,
+    uPigmentDraftStrengthLoc: null,
+    uPigmentDraftWhiteGroundLoc: null,
+    uPigmentDraftCompositeOpLoc: null,
+    uPigmentDraftCombineModeLoc: null,
+    uPigmentDraftMaskEnabledLoc: null,
+    uPigmentDraftLayerColorEnabledLoc: null,
+    uPigmentDraftLayerColorLoc: null,
+    uPigmentDraftLayerSubColorLoc: null,
     aQuadPosLoc: -1,
     aStylesQuadPosLoc: -1,
     aBlitQuadPosLoc: -1,
@@ -167,6 +193,8 @@ function createInitialCompositorState(
     draftTexWidth: 0,
     draftTexHeight: 0,
     draftHasMipmap: false,
+    draftNeedsFullUpload: true,
+    lastDraftLayerId: null,
     lastDraftVersion: -1,
     currentOptions: null,
     currentZoom: 1.0,
@@ -248,6 +276,8 @@ function createInitialCompositorState(
     fallbackTileCanvas: null,
     fallbackTileImageData: null,
     fallbackIsoCanvas: null,
+    fallbackDraftCanvas: null,
+    draftUploadCanvas: null,
     lastRenderedGrid: null,
     renderBackend,
     powerPreference,
@@ -341,6 +371,8 @@ export class ViewportCompositor {
   public flushGpuCaches(): void {
     invalidateTileTextures(this.state);
     invalidateMaskTexture(this.state);
+    this.state.draftNeedsFullUpload = true;
+    this.state.lastDraftVersion = -1;
     this.state.stackCache.invalidateAll();
   }
 
@@ -489,6 +521,11 @@ export class ViewportCompositor {
         gl.deleteProgram(s.viewportDraftProgram);
         s.viewportDraftProgram = null;
       }
+      if (s.pigmentDraftProgram) {
+        gl.deleteProgram(s.pigmentDraftProgram);
+        s.pigmentDraftProgram = null;
+      }
+      invalidatePigmentLutTexture(gl, true);
       if (s.adjProgram) {
         gl.deleteProgram(s.adjProgram);
         s.adjProgram = null;
@@ -549,6 +586,16 @@ export class ViewportCompositor {
       s.fallbackIsoCanvas.width = 0;
       s.fallbackIsoCanvas.height = 0;
       s.fallbackIsoCanvas = null;
+    }
+    if (s.fallbackDraftCanvas) {
+      s.fallbackDraftCanvas.width = 0;
+      s.fallbackDraftCanvas.height = 0;
+      s.fallbackDraftCanvas = null;
+    }
+    if (s.draftUploadCanvas) {
+      s.draftUploadCanvas.width = 0;
+      s.draftUploadCanvas.height = 0;
+      s.draftUploadCanvas = null;
     }
     s.layerVisScratch.clear();
     if (typeof s.canvas.removeEventListener === 'function') {

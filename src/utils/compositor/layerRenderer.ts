@@ -1,5 +1,9 @@
 import { CanvasDimensions, LayerItem } from '../../types/editor';
 import { SparseTileGrid, TILE_SIZE, TileBuffer } from '../tileEngine';
+import {
+  getPigmentLutTexture,
+  isPigmentCompatibleCombineMode,
+} from '../pigmentEngine';
 import { parseHexColor } from './bounds';
 import { blitFolderTexture } from './effectsPass';
 import {
@@ -9,7 +13,11 @@ import {
   prepareBackdropFromPingPong,
 } from './fboManager';
 import { restoreStandardProgram, unbindSceneTextureUnits } from './layerUniforms';
-import { drawVisibleTiles, renderActiveDraftForLayer } from './tileDraw';
+import {
+  drawVisibleTiles,
+  renderActiveDraftForLayer,
+  uploadActiveDraftTexture,
+} from './tileDraw';
 import { getMaskTexture } from './tileTexturePool';
 import {
   BLEND_MODE_MAP,
@@ -87,7 +95,19 @@ export function renderSingleLayer(
   const draftOp = hasDraft && draftCanvas
     ? ((draftCanvas as any).__draftCompositeOp as GlobalCompositeOperation | undefined)
     : undefined;
+  const draftPigmentStrength = hasDraft ? (opts?.activeDraftPigmentStrength ?? 0) : 0;
+  const draftCombineMode = opts?.activeDraftCombineMode;
+  const needsPigmentDraftFbo =
+    hasDraft &&
+    draftCanvas !== null &&
+    draftOp !== 'destination-out' &&
+    !layer.toneEnabled &&
+    layer.expressionColor !== 'monochrome' &&
+    layer.expressionColor !== 'gray' &&
+    draftPigmentStrength > 0.005 &&
+    isPigmentCompatibleCombineMode(draftCombineMode);
   const needsIsolatedDraftFbo =
+    !needsPigmentDraftFbo &&
     hasDraft &&
     draftCanvas !== null &&
     (draftOp === 'destination-out' || draftOp === 'source-atop');
@@ -100,6 +120,182 @@ export function renderSingleLayer(
   const hasMask = Boolean(layer.maskCanvas && layer.maskEnabled !== false);
   const maskTex = hasMask && layer.maskCanvas ? getMaskTexture(state, layer) : null;
   const effectiveOpacity = layer.opacity * opacityMultiplier;
+
+  // Live Physical Pigment Draft Compositing Path (WebGL2 Kubelka-Munk 4-Pigment LUT)
+  // Renders the active layer's existing tiles into state.layerFbo, composites the active draft
+  // in pigment latent space into state.layerStylesOutFbo (matching CPU compositePigmentOverPixelInto 1:1),
+  // and blits the result onto target with the layer's blendMode & opacity — zero pop on pointerUp!
+  if (
+    needsPigmentDraftFbo &&
+    draftCanvas &&
+    target &&
+    fs &&
+    fs.viewportW > 0 &&
+    fs.viewportH > 0 &&
+    state.pigmentDraftProgram &&
+    state.blitProgram &&
+    ensureLayerFbo(state, fs.viewportW, fs.viewportH) &&
+    state.layerFbo &&
+    state.layerTexture
+  ) {
+    if (!state.layerStylesOutFbo) {
+      state.layerStylesOutFbo = createFboSurface(gl, false);
+    }
+    const pigmentLutTex = getPigmentLutTexture(gl);
+    const draftSpace = opts?.activeDraftSpace ?? 'document';
+    const draftUploaded =
+      state.layerStylesOutFbo &&
+      ensureFboSurfaceSize(gl, state.layerStylesOutFbo, fs.viewportW, fs.viewportH) &&
+      pigmentLutTex !== null &&
+      uploadActiveDraftTexture(state, gl, draftCanvas, opts?.activeDraftVersion, draftSpace);
+
+    if (draftUploaded && state.layerStylesOutFbo && state.draftTexture && pigmentLutTex) {
+      const stencilWasEnabled = gl.isEnabled(gl.STENCIL_TEST);
+      if (stencilWasEnabled) gl.disable(gl.STENCIL_TEST);
+
+      // 1. Render existing layer tiles (unmasked, untinted, full opacity) into state.layerFbo
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.layerFbo);
+      gl.viewport(0, 0, fs.viewportW, fs.viewportH);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+      if (visibleTiles.length > 0) {
+        const rawLayerForFbo = layer.layerColorEnabled
+          ? { ...layer, layerColorEnabled: false }
+          : layer;
+        drawVisibleTiles(
+          state,
+          gl,
+          visibleTiles,
+          grid,
+          rawLayerForFbo,
+          dimensions,
+          lodTileDocSize,
+          1.0,
+          0,
+          null,
+          null
+        );
+      }
+
+      // 2. Run physical pigment draft compositor into state.layerStylesOutFbo (no feedback loop)
+      unbindSceneTextureUnits(gl);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, state.layerStylesOutFbo.fbo);
+      gl.viewport(0, 0, fs.viewportW, fs.viewportH);
+      gl.clearColor(0.0, 0.0, 0.0, 0.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.blendFunc(gl.ONE, gl.ZERO);
+
+      gl.useProgram(state.pigmentDraftProgram);
+      gl.bindBuffer(gl.ARRAY_BUFFER, state.stylesQuadBuffer || state.quadBuffer);
+      if (state.aPigmentDraftQuadPosLoc >= 0) {
+        gl.enableVertexAttribArray(state.aPigmentDraftQuadPosLoc);
+        gl.vertexAttribPointer(state.aPigmentDraftQuadPosLoc, 2, gl.FLOAT, false, 0, 0);
+      }
+
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, state.layerTexture);
+      gl.uniform1i(state.uPigmentDraftLayerTexLoc, 0);
+
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, state.draftTexture);
+      gl.uniform1i(state.uPigmentDraftDraftTexLoc, 1);
+
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, maskTex);
+      gl.uniform1i(state.uPigmentDraftMaskTexLoc, 2);
+
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, pigmentLutTex);
+      gl.uniform1i(state.uPigmentDraftLutTexLoc, 3);
+
+      gl.uniform2f(state.uPigmentDraftDocDimensionsLoc, dimensions.width, dimensions.height);
+      gl.uniform2f(state.uPigmentDraftViewportSizeLoc, fs.viewportW, fs.viewportH);
+      gl.uniform2f(state.uPigmentDraftPanLoc, fs.transform.pan.x, fs.transform.pan.y);
+      gl.uniform1f(state.uPigmentDraftZoomLoc, fs.transform.zoom);
+      gl.uniform1f(state.uPigmentDraftRotationRadLoc, fs.rotRad);
+      gl.uniform2f(
+        state.uPigmentDraftFlipLoc,
+        fs.transform.flipX ? -1.0 : 1.0,
+        fs.transform.flipY ? -1.0 : 1.0
+      );
+      gl.uniform1f(state.uPigmentDraftDprLoc, fs.dpr);
+
+      const docRect = opts?.activeDraftDirtyRect;
+      gl.uniform4f(
+        state.uPigmentDraftRectLoc,
+        docRect ? docRect.x : 0,
+        docRect ? docRect.y : 0,
+        docRect ? docRect.width : dimensions.width,
+        docRect ? docRect.height : dimensions.height
+      );
+      gl.uniform1i(state.uPigmentDraftSpaceLoc, draftSpace === 'viewport' ? 1 : 0);
+      gl.uniform1f(state.uPigmentDraftOpacityLoc, opts?.activeDraftOpacity ?? 1.0);
+      gl.uniform1f(state.uPigmentDraftStrengthLoc, draftPigmentStrength);
+      gl.uniform1i(
+        state.uPigmentDraftWhiteGroundLoc,
+        opts?.activeDraftPigmentWhiteGround ? 1 : 0
+      );
+      gl.uniform1i(state.uPigmentDraftCompositeOpLoc, draftOp === 'source-atop' ? 1 : 0);
+      const combineCode =
+        draftCombineMode === 'compare-density'
+          ? 1
+          : draftCombineMode === 'behind' || draftOp === 'destination-over'
+            ? 2
+            : 0;
+      gl.uniform1i(state.uPigmentDraftCombineModeLoc, combineCode);
+      gl.uniform1i(state.uPigmentDraftMaskEnabledLoc, maskTex ? 1 : 0);
+
+      const tintEnabled = Boolean(layer.layerColorEnabled);
+      gl.uniform1i(state.uPigmentDraftLayerColorEnabledLoc, tintEnabled ? 1 : 0);
+      if (tintEnabled) {
+        const prim = parseHexColor(layer.layerColor || '#1c73c2');
+        const sub = parseHexColor(layer.layerSubColor || '#ffffff');
+        gl.uniform3f(state.uPigmentDraftLayerColorLoc, prim[0], prim[1], prim[2]);
+        gl.uniform3f(state.uPigmentDraftLayerSubColorLoc, sub[0], sub[1], sub[2]);
+      }
+
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+      // Unbind all texture units before re-binding parent FBO
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.activeTexture(gl.TEXTURE2);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+
+      // 3. Blit pigment-composited layer onto parent target with layer blendMode & opacity
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, target.surfaces[target.activeIndex].fbo);
+      gl.viewport(0, 0, fs.viewportW, fs.viewportH);
+      if (stencilWasEnabled) gl.enable(gl.STENCIL_TEST);
+
+      blitFolderTexture(
+        state,
+        gl,
+        state.layerStylesOutFbo.texture,
+        layer.blendMode,
+        effectiveOpacity,
+        fs.viewportW,
+        fs.viewportH,
+        target,
+        preserveStencil
+      );
+
+      if (state.stdLocs) {
+        if (maskTex) {
+          gl.uniform1i(state.stdLocs.uMaskEnabled, 0);
+        }
+        gl.uniform1i(state.stdLocs.uHasBackdrop, 0);
+      }
+      unbindSceneTextureUnits(gl);
+      return;
+    }
+  }
 
   // Isolated GPU FBO path for WYSIWYG live Eraser (destination-out) and Alpha Lock (source-atop)
   // Erases/paints strictly against this layer's tiles without affecting underlying layers and with zero getImageData!

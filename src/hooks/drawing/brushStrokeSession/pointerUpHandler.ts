@@ -18,6 +18,12 @@ import {
   resolveStrokeHistoryLabel,
 } from './pointerUpSpecialCommit';
 import { commitRasterStrokeToTiles } from './pointerUpRasterCommit';
+import { renderInitialStrokeDot } from './pointerDownInitialStamp';
+import {
+  resetAndClearOffscreenDraftCanvas,
+  syncDualBrushRegionToDraft,
+  syncStrokePaperTextureRegionToDraft,
+} from './strokeHelpers';
 
 export function runPointerUp(
   state: StrokeSessionState,
@@ -152,15 +158,19 @@ export function runPointerUp(
     exitSpeed = Math.hypot(pB.x - pA.x, pB.y - pA.y) / dt;
   }
 
+  const hasActiveTaper = Boolean(bs.taper && bs.taper.inOutType !== 0);
   const hasCspArcLengthTaper = Boolean(
-    bs.taper &&
+    hasActiveTaper &&
+      bs.taper &&
       (bs.taper.inOutType !== undefined ||
         bs.taper.affectDensity ||
         bs.taper.affectOpacity ||
         bs.taper.minSizeRatio !== undefined)
   );
   const shouldTaper =
-    Boolean(bs.taper?.useIn) || (Boolean(bs.taper?.useOut) && (!addedFlickPoints || hasCspArcLengthTaper));
+    hasActiveTaper &&
+    (Boolean(bs.taper?.useIn) ||
+      (Boolean(bs.taper?.useOut) && (!addedFlickPoints || hasCspArcLengthTaper)));
   if (shouldTaper && !hasCspArcLengthTaper && state.allStrokePoints.length >= 3) {
     applyParametricTaper(state.allStrokePoints, {
       useIn: Boolean(bs.taper?.useIn),
@@ -171,6 +181,67 @@ export function runPointerUp(
   }
 
   const allPoints = state.allStrokePoints;
+  if (
+    state.deferredInitialDot &&
+    allPoints.length === 1 &&
+    tailSegments.length === 0 &&
+    draftCanvas
+  ) {
+    state.deferredInitialDot = false;
+    const dCtx = get2DContext(draftCanvas);
+    if (dCtx) {
+      const activeDrawCtx =
+        state.isDualBrushStroke && state.dualPrimaryCanvas
+          ? get2DContext(state.dualPrimaryCanvas) || dCtx
+          : state.isStrokePaperTextureActive && state.rawDraftCanvas
+          ? get2DContext(state.rawDraftCanvas) || dCtx
+          : dCtx;
+      const isVectorOrMask =
+        activeLayer?.type === 'vector' || params.isMaskModeRef.current;
+      const useWireframeEraser = isVectorOrMask && isEraser && !isBgEraser;
+      renderInitialStrokeDot(state, helpers, {
+        draftCtx: activeDrawCtx,
+        firstDotPoint: allPoints[0],
+        bs,
+        strokeColor,
+        strokeHardness: isMonochrome ? 1.0 : bs.hardness ?? 1.0,
+        strokeFlow: isMonochrome ? 1.0 : bs.flow ?? 1.0,
+        strokeSpacing: bs.spacing ?? 0.08,
+        isMonochrome,
+        isEraser,
+        isBgEraser,
+        useWireframeEraser,
+        draftScale: draftCanvas.__draftScale ?? 1.0,
+        zoom: params.zoomRef.current,
+        canvas: maskCanvas,
+        activeLayer,
+      });
+      if (state.isDualBrushStroke && mergedDirty) {
+        syncDualBrushRegionToDraft(
+          state,
+          draftCanvas,
+          dCtx,
+          bs,
+          mergedDirty.minX,
+          mergedDirty.minY,
+          mergedDirty.maxX,
+          mergedDirty.maxY
+        );
+      } else if (state.isStrokePaperTextureActive && mergedDirty) {
+        syncStrokePaperTextureRegionToDraft(
+          state,
+          draftCanvas,
+          dCtx,
+          bs,
+          mergedDirty.minX,
+          mergedDirty.minY,
+          mergedDirty.maxX,
+          mergedDirty.maxY
+        );
+      }
+      draftCanvas.__draftHasContent = true;
+    }
+  }
   let createdVectorStroke: VectorStroke | undefined;
   let postPresentWork: (() => void) | null = null;
 
@@ -258,6 +329,7 @@ export function runPointerUp(
           currentTool,
           currentLayerId,
           activeLayer,
+          allLayers: params.layersRef.current,
           activeSelection,
           effectiveMode,
           targetFormat,
@@ -287,19 +359,32 @@ export function runPointerUp(
   if (draftCanvas) {
     const dCtx = get2DContext(draftCanvas);
     if (dCtx) {
-      try {
-        dCtx.restore();
-      } catch {
-        // Ignore restore underflow
+      if (draftCanvas.__clipSaved) {
+        try {
+          dCtx.restore();
+        } catch {
+          // Ignore restore underflow
+        }
+        draftCanvas.__clipSaved = false;
       }
       dCtx.resetTransform();
       dCtx.clearRect(0, 0, draftCanvas.width, draftCanvas.height);
+    } else {
+      draftCanvas.__clipSaved = false;
     }
     draftCanvas.__draftHasContent = false;
     draftCanvas.__draftCompositeOp = 'source-over';
     draftCanvas.__draftMonochrome = false;
+    draftCanvas.__draftPigmentStrength = 0;
+    draftCanvas.__draftPigmentWhiteGround = false;
+    draftCanvas.__draftCombineMode = undefined;
+    draftCanvas.__draftFrameDirtyRect = null;
+    draftCanvas.__draftForceFullUpload = true;
     draftCanvas.__draftVersion = (draftCanvas.__draftVersion || 0) + 1;
   }
+  resetAndClearOffscreenDraftCanvas(state.rawDraftCanvas as DraftCanvasElement | null);
+  resetAndClearOffscreenDraftCanvas(state.dualPrimaryCanvas as DraftCanvasElement | null);
+  resetAndClearOffscreenDraftCanvas(state.dualSecondaryCanvas as DraftCanvasElement | null);
   helpers.clearPredictedCanvas();
 
   grid.notifyChange(true);
@@ -341,12 +426,23 @@ export function runPointerUp(
   state.touchedTiles.clear();
   state.liveNeedsNotify = false;
   state.isShiftLineStroke = false;
+  state.deferredInitialDot = false;
+  state.deferredStartRawPressure = 0;
   state.layerPixelSampler = null;
   state.activeReservoir = null;
+  state.isStrokePaperTextureActive = false;
+  state.isDualBrushStroke = false;
+  state.dualSecondaryRemainderDist = 0;
+  state.dualSecondaryDabCounter.count = 0;
+  state.dualSecondaryDabCounter.lastAngle = undefined;
+  state.dualSecondaryDabCounter.lastStepDist = undefined;
+  state.dualSecondaryRibbonSession = null;
+  state.dualFrameSecondaryGpuDabs.length = 0;
   if (state.naturalPaintSession) {
     state.naturalPaintSession.finishAndDispose();
     state.naturalPaintSession = null;
   }
+  state.ribbonSession = null;
   state.snapSession.endStroke();
   state.straightSnapSession.endStroke();
   helpers.emitConstraintAxisChange(null);

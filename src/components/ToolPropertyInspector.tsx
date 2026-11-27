@@ -14,6 +14,7 @@ import {
   Layers,
   Trash2,
   Crop,
+  AlertTriangle,
 } from 'lucide-react';
 import {
   BrushSettings,
@@ -190,9 +191,14 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
     const isHidden = useUiStore((s) => s.isLeftPanelHidden);
 
     const [openAccordion, setOpenAccordion] = useState<InspectorAccordionId | null>(null);
+    const [warningsExpanded, setWarningsExpanded] = useState<boolean>(false);
     const previewCanvasRef = useRef<HTMLCanvasElement>(null);
 
     const isBrushOrEraser = currentTool === 'brush' || currentTool === 'eraser';
+
+    useEffect(() => {
+      setWarningsExpanded(false);
+    }, [brushSettings.preset]);
 
     useEffect(() => {
       if (isHidden || !isBrushOrEraser) return;
@@ -216,38 +222,104 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             preset: brushSettings.preset,
             size: brushSettings.size,
             flow: brushSettings.flow,
+            brushDensity: brushSettings.brushDensity,
             opacity: brushSettings.opacity,
             grain: brushSettings.grain,
+            textureDensity: brushSettings.textureDensity,
+            paperTexture: brushSettings.paperTexture,
+            paperTextureImage: brushSettings.paperTextureImage,
             paperTextureMode: brushSettings.paperTextureMode,
             paperTextureScale: brushSettings.paperTextureScale,
+            paperTextureRotate: brushSettings.paperTextureRotate,
+            paperTextureOffsetX: brushSettings.paperTextureOffsetX,
+            paperTextureOffsetY: brushSettings.paperTextureOffsetY,
             paperTextureContrast: brushSettings.paperTextureContrast,
             paperTextureBrightness: brushSettings.paperTextureBrightness,
+            paperTextureApplyEachPlot: brushSettings.paperTextureApplyEachPlot,
+            paperTextureEmphasizeDensity: brushSettings.paperTextureEmphasizeDensity,
             paperTextureInverted: brushSettings.paperTextureInverted,
             hardness: brushSettings.hardness,
             spacing: brushSettings.spacing,
             minSizeFactor: brushSettings.minSizeFactor,
             usePressure: brushSettings.usePressure,
+            useTilt: brushSettings.useTilt,
+            tiltScale: brushSettings.tiltScale,
+            useVelocity: brushSettings.useVelocity,
             color: currentTool === 'eraser' ? '#e5e5e5' : '#ececec',
+            secondaryColor: secondaryColor || brushSettings.secondaryColor || '#60a5fa',
             backgroundColor: '#161616',
             tool: currentTool === 'eraser' ? 'eraser' : 'brush',
+            customTipDataUrl: brushSettings.customTipDataUrl,
             customTipImage: resolvedTip,
             customTipAngle: brushSettings.customTipAngle,
             customTipAngleDynamics: brushSettings.customTipAngleDynamics,
+            customTipRotationRandomScale: brushSettings.customTipRotationRandomScale,
+            isColorTip: brushSettings.isColorTip,
+            isDualToneTip: brushSettings.isDualToneTip,
+            isRibbon: brushSettings.isRibbon,
+            subTips: brushSettings.subTips,
+            subTipOrder: brushSettings.subTipOrder,
+            subTipImages: brushSettings.subTipImages,
             thickness: brushSettings.thickness,
             thicknessVertical: brushSettings.thicknessVertical,
+            thicknessSensor: brushSettings.thicknessSensor,
             flipH: brushSettings.flipH,
             flipV: brushSettings.flipV,
             blendTipsMode: brushSettings.blendTipsMode,
+            brushCombineMode: brushSettings.brushCombineMode,
             adjustDensityByGap: brushSettings.adjustDensityByGap,
             antiAlias: brushSettings.antiAlias,
             pressureCurve: brushSettings.pressureCurve,
+            velocityCurve: brushSettings.velocityCurve,
+            sizeSensor: brushSettings.sizeSensor,
+            opacitySensor: brushSettings.opacitySensor,
+            densitySensor: brushSettings.densitySensor,
+            intervalSensor: brushSettings.intervalSensor,
+            textureDensitySensor: brushSettings.textureDensitySensor,
+            angleSensor: brushSettings.angleSensor,
+            scatterSensor: brushSettings.scatterSensor,
             spray: brushSettings.spray,
+            taper: brushSettings.taper,
             dynamics: brushSettings.dynamics,
             colorMixing: brushSettings.colorMixing,
+            perceptualMixing: brushSettings.perceptualMixing,
             amountOfPaint: brushSettings.amountOfPaint,
             densityOfPaint: brushSettings.densityOfPaint,
             colorStretch: brushSettings.colorStretch,
+            amountOfPaintSensor: brushSettings.amountOfPaintSensor,
+            densityOfPaintSensor: brushSettings.densityOfPaintSensor,
+            colorStretchSensor: brushSettings.colorStretchSensor,
+            useBlur: brushSettings.useBlur,
+            blurStrength: brushSettings.blurStrength,
+            mixingMode: brushSettings.mixingMode,
             wetEdge: brushSettings.wetEdge,
+            wetEdgeRadius: brushSettings.wetEdgeRadius,
+            wetEdgeAlphaPower: brushSettings.wetEdgeAlphaPower,
+            wetEdgeValuePower: brushSettings.wetEdgeValuePower,
+            dualBrush: brushSettings.dualBrush,
+            dualBrushConfig: brushSettings.dualBrushConfig,
+            dualBrushCompositeMode: brushSettings.dualBrushCompositeMode,
+            dualTipDataUrl: brushSettings.dualTipDataUrl,
+            dualTipImage: brushSettings.dualTipImage,
+            dualSize: brushSettings.dualSize,
+            dualLinkSize: brushSettings.dualLinkSize,
+            dualSpacing: brushSettings.dualSpacing,
+            dualScatter: brushSettings.dualScatter,
+            dualThickness: brushSettings.dualThickness,
+            dualThicknessVertical: brushSettings.dualThicknessVertical,
+            dualAngle: brushSettings.dualAngle,
+            dualAngleDynamics: brushSettings.dualAngleDynamics,
+            dualAngleSensor: brushSettings.dualAngleSensor,
+            dualHardness: brushSettings.dualHardness,
+            dualDensity: brushSettings.dualDensity,
+            dualSubTips: brushSettings.dualSubTips,
+            dualSubTipImages: brushSettings.dualSubTipImages,
+            dualSubTipOrder: brushSettings.dualSubTipOrder,
+            dualFlipH: brushSettings.dualFlipH,
+            dualFlipV: brushSettings.dualFlipV,
+            dualSpray: brushSettings.dualSpray,
+            dualIsRibbon: brushSettings.dualIsRibbon,
+            dualScale: brushSettings.dualScale,
             renderMode: brushSettings.renderMode,
             bristle: brushSettings.bristle,
             naturalPaint: brushSettings.naturalPaint,
@@ -263,7 +335,7 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
         cancelAnimationFrame(rafId);
         loadListenerCleanup?.();
       };
-    }, [isHidden, isBrushOrEraser, width, currentTool, brushSettings]);
+    }, [isHidden, isBrushOrEraser, width, currentTool, brushSettings, secondaryColor]);
 
     const activePreset: BrushPresetId = brushSettings.preset || DEFAULT_BRUSH_PRESET_ID;
     const activeBuiltinBrush = BUILTIN_BRUSHES.find((b) => b.id === activePreset);
@@ -2006,6 +2078,14 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
     }
 
     const currentAntiAlias = brushSettings.antiAlias ?? 2;
+    const activeImportWarnings =
+      currentTool === 'brush'
+        ? activeCustomBrush?.importWarnings?.length
+          ? activeCustomBrush.importWarnings
+          : brushSettings.importWarnings?.length
+            ? brushSettings.importWarnings
+            : []
+        : [];
 
     return (
       <>
@@ -2025,6 +2105,40 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
               </button>
             )}
           </div>
+          {activeImportWarnings.length > 0 && (
+            <div
+              data-testid="brush-import-warnings-badge"
+              className="rounded bg-amber-500/10 border border-amber-400/25 px-1.5 py-1 text-[10px] text-amber-200"
+            >
+              <button
+                type="button"
+                onClick={() => setWarningsExpanded((v) => !v)}
+                className="w-full flex items-center justify-between gap-1 text-left cursor-pointer"
+                title={activeImportWarnings.join('\n')}
+              >
+                <span className="flex items-center gap-1 min-w-0">
+                  <AlertTriangle className="w-3 h-3 text-amber-400 shrink-0" />
+                  <span className="truncate font-medium">
+                    {activeImportWarnings.length === 1
+                      ? '1 CSP import notice'
+                      : `${activeImportWarnings.length} CSP import notices`}
+                  </span>
+                </span>
+                {warningsExpanded ? (
+                  <ChevronDown className="w-3 h-3 shrink-0 text-amber-300" />
+                ) : (
+                  <ChevronRight className="w-3 h-3 shrink-0 text-amber-300" />
+                )}
+              </button>
+              {warningsExpanded && (
+                <ul className="mt-1 space-y-1 pl-4 list-disc text-[9.5px] leading-snug text-amber-100/90">
+                  {activeImportWarnings.map((w, idx) => (
+                    <li key={idx}>{w}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
           <CompactSlider
             label="Brush Size ([ / ])"
             valueLabel={`${brushSettings.size < 10 ? brushSettings.size.toFixed(1) : Math.round(brushSettings.size)}px`}
@@ -2460,17 +2574,15 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
             >
               <span>Blending &amp; Mixing</span>
               <div className="flex items-center gap-1">
-                {brushSettings.colorMixing && (
-                  <span
-                    className={`px-1.5 py-[1px] rounded-full text-[9px] font-medium border ${
-                      (brushSettings.perceptualMixing ?? true)
-                        ? 'bg-emerald-500/12 text-emerald-300 border-emerald-400/25'
-                        : 'bg-white/[0.04] text-[#8a8a8a] border-white/[0.08]'
-                    }`}
-                  >
-                    {(brushSettings.perceptualMixing ?? true) ? 'Pigment' : 'Regular'}
-                  </span>
-                )}
+                <span
+                  className={`px-1.5 py-[1px] rounded-full text-[9px] font-medium border ${
+                    (brushSettings.perceptualMixing ?? true)
+                      ? 'bg-emerald-500/12 text-emerald-300 border-emerald-400/25'
+                      : 'bg-white/[0.04] text-[#8a8a8a] border-white/[0.08]'
+                  }`}
+                >
+                  {(brushSettings.perceptualMixing ?? true) ? 'Pigment' : 'Regular'}
+                </span>
                 {openAccordion === 'mixing' ? (
                   <ChevronDown className="w-3 h-3" />
                 ) : (
@@ -2481,7 +2593,30 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
 
             {openAccordion === 'mixing' && (
               <div className="px-2.5 pb-2.5 pt-1 space-y-2.5">
-                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                <PigmentBlendControl
+                  label="Color Blending"
+                  strengthLabel="Pigment Strength"
+                  enabled={brushSettings.perceptualMixing ?? true}
+                  onEnabledChange={(enabled) =>
+                    handleUpdateBrushSettings({
+                      perceptualMixing: enabled,
+                    })
+                  }
+                  strength={brushSettings.naturalPaint?.pigmentMixingStrength ?? 1.0}
+                  onStrengthChange={(s) =>
+                    handleUpdateBrushSettings({
+                      perceptualMixing: true,
+                      naturalPaint: {
+                        ...DEFAULT_NATURAL_PAINT_SETTINGS,
+                        ...(brushSettings.naturalPaint || {}),
+                        pigmentMixingStrength: s,
+                      },
+                    })
+                  }
+                  primaryColor={primaryColor}
+                  secondaryColor={secondaryColor}
+                />
+                <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer pt-1 border-t border-white/[0.06]">
                   <span>Color Mixing</span>
                   <input
                     type="checkbox"
@@ -2527,29 +2662,6 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                         </button>
                       ))}
                     </div>
-                    <PigmentBlendControl
-                      label="Color Blending"
-                      strengthLabel="Pigment Strength"
-                      enabled={brushSettings.perceptualMixing ?? true}
-                      onEnabledChange={(enabled) =>
-                        handleUpdateBrushSettings({
-                          perceptualMixing: enabled,
-                        })
-                      }
-                      strength={brushSettings.naturalPaint?.pigmentMixingStrength ?? 1.0}
-                      onStrengthChange={(s) =>
-                        handleUpdateBrushSettings({
-                          perceptualMixing: true,
-                          naturalPaint: {
-                            ...DEFAULT_NATURAL_PAINT_SETTINGS,
-                            ...(brushSettings.naturalPaint || {}),
-                            pigmentMixingStrength: s,
-                          },
-                        })
-                      }
-                      primaryColor={primaryColor}
-                      secondaryColor={secondaryColor}
-                    />
                     <CompactSlider
                       label="Amount of Paint"
                       valueLabel={`${Math.round((brushSettings.amountOfPaint ?? brushSettings.naturalPaint?.paintLoad ?? 0.7) * 100)}%`}
@@ -2582,6 +2694,32 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                       value={Math.round((brushSettings.colorStretch ?? 0.6) * 100)}
                       onChange={(v) => handleUpdateBrushSettings({ colorStretch: v / 100 })}
                     />
+                    <label className="flex items-center justify-between text-[11px] text-[#8a8a8a] cursor-pointer">
+                      <span>Optical Blur</span>
+                      <input
+                        type="checkbox"
+                        checked={Boolean(brushSettings.useBlur)}
+                        onChange={(e) => {
+                          const enabled = e.target.checked;
+                          handleUpdateBrushSettings({
+                            useBlur: enabled,
+                            ...(enabled && brushSettings.blurStrength === undefined
+                              ? { blurStrength: 0.35 }
+                              : {}),
+                          });
+                        }}
+                      />
+                    </label>
+                    {brushSettings.useBlur && (
+                      <CompactSlider
+                        label="Blur Strength"
+                        valueLabel={`${Math.round((brushSettings.blurStrength ?? 0.35) * 100)}%`}
+                        min={5}
+                        max={100}
+                        value={Math.round((brushSettings.blurStrength ?? 0.35) * 100)}
+                        onChange={(v) => handleUpdateBrushSettings({ blurStrength: v / 100 })}
+                      />
+                    )}
                   </>
                 )}
                 <CompactSlider
@@ -2646,10 +2784,14 @@ export const ToolPropertyInspector: React.FC<ToolPropertyInspectorProps> = React
                         }
                         className="w-full h-6 bg-[#161616] text-[#e5e5e5] text-[10px] px-1.5 rounded cursor-pointer"
                       >
-                        <option value="subtract">Subtract (Valley Fill)</option>
+                        <option value="normal">Normal</option>
                         <option value="multiply">Multiply</option>
+                        <option value="subtract">Subtract (Valley Fill)</option>
                         <option value="compare">Compare Density</option>
                         <option value="overlay">Overlay</option>
+                        <option value="color-burn">Color Burn</option>
+                        <option value="linear-burn">Linear Burn</option>
+                        <option value="height">Height</option>
                         <option value="outline">Outline</option>
                       </select>
                     </div>

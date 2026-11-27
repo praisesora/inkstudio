@@ -420,6 +420,34 @@ export class StrokePipeline {
   }
 
   /**
+   * Reconciles the initial seeded knot's pressure and width with the first real hardware
+   * pointermove sample when initial pen touchdown was deferred (prevents 0.5 sentinel / click spikes).
+   */
+  public updateSeedKnotPressure(
+    pressure: number,
+    width: number,
+    timestamp: number = 0,
+    tiltX?: number,
+    tiltY?: number
+  ): void {
+    if (this.knotCount === 1) {
+      this.knotP0.pressure = pressure;
+      this.knotP0.width = width;
+      this.knotP1.pressure = pressure;
+      this.knotP1.width = width;
+      if (tiltX !== undefined && tiltY !== undefined) {
+        this.knotP0.tiltX = tiltX;
+        this.knotP0.tiltY = tiltY;
+        this.knotP1.tiltX = tiltX;
+        this.knotP1.tiltY = tiltY;
+      }
+    }
+    if (this.stabilizerLevel > 0) {
+      this.stabilizer.resetPressureState(pressure, timestamp || this.lastRawTime);
+    }
+  }
+
+  /**
    * Advances the deterministic Catmull-Rom + corner-snapping spline window using an already-stabilized
    * sample (e.g. remote STROKE_CHUNK preview points) without double-applying input stabilization.
    */
@@ -548,6 +576,124 @@ export class StrokePipeline {
         isCorner = false;
       }
 
+      const cornerPlan =
+        this.stabilizerLevel > 0 && isCorner ? this.stabilizer.consumeCornerPlan() : null;
+
+      if (cornerPlan) {
+        // Walk a short, smooth sub-path from current stabilized tail -> corner apex -> target
+        // in bounded steps (<= 10 screen px) so sharp corners never jump across lag in one straight line.
+        const clampedZoom = Math.max(0.15, Math.min(4.0, this.zoomScale));
+        const maxStepDoc = 10.0 / clampedZoom;
+        const startX = cornerPlan.startX;
+        const startY = cornerPlan.startY;
+        const apexX = cornerPlan.apexX;
+        const apexY = cornerPlan.apexY;
+        const targetX = cornerPlan.targetX;
+        const targetY = cornerPlan.targetY;
+
+        const leg1Dist = Math.hypot(apexX - startX, apexY - startY);
+        const leg2Dist = Math.hypot(targetX - apexX, targetY - apexY);
+        const leg1Steps = leg1Dist > 1.0 / clampedZoom ? Math.min(6, Math.max(1, Math.ceil(leg1Dist / maxStepDoc))) : 0;
+        const leg2Steps = leg2Dist > 1.0 / clampedZoom ? Math.min(6, Math.max(1, Math.ceil(leg2Dist / maxStepDoc))) : 1;
+        const totalSubSteps = leg1Steps + leg2Steps;
+
+        const calibratedStabPressure = evaluateGlobalPressureCurve(
+          stabPressure,
+          this.globalPressureCurve
+        );
+        const sample = this.scratchSample;
+        sample.tiltX = tiltX;
+        sample.tiltY = tiltY;
+        sample.twist = twist;
+        sample.timestamp = timeMs;
+        sample.vx = vx;
+        sample.vy = vy;
+        sample.pointerType = pointerType;
+
+        if (options?.resolvePoint) {
+          sample.opacity = calibratedStabPressure;
+          options.resolvePoint(
+            rawX,
+            rawY,
+            rawP,
+            calibratedStabPressure,
+            pointerType,
+            vx,
+            vy,
+            dtMs,
+            sample
+          );
+        } else {
+          const hasNonLinearGlobalCurve = Boolean(
+            this.globalPressureCurve &&
+              this.globalPressureCurve.enabled &&
+              !isLinearPressureCurve(this.globalPressureCurve.points)
+          );
+          const mappedPressure = hasNonLinearGlobalCurve
+            ? calibratedStabPressure
+            : this.taperEngine.mapPressure(calibratedStabPressure);
+          const smoothPressure = this.taperEngine.smoothPressure(mappedPressure);
+          sample.pressure = smoothPressure;
+          sample.width = Math.max(0.5, this.baseBrushSize * smoothPressure);
+          sample.opacity = Math.max(0, Math.min(1, smoothPressure));
+        }
+
+        let stepIdx = 0;
+        const emitSubStep = (sx: number, sy: number, markCorner: boolean) => {
+          stepIdx++;
+          sample.x = sx;
+          sample.y = sy;
+          sample.isCorner = markCorner;
+          this.expandDirtyRect(sx, sy, sample.width + padExtra);
+          options?.onPoint?.(sample);
+          this.advanceSplineKnot(
+            sx,
+            sy,
+            sample.pressure,
+            sample.width,
+            sample.tiltX,
+            sample.tiltY,
+            sample.twist,
+            sample.timestamp,
+            sample.vx,
+            sample.vy,
+            markCorner,
+            padExtra,
+            options?.onSegment
+          );
+        };
+
+        for (let k = 1; k <= leg1Steps; k++) {
+          const t = k / leg1Steps;
+          const isFinal = stepIdx + 1 === totalSubSteps;
+          emitSubStep(startX + (apexX - startX) * t, startY + (apexY - startY) * t, isFinal);
+        }
+        for (let k = 1; k <= leg2Steps; k++) {
+          const t = k / leg2Steps;
+          const isFinal = k === leg2Steps;
+          emitSubStep(apexX + (targetX - apexX) * t, apexY + (targetY - apexY) * t, isFinal);
+        }
+
+        this.stabilizer.settleAfterCornerSubPath(targetX, targetY);
+        this.lastRawX = targetX;
+        this.lastRawY = targetY;
+        this.lastRawTime = timeMs;
+        this.lastVx = vx;
+        this.lastVy = vy;
+        this.hasLastRaw = true;
+        continue;
+      }
+
+      // When stabilized, suppress degenerate micro-knots (<0.25 screen px) from deadzone or glitch-hold
+      // so zero-length chords never collapse or skew Catmull-Rom tangents on fast strokes.
+      if (this.stabilizerLevel > 0 && !isCorner && this.knotCount >= 1) {
+        const lastKnot = this.knotCount === 1 ? this.knotP1 : this.knotP2;
+        const minKnotDoc = 0.25 / Math.max(0.15, Math.min(4.0, this.zoomScale));
+        if (Math.hypot(outX - lastKnot.x, outY - lastKnot.y) < minKnotDoc) {
+          continue;
+        }
+      }
+
       this.lastRawX = outX;
       this.lastRawY = outY;
       this.lastRawTime = timeMs;
@@ -645,9 +791,64 @@ export class StrokePipeline {
     );
     onSegment(bridgeSeg);
 
-    // 2. Speculative lookahead strictly from hardware getPredictedEvents()
+    this.copyKnot(this.scratchPrevPredPt, this.knotP2);
+
+    // 2. Low-latency provisional bridge from stabilized tail toward live raw stylus coordinate
+    if (this.stabilizerLevel > 0) {
+      const catchUp = this.stabilizer.getCatchUpTarget();
+      const clampedZoom = Math.max(0.15, Math.min(4.0, this.zoomScale));
+      const minBridgeDoc = 0.75 / clampedZoom;
+      const maxBridgeDoc = Math.max(maxPredDist * 1.5, 28.0 / clampedZoom);
+      const dxRaw = catchUp.x - this.scratchPrevPredPt.x;
+      const dyRaw = catchUp.y - this.scratchPrevPredPt.y;
+      const distRaw = Math.hypot(dxRaw, dyRaw);
+      if (distRaw >= minBridgeDoc && distRaw <= maxBridgeDoc * 2.5) {
+        const clampScale = distRaw > maxBridgeDoc ? maxBridgeDoc / distRaw : 1.0;
+        const tipX = this.scratchPrevPredPt.x + dxRaw * clampScale;
+        const tipY = this.scratchPrevPredPt.y + dyRaw * clampScale;
+
+        // Curve gently through s1 guide point when lag is notable so provisional bridge follows arcs smoothly
+        const midDx = catchUp.midX - this.scratchPrevPredPt.x;
+        const midDy = catchUp.midY - this.scratchPrevPredPt.y;
+        const midDist = Math.hypot(midDx, midDy);
+        if (midDist >= minBridgeDoc && midDist < distRaw * 0.85) {
+          this.scratchPredPt.x = this.scratchPrevPredPt.x + midDx * clampScale;
+          this.scratchPredPt.y = this.scratchPrevPredPt.y + midDy * clampScale;
+          this.scratchPredPt.pressure = this.scratchPrevPredPt.pressure;
+          this.scratchPredPt.width = this.scratchPrevPredPt.width;
+          this.scratchPredPt.tiltX = this.knotP2.tiltX;
+          this.scratchPredPt.tiltY = this.knotP2.tiltY;
+          this.scratchPredPt.twist = this.knotP2.twist;
+          const midSeg = this.splineGen.generateProvisionalSegment(
+            this.scratchPrevPredPt,
+            this.scratchPredPt,
+            vel.vx,
+            vel.vy
+          );
+          onSegment(midSeg);
+          this.copyKnot(this.scratchPrevPredPt, this.scratchPredPt);
+        }
+
+        this.scratchPredPt.x = tipX;
+        this.scratchPredPt.y = tipY;
+        this.scratchPredPt.pressure = this.scratchPrevPredPt.pressure;
+        this.scratchPredPt.width = this.scratchPrevPredPt.width;
+        this.scratchPredPt.tiltX = this.knotP2.tiltX;
+        this.scratchPredPt.tiltY = this.knotP2.tiltY;
+        this.scratchPredPt.twist = this.knotP2.twist;
+        const rawSeg = this.splineGen.generateProvisionalSegment(
+          this.scratchPrevPredPt,
+          this.scratchPredPt,
+          vel.vx,
+          vel.vy
+        );
+        onSegment(rawSeg);
+        this.copyKnot(this.scratchPrevPredPt, this.scratchPredPt);
+      }
+    }
+
+    // 3. Speculative lookahead strictly from hardware getPredictedEvents()
     if (predictedDocCoords && predictedDocCoords.length > 0) {
-      this.copyKnot(this.scratchPrevPredPt, this.knotP2);
       for (let i = 0; i < predictedDocCoords.length; i++) {
         const raw = predictedDocCoords[i];
         const dx = raw.x - this.scratchPrevPredPt.x;
@@ -686,6 +887,66 @@ export class StrokePipeline {
     const padExtra = options?.dirtyPadExtra ?? 0;
 
     if (this.knotCount >= 2) {
+      // Smoothly catch up residual stabilizer lag all the way to the true pen-lift coordinate (rawX, rawY),
+      // curving gently through the 1st-stage guide point (s1) so curved tails close naturally without cutting short.
+      if (this.stabilizerLevel > 0) {
+        const catchUp = this.stabilizer.getCatchUpTarget();
+        const clampedZoom = Math.max(0.15, Math.min(4.0, this.zoomScale));
+        const minCatchUpDoc = 0.75 / clampedZoom;
+        if (catchUp.lagDist > minCatchUpDoc) {
+          const lagScreen = catchUp.lagDist * clampedZoom;
+          const steps = Math.min(6, Math.max(2, Math.ceil(lagScreen / 5.0)));
+          const startX = this.knotP2.x;
+          const startY = this.knotP2.y;
+          const ctrlX = catchUp.midX;
+          const ctrlY = catchUp.midY;
+          const endX = catchUp.x;
+          const endY = catchUp.y;
+          const startP = this.knotP2.pressure;
+          const startW = this.knotP2.width;
+          const vel = this.getLastVelocity();
+          for (let i = 1; i <= steps; i++) {
+            const frac = i / steps;
+            const inv = 1.0 - frac;
+            // Quadratic Bézier from stabilized tail (s3) through s1 to exact raw pen-lift coordinate
+            const cx = inv * inv * startX + 2.0 * inv * frac * ctrlX + frac * frac * endX;
+            const cy = inv * inv * startY + 2.0 * inv * frac * ctrlY + frac * frac * endY;
+            const sample = this.scratchSample;
+            sample.x = cx;
+            sample.y = cy;
+            sample.pressure = startP;
+            sample.width = startW;
+            sample.opacity = Math.max(0, Math.min(1, startP));
+            sample.tiltX = this.knotP2.tiltX ?? 0;
+            sample.tiltY = this.knotP2.tiltY ?? 0;
+            sample.twist = this.knotP2.twist ?? 0;
+            sample.timestamp = endTimestampMs;
+            sample.isCorner = false;
+            sample.vx = vel.vx;
+            sample.vy = vel.vy;
+            sample.pointerType = 'pen';
+
+            this.expandDirtyRect(cx, cy, startW + padExtra);
+            options?.onPoint?.(sample);
+            this.advanceSplineKnot(
+              cx,
+              cy,
+              startP,
+              startW,
+              sample.tiltX,
+              sample.tiltY,
+              sample.twist,
+              endTimestampMs,
+              vel.vx,
+              vel.vy,
+              false,
+              padExtra,
+              options?.onSegment
+            );
+          }
+        }
+      }
+
       let flickCount = 0;
       let flickPoints: ReturnType<TaperEngine['computeFlickTaper']>['points'] = [];
       let velX = 0;

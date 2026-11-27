@@ -249,6 +249,35 @@ export class UndoCacheManager {
   }
 
   /**
+   * Returns true if tile deltas for this history item can be resolved synchronously
+   * without awaiting compressed RAM decompression, disk IPC, or an in-flight offload.
+   */
+  public canResolveDeltasSync(item: HistoryItem): boolean {
+    if (item.tileDeltas && item.tileDeltas.length > 0) {
+      return true;
+    }
+    return (
+      !this.inFlightOffloads.has(item.id) &&
+      !this.compressedRamCache.has(item.id) &&
+      !this.diskCachedIds.has(item.id)
+    );
+  }
+
+  /**
+   * Synchronously returns in-RAM tile deltas for a history item (pinning it against
+   * any in-flight offload). Only call when `canResolveDeltasSync(item)` is true.
+   */
+  public resolveDeltasSync(item: HistoryItem): TileDelta[] | null {
+    if (item.tileDeltas && item.tileDeltas.length > 0) {
+      if (this.inFlightOffloads.has(item.id)) {
+        this.keepInRamIds.add(item.id);
+      }
+      return item.tileDeltas;
+    }
+    return null;
+  }
+
+  /**
    * Retrieve tile deltas for a history item, restoring from compressed RAM or disk if necessary.
    */
   public async resolveDeltas(item: HistoryItem): Promise<TileDelta[] | null> {

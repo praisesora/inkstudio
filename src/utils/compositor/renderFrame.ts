@@ -45,6 +45,19 @@ export function renderFrame(
   state.currentOptions = _options;
   state.currentZoom = transform.zoom;
 
+  const optDraft = _options.activeDraftCanvas;
+  const optDraftLayerId = _options.activeDraftLayerId ?? null;
+  if (
+    !optDraft ||
+    optDraft.width <= 0 ||
+    optDraft.height <= 0 ||
+    (optDraft as any).__draftHasContent === false
+  ) {
+    state.draftNeedsFullUpload = true;
+  } else if (state.lastDraftLayerId !== optDraftLayerId) {
+    state.draftNeedsFullUpload = true;
+  }
+
   if (!gl || !state.program || !state.stdLocs) {
     render2DFallback(state, layers, transform, dimensions, grid, _options);
     return;

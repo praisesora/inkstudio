@@ -1,5 +1,6 @@
 import React, { useState, useRef } from 'react';
 import {
+  Droplets,
   Paintbrush,
   Palette,
   PenTool,
@@ -13,6 +14,7 @@ import {
   ChevronDown,
   ChevronRight,
   Sliders,
+  AlertTriangle,
 } from 'lucide-react';
 import { BrushCategory, BrushPresetId, CspBrush } from '../types/editor';
 import {
@@ -48,6 +50,7 @@ export interface SubToolListProps {
 function renderBuiltinIcon(icon: BuiltinBrushDefinition['icon']) {
   if (icon === 'pen') return <PenTool className="w-3 h-3 shrink-0 opacity-80" />;
   if (icon === 'pencil') return <Pencil className="w-3 h-3 shrink-0 opacity-80" />;
+  if (icon === 'droplets') return <Droplets className="w-3 h-3 shrink-0 text-sky-300/85" />;
   if (icon === 'palette') return <Palette className="w-3 h-3 shrink-0 text-rose-300/85" />;
   return <Paintbrush className="w-3 h-3 shrink-0 opacity-80" />;
 }
@@ -102,6 +105,17 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
           ),
         ]);
         saveActivePresetId(parsedBrush.id);
+        if (parsedBrush.importWarnings && parsedBrush.importWarnings.length > 0) {
+          const count = parsedBrush.importWarnings.length;
+          const first = parsedBrush.importWarnings[0];
+          uiStoreActions.showToast(
+            count === 1
+              ? `Imported "${parsedBrush.name}" (Notice: ${first})`
+              : `Imported "${parsedBrush.name}" with ${count} CSP import notices — check inspector`
+          );
+        } else {
+          uiStoreActions.showToast(`Imported brush "${parsedBrush.name}"`);
+        }
       } catch (err: unknown) {
         const msg =
           err instanceof Error ? err.message : 'Failed to import brush file.';
@@ -386,6 +400,15 @@ export const SubToolList: React.FC<SubToolListProps> = React.memo(
                           <Paintbrush className="w-3 h-3 shrink-0 opacity-70" />
                         )}
                         <span className="text-[11px] truncate leading-tight">{brush.name}</span>
+                        {brush.importWarnings && brush.importWarnings.length > 0 && (
+                          <span
+                            title={brush.importWarnings.join('\n')}
+                            className="text-amber-400 shrink-0"
+                            aria-label="Import warning"
+                          >
+                            <AlertTriangle className="w-2.5 h-2.5" />
+                          </span>
+                        )}
                       </div>
                       <div className="flex items-center gap-1 shrink-0">
                         <button

@@ -247,6 +247,12 @@ export interface AppSettings {
   // Auto-Updater (Desktop)
   autoCheckUpdates: boolean;
   skippedUpdateVersion: string;
+
+  // Collaborative Drawing (Optional WebRTC Signaling & TURN)
+  collabSignalingUrl: string;
+  collabTurnUrl: string;
+  collabTurnUsername: string;
+  collabTurnCredential: string;
 }
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
@@ -302,6 +308,11 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
 
   autoCheckUpdates: true,
   skippedUpdateVersion: '',
+
+  collabSignalingUrl: '',
+  collabTurnUrl: '',
+  collabTurnUsername: '',
+  collabTurnCredential: '',
 };
 
 const VALID_MODIFIER_ACTIONS = new Set<ModifierAction>([
@@ -565,6 +576,22 @@ export function loadAppSettings(): AppSettings {
         typeof parsed.skippedUpdateVersion === 'string'
           ? parsed.skippedUpdateVersion.trim()
           : DEFAULT_APP_SETTINGS.skippedUpdateVersion;
+      const validCollabSignalingUrl: string =
+        typeof parsed.collabSignalingUrl === 'string' && !parsed.collabSignalingUrl.includes('\0')
+          ? parsed.collabSignalingUrl.trim().slice(0, 512)
+          : DEFAULT_APP_SETTINGS.collabSignalingUrl;
+      const validCollabTurnUrl: string =
+        typeof parsed.collabTurnUrl === 'string' && !parsed.collabTurnUrl.includes('\0')
+          ? parsed.collabTurnUrl.trim().slice(0, 512)
+          : DEFAULT_APP_SETTINGS.collabTurnUrl;
+      const validCollabTurnUsername: string =
+        typeof parsed.collabTurnUsername === 'string' && !parsed.collabTurnUsername.includes('\0')
+          ? parsed.collabTurnUsername.trim().slice(0, 256)
+          : DEFAULT_APP_SETTINGS.collabTurnUsername;
+      const validCollabTurnCredential: string =
+        typeof parsed.collabTurnCredential === 'string' && !parsed.collabTurnCredential.includes('\0')
+          ? parsed.collabTurnCredential.trim().slice(0, 256)
+          : DEFAULT_APP_SETTINGS.collabTurnCredential;
       return {
         ...DEFAULT_APP_SETTINGS,
         ...parsed,
@@ -575,6 +602,10 @@ export function loadAppSettings(): AppSettings {
         modernCustomColor: validCustomColor,
         uiTone: validTone,
         maxHistorySteps: validMaxHistorySteps,
+        collabSignalingUrl: validCollabSignalingUrl,
+        collabTurnUrl: validCollabTurnUrl,
+        collabTurnUsername: validCollabTurnUsername,
+        collabTurnCredential: validCollabTurnCredential,
         autoOptimizePerformance: validAutoOptimizePerformance,
         tileMemoryBudgetMb: validBudget,
         memoryAllocationPercent: validMemoryPercent,

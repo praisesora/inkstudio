@@ -1,7 +1,7 @@
 {
   "name": "ink-studio",
   "private": true,
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Collaborative Drawing Studio",
   "author": "Sora",
   "license": "GPL-3.0",

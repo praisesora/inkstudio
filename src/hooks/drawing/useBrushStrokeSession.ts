@@ -14,10 +14,13 @@ import { useToolStore, toolStoreActions } from '../../stores';
 import { recoveryService } from '../../services/recoveryService';
 import { isNativeRustAvailable } from '../../utils/nativeBackend';
 import {
-  NativeTabletSample,
   startNativeTablet,
   subscribeNativeTablet,
 } from '../../utils/nativeTabletInput';
+import {
+  NativeTabletBridgeState,
+  processNativeTabletBatch,
+} from './brushStrokeSession/nativeTabletBridge';
 import {
   StrokeSessionHelpers,
   StrokeSessionState,
@@ -174,6 +177,11 @@ export function useBrushStrokeSession(
     []
   );
 
+  const nativeBridgeStateRef = useRef<NativeTabletBridgeState>({
+    nativeStrokeActive: false,
+    prevToolBeforeEraserFlip: null,
+  });
+
   const abortActiveStroke = useCallback(() => {
     abortActiveStrokeSession(
       { isDrawingRef, effectiveDraftCanvasRef, activeTileGridRef, interactionRef },
@@ -181,6 +189,13 @@ export function useBrushStrokeSession(
       clearPredictedCanvas,
       emitConstraintAxisChange
     );
+    const bridge = nativeBridgeStateRef.current;
+    bridge.nativeStrokeActive = false;
+    if (bridge.prevToolBeforeEraserFlip !== null) {
+      const prev = bridge.prevToolBeforeEraserFlip;
+      bridge.prevToolBeforeEraserFlip = null;
+      toolStoreActions.selectTool(prev);
+    }
   }, [
     activeTileGridRef,
     clearPredictedCanvas,
@@ -279,7 +294,8 @@ export function useBrushStrokeSession(
       useWireframeEraser: boolean,
       canvas: HTMLCanvasElement | null,
       activeLayer: LayerItem | undefined,
-      gpuBatch: GpuDab[] | undefined
+      gpuBatch: GpuDab[] | undefined,
+      precomputedBrushOpts?: BrushRenderOptions
     ) => {
       emitLiveSegmentToDraft(
         sessionStateRef.current!,
@@ -298,7 +314,8 @@ export function useBrushStrokeSession(
         useWireframeEraser,
         canvas,
         activeLayer,
-        gpuBatch
+        gpuBatch,
+        precomputedBrushOpts
       );
     },
     []
@@ -392,9 +409,9 @@ export function useBrushStrokeSession(
   useEffect(() => {
     if (!isNativeRustAvailable()) return;
 
-    const NATIVE_PEN_POINTER_ID = -1001;
-    let nativeStrokeActive = false;
-    let prevToolBeforeEraserFlip: ToolType | null = null;
+    const bridgeState = nativeBridgeStateRef.current;
+    bridgeState.nativeStrokeActive = false;
+    bridgeState.prevToolBeforeEraserFlip = null;
     const modKeys = { shift: false, alt: false };
 
     const onKeyDown = (ev: KeyboardEvent) => {
@@ -407,30 +424,6 @@ export function useBrushStrokeSession(
     };
     window.addEventListener('keydown', onKeyDown, true);
     window.addEventListener('keyup', onKeyUp, true);
-
-    const makeSyntheticEvent = (s: NativeTabletSample): React.PointerEvent<HTMLElement> => {
-      const evt: any = {
-        pointerId: NATIVE_PEN_POINTER_ID,
-        pointerType: 'pen',
-        button: 0,
-        buttons: s.buttons & 1 ? 1 : 0,
-        clientX: s.clientX,
-        clientY: s.clientY,
-        pressure: s.pressure,
-        tiltX: s.tiltX,
-        tiltY: s.tiltY,
-        twist: s.twist,
-        timeStamp: s.timestamp,
-        shiftKey: modKeys.shift,
-        altKey: modKeys.alt,
-        ctrlKey: false,
-        metaKey: false,
-        preventDefault() {},
-        stopPropagation() {},
-      };
-      evt.nativeEvent = evt;
-      return evt as React.PointerEvent<HTMLElement>;
-    };
 
     const isPointOverCanvasViewport = (x: number, y: number): boolean => {
       const vp = viewportRef.current;
@@ -452,61 +445,21 @@ export function useBrushStrokeSession(
       const helpers = helpersRef.current;
       if (!state || !helpers) return;
 
-      const curTool = helpers.getTool();
-      const isBrushOrEraser = curTool === 'brush' || curTool === 'eraser';
-
-      let i = 0;
-      while (i < batch.length) {
-        const s = batch[i];
-
-        if (s.phase === 1) {
-          // Pen down
-          if (
-            !paramsRef.current.disabled &&
-            isBrushOrEraser &&
-            isPointOverCanvasViewport(s.clientX, s.clientY)
-          ) {
-            const isTailEraser = (s.buttons & 8) !== 0;
-            if (isTailEraser && curTool !== 'eraser') {
-              prevToolBeforeEraserFlip = curTool;
-              toolStoreActions.selectTool('eraser');
-            }
-            nativeStrokeActive = true;
-            runPointerDown(state, paramsRef.current, helpers, makeSyntheticEvent(s));
-          }
-          i++;
-        } else if (s.phase === 2) {
-          // Batch all contiguous drag samples in this hardware burst
-          const coalesced: PointerEvent[] = [];
-          while (i < batch.length && batch[i].phase === 2) {
-            coalesced.push(makeSyntheticEvent(batch[i]) as unknown as PointerEvent);
-            i++;
-          }
-          if (nativeStrokeActive && coalesced.length > 0) {
-            const last = coalesced[coalesced.length - 1] as unknown as React.PointerEvent<HTMLElement>;
-            runPointerMove(state, paramsRef.current, helpers, last, coalesced);
-          }
-        } else if (s.phase === 3 || s.phase === 4) {
-          // Pen up or leave
-          if (nativeStrokeActive) {
-            nativeStrokeActive = false;
-            runPointerUp(state, paramsRef.current, helpers, makeSyntheticEvent(s));
-            if (prevToolBeforeEraserFlip !== null) {
-              const prev = prevToolBeforeEraserFlip;
-              prevToolBeforeEraserFlip = null;
-              toolStoreActions.selectTool(prev);
-            }
-          }
-          i++;
-        } else {
-          // Hover (phase 0)
-          if (!nativeStrokeActive && isPointOverCanvasViewport(s.clientX, s.clientY)) {
-            const pt = helpers.getCanvasPoint(makeSyntheticEvent(s));
-            helpers.dispatchPointerStat(pt.x, pt.y, pt.pressure);
-          }
-          i++;
-        }
-      }
+      processNativeTabletBatch(batch, bridgeState, modKeys, {
+        getTool: helpers.getTool,
+        selectTool: (tool) => toolStoreActions.selectTool(tool),
+        isDisabled: () => paramsRef.current.disabled,
+        isStrokeActive: () => paramsRef.current.isDrawingRef.current,
+        isPointOverCanvasViewport,
+        onPointerDown: (evt) => runPointerDown(state, paramsRef.current, helpers, evt),
+        onPointerMove: (lastEvt, coalesced) =>
+          runPointerMove(state, paramsRef.current, helpers, lastEvt, coalesced),
+        onPointerUp: (evt) => runPointerUp(state, paramsRef.current, helpers, evt),
+        onHover: (evt) => {
+          const pt = helpers.getCanvasPoint(evt);
+          helpers.dispatchPointerStat(pt.x, pt.y, pt.pressure);
+        },
+      });
     });
 
     return () => {

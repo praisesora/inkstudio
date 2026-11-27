@@ -436,6 +436,10 @@ export function useDocumentLifecycle({
 
   const handleResizeCanvas = useCallback(
     (options: ResizeCanvasOptions) => {
+      if (multiplayerService.isConnected() && multiplayerService.getLocalRole() === 'viewer') {
+        showToast('Viewers have read-only access');
+        return;
+      }
       const curDims = useDocumentStore.getState().dimensions;
       const newDims: CanvasDimensions = {
         width: options.width,
@@ -516,7 +520,16 @@ export function useDocumentLifecycle({
         try {
           uiStoreActions.setLoading(true, `Importing Brush: ${file.name}...`);
           const parsedBrush = await importBrushFile(file);
-          showToast(`Imported brush "${parsedBrush.name}"`);
+          if (parsedBrush.importWarnings && parsedBrush.importWarnings.length > 0) {
+            const count = parsedBrush.importWarnings.length;
+            showToast(
+              count === 1
+                ? `Imported "${parsedBrush.name}" (Notice: ${parsedBrush.importWarnings[0]})`
+                : `Imported "${parsedBrush.name}" with ${count} CSP import notices — check inspector`
+            );
+          } else {
+            showToast(`Imported brush "${parsedBrush.name}"`);
+          }
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : 'Failed to import brush file.';
           showToast(msg);

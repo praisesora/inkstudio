@@ -60,7 +60,7 @@ export interface Point {
   isCorner?: boolean;
 }
 
-export type BrushCategory = 'pen' | 'sketch' | 'brush' | 'natural-paint';
+export type BrushCategory = 'pen' | 'sketch' | 'brush' | 'blend' | 'natural-paint';
 
 export type BrushRenderMode = 'stamp' | 'bristle-ribbon' | 'bristle-hybrid';
 
@@ -130,7 +130,7 @@ export interface NaturalPaintSettings {
 export const DEFAULT_NATURAL_PAINT_SETTINGS: NaturalPaintSettings = {
   enabled: false,
   spatialMixing: false,
-  pigmentMixingStrength: 0.85,
+  pigmentMixingStrength: 1.0,
   paintLoad: 0.85,
   depletionRate: 0.25,
   wetness: 0.5,
@@ -166,6 +166,7 @@ export type BrushPresetId =
   | 'g-pen'
   | 'real-g-pen'
   | 'textured-pen'
+  | 'rough-pen'
   | 'dot-pen'
   | 'calligraphy'
   // Sketch section
@@ -174,14 +175,23 @@ export type BrushPresetId =
   | 'pencil-6b-8b'
   | 'charcoal-pencil'
   | 'standard-chalk'
-  // Brush section
-  | 'oil-painting'
-  | 'thick-oil-painting'
-  | 'chalk-painting'
-  | 'blend-brush'
-  | 'blend-chalk-brush'
-  | 'soft-round'
-  | 'noise-shader'
+  // Brush section (Painterly Coloring & Illustration)
+  | 'oil-flat-alla-prima'
+  | 'thick-oil-impasto'
+  | 'dry-bristle-rake-paint'
+  | 'concept-matte-chalk'
+  | 'silky-portrait-round'
+  | 'canvas-scumble-oil'
+  | 'soft-glaze-airbrush'
+  | 'atmospheric-grain-shader'
+  | 'fine-detail-filbert'
+  // Blend section (Dedicated Pure Blenders)
+  | 'blend-velvet-soft'
+  | 'blend-oil-bristle'
+  | 'blend-matte-chalk'
+  | 'blend-rake-hair'
+  | 'blend-canvas-scumble'
+  | 'blend-fingertip'
   // Natural Paint section
   | 'impasto-bristle-oil'
   | 'wet-mixing-filbert'
@@ -204,6 +214,7 @@ export interface CspSubTip {
   width: number;
   height: number;
   isColor?: boolean;
+  isDualToneTip?: boolean;
 }
 
 export interface CspSpraySettings {
@@ -211,6 +222,14 @@ export interface CspSpraySettings {
   size: number;
   density: number;
   bias: number;
+  particleSize?: number; // CSP BrushSprayParticleSize
+  linkSize?: boolean; // CSP BrushSprayLinkSize
+  sizeSensor?: CspSensorConfig; // CSP BrushSpraySizeEffector
+  densitySensor?: CspSensorConfig; // CSP BrushSprayDensityEffector
+  direction?: number; // CSP BrushSprayDirection (degrees 0..360)
+  directionDynamics?: CspAngleDynamicsMode; // CSP BrushSprayDirectionEffector mode
+  directionSensor?: CspSensorConfig; // CSP BrushSprayDirectionEffector BLOB
+  deviation?: number; // CSP BrushSprayDeviation (-1..1)
 }
 
 export interface CspTaperSettings {
@@ -239,23 +258,83 @@ export interface CspTaperSettings {
 export type CspAntiAliasLevel = 0 | 1 | 2 | 3; // 0: None (Binary), 1: Weak, 2: Medium, 3: Strong
 
 export type CspPaperTextureMode =
+  | 'normal'
   | 'multiply'
   | 'subtract'
   | 'compare'
   | 'overlay'
+  | 'color-burn'
+  | 'linear-burn'
+  | 'height'
   | 'outline';
 
 export type CspBlendTipsMode = 'normal' | 'darken' | 'compare';
+
+export type CspBrushCombineMode =
+  | BlendMode
+  | 'add'
+  | 'behind'
+  | 'clear'
+  | 'compare-density';
+
+export type CspSubTipOrder =
+  | 'sequential'
+  | 'reverse'
+  | 'random'
+  | 'random-no-repeat'
+  | 'once'
+  | 'direction';
 
 export type CspTipFlipMode = 'none' | 'random' | 'alternate';
 
 export type CspAngleDynamicsMode =
   | 'none'
+  | 'initial-direction'
   | 'direction'
   | 'tilt'
   | 'twist'
   | 'random'
   | 'direction-random';
+
+export type DualBrushCompositeMode =
+  | 'multiply'
+  | 'darken'
+  | 'subtract'
+  | 'compare-density'
+  | 'linear-burn'
+  | 'color-burn'
+  | 'height'
+  | 'overlay'
+  | 'screen'
+  | 'lighten'
+  | 'hard-mix'
+  | 'normal';
+
+export interface CspDualBrushConfig {
+  enabled: boolean;
+  compositeMode: DualBrushCompositeMode;
+  linkSizeWithMain?: boolean;
+  size?: number;
+  sizeRatio?: number;
+  spacing?: number;
+  scatter?: number;
+  thickness?: number;
+  thicknessVertical?: boolean;
+  hardness?: number;
+  density?: number;
+  angle?: number;
+  angleDynamics?: CspAngleDynamicsMode;
+  angleSensor?: CspSensorConfig;
+  flipH?: CspTipFlipMode;
+  flipV?: CspTipFlipMode;
+  spray?: CspSpraySettings;
+  tipDataUrl?: string;
+  tipImage?: HTMLImageElement;
+  subTips?: CspSubTip[];
+  subTipImages?: HTMLImageElement[];
+  subTipOrder?: CspSubTipOrder;
+  isRibbon?: boolean;
+}
 
 export interface CspSensorConfig {
   usePressure?: boolean;
@@ -263,11 +342,15 @@ export interface CspSensorConfig {
   pressureCurve?: [number, number][];
   useTilt?: boolean;
   tiltMin?: number; // 0.0 to 1.0
+  tiltMax?: number; // 1.0 to 10.0 (CSP Tilt enlargement ceiling, e.g. 1.75 for 175%)
+  tiltCurve?: [number, number][];
+  invertTilt?: boolean;
   useTiltAzimuth?: boolean;
   useBarrelTwist?: boolean;
   twistMin?: number; // 0.0 to 1.0
   useVelocity?: boolean;
   velocityMin?: number; // 0.0 to 1.0
+  velocityCurve?: [number, number][];
   invertVelocity?: boolean;
   useDistance?: boolean;
   distanceMin?: number; // 0.0 to 1.0
@@ -286,11 +369,16 @@ export interface BrushDynamics {
   flowJitter: number; // 0.0 to 1.0
   // Color Dynamics
   colorJitterEnabled: boolean;
+  colorJitterPerStroke?: boolean; // CSP BrushChangeColorPerStroke (true = per stroke, false = per dab)
   hueJitter: number; // 0.0 to 1.0
   saturationJitter: number; // 0.0 to 1.0
   brightnessJitter: number; // 0.0 to 1.0
   temperatureJitter?: number; // 0.0 to 1.0 (warm-cool pigment shift)
   foregroundBackgroundJitter: number; // 0.0 to 1.0 (mix with secondary color)
+  subColorMixSensor?: CspSensorConfig;
+  hueJitterSensor?: CspSensorConfig;
+  saturationJitterSensor?: CspSensorConfig;
+  luminanceJitterSensor?: CspSensorConfig;
 }
 
 export const DEFAULT_BRUSH_DYNAMICS: BrushDynamics = {
@@ -322,15 +410,18 @@ export interface CspBrush {
   secondaryTipWidth?: number;
   secondaryTipHeight?: number;
   subTips?: CspSubTip[]; // Multiple tip array for patterned brushes
-  subTipOrder?: 'random' | 'sequential' | 'direction' | 'reverse';
+  subTipOrder?: CspSubTipOrder;
   size: number;
+  brushSizeUnit?: number; // CSP BrushSizeUnit (0=px, 1=mm, etc.)
+  brushSizeSpecifiedByScreen?: boolean; // CSP BrushSizeSpecifiedByScreen
   minSizeFactor: number;
   opacity: number;
   flow: number;
   spacing: number;
   hardness: number;
-  thickness: number; // 0.05 to 1.0 (elliptical aspect ratio)
+  thickness: number; // 0.05 to 20.0 (elliptical aspect ratio)
   thicknessVertical?: boolean;
+  thicknessSensor?: CspSensorConfig;
   angle: number;
   angleDynamics?: CspAngleDynamicsMode;
   rotationRandomScale?: number; // 0.0 to 1.0
@@ -351,10 +442,12 @@ export interface CspBrush {
   brushDensity?: number; // 0.0 to 1.0 (CSP Brush Density)
   adjustDensityByGap?: boolean; // CSP Adjust brush density by gap
   blendTipsMode?: CspBlendTipsMode; // normal | darken | compare
-  brushCombineMode?: BlendMode;
+  brushCombineMode?: CspBrushCombineMode;
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  intervalSensor?: CspSensorConfig;
+  textureDensitySensor?: CspSensorConfig;
   bristleSplaySensor?: CspSensorConfig;
   paintLoadSensor?: CspSensorConfig;
   grainPenetrationSensor?: CspSensorConfig;
@@ -366,11 +459,17 @@ export interface CspBrush {
   amountOfPaint?: number; // 0.0 to 1.0 (CSP: Amount of Paint)
   densityOfPaint?: number; // 0.0 to 1.0 (CSP: Density of Paint)
   colorStretch?: number; // 0.0 to 1.0 (CSP: Color Stretch along stroke length)
+  amountOfPaintSensor?: CspSensorConfig; // CSP BrushMixColorEffector
+  densityOfPaintSensor?: CspSensorConfig; // CSP BrushMixAlphaEffector
+  colorStretchSensor?: CspSensorConfig; // CSP BrushMixColorExtensionEffector
+  mixGroundColor?: boolean; // CSP BrushMixGroundColor (mix with underlying visible layers)
+  useBlur?: boolean; // CSP BrushUseBlur
+  blurStrength?: number; // 0.0 to 1.0 (CSP BrushBlur)
   mixingMode?: NaturalMixingMode; // CSP / Natural Paint mixing mode
   wetEdge?: number; // 0.0 to 1.0 (CSP: Watercolor Wet / Water Edge)
   wetEdgeRadius?: number;
-  wetEdgeAlphaPower?: number;
-  wetEdgeValuePower?: number;
+  wetEdgeAlphaPower?: number; // Normalized 0.0 to 1.0
+  wetEdgeValuePower?: number; // Normalized 0.0 to 1.0
   paperTexture?: string; // Paper grain texture data URL
   surfaceTextureId?: SurfaceTextureId; // Built-in 512x512 seamless surface texture ID
   grainMappingMode?: GrainMappingMode; // Spatial grain mapping mode
@@ -379,15 +478,32 @@ export interface CspBrush {
   paperTextureBrightness?: number; // -100 to 100
   paperTextureContrast?: number; // -100 to 100
   paperTextureApplyEachPlot?: boolean;
+  paperTextureEmphasizeDensity?: boolean;
   paperTextureScale?: number;
   paperTextureRotate?: number;
+  paperTextureOffsetX?: number;
+  paperTextureOffsetY?: number;
   paperTextureInverted?: boolean;
   dualBrush?: boolean; // CSP Dual Brush compositing
-  dualBrushCompositeMode?: string;
+  dualBrushConfig?: CspDualBrushConfig;
+  dualBrushCompositeMode?: DualBrushCompositeMode | string;
   dualSize?: number;
+  dualLinkSize?: boolean;
   dualSpacing?: number;
   dualScatter?: number;
+  dualThickness?: number;
+  dualThicknessVertical?: boolean;
   dualAngle?: number;
+  dualAngleDynamics?: CspAngleDynamicsMode;
+  dualAngleSensor?: CspSensorConfig;
+  dualHardness?: number;
+  dualDensity?: number;
+  dualSubTips?: CspSubTip[];
+  dualSubTipOrder?: CspSubTipOrder;
+  dualFlipH?: CspTipFlipMode;
+  dualFlipV?: CspTipFlipMode;
+  dualSpray?: CspSpraySettings;
+  dualIsRibbon?: boolean;
   dualScale?: number;
   dualSurfaceTextureId?: SurfaceTextureId;
   dualGrainDepth?: number;
@@ -395,6 +511,7 @@ export interface CspBrush {
   taper?: CspTaperSettings;
   isRibbon?: boolean;
   isColorTip?: boolean;
+  isDualToneTip?: boolean;
   pressureCurveGamma?: number; // CSP Pressure response curve gamma
   velocityDynamics?: boolean; // Velocity-based taper
   dynamics?: BrushDynamics; // Multi-axis jitter matrix
@@ -403,11 +520,14 @@ export interface CspBrush {
   bristle?: BristleSettings;
   naturalPaint?: NaturalPaintSettings;
   impasto?: ImpastoSettings;
+  importWarnings?: string[]; // Non-fatal diagnostics (e.g., missing external CSP CatalogPath materials)
   importedAt: number;
 }
 
 export interface BrushSettings {
   size: number;
+  brushSizeUnit?: number;
+  brushSizeSpecifiedByScreen?: boolean;
   minSizeFactor: number; // minimum width ratio at lowest pressure (e.g. 0.2)
   color: string;
   secondaryColor?: string; // Secondary / background color for color dynamics
@@ -416,7 +536,7 @@ export interface BrushSettings {
   brushDensity?: number; // Explicit CSP Brush Density alias (0.0 to 1.0)
   adjustDensityByGap?: boolean; // CSP Adjust brush density by gap
   blendTipsMode?: CspBlendTipsMode; // CSP Blend brush tips with darken / compare
-  brushCombineMode?: BlendMode;
+  brushCombineMode?: CspBrushCombineMode;
   spacing: number; // Spacing between stamps (0.01 to 1.0)
   usePressure: boolean;
   useTilt?: boolean; // Explicit pen tilt sensitivity toggle (default false except pencils/tilt brushes)
@@ -427,8 +547,9 @@ export interface BrushSettings {
   postCorrection?: number; // 0 to 5 (CSP Post-correction spline refinement)
   sharpCorners?: boolean; // CSP Sharp angles corner-snapping toggle
   hardness: number; // Brush hardness (0.0 to 1.0)
-  thickness?: number; // Elliptical thickness ratio (0.05 to 1.0)
+  thickness?: number; // Elliptical thickness ratio (0.05 to 20.0)
   thicknessVertical?: boolean;
+  thicknessSensor?: CspSensorConfig;
   flipH?: CspTipFlipMode;
   flipV?: CspTipFlipMode;
   antiAlias?: number; // 0: none, 1: low, 2: mid, 3: high
@@ -438,6 +559,8 @@ export interface BrushSettings {
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  intervalSensor?: CspSensorConfig;
+  textureDensitySensor?: CspSensorConfig;
   bristleSplaySensor?: CspSensorConfig;
   paintLoadSensor?: CspSensorConfig;
   grainPenetrationSensor?: CspSensorConfig;
@@ -450,9 +573,10 @@ export interface BrushSettings {
   customTipAngleDynamics?: CspAngleDynamicsMode;
   customTipRotationRandomScale?: number;
   isColorTip?: boolean;
+  isDualToneTip?: boolean;
   brushName?: string; // Custom display name
   subTips?: CspSubTip[];
-  subTipOrder?: 'random' | 'sequential' | 'direction' | 'reverse';
+  subTipOrder?: CspSubTipOrder;
   subTipImages?: HTMLImageElement[];
   pressureCurve?: [number, number][];
   velocityCurve?: [number, number][];
@@ -465,11 +589,17 @@ export interface BrushSettings {
   amountOfPaint?: number; // 0.0 to 1.0 (default 0.7)
   densityOfPaint?: number; // 0.0 to 1.0 (default 0.8)
   colorStretch?: number; // 0.0 to 1.0 (default 0.6)
+  amountOfPaintSensor?: CspSensorConfig;
+  densityOfPaintSensor?: CspSensorConfig;
+  colorStretchSensor?: CspSensorConfig;
+  mixGroundColor?: boolean;
+  useBlur?: boolean;
+  blurStrength?: number;
   mixingMode?: NaturalMixingMode; // 'blend', 'running_color', 'smear', or 'impasto_mix'
   wetEdge?: number; // 0.0 to 1.0 (CSP Water Edge rim density)
   wetEdgeRadius?: number;
-  wetEdgeAlphaPower?: number;
-  wetEdgeValuePower?: number;
+  wetEdgeAlphaPower?: number; // Normalized 0.0 to 1.0
+  wetEdgeValuePower?: number; // Normalized 0.0 to 1.0
   paperTexture?: string; // Optional paper texture data URL
   paperTextureImage?: HTMLImageElement; // Preloaded paper grain image
   surfaceTextureId?: SurfaceTextureId; // Built-in 512x512 seamless surface texture ID
@@ -479,15 +609,33 @@ export interface BrushSettings {
   paperTextureBrightness?: number;
   paperTextureContrast?: number;
   paperTextureApplyEachPlot?: boolean;
+  paperTextureEmphasizeDensity?: boolean;
   paperTextureInverted?: boolean;
   paperTextureScale?: number;
   paperTextureRotate?: number;
+  paperTextureOffsetX?: number;
+  paperTextureOffsetY?: number;
   dualBrush?: boolean;
-  dualBrushCompositeMode?: 'multiply' | 'subtract' | 'darken' | 'overlay' | 'screen' | string;
+  dualBrushConfig?: CspDualBrushConfig;
+  dualBrushCompositeMode?: DualBrushCompositeMode | string;
   dualSize?: number;
+  dualLinkSize?: boolean;
   dualSpacing?: number;
   dualScatter?: number;
+  dualThickness?: number;
+  dualThicknessVertical?: boolean;
   dualAngle?: number;
+  dualAngleDynamics?: CspAngleDynamicsMode;
+  dualAngleSensor?: CspSensorConfig;
+  dualHardness?: number;
+  dualDensity?: number;
+  dualSubTips?: CspSubTip[];
+  dualSubTipImages?: HTMLImageElement[];
+  dualSubTipOrder?: CspSubTipOrder;
+  dualFlipH?: CspTipFlipMode;
+  dualFlipV?: CspTipFlipMode;
+  dualSpray?: CspSpraySettings;
+  dualIsRibbon?: boolean;
   dualScale?: number;
   dualSurfaceTextureId?: SurfaceTextureId;
   dualGrainDepth?: number;
@@ -503,6 +651,7 @@ export interface BrushSettings {
   bristle?: BristleSettings;
   naturalPaint?: NaturalPaintSettings;
   impasto?: ImpastoSettings;
+  importWarnings?: string[];
 }
 
 export interface OnionSkinSettings {

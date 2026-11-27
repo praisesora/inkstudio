@@ -82,7 +82,7 @@ export const NaturalPaintMixingTab: React.FC<BrushStudioTabProps> = ({ bs, onPat
         <PigmentBlendControl
           variant="studio"
           label="Color Blending"
-          strengthLabel="Kubelka-Munk Pigment Strength"
+          strengthLabel="Pigment Strength"
           enabled={bs.perceptualMixing !== false}
           onEnabledChange={(enabled) => onPatch({ perceptualMixing: enabled })}
           strength={np.pigmentMixingStrength}
@@ -140,6 +140,27 @@ export const NaturalPaintMixingTab: React.FC<BrushStudioTabProps> = ({ bs, onPat
           valueLabel={`${Math.round((bs.colorStretch ?? 0.65) * 100)}%`}
           onChange={(v) => onPatch({ colorStretch: v / 100 })}
         />
+        <StudioToggle
+          label="Optical Blend Blur"
+          description="Isotropic smoothing pass on picked-up canvas color for silky blending"
+          checked={Boolean(bs.useBlur)}
+          onChange={(v) =>
+            onPatch({
+              useBlur: v,
+              blurStrength: v ? bs.blurStrength ?? 0.35 : bs.blurStrength,
+            })
+          }
+        />
+        {bs.useBlur && (
+          <StudioSlider
+            label="Blur Strength"
+            value={Math.round((bs.blurStrength ?? 0.35) * 100)}
+            min={5}
+            max={100}
+            valueLabel={`${Math.round((bs.blurStrength ?? 0.35) * 100)}%`}
+            onChange={(v) => onPatch({ blurStrength: v / 100 })}
+          />
+        )}
         <StudioSlider
           label="Charge per Pressure"
           value={Math.round(np.chargePerPressure * 100)}
@@ -527,6 +548,7 @@ export interface AboutPresetsTabProps extends BrushStudioTabProps {
 }
 
 export const AboutPresetsTab: React.FC<AboutPresetsTabProps> = ({
+  bs,
   brushName,
   onBrushNameChange,
   category,
@@ -543,6 +565,18 @@ export const AboutPresetsTab: React.FC<AboutPresetsTabProps> = ({
 
   return (
     <div className="space-y-4">
+      {bs.importWarnings && bs.importWarnings.length > 0 && (
+        <div className="p-2.5 rounded bg-amber-500/10 border border-amber-400/25 space-y-1.5">
+          <div className="text-[11px] font-medium text-amber-300">
+            CSP Import Notices ({bs.importWarnings.length})
+          </div>
+          <ul className="pl-4 list-disc space-y-1 text-[10.5px] leading-snug text-amber-100/90">
+            {bs.importWarnings.map((w, idx) => (
+              <li key={idx}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       <div className="p-2.5 rounded bg-[#181818] border border-white/[0.06] space-y-3">
         <div className="space-y-1">
           <label className="text-[11px] text-[#a3a3a3]">Brush Name</label>
@@ -561,10 +595,11 @@ export const AboutPresetsTab: React.FC<AboutPresetsTabProps> = ({
             onChange={(e) => onCategoryChange(e.target.value as BrushCategory | 'custom')}
             className="w-full px-2.5 py-1.5 rounded bg-[#111111] border border-white/10 text-[12px] text-[#f5f5f5]"
           >
-            <option value="natural-paint">Natural Paint</option>
-            <option value="brush">Brush</option>
-            <option value="sketch">Sketch</option>
             <option value="pen">Pen</option>
+            <option value="sketch">Sketch</option>
+            <option value="brush">Brush</option>
+            <option value="blend">Blend</option>
+            <option value="natural-paint">Natural Paint</option>
             <option value="custom">Custom</option>
           </select>
         </div>

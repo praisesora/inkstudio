@@ -1,7 +1,6 @@
 import { zipSync, unzipSync, strToU8, strFromU8 } from 'fflate';
 import {
   ALL_BLEND_MODES,
-  BlendMode,
   BristleProfilePreset,
   BristleSettings,
   BrushCategory,
@@ -11,10 +10,13 @@ import {
   CspAngleDynamicsMode,
   CspBlendTipsMode,
   CspBrush,
+  CspBrushCombineMode,
+  CspDualBrushConfig,
   CspPaperTextureMode,
   CspSensorConfig,
   CspSpraySettings,
   CspSubTip,
+  CspSubTipOrder,
   CspTaperSettings,
   CspTipFlipMode,
   GrainMappingMode,
@@ -32,6 +34,7 @@ import {
   saveCustomBrush,
 } from './brushStorage';
 import { parseSutFile } from './sutParser';
+import { normalizeDualBrushCompositeMode } from '../engine/DualBrushEngine';
 import { toolStoreActions } from '../stores';
 
 export const INKB_FORMAT = 'inkb';
@@ -44,9 +47,17 @@ const MAX_SUB_TIPS = 32;
 const MAX_CURVE_POINTS = 64;
 const SAFE_RASTER_DATA_URL_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=]+$/i;
 
-const VALID_SUBTIP_ORDERS = new Set(['random', 'sequential', 'direction', 'reverse']);
+const VALID_SUBTIP_ORDERS = new Set<CspSubTipOrder>([
+  'random',
+  'random-no-repeat',
+  'sequential',
+  'direction',
+  'reverse',
+  'once',
+]);
 const VALID_ANGLE_DYNAMICS = new Set<CspAngleDynamicsMode>([
   'none',
+  'initial-direction',
   'direction',
   'tilt',
   'twist',
@@ -62,10 +73,14 @@ const VALID_MIXING_MODES = new Set<NaturalMixingMode>([
   'impasto_mix',
 ]);
 const VALID_TEXTURE_MODES = new Set<CspPaperTextureMode>([
+  'normal',
   'multiply',
   'subtract',
   'compare',
   'overlay',
+  'color-burn',
+  'linear-burn',
+  'height',
   'outline',
 ]);
 const VALID_RENDER_MODES = new Set<BrushRenderMode>(['stamp', 'bristle-ribbon', 'bristle-hybrid']);
@@ -97,10 +112,17 @@ const VALID_CATEGORIES = new Set<BrushCategory | 'custom'>([
   'pen',
   'sketch',
   'brush',
+  'blend',
   'natural-paint',
   'custom',
 ]);
-const VALID_BLEND_MODES = new Set<BlendMode>(ALL_BLEND_MODES);
+const VALID_BRUSH_COMBINE_MODES = new Set<CspBrushCombineMode>([
+  ...ALL_BLEND_MODES,
+  'add',
+  'behind',
+  'clear',
+  'compare-density',
+]);
 
 interface InkbArchivePayload {
   format: typeof INKB_FORMAT;
@@ -158,6 +180,11 @@ function sanitizeSensor(val: unknown): CspSensorConfig | undefined {
   if (typeof s.useTilt === 'boolean') out.useTilt = s.useTilt;
   const tMin = optNum(s.tiltMin, 0, 1);
   if (tMin !== undefined) out.tiltMin = tMin;
+  const tMax = optNum(s.tiltMax, 1, 10);
+  if (tMax !== undefined && tMax > 1) out.tiltMax = tMax;
+  const tCurve = sanitizeCurve(s.tiltCurve);
+  if (tCurve) out.tiltCurve = tCurve;
+  if (typeof s.invertTilt === 'boolean') out.invertTilt = s.invertTilt;
   if (typeof s.useTiltAzimuth === 'boolean') out.useTiltAzimuth = s.useTiltAzimuth;
   if (typeof s.useBarrelTwist === 'boolean') out.useBarrelTwist = s.useBarrelTwist;
   const twMin = optNum(s.twistMin, 0, 1);
@@ -165,6 +192,8 @@ function sanitizeSensor(val: unknown): CspSensorConfig | undefined {
   if (typeof s.useVelocity === 'boolean') out.useVelocity = s.useVelocity;
   const vMin = optNum(s.velocityMin, 0, 1);
   if (vMin !== undefined) out.velocityMin = vMin;
+  const vCurve = sanitizeCurve(s.velocityCurve);
+  if (vCurve) out.velocityCurve = vCurve;
   if (typeof s.invertVelocity === 'boolean') out.invertVelocity = s.invertVelocity;
   if (typeof s.useDistance === 'boolean') out.useDistance = s.useDistance;
   const dMin = optNum(s.distanceMin, 0, 1);
@@ -233,12 +262,33 @@ function sanitizeSpray(val: unknown): CspSpraySettings | undefined {
   if (!val || typeof val !== 'object' || Array.isArray(val)) return undefined;
   const s = val as Record<string, unknown>;
   if (typeof s.enabled !== 'boolean') return undefined;
-  return {
+  const out: CspSpraySettings = {
     enabled: s.enabled,
     size: clampNum(s.size, 0, 1000, 10),
     density: clampNum(s.density, 0, 100, 5),
     bias: clampNum(s.bias, -100, 100, 0),
   };
+  const particleSize = optNum(s.particleSize, 0.5, 2000);
+  if (particleSize !== undefined) out.particleSize = particleSize;
+  const linkSize = optBool(s.linkSize);
+  if (linkSize !== undefined) out.linkSize = linkSize;
+  const sizeSensor = sanitizeSensor(s.sizeSensor);
+  if (sizeSensor) out.sizeSensor = sizeSensor;
+  const densitySensor = sanitizeSensor(s.densitySensor);
+  if (densitySensor) out.densitySensor = densitySensor;
+  const direction = optNum(s.direction, -360, 360);
+  if (direction !== undefined) out.direction = direction;
+  if (
+    typeof s.directionDynamics === 'string' &&
+    VALID_ANGLE_DYNAMICS.has(s.directionDynamics as CspAngleDynamicsMode)
+  ) {
+    out.directionDynamics = s.directionDynamics as CspAngleDynamicsMode;
+  }
+  const directionSensor = sanitizeSensor(s.directionSensor);
+  if (directionSensor) out.directionSensor = directionSensor;
+  const deviation = optNum(s.deviation, -1, 1);
+  if (deviation !== undefined) out.deviation = deviation;
+  return out;
 }
 
 function sanitizeTaper(val: unknown): CspTaperSettings | undefined {
@@ -280,11 +330,16 @@ function sanitizeDynamics(val: unknown): BrushDynamics | undefined {
     count: Math.round(clampNum(d.count, 1, 10, 1)),
     flowJitter: clampNum(d.flowJitter, 0, 1, 0),
     colorJitterEnabled: Boolean(d.colorJitterEnabled),
+    colorJitterPerStroke: optBool(d.colorJitterPerStroke),
     hueJitter: clampNum(d.hueJitter, 0, 1, 0),
     saturationJitter: clampNum(d.saturationJitter, 0, 1, 0),
     brightnessJitter: clampNum(d.brightnessJitter, 0, 1, 0),
     temperatureJitter: optNum(d.temperatureJitter, 0, 1),
     foregroundBackgroundJitter: clampNum(d.foregroundBackgroundJitter, 0, 1, 0),
+    subColorMixSensor: sanitizeSensor(d.subColorMixSensor),
+    hueJitterSensor: sanitizeSensor(d.hueJitterSensor),
+    saturationJitterSensor: sanitizeSensor(d.saturationJitterSensor),
+    luminanceJitterSensor: sanitizeSensor(d.luminanceJitterSensor),
   };
 }
 
@@ -301,9 +356,90 @@ function sanitizeSubTips(val: unknown): CspSubTip[] | undefined {
       width: Math.round(clampNum(st.width, 1, 4096, 128)),
       height: Math.round(clampNum(st.height, 1, 4096, 128)),
       isColor: optBool(st.isColor),
+      isDualToneTip: optBool(st.isDualToneTip),
     });
   }
   return out.length > 0 ? out : undefined;
+}
+
+function sanitizeDualBrushConfig(val: unknown): CspDualBrushConfig | undefined {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) return undefined;
+  const d = val as Record<string, unknown>;
+  if (typeof d.enabled !== 'boolean') return undefined;
+  const out: CspDualBrushConfig = {
+    enabled: d.enabled,
+    compositeMode: normalizeDualBrushCompositeMode(
+      typeof d.compositeMode === 'string' ? d.compositeMode : undefined
+    ),
+  };
+  const linkSizeWithMain = optBool(d.linkSizeWithMain);
+  if (linkSizeWithMain !== undefined) out.linkSizeWithMain = linkSizeWithMain;
+  const size = optNum(d.size, 0.5, 2000);
+  if (size !== undefined) out.size = size;
+  const sizeRatio = optNum(d.sizeRatio, 0.01, 20);
+  if (sizeRatio !== undefined) out.sizeRatio = sizeRatio;
+  const spacing = optNum(d.spacing, 0.003, 5);
+  if (spacing !== undefined) out.spacing = spacing;
+  const scatter = optNum(d.scatter, 0, 5);
+  if (scatter !== undefined) out.scatter = scatter;
+  const thickness = optNum(d.thickness, 0.05, 20);
+  if (thickness !== undefined) out.thickness = thickness;
+  const thicknessVertical = optBool(d.thicknessVertical);
+  if (thicknessVertical !== undefined) out.thicknessVertical = thicknessVertical;
+  const hardness = optNum(d.hardness, 0, 1);
+  if (hardness !== undefined) out.hardness = hardness;
+  const density = optNum(d.density, 0, 1);
+  if (density !== undefined) out.density = density;
+  const angle = optNum(d.angle, -360, 360);
+  if (angle !== undefined) out.angle = angle;
+  if (
+    typeof d.angleDynamics === 'string' &&
+    VALID_ANGLE_DYNAMICS.has(d.angleDynamics as CspAngleDynamicsMode)
+  ) {
+    out.angleDynamics = d.angleDynamics as CspAngleDynamicsMode;
+  }
+  const angleSensor = sanitizeSensor(d.angleSensor);
+  if (angleSensor) out.angleSensor = angleSensor;
+  if (typeof d.flipH === 'string' && VALID_FLIP_MODES.has(d.flipH as CspTipFlipMode)) {
+    out.flipH = d.flipH as CspTipFlipMode;
+  }
+  if (typeof d.flipV === 'string' && VALID_FLIP_MODES.has(d.flipV as CspTipFlipMode)) {
+    out.flipV = d.flipV as CspTipFlipMode;
+  }
+  const spray = sanitizeSpray(d.spray);
+  if (spray) out.spray = spray;
+  const tipDataUrl = sanitizeDataUrl(d.tipDataUrl);
+  if (tipDataUrl) out.tipDataUrl = tipDataUrl;
+  const subTips = sanitizeSubTips(d.subTips);
+  if (subTips) out.subTips = subTips;
+  if (
+    typeof d.subTipOrder === 'string' &&
+    VALID_SUBTIP_ORDERS.has(d.subTipOrder as CspSubTipOrder)
+  ) {
+    out.subTipOrder = d.subTipOrder as CspSubTipOrder;
+  }
+  const isRibbon = optBool(d.isRibbon);
+  if (isRibbon !== undefined) out.isRibbon = isRibbon;
+  return out;
+}
+
+function sanitizeImportWarnings(val: unknown): string[] | undefined {
+  if (!Array.isArray(val) || val.length === 0) return undefined;
+  const out: string[] = [];
+  for (const item of val.slice(0, 32)) {
+    if (typeof item !== 'string') continue;
+    const cleaned = item.replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 500);
+    if (cleaned) out.push(cleaned);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function stripDomImagesFromDualConfig(
+  cfg: CspDualBrushConfig | undefined
+): CspDualBrushConfig | undefined {
+  if (!cfg) return undefined;
+  const { tipImage: _ti, subTipImages: _sti, ...clean } = cfg;
+  return clean;
 }
 
 function sanitizeBrushName(raw: unknown, fallbackFileName?: string): string {
@@ -360,13 +496,16 @@ export function buildExportableBrush(
     subTips: merged.subTips ?? existingCustom?.subTips,
     subTipOrder: merged.subTipOrder ?? existingCustom?.subTipOrder,
     size: clampNum(merged.size, 0.5, 2000, 12),
+    brushSizeUnit: merged.brushSizeUnit,
+    brushSizeSpecifiedByScreen: merged.brushSizeSpecifiedByScreen,
     minSizeFactor: clampNum(merged.minSizeFactor, 0, 1, 0.1),
     opacity: clampNum(merged.opacity, 0.01, 1, 1),
     flow: clampNum(merged.flow, 0.01, 1, 1),
     spacing: clampNum(merged.spacing, 0.01, 5, 0.05),
     hardness: clampNum(merged.hardness, 0, 1, 0.9),
-    thickness: clampNum(merged.thickness, 0.05, 1, 1),
+    thickness: clampNum(merged.thickness, 0.05, 20, 1),
     thicknessVertical: merged.thicknessVertical,
+    thicknessSensor: merged.thicknessSensor,
     angle: clampNum(merged.customTipAngle ?? existingCustom?.angle, -360, 360, 0),
     angleDynamics: merged.customTipAngleDynamics ?? existingCustom?.angleDynamics,
     rotationRandomScale: merged.customTipRotationRandomScale ?? existingCustom?.rotationRandomScale,
@@ -390,6 +529,8 @@ export function buildExportableBrush(
     sizeSensor: merged.sizeSensor,
     opacitySensor: merged.opacitySensor,
     densitySensor: merged.densitySensor,
+    intervalSensor: merged.intervalSensor,
+    textureDensitySensor: merged.textureDensitySensor,
     bristleSplaySensor: merged.bristleSplaySensor,
     paintLoadSensor: merged.paintLoadSensor,
     grainPenetrationSensor: merged.grainPenetrationSensor,
@@ -400,6 +541,12 @@ export function buildExportableBrush(
     amountOfPaint: merged.amountOfPaint,
     densityOfPaint: merged.densityOfPaint,
     colorStretch: merged.colorStretch,
+    amountOfPaintSensor: merged.amountOfPaintSensor,
+    densityOfPaintSensor: merged.densityOfPaintSensor,
+    colorStretchSensor: merged.colorStretchSensor,
+    mixGroundColor: merged.mixGroundColor,
+    useBlur: merged.useBlur,
+    blurStrength: merged.blurStrength,
     mixingMode: merged.mixingMode,
     wetEdge: merged.wetEdge,
     wetEdgeRadius: merged.wetEdgeRadius,
@@ -413,15 +560,34 @@ export function buildExportableBrush(
     paperTextureBrightness: merged.paperTextureBrightness,
     paperTextureContrast: merged.paperTextureContrast,
     paperTextureApplyEachPlot: merged.paperTextureApplyEachPlot,
+    paperTextureEmphasizeDensity: merged.paperTextureEmphasizeDensity,
     paperTextureInverted: merged.paperTextureInverted,
     paperTextureScale: merged.paperTextureScale,
     paperTextureRotate: merged.paperTextureRotate,
+    paperTextureOffsetX: merged.paperTextureOffsetX,
+    paperTextureOffsetY: merged.paperTextureOffsetY,
     dualBrush: merged.dualBrush,
+    dualBrushConfig: stripDomImagesFromDualConfig(
+      merged.dualBrushConfig ?? existingCustom?.dualBrushConfig
+    ),
     dualBrushCompositeMode: merged.dualBrushCompositeMode,
     dualSize: merged.dualSize,
+    dualLinkSize: merged.dualLinkSize,
     dualSpacing: merged.dualSpacing,
     dualScatter: merged.dualScatter,
+    dualThickness: merged.dualThickness,
+    dualThicknessVertical: merged.dualThicknessVertical,
     dualAngle: merged.dualAngle,
+    dualAngleDynamics: merged.dualAngleDynamics,
+    dualAngleSensor: merged.dualAngleSensor,
+    dualHardness: merged.dualHardness,
+    dualDensity: merged.dualDensity,
+    dualSubTips: merged.dualSubTips ?? existingCustom?.dualSubTips,
+    dualSubTipOrder: merged.dualSubTipOrder ?? existingCustom?.dualSubTipOrder,
+    dualFlipH: merged.dualFlipH,
+    dualFlipV: merged.dualFlipV,
+    dualSpray: merged.dualSpray,
+    dualIsRibbon: merged.dualIsRibbon,
     dualScale: merged.dualScale,
     dualSurfaceTextureId: merged.dualSurfaceTextureId,
     dualGrainDepth: merged.dualGrainDepth,
@@ -429,6 +595,7 @@ export function buildExportableBrush(
     taper: merged.taper,
     isRibbon: merged.isRibbon,
     isColorTip: merged.isColorTip,
+    isDualToneTip: merged.isDualToneTip,
     pressureCurveGamma: merged.pressureCurveGamma,
     velocityDynamics: merged.velocityDynamics,
     dynamics: merged.dynamics,
@@ -436,6 +603,7 @@ export function buildExportableBrush(
     bristle: merged.bristle,
     naturalPaint: merged.naturalPaint,
     impasto: merged.impasto,
+    importWarnings: merged.importWarnings ?? existingCustom?.importWarnings,
     importedAt: Date.now(),
   };
 }
@@ -450,6 +618,7 @@ export function serializeInkbBrush(brush: CspBrush): Uint8Array {
     exportedAt: Date.now(),
     brush: {
       ...brush,
+      dualBrushConfig: stripDomImagesFromDualConfig(brush.dualBrushConfig),
       badge: 'INKB',
     },
   };
@@ -538,17 +707,20 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     secondaryTipHeight: optNum(b.secondaryTipHeight, 1, 4096),
     subTips: sanitizeSubTips(b.subTips),
     subTipOrder:
-      typeof b.subTipOrder === 'string' && VALID_SUBTIP_ORDERS.has(b.subTipOrder)
+      typeof b.subTipOrder === 'string' && VALID_SUBTIP_ORDERS.has(b.subTipOrder as CspSubTipOrder)
         ? (b.subTipOrder as CspBrush['subTipOrder'])
         : undefined,
     size: clampNum(b.size, 0.5, 2000, 12),
+    brushSizeUnit: optNum(b.brushSizeUnit, 0, 10),
+    brushSizeSpecifiedByScreen: optBool(b.brushSizeSpecifiedByScreen),
     minSizeFactor: clampNum(b.minSizeFactor, 0, 1, 0.1),
     opacity: clampNum(b.opacity, 0.01, 1, 1),
     flow: clampNum(b.flow, 0.01, 1, 1),
     spacing: clampNum(b.spacing, 0.01, 5, 0.05),
     hardness: clampNum(b.hardness, 0, 1, 0.9),
-    thickness: clampNum(b.thickness, 0.05, 1, 1),
+    thickness: clampNum(b.thickness, 0.05, 20, 1),
     thicknessVertical: optBool(b.thicknessVertical),
+    thicknessSensor: sanitizeSensor(b.thicknessSensor),
     angle: clampNum(b.angle, -360, 360, 0),
     angleDynamics:
       typeof b.angleDynamics === 'string' &&
@@ -584,12 +756,14 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
         : undefined,
     brushCombineMode:
       typeof b.brushCombineMode === 'string' &&
-      VALID_BLEND_MODES.has(b.brushCombineMode as BlendMode)
-        ? (b.brushCombineMode as BlendMode)
+      VALID_BRUSH_COMBINE_MODES.has(b.brushCombineMode as CspBrushCombineMode)
+        ? (b.brushCombineMode as CspBrushCombineMode)
         : undefined,
     sizeSensor: sanitizeSensor(b.sizeSensor),
     opacitySensor: sanitizeSensor(b.opacitySensor),
     densitySensor: sanitizeSensor(b.densitySensor),
+    intervalSensor: sanitizeSensor(b.intervalSensor),
+    textureDensitySensor: sanitizeSensor(b.textureDensitySensor),
     bristleSplaySensor: sanitizeSensor(b.bristleSplaySensor),
     paintLoadSensor: sanitizeSensor(b.paintLoadSensor),
     grainPenetrationSensor: sanitizeSensor(b.grainPenetrationSensor),
@@ -600,14 +774,30 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     amountOfPaint: optNum(b.amountOfPaint, 0, 1),
     densityOfPaint: optNum(b.densityOfPaint, 0, 1),
     colorStretch: optNum(b.colorStretch, 0, 1),
+    amountOfPaintSensor: sanitizeSensor(b.amountOfPaintSensor),
+    densityOfPaintSensor: sanitizeSensor(b.densityOfPaintSensor),
+    colorStretchSensor: sanitizeSensor(b.colorStretchSensor),
+    mixGroundColor: optBool(b.mixGroundColor),
+    useBlur: optBool(b.useBlur),
+    blurStrength: optNum(b.blurStrength, 0, 1),
     mixingMode:
       typeof b.mixingMode === 'string' && VALID_MIXING_MODES.has(b.mixingMode as NaturalMixingMode)
         ? (b.mixingMode as CspBrush['mixingMode'])
         : undefined,
     wetEdge: optNum(b.wetEdge, 0, 1),
     wetEdgeRadius: optNum(b.wetEdgeRadius, 0, 100),
-    wetEdgeAlphaPower: optNum(b.wetEdgeAlphaPower, 0, 10),
-    wetEdgeValuePower: optNum(b.wetEdgeValuePower, 0, 10),
+    wetEdgeAlphaPower:
+      typeof b.wetEdgeAlphaPower === 'number' && Number.isFinite(b.wetEdgeAlphaPower)
+        ? b.wetEdgeAlphaPower > 1
+          ? Math.max(0, Math.min(1, b.wetEdgeAlphaPower / 100))
+          : Math.max(0, Math.min(1, b.wetEdgeAlphaPower))
+        : undefined,
+    wetEdgeValuePower:
+      typeof b.wetEdgeValuePower === 'number' && Number.isFinite(b.wetEdgeValuePower)
+        ? b.wetEdgeValuePower > 1
+          ? Math.max(0, Math.min(1, b.wetEdgeValuePower / 100))
+          : Math.max(0, Math.min(1, b.wetEdgeValuePower))
+        : undefined,
     paperTexture: sanitizeDataUrl(b.paperTexture),
     surfaceTextureId:
       typeof b.surfaceTextureId === 'string' &&
@@ -628,16 +818,47 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     paperTextureBrightness: optNum(b.paperTextureBrightness, -100, 100),
     paperTextureContrast: optNum(b.paperTextureContrast, -100, 100),
     paperTextureApplyEachPlot: optBool(b.paperTextureApplyEachPlot),
+    paperTextureEmphasizeDensity: optBool(b.paperTextureEmphasizeDensity),
     paperTextureScale: optNum(b.paperTextureScale, 0.05, 20),
     paperTextureRotate: optNum(b.paperTextureRotate, -360, 360),
+    paperTextureOffsetX: optNum(b.paperTextureOffsetX, -10000, 10000),
+    paperTextureOffsetY: optNum(b.paperTextureOffsetY, -10000, 10000),
     paperTextureInverted: optBool(b.paperTextureInverted),
     dualBrush: optBool(b.dualBrush),
+    dualBrushConfig: sanitizeDualBrushConfig(b.dualBrushConfig),
     dualBrushCompositeMode:
       typeof b.dualBrushCompositeMode === 'string' ? b.dualBrushCompositeMode.slice(0, 32) : undefined,
     dualSize: optNum(b.dualSize, 0.5, 2000),
-    dualSpacing: optNum(b.dualSpacing, 0.01, 5),
+    dualLinkSize: optBool(b.dualLinkSize),
+    dualSpacing: optNum(b.dualSpacing, 0.003, 5),
     dualScatter: optNum(b.dualScatter, 0, 5),
+    dualThickness: optNum(b.dualThickness, 0.05, 20),
+    dualThicknessVertical: optBool(b.dualThicknessVertical),
     dualAngle: optNum(b.dualAngle, -360, 360),
+    dualAngleDynamics:
+      typeof b.dualAngleDynamics === 'string' &&
+      VALID_ANGLE_DYNAMICS.has(b.dualAngleDynamics as CspAngleDynamicsMode)
+        ? (b.dualAngleDynamics as CspAngleDynamicsMode)
+        : undefined,
+    dualAngleSensor: sanitizeSensor(b.dualAngleSensor),
+    dualHardness: optNum(b.dualHardness, 0, 1),
+    dualDensity: optNum(b.dualDensity, 0, 1),
+    dualSubTips: sanitizeSubTips(b.dualSubTips),
+    dualSubTipOrder:
+      typeof b.dualSubTipOrder === 'string' &&
+      VALID_SUBTIP_ORDERS.has(b.dualSubTipOrder as CspSubTipOrder)
+        ? (b.dualSubTipOrder as CspSubTipOrder)
+        : undefined,
+    dualFlipH:
+      typeof b.dualFlipH === 'string' && VALID_FLIP_MODES.has(b.dualFlipH as CspTipFlipMode)
+        ? (b.dualFlipH as CspTipFlipMode)
+        : undefined,
+    dualFlipV:
+      typeof b.dualFlipV === 'string' && VALID_FLIP_MODES.has(b.dualFlipV as CspTipFlipMode)
+        ? (b.dualFlipV as CspTipFlipMode)
+        : undefined,
+    dualSpray: sanitizeSpray(b.dualSpray),
+    dualIsRibbon: optBool(b.dualIsRibbon),
     dualScale: optNum(b.dualScale, 0.05, 10),
     dualSurfaceTextureId:
       typeof b.dualSurfaceTextureId === 'string' &&
@@ -649,6 +870,7 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     taper: sanitizeTaper(b.taper),
     isRibbon: optBool(b.isRibbon),
     isColorTip: optBool(b.isColorTip),
+    isDualToneTip: optBool(b.isDualToneTip),
     pressureCurveGamma: optNum(b.pressureCurveGamma, 0.1, 5),
     velocityDynamics: optBool(b.velocityDynamics),
     dynamics: sanitizeDynamics(b.dynamics),
@@ -659,6 +881,7 @@ export function parseInkbFile(buffer: ArrayBuffer, fileName: string = 'Brush.ink
     bristle: sanitizeBristle(b.bristle),
     naturalPaint: sanitizeNaturalPaint(b.naturalPaint),
     impasto: sanitizeImpasto(b.impasto),
+    importWarnings: sanitizeImportWarnings(b.importWarnings),
     importedAt: Date.now(),
   };
 }

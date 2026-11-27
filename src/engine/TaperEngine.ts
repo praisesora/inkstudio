@@ -20,10 +20,10 @@ export interface FlickConfig {
 }
 
 export const DEFAULT_PRESSURE_CONFIG: PressureConfig = {
-  deadzone: 0.02,
+  deadzone: 0.005,
   gamma: 1.85,
   midpoint: 0.45,
-  minPressure: 0.005,
+  minPressure: 0.012,
 };
 
 export const DEFAULT_FLICK_CONFIG: FlickConfig = {

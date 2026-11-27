@@ -2,6 +2,7 @@ import React from 'react';
 import {
   ToolType,
   BrushSettings,
+  CspBrushCombineMode,
   Point,
   CanvasDimensions,
   CanvasSelection,
@@ -24,7 +25,13 @@ export interface DraftCanvasElement extends HTMLCanvasElement {
   __draftDocRect?: { x: number; y: number; width: number; height: number };
   __draftScale?: number;
   __draftMonochrome?: boolean;
+  __draftPigmentStrength?: number;
+  __draftPigmentWhiteGround?: boolean;
+  __draftCombineMode?: CspBrushCombineMode;
   __draftVersion?: number;
+  __draftFrameDirtyRect?: { x: number; y: number; width: number; height: number } | null;
+  __draftForceFullUpload?: boolean;
+  __clipSaved?: boolean;
   __isBlank?: boolean;
   __isSolidWhite?: boolean;
 }

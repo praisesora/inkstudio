@@ -1,4 +1,4 @@
-mod clip_parser;
+pub mod clip_parser;
 mod doc_wire;
 mod psd_parser;
 mod raster_ops;

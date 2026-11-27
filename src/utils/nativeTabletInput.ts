@@ -42,6 +42,10 @@ let activeStatus: NativeTabletStatus = {
   maxPressure: 1024,
 };
 let lastPacketPerfMs = 0;
+let nativePenInProximity = false;
+let nativePenInContact = false;
+let lastNativeClientX = 0;
+let lastNativeClientY = 0;
 let startPromise: Promise<NativeTabletStatus> | null = null;
 
 /**
@@ -82,13 +86,102 @@ export function unpackTabletSampleBatch(raw: ArrayBuffer | Uint8Array | number[]
 }
 
 /**
+ * Updates internal native pen proximity/contact tracking from a received native tablet batch.
+ * Exported for deterministic unit testing of DOM pointer suppression logic.
+ */
+export function recordNativeTabletBatchForSuppression(
+  batch: ReadonlyArray<NativeTabletSample>,
+  nowMs?: number
+): void {
+  if (batch.length === 0) return;
+  lastPacketPerfMs =
+    nowMs !== undefined ? nowMs : typeof performance !== 'undefined' ? performance.now() : Date.now();
+  for (let i = 0; i < batch.length; i++) {
+    const s = batch[i];
+    if (s.phase === 1 || s.phase === 2) {
+      nativePenInProximity = true;
+      nativePenInContact = true;
+      lastNativeClientX = s.clientX;
+      lastNativeClientY = s.clientY;
+    } else if (s.phase === 0 || s.phase === 3) {
+      nativePenInProximity = true;
+      nativePenInContact = false;
+      lastNativeClientX = s.clientX;
+      lastNativeClientY = s.clientY;
+    } else if (s.phase === 4) {
+      const stillDown = (s.buttons & 1) !== 0 || s.pressure > 0.001;
+      if (!stillDown) {
+        nativePenInProximity = false;
+        nativePenInContact = false;
+      }
+    }
+  }
+}
+
+/**
+ * Resets internal native tablet stream state (for unit tests and shutdown).
+ */
+export function resetNativeTabletSuppressionState(activeOverride?: boolean): void {
+  lastPacketPerfMs = 0;
+  nativePenInProximity = false;
+  nativePenInContact = false;
+  lastNativeClientX = 0;
+  lastNativeClientY = 0;
+  if (activeOverride !== undefined) {
+    activeStatus = { ...activeStatus, active: activeOverride };
+  }
+}
+
+/**
  * Returns true if native WinTab / Windows Ink packets are currently active and recently received
  * (used to suppress redundant DOM `pointerType === 'pen'` PointerEvents).
  */
-export function isNativePenStreamActive(): boolean {
+export function isNativePenStreamActive(nowMs?: number): boolean {
   if (!activeStatus.active) return false;
-  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-  return now - lastPacketPerfMs < 250;
+  const now =
+    nowMs !== undefined ? nowMs : typeof performance !== 'undefined' ? performance.now() : Date.now();
+  return lastPacketPerfMs > 0 && now - lastPacketPerfMs < 1500;
+}
+
+/**
+ * Returns true if a DOM PointerEvent should be suppressed because the native WinTab / Windows Ink
+ * channel already owns this pen interaction.
+ *
+ * Critically suppresses WinTab `CXO_SYSTEM`-synthesized DOM `pointerType === 'mouse'` events
+ * (which carry constant `pressure = 0.5` and would otherwise abort/hijack active native pen strokes!),
+ * while allowing a separate physical mouse to work immediately once the stylus leaves proximity.
+ */
+export function shouldSuppressDomPointerEvent(
+  pointerType: string,
+  clientX: number,
+  clientY: number,
+  nowMs?: number
+): boolean {
+  if (!activeStatus.active || lastPacketPerfMs <= 0) return false;
+  const now =
+    nowMs !== undefined ? nowMs : typeof performance !== 'undefined' ? performance.now() : Date.now();
+  const elapsed = now - lastPacketPerfMs;
+
+  if (pointerType === 'pen') {
+    return elapsed < 1500;
+  }
+
+  if (pointerType === 'mouse') {
+    // Active native pen stroke: NEVER allow a WinTab-synthesized mouse event to abort or duplicate it
+    if (nativePenInContact && elapsed < 1500) {
+      return true;
+    }
+    // Stylus actively hovering/tracking in proximity: WinTab CXO_SYSTEM drives the OS mouse cursor
+    if (nativePenInProximity && elapsed < 400) {
+      return true;
+    }
+    // Brief post-lift/pre-down coincidence window at the exact pen cursor location
+    if (elapsed < 250 && Math.hypot(clientX - lastNativeClientX, clientY - lastNativeClientY) <= 24) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 export function getCachedTabletStatus(): NativeTabletStatus {
@@ -119,7 +212,7 @@ export async function startNativeTablet(mode: TabletInputMode = 'auto'): Promise
       channel.onmessage = (payload) => {
         const batch = unpackTabletSampleBatch(payload);
         if (batch.length === 0) return;
-        lastPacketPerfMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        recordNativeTabletBatchForSuppression(batch);
         for (const fn of listeners) {
           fn(batch);
         }
@@ -154,6 +247,7 @@ export async function stopNativeTablet(): Promise<void> {
   } catch {
     // Ignore shutdown errors
   }
+  resetNativeTabletSuppressionState(false);
   activeStatus = {
     ...activeStatus,
     active: false,

@@ -326,16 +326,37 @@ export async function parsePsdNative(
   return hydrateParsedDocumentBinary(toUint8Array(raw), fileName, targetGrid);
 }
 
+export type CspExpressionColor = 'color' | 'gray' | 'monochrome';
+
+export interface NativeSutMaterial {
+  pwId: string;
+  originalPath: string;
+  catalogPath: string;
+  fileData: Uint8Array;
+  decodedPng?: Uint8Array;
+  width?: number;
+  height?: number;
+  expressionColor?: CspExpressionColor;
+  isPaperTexture?: boolean;
+  hasSubColor?: boolean;
+  decodedFromLayer?: boolean;
+}
+
 export interface NativeSutExtract {
   nodeName: string | null;
+  nodeUuid?: string | null;
   variantId: number | null;
+  nodeInitVariantId?: number | null;
   variantValues: Map<string, unknown>;
-  materials: Array<{
-    pwId: string;
-    originalPath: string;
-    catalogPath: string;
-    fileData: Uint8Array;
-  }>;
+  dualVariantValues?: Map<string, unknown>;
+  materials: NativeSutMaterial[];
+}
+
+function normalizeExpressionColor(val: unknown): CspExpressionColor | undefined {
+  if (val === 'color' || val === 'gray' || val === 'monochrome') {
+    return val;
+  }
+  return undefined;
 }
 
 export async function parseSutSqliteNative(bytes: Uint8Array): Promise<NativeSutExtract> {
@@ -353,17 +374,32 @@ export async function parseSutSqliteNative(bytes: Uint8Array): Promise<NativeSut
   }
   const view = new DataView(wire.buffer, wire.byteOffset, wire.byteLength);
   const metaLen = view.getUint32(4, true);
+  if (8 + metaLen > wire.byteLength) {
+    throw new Error('Truncated SUTD metadata header');
+  }
   const meta = JSON.parse(utf8Decoder.decode(wire.subarray(8, 8 + metaLen))) as {
     nodeName: string | null;
+    nodeUuid?: string | null;
     variantId: number | null;
+    nodeInitVariantId?: number | null;
     variantScalars: Record<string, unknown>;
     variantBlobs: Record<string, { offset: number; len: number }>;
+    dualVariantScalars?: Record<string, unknown>;
+    dualVariantBlobs?: Record<string, { offset: number; len: number }>;
     materials: Array<{
       pwId: string;
       originalPath: string;
       catalogPath: string;
       fileDataOffset: number;
       fileDataLen: number;
+      decodedPngOffset?: number;
+      decodedPngLen?: number;
+      width?: number;
+      height?: number;
+      expressionColor?: string;
+      isPaperTexture?: boolean;
+      hasSubColor?: boolean;
+      decodedFromLayer?: boolean;
     }>;
   };
   const blobs = wire.subarray(8 + metaLen);
@@ -374,16 +410,50 @@ export async function parseSutSqliteNative(bytes: Uint8Array): Promise<NativeSut
   for (const [k, ref] of Object.entries(meta.variantBlobs)) {
     variantValues.set(k.toLowerCase(), blobs.subarray(ref.offset, ref.offset + ref.len));
   }
-  const materials = meta.materials.map((m) => ({
+
+  let dualVariantValues: Map<string, unknown> | undefined = undefined;
+  if (meta.dualVariantScalars || meta.dualVariantBlobs) {
+    const dualMap = new Map<string, unknown>();
+    if (meta.dualVariantScalars) {
+      for (const [k, v] of Object.entries(meta.dualVariantScalars)) {
+        dualMap.set(k.toLowerCase(), v);
+      }
+    }
+    if (meta.dualVariantBlobs) {
+      for (const [k, ref] of Object.entries(meta.dualVariantBlobs)) {
+        dualMap.set(k.toLowerCase(), blobs.subarray(ref.offset, ref.offset + ref.len));
+      }
+    }
+    if (dualMap.size > 0) {
+      dualVariantValues = dualMap;
+    }
+  }
+
+  const materials: NativeSutMaterial[] = meta.materials.map((m) => ({
     pwId: m.pwId,
     originalPath: m.originalPath,
     catalogPath: m.catalogPath,
     fileData: blobs.subarray(m.fileDataOffset, m.fileDataOffset + m.fileDataLen),
+    decodedPng:
+      typeof m.decodedPngOffset === 'number' &&
+      typeof m.decodedPngLen === 'number' &&
+      m.decodedPngLen > 0
+        ? blobs.subarray(m.decodedPngOffset, m.decodedPngOffset + m.decodedPngLen)
+        : undefined,
+    width: m.width,
+    height: m.height,
+    expressionColor: normalizeExpressionColor(m.expressionColor),
+    isPaperTexture: m.isPaperTexture,
+    hasSubColor: m.hasSubColor,
+    decodedFromLayer: m.decodedFromLayer,
   }));
   return {
     nodeName: meta.nodeName,
+    nodeUuid: meta.nodeUuid ?? null,
     variantId: meta.variantId,
+    nodeInitVariantId: meta.nodeInitVariantId ?? null,
     variantValues,
+    dualVariantValues,
     materials,
   };
 }

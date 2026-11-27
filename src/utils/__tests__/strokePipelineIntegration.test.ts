@@ -312,6 +312,100 @@ describe('StrokePipeline: Ring Buffer, Stabilization, Taper, Prediction & Bake D
     expect(encodePointerType('mouse')).toBe(POINTER_TYPE_MOUSE);
     expect(encodePointerType('touch')).toBe(POINTER_TYPE_TOUCH);
   });
+
+  it('keeps fast diagonal lines straight with zero anisotropy and suppresses mid-stroke twitches at stabilization 20', () => {
+    // 1. Asymmetric fast diagonal line (dx:dy = 4:3, ~2.5 px/ms = 2500 px/s) with coalesced identical timestamps
+    pipeline.beginStroke({ stabilizerLevel: 20, zoom: 1.0, sharpCorners: true, brushSize: 6 });
+    const dirX = 0.8;
+    const dirY = 0.6;
+    const normX = -dirY;
+    const normY = dirX;
+
+    let t = 1000;
+    for (let i = 0; i <= 40; i++) {
+      const dist = i * 10; // 400px total at 2.5 px/ms (4ms per step)
+      // Simulate realistic 4-packet coalesced bursts sharing identical frame timestamps
+      if (i > 0 && i % 4 === 0) t += 16;
+      pipeline.enqueueSample(dist * dirX, dist * dirY, 0.7, 0, 0, 0, t, POINTER_TYPE_PEN);
+    }
+
+    const straightPts: Array<{ x: number; y: number; isCorner: boolean }> = [];
+    pipeline.drain({
+      onPoint: (pt) => straightPts.push({ x: pt.x, y: pt.y, isCorner: pt.isCorner }),
+    });
+
+    expect(straightPts.length).toBeGreaterThan(20);
+    for (const pt of straightPts) {
+      // Strictly collinear (isotropic 2D smoothing -> zero perpendicular warp on diagonal lines!)
+      const perpErr = Math.abs(pt.x * normX + pt.y * normY);
+      expect(perpErr).toBeLessThan(1e-6);
+      expect(pt.isCorner).toBe(false);
+    }
+
+    // 2. Fast diagonal line with a 1-sample 12px twitch, a 2-sample 12px twitch, AND a 15px backtrack glitch
+    const runFastTwitchStroke = (
+      inject: (i: number, dist: number) => { x: number; y: number }
+    ) => {
+      pipeline.beginStroke({ stabilizerLevel: 20, zoom: 1.0, sharpCorners: true, brushSize: 6 });
+      let ts = 2000;
+      for (let i = 0; i <= 50; i++) {
+        ts += 4;
+        const pos = inject(i, i * 10);
+        pipeline.enqueueSample(pos.x, pos.y, 0.7, 0, 0, 0, ts, POINTER_TYPE_PEN);
+      }
+      const pts: Array<{ x: number; y: number; isCorner: boolean }> = [];
+      pipeline.drain({
+        onPoint: (pt) => pts.push({ x: pt.x, y: pt.y, isCorner: pt.isCorner }),
+      });
+      let maxPerp = 0;
+      let corners = 0;
+      for (const pt of pts) {
+        const perp = Math.abs(pt.x * normX + pt.y * normY);
+        if (perp > maxPerp) maxPerp = perp;
+        if (pt.isCorner) corners++;
+      }
+      return { pts, maxPerp, corners, endTs: ts };
+    };
+
+    // 2a. 1-sample 12px lateral twitch -> attenuated by >85% (< 1.8px) with zero false corners
+    const oneSampleTwitch = runFastTwitchStroke((i, dist) => ({
+      x: dist * dirX + (i === 20 ? normX * 12 : 0),
+      y: dist * dirY + (i === 20 ? normY * 12 : 0),
+    }));
+    expect(oneSampleTwitch.corners).toBe(0);
+    expect(oneSampleTwitch.maxPerp).toBeLessThan(1.8);
+
+    // 2b. 2-sample (20px wide) 12px lateral twitch -> attenuated by >75% (< 3.0px) with zero false corners
+    const twoSampleTwitch = runFastTwitchStroke((i, dist) => ({
+      x: dist * dirX + (i === 20 || i === 21 ? normX * 12 : 0),
+      y: dist * dirY + (i === 20 || i === 21 ? normY * 12 : 0),
+    }));
+    expect(twoSampleTwitch.corners).toBe(0);
+    expect(twoSampleTwitch.maxPerp).toBeLessThan(3.0);
+
+    // 2c. 1-sample backwards hardware glitch (-30px along stroke, +15px lateral) -> completely rejected (< 0.25px)
+    const backtrackGlitch = runFastTwitchStroke((i, dist) =>
+      i === 25
+        ? { x: (dist - 30) * dirX + normX * 15, y: (dist - 30) * dirY + normY * 15 }
+        : { x: dist * dirX, y: dist * dirY }
+    );
+    expect(backtrackGlitch.corners).toBe(0);
+    expect(backtrackGlitch.maxPerp).toBeLessThan(0.25);
+
+    // 3. Finalize smoothly catches up residual stabilizer lag along the exact diagonal line
+    const catchUpPts: Array<{ x: number; y: number }> = [];
+    pipeline.finalizeStroke(backtrackGlitch.endTs + 4, {
+      enableFlickTaper: false,
+      onPoint: (pt) => catchUpPts.push({ x: pt.x, y: pt.y }),
+    });
+    expect(catchUpPts.length).toBeGreaterThanOrEqual(2);
+    const lastBeforeFinalize = backtrackGlitch.pts[backtrackGlitch.pts.length - 1];
+    const lastAfterFinalize = catchUpPts[catchUpPts.length - 1];
+    expect(Math.hypot(lastAfterFinalize.x, lastAfterFinalize.y)).toBeGreaterThan(
+      Math.hypot(lastBeforeFinalize.x, lastBeforeFinalize.y)
+    );
+    expect(Math.abs(lastAfterFinalize.x * normX + lastAfterFinalize.y * normY)).toBeLessThan(0.25);
+  });
 });
 
 describe('WebGlBrushEngine Integration & Canvas 2D Fallback in stampEngine', () => {

@@ -72,8 +72,37 @@ export function runPointerMove(
   let lastQueuedPressure = state.lastQueuedPressure;
   let hasQueued = false;
 
+  // Ensure monotonic, evenly spaced timestamps across same-timestamp coalesced hardware bursts
+  // (common in WebView2 / Chromium getCoalescedEvents and Windows Ink / WinTab bursts).
+  const batchEndTs =
+    (rawCoalesced && rawCoalesced.length > 0
+      ? rawCoalesced[rawCoalesced.length - 1].timeStamp
+      : e.nativeEvent.timeStamp) || performance.now();
+  const prevTs = state.lastPointTime || 0;
+  let allSameTs = count > 1;
+  if (allSameTs && rawCoalesced) {
+    const firstTs = rawCoalesced[0].timeStamp;
+    for (let k = 1; k < count; k++) {
+      if (Math.abs(rawCoalesced[k].timeStamp - firstTs) > 0.25) {
+        allSameTs = false;
+        break;
+      }
+    }
+  }
+  const syntheticSpanMs =
+    allSameTs && count > 1
+      ? prevTs > 0 && batchEndTs > prevTs + 0.5
+        ? Math.min(40, batchEndTs - prevTs)
+        : count * 4.0
+      : 0;
+  const syntheticStartTs = batchEndTs - syntheticSpanMs;
+
   for (let i = 0; i < count; i++) {
     const cEvent = rawCoalesced && rawCoalesced.length > 0 ? rawCoalesced[i] : e.nativeEvent;
+    const sampleTs =
+      allSameTs && count > 1
+        ? syntheticStartTs + (syntheticSpanMs * (i + 1)) / count
+        : cEvent.timeStamp;
     screenToCanvasInto(
       cEvent.clientX,
       cEvent.clientY,
@@ -150,7 +179,7 @@ export function runPointerMove(
       cEvent.tiltX ?? 0,
       cEvent.tiltY ?? 0,
       cEvent.twist ?? 0,
-      cEvent.timeStamp,
+      sampleTs,
       encodePointerType(cEvent.pointerType)
     );
     lastQueuedX = cx;

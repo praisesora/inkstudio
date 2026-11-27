@@ -275,12 +275,26 @@ export function prepareBrushSettingsForWire(bs: BrushSettings): {
     customTipImage: _tipImg,
     dualTipDataUrl: _dualUrl,
     dualTipImage: _dualImg,
+    dualSubTips: _dualSubTips,
+    dualSubTipImages: _dualSubImgs,
+    dualBrushConfig: rawDualCfg,
     paperTexture: _paperUrl,
     paperTextureImage: _paperImg,
     subTips: _subTips,
     subTipImages: _subImgs,
     ...clean
   } = bs;
+
+  if (rawDualCfg) {
+    const {
+      tipDataUrl: _dUrl,
+      tipImage: _dImg,
+      subTips: _dSubTips,
+      subTipImages: _dSubImgs,
+      ...cleanDualCfg
+    } = rawDualCfg;
+    (clean as BrushSettings).dualBrushConfig = cleanDualCfg;
+  }
 
   const hasRefs = Boolean(
     refs.tipHash || refs.dualTipHash || refs.paperTextureHash || refs.subTipHashes?.length

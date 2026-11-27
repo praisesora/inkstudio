@@ -9,6 +9,8 @@ import {
   Keyboard,
   SlidersHorizontal,
   Gauge,
+  Users,
+  Shield,
   Info,
   RotateCcw,
   Check,
@@ -64,6 +66,7 @@ type SettingsTab =
   | 'canvas'
   | 'brush'
   | 'performance'
+  | 'collaboration'
   | 'shortcuts'
   | 'modifiers'
   | 'about';
@@ -310,6 +313,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     onShowToast('Modifier keys reset to defaults');
   };
 
+  const handleResetCollaboration = () => {
+    const updated: AppSettings = {
+      ...localSettings,
+      collabSignalingUrl: '',
+      collabTurnUrl: '',
+      collabTurnUsername: '',
+      collabTurnCredential: '',
+    };
+    setLocalSettings(updated);
+    onUpdateSettings(updated);
+    onShowToast('Collaboration network settings reset to defaults');
+  };
+
   const resolvedAccent = resolveModernAccentColor(
     localSettings.modernAccent,
     localSettings.modernCustomColor
@@ -320,6 +336,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     { id: 'canvas', label: 'Canvas', icon: <Layers className="w-3.5 h-3.5" /> },
     { id: 'brush', label: 'Brush & Stylus', icon: <Paintbrush className="w-3.5 h-3.5" /> },
     { id: 'performance', label: 'Performance', icon: <Gauge className="w-3.5 h-3.5" /> },
+    { id: 'collaboration', label: 'Collaboration', icon: <Users className="w-3.5 h-3.5" /> },
     { id: 'shortcuts', label: 'Shortcuts', icon: <Keyboard className="w-3.5 h-3.5" /> },
     {
       id: 'modifiers',
@@ -660,6 +677,147 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 }}
                 onShowToast={onShowToast}
               />
+            )}
+
+            {activeTab === 'collaboration' && (
+              <div className="space-y-5">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-xs font-medium text-[#e5e5e5]">
+                      Collaborative Drawing (WebRTC P2P)
+                    </h3>
+                    <p className="text-[11px] text-[#8a8a8a]">
+                      Configure your display nickname and optional custom signaling or TURN relay servers for P2P rooms
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    data-testid="settings-collab-reset-btn"
+                    onClick={handleResetCollaboration}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded bg-[#161616] hover:bg-[#2c2c2c] text-[11px] text-[#8a8a8a] hover:text-[#e5e5e5] cursor-pointer shrink-0"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    <span>Reset</span>
+                  </button>
+                </div>
+
+                <section className="space-y-2">
+                  <h4 className="text-xs font-medium text-[#e5e5e5]">Artist Nickname</h4>
+                  <input
+                    type="text"
+                    data-testid="settings-collab-nickname"
+                    value={localSettings.userName || ''}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      handleChange('userName', val);
+                      safeLocalStorageSetItem(NICKNAME_STORAGE_KEY, val, 'artist name');
+                      safeLocalStorageSetItem(
+                        NICKNAME_CUSTOMIZED_STORAGE_KEY,
+                        val.trim() ? '1' : '0',
+                        'artist name flag'
+                      );
+                    }}
+                    maxLength={40}
+                    placeholder="Artist"
+                    className="w-full bg-[#161616] px-3 py-1.5 rounded text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"
+                  />
+                  <p className="text-[10px] text-[#8a8a8a]">
+                    Shown to other artists on live cursors, participant lists, and owned layers.
+                  </p>
+                </section>
+
+                <section className="space-y-2">
+                  <h4 className="text-xs font-medium text-[#e5e5e5]">
+                    Custom Signaling Server URL (Optional)
+                  </h4>
+                  <input
+                    type="text"
+                    data-testid="settings-collab-signaling-url"
+                    value={localSettings.collabSignalingUrl || ''}
+                    onChange={(e) => handleChange('collabSignalingUrl', e.target.value)}
+                    placeholder="wss://your-worker.workers.dev/signal (leave blank for built-in free relays)"
+                    className="w-full bg-[#161616] px-3 py-1.5 rounded font-mono text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"
+                  />
+                  {localSettings.collabSignalingUrl.trim() &&
+                    !/^(wss?|https?):\/\//i.test(localSettings.collabSignalingUrl.trim()) && (
+                      <p className="text-[10px] text-amber-400">
+                        Signaling URL should start with <code className="font-mono">wss://</code> or{' '}
+                        <code className="font-mono">https://</code>.
+                      </p>
+                    )}
+                  <p className="text-[10px] text-[#8a8a8a] leading-relaxed">
+                    Leave blank to use Ink Studio&apos;s built-in free multi-relay signaling. Only
+                    tiny SDP/ICE handshakes pass through signaling — all brush strokes and tiles
+                    travel directly peer-to-peer.
+                  </p>
+                </section>
+
+                <section className="space-y-2.5">
+                  <div>
+                    <h4 className="text-xs font-medium text-[#e5e5e5]">
+                      Optional TURN Server (Strict NAT / Firewall)
+                    </h4>
+                    <p className="text-[10px] text-[#8a8a8a] mt-0.5">
+                      Only required when direct P2P hole-punching is blocked by symmetric NAT or
+                      corporate firewalls.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2 bg-[#161616] rounded p-3">
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-[#8a8a8a] block">TURN Server URL</label>
+                      <input
+                        type="text"
+                        data-testid="settings-collab-turn-url"
+                        value={localSettings.collabTurnUrl || ''}
+                        onChange={(e) => handleChange('collabTurnUrl', e.target.value)}
+                        placeholder="turns:turn.example.com:5349"
+                        className="w-full bg-[#202020] px-2.5 py-1.5 rounded font-mono text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"
+                      />
+                      {localSettings.collabTurnUrl.trim() &&
+                        !/^turns?:/i.test(localSettings.collabTurnUrl.trim()) && (
+                          <p className="text-[10px] text-amber-400">
+                            TURN URL must start with <code className="font-mono">turn:</code> or{' '}
+                            <code className="font-mono">turns:</code>.
+                          </p>
+                        )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div className="space-y-1">
+                        <label className="text-[11px] text-[#8a8a8a] block">TURN Username</label>
+                        <input
+                          type="text"
+                          data-testid="settings-collab-turn-username"
+                          value={localSettings.collabTurnUsername || ''}
+                          onChange={(e) => handleChange('collabTurnUsername', e.target.value)}
+                          placeholder="Optional username"
+                          className="w-full bg-[#202020] px-2.5 py-1.5 rounded text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[11px] text-[#8a8a8a] block">TURN Credential</label>
+                        <input
+                          type="password"
+                          data-testid="settings-collab-turn-credential"
+                          value={localSettings.collabTurnCredential || ''}
+                          onChange={(e) => handleChange('collabTurnCredential', e.target.value)}
+                          placeholder="Optional password / token"
+                          className="w-full bg-[#202020] px-2.5 py-1.5 rounded text-xs text-[#e5e5e5] placeholder-[#8a8a8a]/50"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </section>
+
+                <div className="rounded bg-[#161616] p-3 flex items-start gap-2.5 text-[11px] text-[#8a8a8a]">
+                  <Shield className="w-3.5 h-3.5 text-[#8a8a8a] shrink-0 mt-0.5" />
+                  <p className="leading-relaxed">
+                    Free public Google and Cloudflare STUN servers are included automatically for
+                    direct WebRTC P2P connections across PC and Android tablets.
+                  </p>
+                </div>
+              </div>
             )}
 
             {activeTab === 'brush' && (

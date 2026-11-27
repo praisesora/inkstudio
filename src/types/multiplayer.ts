@@ -422,4 +422,12 @@ export interface SessionHostInfo {
   peerCount: number;
   isGlobal?: boolean;
   localInviteUrl?: string;
+  /** Underlying room transport ('ws' for LAN/Relay WebSocket, 'webrtc' for serverless P2P). */
+  transport?: 'ws' | 'webrtc';
+  /** Short human-friendly P2P room code (e.g. "INK-7429"). */
+  roomCode?: string;
+  /** Room authentication secret paired with roomCode. */
+  roomSecret?: string;
+  /** Combined copyable join code (e.g. "INK-7429-K8P2M9"). */
+  joinCode?: string;
 }

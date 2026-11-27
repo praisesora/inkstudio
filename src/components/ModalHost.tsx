@@ -9,7 +9,7 @@ import {
 } from '../types/editor';
 import { AppSettings, ResizeCanvasOptions } from '../types/settings';
 import { CollabPeer, CollabRole, ConnectionStatus, SessionHostInfo } from '../types/multiplayer';
-import { ParsedInviteLink } from '../services/multiplayerService';
+import { ParsedCollabTarget } from '../services/multiplayerService';
 import { CrashedSessionInfo } from '../services/recoveryService';
 import { TonalCorrectionType } from '../utils/tonalEngine';
 import { AnyFilterParams, AnyTonalParams } from '../hooks/useTonalAndFilterActions';
@@ -40,7 +40,7 @@ import { ConfirmDialogModal } from './ConfirmDialogModal';
 import { FilterModal } from './FilterModal';
 import { SaveDocumentResult } from '../utils/appCloseFlow';
 
-export type InviteLinkPayload = ParsedInviteLink;
+export type InviteLinkPayload = ParsedCollabTarget;
 
 export interface ModalHostProps {
   layers: LayerItem[];
@@ -90,8 +90,18 @@ export interface ModalHostProps {
     isGlobal?: boolean,
     onStatus?: (status: string) => void
   ) => Promise<boolean | SessionHostInfo>;
+  handleStartWebRtcHosting?: (
+    roomName: string,
+    hostNickname?: string,
+    onStatus?: (status: string) => void
+  ) => Promise<boolean | SessionHostInfo>;
   stopHosting: () => void;
-  joinByInviteUrl: (rawUrl: string, nickname?: string, persistName?: boolean) => Promise<boolean>;
+  joinByInviteUrl: (
+    rawUrl: string,
+    nickname?: string,
+    persistName?: boolean,
+    secretOverride?: string
+  ) => Promise<boolean>;
   leaveRoom: () => void;
   onSetPeerRole?: (peerId: string | number, role: 'editor' | 'viewer') => void;
   onKickPeer?: (peerId: string | number) => void;
@@ -108,7 +118,8 @@ export interface ModalHostProps {
     name?: string,
     token?: string,
     isSecureOverride?: boolean,
-    persistName?: boolean
+    persistName?: boolean,
+    wsPath?: string
   ) => Promise<boolean>;
   onCaptureTimelapseNow?: () => void;
   handleSave?: () => void;
@@ -148,6 +159,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
     collabMyPeer,
     updateMyName,
     handleStartHosting,
+    handleStartWebRtcHosting,
     stopHosting,
     joinByInviteUrl,
     leaveRoom,
@@ -337,6 +349,7 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
           myPeer={collabMyPeer}
           onUpdateMyName={updateMyName}
           onStartHosting={handleStartHosting}
+          onStartWebRtcHosting={handleStartWebRtcHosting}
           onStopHosting={stopHosting}
           onJoinByInviteUrl={joinByInviteUrl}
           onLeaveRoom={leaveRoom}
@@ -350,8 +363,22 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
         <ClipboardInviteToast
           invite={clipboardInvite}
           onJoin={(h, p, r, t, isSecure) =>
-            void joinRoom(h, p, r, collabMyPeer.name, t, isSecure, false)
+            void joinRoom(
+              h,
+              p,
+              r,
+              collabMyPeer.name,
+              t,
+              isSecure,
+              false,
+              clipboardInvite && (!('kind' in clipboardInvite) || clipboardInvite.kind === 'ws')
+                ? clipboardInvite.wsPath
+                : undefined
+            )
           }
+          onJoinTarget={(target) => {
+            void joinByInviteUrl(target.url, collabMyPeer.name, false);
+          }}
           onDismiss={() => setClipboardInvite(null)}
         />
 
@@ -362,6 +389,12 @@ export const ModalHost: React.FC<ModalHostProps> = React.memo(
               updateMyName(name);
             }
             void joinRoom(h, p, r, name, t, isSecure, Boolean(persistName));
+          }}
+          onJoinTargetInBrowser={(name, target, persistName) => {
+            if (persistName) {
+              updateMyName(name);
+            }
+            void joinByInviteUrl(target.url, name, Boolean(persistName));
           }}
           onDismiss={() => setWebLandingInvite(null)}
         />

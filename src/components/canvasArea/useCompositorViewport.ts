@@ -7,6 +7,7 @@ import {
   SoftProofSettings,
 } from '../../types/editor';
 import { CanvasNavigationHandle } from '../../hooks/useCanvasNavigation';
+import { computeTipStampDimensions } from '../../engine/BrushEngine';
 import { ViewportCompositor } from '../../utils/compositor';
 import { SparseTileGrid } from '../../utils/tileEngine';
 import { getOnionSkinFrames } from '../../utils/animationEngine';
@@ -215,6 +216,9 @@ export function useCompositorViewport({
     const draftSpace = ((draftCanvas as any)?.__draftSpace as 'document' | 'viewport' | undefined) ?? 'viewport';
     const draftDocRect = (draftCanvas as any)?.__draftDocRect ?? null;
     const draftMonochrome = Boolean((draftCanvas as any)?.__draftMonochrome);
+    const draftPigmentStrength = Number((draftCanvas as any)?.__draftPigmentStrength ?? 0);
+    const draftPigmentWhiteGround = Boolean((draftCanvas as any)?.__draftPigmentWhiteGround);
+    const draftCombineMode = (draftCanvas as any)?.__draftCombineMode;
     return {
       dimensions: rp.dimensions,
       showCheckerboard: rp.showCheckerboard,
@@ -230,6 +234,9 @@ export function useCompositorViewport({
       activeDraftSpace: draftSpace,
       activeDraftOpacity: rp.brushOpacity,
       activeDraftMonochrome: draftMonochrome,
+      activeDraftPigmentStrength: draftPigmentStrength,
+      activeDraftPigmentWhiteGround: draftPigmentWhiteGround,
+      activeDraftCombineMode: draftCombineMode,
     };
   };
 
@@ -264,12 +271,15 @@ export function useCompositorViewport({
       const ring = cursorRingRef.current;
       if (ring) {
         const baseW = Math.max(4, cfg.activeToolSize * cam.zoom);
-        const cW = cfg.thicknessVertical
-          ? Math.max(2, baseW * cfg.thicknessRatio)
-          : baseW;
-        const cH = cfg.thicknessVertical
-          ? Math.max(2, baseW * cfg.tipAspect)
-          : Math.max(2, baseW * cfg.tipAspect * cfg.thicknessRatio);
+        const dims = computeTipStampDimensions(
+          baseW,
+          cfg.thicknessRatio,
+          cfg.thicknessVertical,
+          1,
+          cfg.tipAspect
+        );
+        const cW = Math.max(2, dims.width);
+        const cH = Math.max(2, dims.height);
         ring.style.width = `${cW}px`;
         ring.style.height = `${cH}px`;
         const pos = lastPointerPosRef.current;

@@ -1,4 +1,4 @@
-import { CspBrush, BrushSettings } from '../types/editor';
+import { CspBrush, BrushSettings, CspDualBrushConfig } from '../types/editor';
 import {
   handleIndexedDbError,
   safeLocalStorageGetItem,
@@ -26,12 +26,45 @@ function emitCustomBrushesChanged(): void {
   }
 }
 
+function sanitizeDualBrushConfigForStorage(
+  cfg: CspDualBrushConfig | undefined,
+  stripHeavyDataUrls: boolean
+): CspDualBrushConfig | undefined {
+  if (!cfg) return undefined;
+  const {
+    tipImage: _tipImg,
+    subTipImages: _subImgs,
+    tipDataUrl,
+    subTips,
+    ...rest
+  } = cfg;
+  if (stripHeavyDataUrls) {
+    return rest;
+  }
+  return {
+    ...rest,
+    ...(tipDataUrl !== undefined ? { tipDataUrl } : {}),
+    ...(subTips !== undefined ? { subTips } : {}),
+  };
+}
+
+function sanitizeBrushForIndexedDb(brush: CspBrush): CspBrush {
+  if (!brush.dualBrushConfig) return brush;
+  return {
+    ...brush,
+    dualBrushConfig: sanitizeDualBrushConfigForStorage(brush.dualBrushConfig, false),
+  };
+}
+
 function hasHeavyBrushAssets(brush: CspBrush): boolean {
   return Boolean(
     brush.tipDataUrl ||
     brush.secondaryTipDataUrl ||
     brush.paperTexture ||
-    (brush.subTips && brush.subTips.length > 0)
+    (brush.subTips && brush.subTips.length > 0) ||
+    (brush.dualSubTips && brush.dualSubTips.length > 0) ||
+    brush.dualBrushConfig?.tipDataUrl ||
+    (brush.dualBrushConfig?.subTips && brush.dualBrushConfig.subTips.length > 0)
   );
 }
 
@@ -43,22 +76,32 @@ function stripHeavyBrushAssets(brush: CspBrush): CspBrush {
     tipDataUrl: _tip,
     secondaryTipDataUrl: _sec,
     subTips: _subs,
+    dualSubTips: _dualSubs,
     paperTexture: _tex,
+    dualBrushConfig,
     ...lightweight
   } = brush;
-  return lightweight;
+  const lightDual = sanitizeDualBrushConfigForStorage(dualBrushConfig, true);
+  return lightDual ? { ...lightweight, dualBrushConfig: lightDual } : lightweight;
 }
 
 function preloadAllBrushAssets(brush: CspBrush): void {
   if (brush.tipDataUrl) {
     preloadTipImage(brush.tipDataUrl).catch(() => {});
   }
-  if (brush.secondaryTipDataUrl) {
-    preloadTipImage(brush.secondaryTipDataUrl).catch(() => {});
+  const dualTipUrl = brush.secondaryTipDataUrl || brush.dualBrushConfig?.tipDataUrl;
+  if (dualTipUrl) {
+    preloadTipImage(dualTipUrl).catch(() => {});
   }
   if (brush.subTips) {
     for (const st of brush.subTips) {
       if (st.dataUrl) preloadTipImage(st.dataUrl).catch(() => {});
+    }
+  }
+  const dualSubTipList = brush.dualSubTips || brush.dualBrushConfig?.subTips;
+  if (dualSubTipList) {
+    for (const dst of dualSubTipList) {
+      if (dst.dataUrl) preloadTipImage(dst.dataUrl).catch(() => {});
     }
   }
   if (brush.paperTexture) {
@@ -234,16 +277,17 @@ export async function loadCustomBrushes(): Promise<CspBrush[]> {
  * Only lightweight metadata/IDs are mirrored to localStorage (never tip/texture data URLs).
  */
 export async function saveCustomBrush(brush: CspBrush): Promise<void> {
-  preloadAllBrushAssets(brush);
-  const existingIdx = _cachedCustomBrushes.findIndex((b) => b.id === brush.id);
+  const cleanBrush = sanitizeBrushForIndexedDb(brush);
+  preloadAllBrushAssets(cleanBrush);
+  const existingIdx = _cachedCustomBrushes.findIndex((b) => b.id === cleanBrush.id);
   if (existingIdx >= 0) {
     _cachedCustomBrushes = [
       ..._cachedCustomBrushes.slice(0, existingIdx),
-      brush,
+      cleanBrush,
       ..._cachedCustomBrushes.slice(existingIdx + 1),
     ];
   } else {
-    _cachedCustomBrushes = [..._cachedCustomBrushes, brush];
+    _cachedCustomBrushes = [..._cachedCustomBrushes, cleanBrush];
   }
   _hasLoadedCustomBrushes = true;
 
@@ -252,16 +296,16 @@ export async function saveCustomBrush(brush: CspBrush): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       const transaction = db.transaction([STORE_NAME], 'readwrite');
       const store = transaction.objectStore(STORE_NAME);
-      const request = store.put(brush);
+      const request = store.put(cleanBrush);
       request.onsuccess = () => resolve();
       request.onerror = () => reject(request.error);
       transaction.onerror = () => reject(transaction.error);
     });
   } catch (err) {
-    handleIndexedDbError(err, `custom brush "${brush.name}"`);
+    handleIndexedDbError(err, `custom brush "${cleanBrush.name}"`);
   }
 
-  syncLightweightIndexToLocalStorage(brush);
+  syncLightweightIndexToLocalStorage(cleanBrush);
   emitCustomBrushesChanged();
 }
 
@@ -358,10 +402,11 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
   }
 
   let dualTipImg: HTMLImageElement | undefined = undefined;
-  if (brush.secondaryTipDataUrl) {
+  const dualTipUrl = brush.secondaryTipDataUrl || brush.dualBrushConfig?.tipDataUrl;
+  if (dualTipUrl) {
     dualTipImg =
-      getPreloadedTipImage(brush.secondaryTipDataUrl) ||
-      (await preloadTipImage(brush.secondaryTipDataUrl).catch(() => undefined));
+      getPreloadedTipImage(dualTipUrl) ||
+      (await preloadTipImage(dualTipUrl).catch(() => undefined));
   }
 
   let subTipImages: HTMLImageElement[] | undefined = undefined;
@@ -372,6 +417,18 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
         getPreloadedTipImage(st.dataUrl) ||
         (await preloadTipImage(st.dataUrl).catch(() => undefined));
       if (img) subTipImages.push(img);
+    }
+  }
+
+  let dualSubTipImages: HTMLImageElement[] | undefined = undefined;
+  const resolvedDualSubTips = brush.dualSubTips || brush.dualBrushConfig?.subTips;
+  if (resolvedDualSubTips && resolvedDualSubTips.length > 0) {
+    dualSubTipImages = [];
+    for (const dst of resolvedDualSubTips) {
+      const img =
+        getPreloadedTipImage(dst.dataUrl) ||
+        (await preloadTipImage(dst.dataUrl).catch(() => undefined));
+      if (img) dualSubTipImages.push(img);
     }
   }
 
@@ -386,6 +443,8 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     preset: brush.id,
     brushName: brush.name,
     size: brush.size,
+    brushSizeUnit: brush.brushSizeUnit,
+    brushSizeSpecifiedByScreen: brush.brushSizeSpecifiedByScreen,
     minSizeFactor: brush.minSizeFactor,
     flow: brush.flow,
     brushDensity: brush.brushDensity,
@@ -397,6 +456,7 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     hardness: brush.hardness,
     thickness: brush.thickness,
     thicknessVertical: brush.thicknessVertical,
+    thicknessSensor: brush.thicknessSensor,
     antiAlias: brush.antiAlias,
     stabilization: brush.stabilization,
     postCorrection: brush.postCorrection,
@@ -405,6 +465,7 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     customTipDataUrl: brush.tipDataUrl,
     customTipImage: tipImg,
     isColorTip: brush.isColorTip,
+    isDualToneTip: brush.isDualToneTip,
     flipH: brush.flipH,
     flipV: brush.flipV,
     customTipAngle: brush.angle,
@@ -422,6 +483,8 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     sizeSensor: brush.sizeSensor,
     opacitySensor: brush.opacitySensor,
     densitySensor: brush.densitySensor,
+    intervalSensor: brush.intervalSensor,
+    textureDensitySensor: brush.textureDensitySensor,
     bristleSplaySensor: brush.bristleSplaySensor,
     paintLoadSensor: brush.paintLoadSensor,
     grainPenetrationSensor: brush.grainPenetrationSensor,
@@ -435,6 +498,12 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     amountOfPaint: brush.amountOfPaint ?? 0.7,
     densityOfPaint: brush.densityOfPaint ?? 0.8,
     colorStretch: brush.colorStretch ?? 0.6,
+    amountOfPaintSensor: brush.amountOfPaintSensor,
+    densityOfPaintSensor: brush.densityOfPaintSensor,
+    colorStretchSensor: brush.colorStretchSensor,
+    mixGroundColor: brush.mixGroundColor,
+    useBlur: brush.useBlur,
+    blurStrength: brush.blurStrength,
     mixingMode: brush.mixingMode ?? 'blend',
     wetEdge: brush.wetEdge ?? 0,
     wetEdgeRadius: brush.wetEdgeRadius,
@@ -448,19 +517,43 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     grainMappingMode: brush.grainMappingMode,
     paperTextureScale: brush.paperTextureScale,
     paperTextureRotate: brush.paperTextureRotate,
+    paperTextureOffsetX: brush.paperTextureOffsetX,
+    paperTextureOffsetY: brush.paperTextureOffsetY,
     paperTextureMode: brush.paperTextureMode,
     paperTextureBrightness: brush.paperTextureBrightness,
     paperTextureContrast: brush.paperTextureContrast,
     paperTextureApplyEachPlot: brush.paperTextureApplyEachPlot,
+    paperTextureEmphasizeDensity: brush.paperTextureEmphasizeDensity,
     paperTextureInverted: brush.paperTextureInverted,
     dualBrush: brush.dualBrush,
-    dualTipDataUrl: brush.secondaryTipDataUrl,
+    dualBrushConfig: brush.dualBrushConfig
+      ? {
+          ...brush.dualBrushConfig,
+          tipImage: dualTipImg ?? brush.dualBrushConfig.tipImage,
+          subTipImages: dualSubTipImages ?? brush.dualBrushConfig.subTipImages,
+        }
+      : undefined,
+    dualTipDataUrl: dualTipUrl,
     dualTipImage: dualTipImg,
     dualBrushCompositeMode: (brush.dualBrushCompositeMode as BrushSettings['dualBrushCompositeMode']) || 'multiply',
     dualSize: brush.dualSize,
+    dualLinkSize: brush.dualLinkSize,
     dualSpacing: brush.dualSpacing,
     dualScatter: brush.dualScatter,
+    dualThickness: brush.dualThickness,
+    dualThicknessVertical: brush.dualThicknessVertical,
     dualAngle: brush.dualAngle,
+    dualAngleDynamics: brush.dualAngleDynamics,
+    dualAngleSensor: brush.dualAngleSensor,
+    dualHardness: brush.dualHardness,
+    dualDensity: brush.dualDensity,
+    dualSubTips: resolvedDualSubTips,
+    dualSubTipImages,
+    dualSubTipOrder: brush.dualSubTipOrder,
+    dualFlipH: brush.dualFlipH,
+    dualFlipV: brush.dualFlipV,
+    dualSpray: brush.dualSpray,
+    dualIsRibbon: brush.dualIsRibbon,
     dualScale: brush.dualScale,
     dualSurfaceTextureId: brush.dualSurfaceTextureId,
     dualGrainDepth: brush.dualGrainDepth,
@@ -469,6 +562,7 @@ export async function prepareBrushSettingsForCsp(brush: CspBrush): Promise<Parti
     bristle: brush.bristle,
     naturalPaint: brush.naturalPaint,
     impasto: brush.impasto,
+    importWarnings: brush.importWarnings,
     useGpu: true,
   };
 }

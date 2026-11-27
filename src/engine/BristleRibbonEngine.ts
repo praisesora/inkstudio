@@ -179,6 +179,12 @@ export class BristleRibbonEngine {
   private readonly prevBedA = new Float32Array(7);
   private readonly prevBedLoad = new Float32Array(7);
   private readonly prevBedRad = new Float32Array(7);
+  private readonly bandR = new Float32Array(7);
+  private readonly bandG = new Float32Array(7);
+  private readonly bandB = new Float32Array(7);
+  private readonly bandLoad = new Float32Array(7);
+  private readonly bandAlpha = new Float32Array(7);
+  private readonly bandCount = new Int32Array(7);
   private bedInitialized: boolean = false;
 
   // Reusable segment output buffer
@@ -452,8 +458,8 @@ export class BristleRibbonEngine {
     }
 
     const avgW = Math.max(2, (p0.width + p3.width) * 0.5 || this.config.size);
-    // Fine high-DPI continuous ribbon stepping: razor-smooth curves even on large 80-120px brushes
-    const targetStep = Math.max(1.0, Math.min(3.2, avgW * Math.max(0.035, this.config.spacing * 0.55)));
+    // Continuous capsules connect prev->cur seamlessly, so 1.4..4.8px stepping stays smooth without over-rasterizing
+    const targetStep = Math.max(1.4, Math.min(4.8, avgW * Math.max(0.05, this.config.spacing * 0.85)));
     const slices = Math.max(1, Math.min(64, Math.ceil(polyLen / targetStep)));
 
     const n = this.reservoir.count;
@@ -592,12 +598,18 @@ export class BristleRibbonEngine {
       if (hasUnderBed) segCount += BED_BANDS;
 
       // Accumulate local spatial color & load per under-bed band so yellow+purple NEVER muddy together!
-      const bandR = [0, 0, 0, 0, 0, 0, 0];
-      const bandG = [0, 0, 0, 0, 0, 0, 0];
-      const bandB = [0, 0, 0, 0, 0, 0, 0];
-      const bandLoad = [0, 0, 0, 0, 0, 0, 0];
-      const bandAlpha = [0, 0, 0, 0, 0, 0, 0];
-      const bandCount = [0, 0, 0, 0, 0, 0, 0];
+      const bandR = this.bandR;
+      const bandG = this.bandG;
+      const bandB = this.bandB;
+      const bandLoad = this.bandLoad;
+      const bandAlpha = this.bandAlpha;
+      const bandCount = this.bandCount;
+      bandR.fill(0);
+      bandG.fill(0);
+      bandB.fill(0);
+      bandLoad.fill(0);
+      bandAlpha.fill(0);
+      bandCount.fill(0);
 
       for (let i = 0; i < n; i++) {
         const rawOff = this.reservoir.offsets[i];
@@ -640,8 +652,10 @@ export class BristleRibbonEngine {
           this.reservoir.radii[i] * halfW * tuftWidthBoost * rakeCenterBoost * widthBreath
         );
 
+        const pigmentStrength = this.config.naturalPaint.pigmentMixingStrength;
+        const usePigmentSample = pigmentStrength > 0.005;
         if (sampler && this.config.naturalPaint.spatialMixing) {
-          sampler.samplePointFast(bx, by, strandRad, this.scratchSample);
+          sampler.samplePointFast(bx, by, strandRad, this.scratchSample, usePigmentSample);
         } else {
           this.scratchSample.a = 0;
         }
@@ -756,7 +770,8 @@ export class BristleRibbonEngine {
               stepOut.r,
               stepOut.g,
               stepOut.b,
-              effAlpha * 0.35
+              effAlpha * 0.35,
+              pigmentStrength
             );
           }
         }

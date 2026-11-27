@@ -1,6 +1,7 @@
 import {
   BrushSettings,
   CanvasSelection,
+  CspBrushCombineMode,
   DirtyRect,
   LayerItem,
 } from '../../../types/editor';
@@ -8,7 +9,13 @@ import { SparseTileGrid, TileFormat } from '../../../utils/tileEngine';
 import { multiplayerService } from '../../../services/multiplayerService';
 import { CubicBezierSegment } from '../../../engine/SplineGenerator';
 import { canUseWebGlForBrush, flushGpuDabs } from '../../../engine/BrushEngine';
-import { PushHistoryStepFn } from '../types';
+import { get2DContext } from '../../../utils/canvasUtils';
+import { DraftCanvasElement, PushHistoryStepFn } from '../types';
+import {
+  syncDualBrushRegionToDraft,
+  syncStrokePaperTextureRegionToDraft,
+} from './strokeHelpers';
+import { flushLiveDualSecondaryGpuBatch } from './liveSegmentEmitter';
 import { StrokeSessionHelpers, StrokeSessionState } from './types';
 import { StrokeHistoryToolType } from './pointerUpSpecialCommit';
 
@@ -66,6 +73,9 @@ export interface DirectDraftCommitParams {
   activeLayer: LayerItem | undefined;
   targetFormat: TileFormat;
   compositeOp: 'source-over' | 'destination-out' | 'source-atop';
+  brushCombineMode?: CspBrushCombineMode;
+  pigmentStrength?: number;
+  pigmentWhiteGround?: boolean;
   monoOpts?: {
     threshold: number;
     expressBlack: boolean;
@@ -102,6 +112,9 @@ export function commitDirectDraftToTiles(opts: DirectDraftCommitParams): () => v
     activeLayer,
     targetFormat,
     compositeOp,
+    brushCombineMode,
+    pigmentStrength,
+    pigmentWhiteGround,
     monoOpts,
     selMaskOpts,
     isEraser,
@@ -140,10 +153,17 @@ export function commitDirectDraftToTiles(opts: DirectDraftCommitParams): () => v
     const useGpuTail = canUseWebGlForBrush(liveBrushOpts);
     const gpuBatch = state.frameGpuDabs;
     gpuBatch.length = 0;
+    state.dualFrameSecondaryGpuDabs.length = 0;
+    const tailDrawCtx =
+      state.isDualBrushStroke && state.dualPrimaryCanvas
+        ? get2DContext(state.dualPrimaryCanvas) || draftCtx
+        : state.isStrokePaperTextureActive && state.rawDraftCanvas
+        ? get2DContext(state.rawDraftCanvas) || draftCtx
+        : draftCtx;
 
     for (let i = 0; i < tailSegments.length; i++) {
       helpers.emitLiveSegment(
-        draftCtx,
+        tailDrawCtx,
         tailSegments[i],
         bs,
         strokeColor,
@@ -163,11 +183,11 @@ export function commitDirectDraftToTiles(opts: DirectDraftCommitParams): () => v
     if (useGpuTail && gpuBatch.length > 0) {
       const liveColor =
         (isEraser && !isBgEraser) || bs.isTransparentInk ? '#000000' : strokeColor;
-      const flushed = flushGpuDabs(draftCtx, gpuBatch, liveColor, liveBrushOpts);
+      const flushed = flushGpuDabs(tailDrawCtx, gpuBatch, liveColor, liveBrushOpts);
       if (!flushed) {
         for (let i = 0; i < tailSegments.length; i++) {
           helpers.emitLiveSegment(
-            draftCtx,
+            tailDrawCtx,
             tailSegments[i],
             bs,
             strokeColor,
@@ -185,6 +205,31 @@ export function commitDirectDraftToTiles(opts: DirectDraftCommitParams): () => v
         }
       }
       gpuBatch.length = 0;
+    }
+
+    if (state.isDualBrushStroke && draftCtx.canvas) {
+      flushLiveDualSecondaryGpuBatch(state, helpers, bs, isMonochrome, draftScale);
+      syncDualBrushRegionToDraft(
+        state,
+        draftCtx.canvas as DraftCanvasElement,
+        draftCtx,
+        bs,
+        sx,
+        sy,
+        sx + dw,
+        sy + dh
+      );
+    } else if (state.isStrokePaperTextureActive && draftCtx.canvas) {
+      syncStrokePaperTextureRegionToDraft(
+        state,
+        draftCtx.canvas as DraftCanvasElement,
+        draftCtx,
+        bs,
+        sx,
+        sy,
+        sx + dw,
+        sy + dh
+      );
     }
   }
 
@@ -208,7 +253,10 @@ export function commitDirectDraftToTiles(opts: DirectDraftCommitParams): () => v
       destY: sp.y,
       format: targetFormat,
       compositeOp,
+      brushCombineMode,
       opacity: bs.opacity ?? 1.0,
+      pigmentStrength,
+      pigmentWhiteGround,
       monochrome: monoOpts,
       selectionMask: selMaskOpts,
       snapshotOut: beforeSnapshot,

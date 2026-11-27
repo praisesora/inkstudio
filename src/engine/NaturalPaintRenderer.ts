@@ -31,6 +31,7 @@ import {
   SURFACE_TEXTURE_SIZE,
 } from '../utils/proceduralBrushTips';
 import { LayerPixelSampler } from '../utils/colorMixingEngine';
+import { PigmentRgb, pigmentMixRgbOut } from '../utils/pigmentEngine';
 import {
   BRISTLE_SEG_STRIDE,
   BristleRibbonEngine,
@@ -95,6 +96,7 @@ export interface GrainSampleParams {
   scale: number;
   rotateRad: number;
   contrast: number;
+  contrastFactor?: number;
   brightness: number;
   inverted: boolean;
   strokeOffsetX: number;
@@ -236,7 +238,7 @@ export function evaluateMappedSurfaceHeight(
   if (params.inverted) g = 1.0 - g;
   if (params.brightness !== 0) g += params.brightness / 100.0;
   if (params.contrast !== 0) {
-    const cf = Math.pow(Math.max(0.05, 1.0 + params.contrast / 100.0), 2);
+    const cf = params.contrastFactor ?? Math.pow(Math.max(0.05, 1.0 + params.contrast / 100.0), 2);
     g = (g - 0.5) * cf + 0.5;
   }
   return g <= 0 ? 0 : g >= 1 ? 1 : g;
@@ -315,13 +317,13 @@ function acquireChunk(cx: number, cy: number): PaintChunk {
     recycled.b.fill(0);
     recycled.a.fill(0);
     recycled.height.fill(0);
-    recycled.tooth.fill(0.5);
+    recycled.tooth.fill(-1);
     recycled.lastArcU.fill(-9999);
     recycled.lastBristle.fill(-1);
     return recycled;
   }
   const tooth = new Float32Array(CHUNK_PIXELS);
-  tooth.fill(0.5);
+  tooth.fill(-1);
   const lastArcU = new Float32Array(CHUNK_PIXELS);
   lastArcU.fill(-9999);
   const lastBristle = new Int16Array(CHUNK_PIXELS);
@@ -402,6 +404,14 @@ export class NaturalPaintStrokeSession {
   private hGridTmp: Float32Array = new Float32Array(0);
   private hGridSmooth: Float32Array = new Float32Array(0);
   private toothGrid: Float32Array = new Float32Array(0);
+  private rowPaintMinX: Int32Array = new Int32Array(0);
+  private rowPaintMaxX: Int32Array = new Int32Array(0);
+
+  // Per-frame deferred dirty region for batched shading & blit (1 flush per animation frame!)
+  private pendingDirtyMinX: number = Infinity;
+  private pendingDirtyMinY: number = Infinity;
+  private pendingDirtyMaxX: number = -Infinity;
+  private pendingDirtyMaxY: number = -Infinity;
 
   public minX: number = Infinity;
   public minY: number = Infinity;
@@ -445,6 +455,10 @@ export class NaturalPaintStrokeSession {
       scale: Math.max(0.1, settings.paperTextureScale ?? 1.0),
       rotateRad: ((settings.paperTextureRotate ?? 0) * Math.PI) / 180,
       contrast: settings.paperTextureContrast ?? 0,
+      contrastFactor:
+        (settings.paperTextureContrast ?? 0) !== 0
+          ? Math.pow(Math.max(0.05, 1.0 + (settings.paperTextureContrast ?? 0) / 100.0), 2)
+          : 1.0,
       brightness: settings.paperTextureBrightness ?? 0,
       inverted: Boolean(settings.paperTextureInverted),
       strokeOffsetX: s1 * SURFACE_TEXTURE_SIZE,
@@ -474,7 +488,8 @@ export class NaturalPaintStrokeSession {
     const ch = this.getChunk(cx, cy);
     if (!ch) return { hPaint: 0, tooth: 0.5, alpha: 0 };
     const idx = ((y & CHUNK_MASK) << CHUNK_SHIFT) + (x & CHUNK_MASK);
-    return { hPaint: ch.height[idx], tooth: ch.tooth[idx], alpha: ch.a[idx] };
+    const tVal = ch.tooth[idx];
+    return { hPaint: ch.height[idx], tooth: tVal < 0 ? 0.5 : tVal, alpha: ch.a[idx] };
   }
 
   /**
@@ -486,8 +501,20 @@ export class NaturalPaintStrokeSession {
     const grainDepth = this.grainParams.grainDepth;
     const dryBrush = this.natural.dryBrush;
     const penCurve = this.natural.penetrationCurve;
+    const hasGrainOrDry = grainDepth > 0.005 || dryBrush > 0.005;
+    const hasStaticGrain =
+      this.grainParams.mappingMode === 'canvas-locked' ||
+      this.grainParams.mappingMode === 'random-per-stroke';
+    const effectiveDry = Math.max(dryBrush, grainDepth * 0.68);
+    const softnessInv = 1.0 / Math.max(0.06, 0.14 + (1.0 - effectiveDry) * 0.22);
     const bristleRelief = this.impasto.enabled ? this.impasto.bristleRelief : 0.4;
+    const edgeSoft = Math.max(1.25, Math.min(2.5, 1.4 + (1.0 - bristleRelief) * 1.0));
+    const halfEdgeSoft = edgeSoft * 0.5;
+    const invEdgeSoft = 1.0 / edgeSoft;
     const halfBrushW = Math.max(2, (this.settings.size || 24) * 0.5);
+    const pigmentStrength = this.engine.config.naturalPaint.pigmentMixingStrength;
+    const usePigmentBlend = pigmentStrength > 0.005;
+    const mixScratch: PigmentRgb = { r: 0, g: 0, b: 0 };
 
     let dMinX = Infinity;
     let dMinY = Infinity;
@@ -544,11 +571,19 @@ export class NaturalPaintStrokeSession {
       const segCos = segLen > 1e-4 ? sdx / segLen : 1;
       const segSin = segLen > 1e-4 ? sdy / segLen : 0;
       const selfPassWindow = Math.max(14, halfBrushW * 0.9);
+      const curvedP = hasGrainOrDry
+        ? penCurve
+          ? evaluateFastSpline(pressure, penCurve)
+          : Math.max(0, Math.min(1, pressure))
+        : 0;
+      const tiltReduction = 1.0 - Math.max(0, Math.min(1, tiltMag)) * 0.45;
 
       for (let py = by0; py <= by1; py++) {
         const cy = py >> CHUNK_SHIFT;
         const lyOff = (py & CHUNK_MASK) << CHUNK_SHIFT;
         const dy0 = py + 0.5 - y0;
+        let cachedCx = -999999;
+        let cachedCh: PaintChunk | null = null;
 
         for (let px = bx0; px <= bx1; px++) {
           const dx0 = px + 0.5 - x0;
@@ -556,13 +591,15 @@ export class NaturalPaintStrokeSession {
           if (t < 0) t = 0;
           else if (t > 1) t = 1;
 
-          const cxPt = x0 + sdx * t;
-          const cyPt = y0 + sdy * t;
-          const dist = Math.hypot(px + 0.5 - cxPt, py + 0.5 - cyPt);
+          const ddX = px + 0.5 - (x0 + sdx * t);
+          const ddY = py + 0.5 - (y0 + sdy * t);
           const rad = rad0 + (rad1 - rad0) * t;
-          if (dist >= rad + 0.85) continue;
+          const maxR = rad + 0.85;
+          const distSq = ddX * ddX + ddY * ddY;
+          if (distSq >= maxR * maxR) continue;
+          const dist = Math.sqrt(distSq);
 
-          const normD = dist / Math.max(0.5, rad);
+          const normD = dist / (rad > 0.5 ? rad : 0.5);
           const load = load0 + (load1 - load0) * t;
           const arcU = arcU0 + (arcU1 - arcU0) * t;
 
@@ -573,53 +610,67 @@ export class NaturalPaintStrokeSession {
 
           if (isUnderBed) {
             // Cohesive creamy paint cushion: opaque inside core (normD < 0.68), feathered softly across linen flanks
-            const flankT = Math.max(0, Math.min(1, (normD - 0.62) / 0.38));
+            const flankRaw = (normD - 0.62) * (1.0 / 0.38);
+            const flankT = flankRaw <= 0 ? 0 : flankRaw >= 1 ? 1 : flankRaw;
             const coreEnv = 1.0 - flankT * flankT * (3.0 - 2.0 * flankT);
             baseAlpha = (a0 + (a1 - a0) * t) * coreEnv;
             grooveCrown = 0.55 + 0.45 * coreEnv;
             effLoadForTooth = load * (0.28 + 0.72 * coreEnv);
           } else {
             // Sculpted rounded cylindrical bristle ridge + recessed outer furrow carving!
-            // Low-relief brushes get slightly wider creamy edge feathering for seamless blending
-            const edgeSoft = Math.max(1.25, Math.min(2.5, 1.4 + (1.0 - bristleRelief) * 1.0));
-            const aaEdge = 1.0 - Math.max(0, Math.min(1, (dist - (rad - edgeSoft * 0.5)) / edgeSoft));
-            grooveCrown = Math.pow(Math.max(0, 1.0 - normD * normD), 0.72);
+            const aaRaw = (dist - (rad - halfEdgeSoft)) * invEdgeSoft;
+            const aaEdge = 1.0 - (aaRaw <= 0 ? 0 : aaRaw >= 1 ? 1 : aaRaw);
+            const uCrown = 1.0 - normD * normD;
+            grooveCrown = uCrown > 0 ? Math.sqrt(uCrown) * (0.35 + 0.65 * uCrown) : 0;
             // Outer shoulder of a bristle (0.62 < normD < 0.98) gently carves a 3D furrow into the wet paint bed
             if (normD > 0.6 && normD < 0.98) {
-              const tt = (normD - 0.6) / 0.38;
+              const tt = (normD - 0.6) * (1.0 / 0.38);
               troughCarve = Math.sin(tt * Math.PI) * bristleRelief * 0.42;
             }
             baseAlpha = (a0 + (a1 - a0) * t) * aaEdge;
           }
           if (baseAlpha <= 0.002) continue;
 
-          // Sample spatial canvas tooth height H_canvas(x, y)
-          const hCanvas = evaluateMappedSurfaceHeight(
-            this.grainParams,
-            px + 0.5,
-            py + 0.5,
-            arcU,
-            acrossV,
-            halfBrushW,
-            segCos,
-            segSin
-          );
+          const cx = px >> CHUNK_SHIFT;
+          if (cx !== cachedCx) {
+            cachedCh = this.getOrCreateChunk(cx, cy);
+            cachedCx = cx;
+          }
+          const ch = cachedCh!;
+          const idx = lyOff + (px & CHUNK_MASK);
 
-          const toothContact = evaluatePaintCanvasContact(
-            hCanvas,
-            effLoadForTooth,
-            pressure,
-            tiltMag,
-            grainDepth,
-            dryBrush,
-            penCurve
-          );
+          // Sample spatial canvas tooth height H_canvas(x, y) — reuse cached static height across bristle overlaps!
+          let hCanvas = hasStaticGrain ? ch.tooth[idx] : -1;
+          if (hCanvas < 0) {
+            hCanvas = evaluateMappedSurfaceHeight(
+              this.grainParams,
+              px + 0.5,
+              py + 0.5,
+              arcU,
+              acrossV,
+              halfBrushW,
+              segCos,
+              segSin
+            );
+            ch.tooth[idx] = hCanvas;
+          }
+
+          let toothContact = 1.0;
+          if (hasGrainOrDry) {
+            const cLoad = effLoadForTooth <= 0 ? 0 : effLoadForTooth >= 1 ? 1 : effLoadForTooth;
+            const penRaw = (curvedP * 0.5 + cLoad * 0.5) * (0.38 + 0.62 * cLoad) * tiltReduction;
+            const penetration = penRaw <= 0 ? 0 : penRaw >= 1 ? 1 : penRaw;
+            const cutoff = effectiveDry * (1.0 - penetration * 0.84) * 0.76;
+            const ctRaw = (hCanvas - cutoff) * softnessInv;
+            const ct = ctRaw <= 0 ? 0 : ctRaw >= 1 ? 1 : ctRaw;
+            const smooth = ct * ct * (3.0 - 2.0 * ct);
+            const msRaw = grainDepth * (1.0 - penetration * 0.92) + dryBrush * (1.0 - cLoad * 0.94);
+            const maskStrength = msRaw <= 0 ? 0 : msRaw >= 1 ? 1 : msRaw;
+            toothContact = 1.0 - maskStrength + maskStrength * smooth;
+          }
 
           const srcA = baseAlpha * toothContact;
           if (srcA <= 0.002) continue;
-
-          const ch = this.getOrCreateChunk(px >> CHUNK_SHIFT, cy);
-          const idx = lyOff + (px & CHUNK_MASK);
 
           const sr = r0 + (r1 - r0) * t;
           const sg = g0 + (g1 - g0) * t;
@@ -647,9 +698,19 @@ export class NaturalPaintStrokeSession {
                   ch.g[idx] = sg;
                   ch.b[idx] = sb;
                 } else {
-                  ch.r[idx] = ch.r[idx] * (1 - fillW) + sr * fillW;
-                  ch.g[idx] = ch.g[idx] * (1 - fillW) + sg * fillW;
-                  ch.b[idx] = ch.b[idx] * (1 - fillW) + sb * fillW;
+                  const dr = ch.r[idx];
+                  const dg = ch.g[idx];
+                  const db = ch.b[idx];
+                  if (usePigmentBlend && (sr - dr) * (sr - dr) + (sg - dg) * (sg - dg) + (sb - db) * (sb - db) > 16) {
+                    pigmentMixRgbOut(dr, dg, db, sr, sg, sb, fillW, pigmentStrength, mixScratch);
+                    ch.r[idx] = mixScratch.r;
+                    ch.g[idx] = mixScratch.g;
+                    ch.b[idx] = mixScratch.b;
+                  } else {
+                    ch.r[idx] = dr + (sr - dr) * fillW;
+                    ch.g[idx] = dg + (sg - dg) * fillW;
+                    ch.b[idx] = db + (sb - db) * fillW;
+                  }
                 }
                 ch.a[idx] = srcA;
               }
@@ -661,10 +722,25 @@ export class NaturalPaintStrokeSession {
               const depositA = Math.min(1.0, srcA * 0.94);
               const outA = depositA + dstA * (1.0 - depositA);
               if (outA > 0.0005) {
-                const invOut = 1.0 / outA;
-                ch.r[idx] = (sr * depositA + ch.r[idx] * dstA * (1.0 - depositA)) * invOut;
-                ch.g[idx] = (sg * depositA + ch.g[idx] * dstA * (1.0 - depositA)) * invOut;
-                ch.b[idx] = (sb * depositA + ch.b[idx] * dstA * (1.0 - depositA)) * invOut;
+                const dr = ch.r[idx];
+                const dg = ch.g[idx];
+                const db = ch.b[idx];
+                if (
+                  usePigmentBlend &&
+                  dstA > 0.002 &&
+                  (sr - dr) * (sr - dr) + (sg - dg) * (sg - dg) + (sb - db) * (sb - db) > 16
+                ) {
+                  pigmentMixRgbOut(dr, dg, db, sr, sg, sb, depositA / outA, pigmentStrength, mixScratch);
+                  ch.r[idx] = mixScratch.r;
+                  ch.g[idx] = mixScratch.g;
+                  ch.b[idx] = mixScratch.b;
+                } else {
+                  const invOut = 1.0 / outA;
+                  const dstW = dstA * (1.0 - depositA);
+                  ch.r[idx] = (sr * depositA + dr * dstW) * invOut;
+                  ch.g[idx] = (sg * depositA + dg * dstW) * invOut;
+                  ch.b[idx] = (sb * depositA + db * dstW) * invOut;
+                }
                 ch.a[idx] = outA;
               }
               ch.height[idx] = ch.height[idx] * (1.0 - depositA * 0.72) + strandH * (0.28 + depositA * 0.72);
@@ -690,9 +766,23 @@ export class NaturalPaintStrokeSession {
               const blendW = overBed
                 ? Math.min(0.92, srcA * 1.15)
                 : srcA / Math.max(0.001, srcA + dstA);
-              ch.r[idx] = ch.r[idx] * (1 - blendW) + sr * blendW;
-              ch.g[idx] = ch.g[idx] * (1 - blendW) + sg * blendW;
-              ch.b[idx] = ch.b[idx] * (1 - blendW) + sb * blendW;
+              const dr = ch.r[idx];
+              const dg = ch.g[idx];
+              const db = ch.b[idx];
+              if (
+                usePigmentBlend &&
+                dstA > 0.002 &&
+                (sr - dr) * (sr - dr) + (sg - dg) * (sg - dg) + (sb - db) * (sb - db) > 16
+              ) {
+                pigmentMixRgbOut(dr, dg, db, sr, sg, sb, blendW, pigmentStrength, mixScratch);
+                ch.r[idx] = mixScratch.r;
+                ch.g[idx] = mixScratch.g;
+                ch.b[idx] = mixScratch.b;
+              } else {
+                ch.r[idx] = dr + (sr - dr) * blendW;
+                ch.g[idx] = dg + (sg - dg) * blendW;
+                ch.b[idx] = db + (sb - db) * blendW;
+              }
               ch.a[idx] = targetA;
             }
             if (overBed) {
@@ -716,10 +806,25 @@ export class NaturalPaintStrokeSession {
             const depositA = Math.min(1.0, srcA * 0.94);
             const outA = depositA + dstA * (1.0 - depositA);
             if (outA > 0.0005) {
-              const invOut = 1.0 / outA;
-              ch.r[idx] = (sr * depositA + ch.r[idx] * dstA * (1.0 - depositA)) * invOut;
-              ch.g[idx] = (sg * depositA + ch.g[idx] * dstA * (1.0 - depositA)) * invOut;
-              ch.b[idx] = (sb * depositA + ch.b[idx] * dstA * (1.0 - depositA)) * invOut;
+              const dr = ch.r[idx];
+              const dg = ch.g[idx];
+              const db = ch.b[idx];
+              if (
+                usePigmentBlend &&
+                dstA > 0.002 &&
+                (sr - dr) * (sr - dr) + (sg - dg) * (sg - dg) + (sb - db) * (sb - db) > 16
+              ) {
+                pigmentMixRgbOut(dr, dg, db, sr, sg, sb, depositA / outA, pigmentStrength, mixScratch);
+                ch.r[idx] = mixScratch.r;
+                ch.g[idx] = mixScratch.g;
+                ch.b[idx] = mixScratch.b;
+              } else {
+                const invOut = 1.0 / outA;
+                const dstW = dstA * (1.0 - depositA);
+                ch.r[idx] = (sr * depositA + dr * dstW) * invOut;
+                ch.g[idx] = (sg * depositA + dg * dstW) * invOut;
+                ch.b[idx] = (sb * depositA + db * dstW) * invOut;
+              }
               ch.a[idx] = outA;
             }
             ch.height[idx] = ch.height[idx] * (1.0 - depositA * 0.78) + strandH * (0.22 + depositA * 0.85);
@@ -727,7 +832,6 @@ export class NaturalPaintStrokeSession {
           }
 
           ch.lastArcU[idx] = arcU;
-          ch.tooth[idx] = hCanvas;
         }
       }
     }
@@ -797,6 +901,10 @@ export class NaturalPaintStrokeSession {
     const gh = rh + border * 2;
     let smoothPaintH: Float32Array | null = null;
     let rawToothGrid: Float32Array | null = null;
+    let minPaintGx = gw;
+    let maxPaintGx = -1;
+    let minPaintGy = gh;
+    let maxPaintGy = -1;
     if (impastoOn) {
       const needed = gw * gh;
       if (this.hGridRaw.length < needed) {
@@ -805,36 +913,57 @@ export class NaturalPaintStrokeSession {
         this.hGridSmooth = new Float32Array(needed);
         this.toothGrid = new Float32Array(needed);
       }
+      if (this.rowPaintMinX.length < gh) {
+        this.rowPaintMinX = new Int32Array(gh);
+        this.rowPaintMaxX = new Int32Array(gh);
+      }
       const rawH = this.hGridRaw;
       const tmpH = this.hGridTmp;
       smoothPaintH = this.hGridSmooth;
       rawToothGrid = this.toothGrid;
 
-      // Stage 1: Single-lookup dual-channel extraction:
-      // - rawH: pure sculptural paint thickness (zero weave blur contamination!)
-      // - rawToothGrid: unblurred high-DPI surface weave fallback
+      // Stage 1: Single-lookup dual-channel extraction with scanline chunk caching
       for (let gy = 0; gy < gh; gy++) {
         const wy = ry + gy - border;
         const cy = wy >> CHUNK_SHIFT;
         const lyOff = (wy & CHUNK_MASK) << CHUNK_SHIFT;
         const rowOff = gy * gw;
+        let cachedCx = -999999;
+        let cachedCh: PaintChunk | undefined = undefined;
+        let rMin = gw;
+        let rMax = -1;
         for (let gx = 0; gx < gw; gx++) {
           const wx = rx + gx - border;
-          const ch = this.getChunk(wx >> CHUNK_SHIFT, cy);
-          if (!ch) {
+          const cx = wx >> CHUNK_SHIFT;
+          if (cx !== cachedCx) {
+            cachedCh = this.getChunk(cx, cy);
+            cachedCx = cx;
+          }
+          if (!cachedCh) {
             rawH[rowOff + gx] = 0;
             rawToothGrid[rowOff + gx] = 0.5;
             continue;
           }
           const idx = lyOff + (wx & CHUNK_MASK);
-          const a = ch.a[idx];
-          rawToothGrid[rowOff + gx] = ch.tooth[idx];
+          const a = cachedCh.a[idx];
+          const tVal = cachedCh.tooth[idx];
+          rawToothGrid[rowOff + gx] = tVal < 0 ? 0.5 : tVal;
           if (a <= 0.002) {
             rawH[rowOff + gx] = 0;
             continue;
           }
           // Pure volumetric paint height (thick oil ridges rise high, edges taper naturally to canvas)
-          rawH[rowOff + gx] = ch.height[idx] * impDepth * 1.75 * Math.min(1.0, a * 1.45);
+          rawH[rowOff + gx] = cachedCh.height[idx] * impDepth * 1.75 * (a * 1.45 >= 1.0 ? 1.0 : a * 1.45);
+          if (gx < rMin) rMin = gx;
+          if (gx > rMax) rMax = gx;
+        }
+        this.rowPaintMinX[gy] = rMin;
+        this.rowPaintMaxX[gy] = rMax;
+        if (rMax >= rMin) {
+          if (rMin < minPaintGx) minPaintGx = rMin;
+          if (rMax > maxPaintGx) maxPaintGx = rMax;
+          if (gy < minPaintGy) minPaintGy = gy;
+          if (gy > maxPaintGy) maxPaintGy = gy;
         }
       }
 
@@ -863,40 +992,43 @@ export class NaturalPaintStrokeSession {
       }
     }
 
-    // Fast bilinear height sampler inside smoothPaintH for smooth diagonal directional cast-shadow rays
-    const sampleSmoothBilinear = (fx: number, fy: number): number => {
-      if (!smoothPaintH) return 0;
-      const ix = fx | 0;
-      const iy = fy | 0;
-      if (ix < 0 || iy < 0 || ix >= gw - 1 || iy >= gh - 1) return 0;
-      const tx = fx - ix;
-      const ty = fy - iy;
-      const r0 = iy * gw + ix;
-      const r1 = r0 + gw;
-      const v00 = smoothPaintH[r0];
-      const v10 = smoothPaintH[r0 + 1];
-      const v01 = smoothPaintH[r1];
-      const v11 = smoothPaintH[r1 + 1];
-      const top = v00 + (v10 - v00) * tx;
-      const bot = v01 + (v11 - v01) * tx;
-      return top + (bot - top) * ty;
-    };
-
+    // 5 adaptive horizon-shadow taps marching toward the directional light source (1.2px .. 7.8px)
+    const shadowScale = 1.55 + impContrast * 1.45;
     const marchCastShadow = (gxIdx: number, gyIdx: number, h0: number): number => {
+      if (!smoothPaintH) return 0;
       let maxOcc = 0;
-      // 8 physical horizon-shadow taps marching toward the directional light source (1.0px .. 8.0px)
-      for (let step = 1; step <= 8; step++) {
-        const dist = step * 1.0;
-        const hS = sampleSmoothBilinear(gxIdx + dlx * dist, gyIdx + dly * dist);
+      const gwM1 = gw - 1;
+      const ghM1 = gh - 1;
+      // Adaptive distances [1.2, 2.5, 4.0, 5.8, 7.8] preserve crisp contact hugs + soft penumbra with 38% fewer taps
+      for (let step = 0; step < 5; step++) {
+        const dist = step === 0 ? 1.2 : step === 1 ? 2.5 : step === 2 ? 4.0 : step === 3 ? 5.8 : 7.8;
+        const fx = gxIdx + dlx * dist;
+        const fy = gyIdx + dly * dist;
+        const ix = fx | 0;
+        const iy = fy | 0;
+        if (ix < 0 || iy < 0 || ix >= gwM1 || iy >= ghM1) continue;
+        const tx = fx - ix;
+        const ty = fy - iy;
+        const r0 = iy * gw + ix;
+        const r1 = r0 + gw;
+        const v00 = smoothPaintH[r0];
+        const v10 = smoothPaintH[r0 + 1];
+        const v01 = smoothPaintH[r1];
+        const v11 = smoothPaintH[r1 + 1];
+        const top = v00 + (v10 - v00) * tx;
+        const bot = v01 + (v11 - v01) * tx;
+        const hS = top + (bot - top) * ty;
         const occ = hS - (h0 + raySlope * dist);
         if (occ > 0) {
-          // Crisp hugging contact shadow near the paint rim, softening naturally into a delicate penumbra
-          const distFade = Math.max(0, 1.0 - dist * 0.115);
-          const soft = occ * distFade * distFade * 1.25;
-          if (soft > maxOcc) maxOcc = soft;
+          const distFade = 1.0 - dist * 0.115;
+          if (distFade > 0) {
+            const soft = occ * distFade * distFade * 1.25;
+            if (soft > maxOcc) maxOcc = soft;
+          }
         }
       }
-      return Math.min(1.0, maxOcc * (1.55 + impContrast * 1.45));
+      const res = maxOcc * shadowScale;
+      return res >= 1.0 ? 1.0 : res;
     };
 
     // Use true 2x-DPI analytical surface gradients for built-in canvas-locked / random-per-stroke textures
@@ -905,6 +1037,7 @@ export class NaturalPaintStrokeSession {
       (this.grainParams.mappingMode === 'canvas-locked' ||
         this.grainParams.mappingMode === 'random-per-stroke');
     const gradScratch = { gx: 0, gy: 0 };
+    const hasPaintedBBox = maxPaintGx >= minPaintGx && maxPaintGy >= minPaintGy;
 
     for (let y = 0; y < rh; y++) {
       const wy = ry + y;
@@ -915,10 +1048,23 @@ export class NaturalPaintStrokeSession {
       const gRowU = (gyIdx - 1) * gw;
       const gRowC = gyIdx * gw;
       const gRowD = (gyIdx + 1) * gw;
+      const canRowReceiveCast =
+        impastoOn &&
+        impDepth > 0.25 &&
+        hasPaintedBBox &&
+        gyIdx >= minPaintGy - 9 &&
+        gyIdx <= maxPaintGy + 9;
+      let cachedCx = -999999;
+      let cachedCh: PaintChunk | undefined = undefined;
 
       for (let x = 0; x < rw; x++) {
         const wx = rx + x;
-        const ch = this.getChunk(wx >> CHUNK_SHIFT, cy);
+        const cx = wx >> CHUNK_SHIFT;
+        if (cx !== cachedCx) {
+          cachedCh = this.getChunk(cx, cy);
+          cachedCx = cx;
+        }
+        const ch = cachedCh;
         const outIdx = rowOut + x * 4;
         const gxIdx = x + border;
 
@@ -927,7 +1073,12 @@ export class NaturalPaintStrokeSession {
 
         // Bare canvas / lower-layer pixel: check if a genuinely thick impasto ridge casts a subtle shadow
         if (alpha <= 0.003) {
-          if (impastoOn && impDepth > 0.25 && smoothPaintH) {
+          if (
+            canRowReceiveCast &&
+            smoothPaintH &&
+            gxIdx >= minPaintGx - 9 &&
+            gxIdx <= maxPaintGx + 9
+          ) {
             const castS = marchCastShadow(gxIdx, gyIdx, 0);
             if (castS > 0.08) {
               const shadowAlpha = Math.min(0.18, Math.pow(castS, 1.35) * (0.08 + impDepth * 0.14));
@@ -948,7 +1099,8 @@ export class NaturalPaintStrokeSession {
         let r = ch!.r[idx];
         let g = ch!.g[idx];
         let b = ch!.b[idx];
-        const tooth = ch!.tooth[idx];
+        const rawTooth = ch!.tooth[idx];
+        const tooth = rawTooth < 0 ? 0.5 : rawTooth;
         const hp = ch!.height[idx];
 
         // Watercolor granulation: pigment particles settle into recessed paper valleys
@@ -1187,6 +1339,58 @@ export class NaturalPaintStrokeSession {
     }
   }
 
+  /**
+   * Rasterizes a cubic segment into sparse RGBA+Height chunks and accumulates its dirty bounds
+   * for deferred single-pass per-frame shading (`flushPendingDirtyToContext`).
+   */
+  public appendCubicSegment(
+    p0: Point,
+    c1: Point,
+    c2: Point,
+    p3: Point,
+    sampler?: LayerPixelSampler
+  ): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    this.hasEmittedSegment = true;
+    this.pendingTapPoint = null;
+    const batch = this.engine.emitCubicSegment(p0, c1, c2, p3, sampler);
+    const dirty = this.rasterizeBatch(batch);
+    if (dirty) {
+      if (dirty.minX < this.pendingDirtyMinX) this.pendingDirtyMinX = dirty.minX;
+      if (dirty.minY < this.pendingDirtyMinY) this.pendingDirtyMinY = dirty.minY;
+      if (dirty.maxX > this.pendingDirtyMaxX) this.pendingDirtyMaxX = dirty.maxX;
+      if (dirty.maxY > this.pendingDirtyMaxY) this.pendingDirtyMaxY = dirty.maxY;
+    }
+    return dirty;
+  }
+
+  /**
+   * Shades and blits all segments accumulated since the previous frame flush in ONE pass.
+   */
+  public flushPendingDirtyToContext(
+    ctx: CanvasRenderingContext2D,
+    replaceRegion: boolean = true
+  ): { minX: number; minY: number; maxX: number; maxY: number } | null {
+    if (
+      !Number.isFinite(this.pendingDirtyMinX) ||
+      !Number.isFinite(this.pendingDirtyMaxX) ||
+      this.pendingDirtyMaxX < this.pendingDirtyMinX
+    ) {
+      return null;
+    }
+    const dirty = {
+      minX: this.pendingDirtyMinX,
+      minY: this.pendingDirtyMinY,
+      maxX: this.pendingDirtyMaxX,
+      maxY: this.pendingDirtyMaxY,
+    };
+    this.pendingDirtyMinX = Infinity;
+    this.pendingDirtyMinY = Infinity;
+    this.pendingDirtyMaxX = -Infinity;
+    this.pendingDirtyMaxY = -Infinity;
+    this.flushDirtyRectToContext(ctx, dirty, replaceRegion, 1.0, 'source-over');
+    return dirty;
+  }
+
   public drawCubicSegment(
     ctx: CanvasRenderingContext2D,
     p0: Point,
@@ -1196,13 +1400,8 @@ export class NaturalPaintStrokeSession {
     sampler?: LayerPixelSampler,
     replaceRegion: boolean = true
   ): void {
-    this.hasEmittedSegment = true;
-    this.pendingTapPoint = null;
-    const batch = this.engine.emitCubicSegment(p0, c1, c2, p3, sampler);
-    const dirty = this.rasterizeBatch(batch);
-    if (dirty) {
-      this.flushDirtyRectToContext(ctx, dirty, replaceRegion, 1.0, 'source-over');
-    }
+    this.appendCubicSegment(p0, c1, c2, p3, sampler);
+    this.flushPendingDirtyToContext(ctx, replaceRegion);
   }
 
   public getDirtyBounds(): { minX: number; minY: number; maxX: number; maxY: number } | null {

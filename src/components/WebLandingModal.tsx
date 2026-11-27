@@ -1,12 +1,23 @@
 import React, { useEffect, useState } from 'react';
 import { Users, Globe, Monitor, ArrowRight, User, X } from 'lucide-react';
 import { isTauriEnvironment } from '../hooks/useMultiplayer';
-import { DEEP_LINK_SCHEME, ParsedInviteLink } from '../services/multiplayerService';
+import {
+  DEEP_LINK_SCHEME,
+  ParsedCollabTarget,
+  ParsedInviteLink,
+  ParsedP2pInvite,
+} from '../services/multiplayerService';
 import { NICKNAME_CUSTOMIZED_STORAGE_KEY, NICKNAME_STORAGE_KEY } from '../types/settings';
 import { safeLocalStorageSetItem } from '../utils/safeStorage';
 
+function isP2pInvite(
+  invite: ParsedCollabTarget | ParsedInviteLink
+): invite is ParsedP2pInvite {
+  return 'kind' in invite && invite.kind === 'p2p';
+}
+
 interface WebLandingModalProps {
-  invite: ParsedInviteLink | null;
+  invite: ParsedCollabTarget | ParsedInviteLink | null;
   onJoinInBrowser: (
     name: string,
     host: string,
@@ -16,12 +27,18 @@ interface WebLandingModalProps {
     isSecure?: boolean,
     persistName?: boolean
   ) => void;
+  onJoinTargetInBrowser?: (
+    name: string,
+    target: ParsedCollabTarget,
+    persistName?: boolean
+  ) => void;
   onDismiss: () => void;
 }
 
 export const WebLandingModal: React.FC<WebLandingModalProps> = ({
   invite,
   onJoinInBrowser,
+  onJoinTargetInBrowser,
   onDismiss,
 }) => {
   const [userName, setUserName] = useState(() => {
@@ -49,19 +66,52 @@ export const WebLandingModal: React.FC<WebLandingModalProps> = ({
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isVisible, onDismiss]);
 
-  // If running inside desktop Tauri app, don't show the web browser welcome banner
+  // If running inside native Tauri app, don't show the web browser welcome banner
   if (!invite || isTauri) return null;
 
+  const p2pMode = isP2pInvite(invite);
+  const isSecureWs = !isP2pInvite(invite) && invite.isSecure;
   const trimmedName = userName.trim();
-  const hostDisplay = `${invite.host}${
-    invite.port && invite.port !== 443 && invite.port !== 80 ? `:${invite.port}` : ''
-  }`;
+  const hostDisplay = isP2pInvite(invite)
+    ? `WebRTC P2P · ${invite.joinCode}`
+    : `${invite.host}${
+        invite.port && invite.port !== 443 && invite.port !== 80 ? `:${invite.port}` : ''
+      }`;
 
   const handleOpenInApp = () => {
+    if (isP2pInvite(invite)) {
+      const params = new URLSearchParams();
+      params.set('code', invite.roomCode);
+      if (invite.roomSecret) params.set('secret', invite.roomSecret);
+      if (invite.roomName && invite.roomName !== invite.roomCode) {
+        params.set('room', invite.roomName);
+      }
+      if (invite.signalingUrl) params.set('sig', invite.signalingUrl);
+      window.location.href = `${DEEP_LINK_SCHEME}//p2p?${params.toString()}`;
+      return;
+    }
     const tokenPart = invite.token ? `&token=${encodeURIComponent(invite.token)}` : '';
     const protoPart = invite.isSecure ? '&protocol=https' : '';
     const deepLink = `${DEEP_LINK_SCHEME}//join?host=${encodeURIComponent(invite.host)}&port=${invite.port}&room=${encodeURIComponent(invite.roomName)}${tokenPart}${protoPart}`;
     window.location.href = deepLink;
+  };
+
+  const dispatchJoin = (name: string, persistName: boolean) => {
+    if ('kind' in invite && onJoinTargetInBrowser) {
+      onJoinTargetInBrowser(name, invite, persistName);
+      return;
+    }
+    if (!isP2pInvite(invite)) {
+      onJoinInBrowser(
+        name,
+        invite.host,
+        invite.port,
+        invite.roomName,
+        invite.token,
+        invite.isSecure,
+        persistName
+      );
+    }
   };
 
   const handleJoinWithNickname = (e?: React.FormEvent) => {
@@ -72,27 +122,11 @@ export const WebLandingModal: React.FC<WebLandingModalProps> = ({
     }
     safeLocalStorageSetItem(NICKNAME_STORAGE_KEY, trimmedName, 'artist name');
     safeLocalStorageSetItem(NICKNAME_CUSTOMIZED_STORAGE_KEY, '1', 'artist name flag');
-    onJoinInBrowser(
-      trimmedName,
-      invite.host,
-      invite.port,
-      invite.roomName,
-      invite.token,
-      invite.isSecure,
-      true
-    );
+    dispatchJoin(trimmedName, true);
   };
 
   const handlePlayAsGuest = () => {
-    onJoinInBrowser(
-      'Guest',
-      invite.host,
-      invite.port,
-      invite.roomName,
-      invite.token,
-      invite.isSecure,
-      false
-    );
+    dispatchJoin('Guest', false);
   };
 
   return (
@@ -134,9 +168,9 @@ export const WebLandingModal: React.FC<WebLandingModalProps> = ({
               <span className="text-[10px] uppercase tracking-wider text-[#8a8a8a]">
                 Connecting to Canvas
               </span>
-              {invite.isSecure && (
+              {(p2pMode || isSecureWs) && (
                 <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#202020] border border-[#2c2c2c] text-[#a0a0a0]">
-                  HTTPS · WSS
+                  {p2pMode ? 'WEBRTC · P2P' : 'HTTPS · WSS'}
                 </span>
               )}
             </div>
@@ -203,11 +237,11 @@ export const WebLandingModal: React.FC<WebLandingModalProps> = ({
               <button
                 type="button"
                 onClick={handleOpenInApp}
-                className="w-full flex items-center justify-between gap-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-[#2c2c2c] px-3.5 py-2 text-xs font-medium text-[#d4d4d4] hover:text-[#e5e5e5] transition-colors cursor-pointer"
+                className="w-full min-h-[44px] flex items-center justify-between gap-2 rounded bg-[#161616] hover:bg-[#2c2c2c] border border-[#2c2c2c] px-3.5 py-2 text-xs font-medium text-[#d4d4d4] hover:text-[#e5e5e5] transition-colors cursor-pointer"
               >
                 <span className="flex items-center gap-2">
                   <Monitor className="w-3.5 h-3.5 text-[var(--accent)]" />
-                  <span>Launch Desktop Client (.exe)</span>
+                  <span>Open in Ink Studio App</span>
                 </span>
                 <ArrowRight className="w-3.5 h-3.5 text-[#8a8a8a]" />
               </button>

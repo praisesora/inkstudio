@@ -1,4 +1,5 @@
 import { TILE_SIZE } from '../tileEngine';
+import { invalidatePigmentLutTexture } from '../pigmentEngine';
 import {
   COMPOSITOR_FRAGMENT_SHADER,
   COMPOSITOR_VERTEX_SHADER,
@@ -6,6 +7,7 @@ import {
   FOLDER_BLIT_VERTEX_SHADER,
   FRAME_POLY_FRAGMENT_SHADER,
   FRAME_POLY_VERTEX_SHADER,
+  PIGMENT_DRAFT_FRAGMENT_SHADER,
   VIEWPORT_DRAFT_VERTEX_SHADER,
 } from './shaders/coreShaders';
 import {
@@ -209,6 +211,7 @@ export function initTileArrayPool(state: CompositorState, gl: WebGL2RenderingCon
 }
 
 export function resetGLStateOnContextLost(state: CompositorState): void {
+  invalidatePigmentLutTexture(state.gl, false);
   state.contextLost = true;
   state.gl = null;
   state.program = null;
@@ -222,6 +225,7 @@ export function resetGLStateOnContextLost(state: CompositorState): void {
   state.arrayPoolCapacity = 0;
   state.arrayPoolFilterTier = -1;
   state.viewportDraftProgram = null;
+  state.pigmentDraftProgram = null;
   state.adjProgram = null;
   state.stylesProgram = null;
   state.blitProgram = null;
@@ -243,6 +247,8 @@ export function resetGLStateOnContextLost(state: CompositorState): void {
   state.draftTexWidth = 0;
   state.draftTexHeight = 0;
   state.draftHasMipmap = false;
+  state.draftNeedsFullUpload = true;
+  state.lastDraftLayerId = null;
   state.lastDraftVersion = -1;
   state.stackCache.invalidateAll();
 }
@@ -412,6 +418,47 @@ export function initGL(state: CompositorState): boolean {
         state.uBlitBlendModeLoc = gl.getUniformLocation(bProg, 'u_blendMode');
         state.uBlitOpacityLoc = gl.getUniformLocation(bProg, 'u_blitOpacity');
       }
+    }
+
+    // Compile Live Pigment Draft Compositing Program (reuses FOLDER_BLIT_VERTEX_SHADER)
+    const pigDraftFs = compileShader(gl, gl.FRAGMENT_SHADER, PIGMENT_DRAFT_FRAGMENT_SHADER);
+    if (
+      blitVs &&
+      pigDraftFs &&
+      gl.getShaderParameter(blitVs, gl.COMPILE_STATUS) &&
+      gl.getShaderParameter(pigDraftFs, gl.COMPILE_STATUS)
+    ) {
+      const pdProg = linkProgram(gl, blitVs, pigDraftFs);
+      if (pdProg && gl.getProgramParameter(pdProg, gl.LINK_STATUS)) {
+        state.pigmentDraftProgram = pdProg;
+        state.aPigmentDraftQuadPosLoc = gl.getAttribLocation(pdProg, 'a_quadPos');
+        state.uPigmentDraftLayerTexLoc = gl.getUniformLocation(pdProg, 'u_layerTex');
+        state.uPigmentDraftDraftTexLoc = gl.getUniformLocation(pdProg, 'u_draftTex');
+        state.uPigmentDraftMaskTexLoc = gl.getUniformLocation(pdProg, 'u_maskTex');
+        state.uPigmentDraftLutTexLoc = gl.getUniformLocation(pdProg, 'u_pigmentLut');
+        state.uPigmentDraftDocDimensionsLoc = gl.getUniformLocation(pdProg, 'u_docDimensions');
+        state.uPigmentDraftViewportSizeLoc = gl.getUniformLocation(pdProg, 'u_viewportSize');
+        state.uPigmentDraftPanLoc = gl.getUniformLocation(pdProg, 'u_pan');
+        state.uPigmentDraftZoomLoc = gl.getUniformLocation(pdProg, 'u_zoom');
+        state.uPigmentDraftRotationRadLoc = gl.getUniformLocation(pdProg, 'u_rotationRad');
+        state.uPigmentDraftFlipLoc = gl.getUniformLocation(pdProg, 'u_flip');
+        state.uPigmentDraftDprLoc = gl.getUniformLocation(pdProg, 'u_dpr');
+        state.uPigmentDraftRectLoc = gl.getUniformLocation(pdProg, 'u_draftRect');
+        state.uPigmentDraftSpaceLoc = gl.getUniformLocation(pdProg, 'u_draftSpace');
+        state.uPigmentDraftOpacityLoc = gl.getUniformLocation(pdProg, 'u_draftOpacity');
+        state.uPigmentDraftStrengthLoc = gl.getUniformLocation(pdProg, 'u_pigmentStrength');
+        state.uPigmentDraftWhiteGroundLoc = gl.getUniformLocation(pdProg, 'u_whiteGround');
+        state.uPigmentDraftCompositeOpLoc = gl.getUniformLocation(pdProg, 'u_compositeOp');
+        state.uPigmentDraftCombineModeLoc = gl.getUniformLocation(pdProg, 'u_combineMode');
+        state.uPigmentDraftMaskEnabledLoc = gl.getUniformLocation(pdProg, 'u_maskEnabled');
+        state.uPigmentDraftLayerColorEnabledLoc = gl.getUniformLocation(pdProg, 'u_layerColorEnabled');
+        state.uPigmentDraftLayerColorLoc = gl.getUniformLocation(pdProg, 'u_layerColor');
+        state.uPigmentDraftLayerSubColorLoc = gl.getUniformLocation(pdProg, 'u_layerSubColor');
+      } else if (pdProg) {
+        console.error('Pigment draft link error:', gl.getProgramInfoLog(pdProg));
+      }
+    } else if (pigDraftFs) {
+      console.error('Pigment draft FS error:', gl.getShaderInfoLog(pigDraftFs));
     }
 
     // Compile Soft Proof Shader Program

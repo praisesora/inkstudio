@@ -6,7 +6,14 @@ import {
   centripetalCatmullRomToBezier,
   drawBrushCubicBezierSegment,
   drawBrushDot,
+  renderCompleteStroke,
 } from '../../engine/BrushEngine';
+import {
+  buildRibbonRenderOptionsFromBrushSettings,
+  isRibbonBrush,
+  RibbonStrokeSession,
+} from '../../engine/RibbonBrushEngine';
+import { resolveDualBrushConfig } from '../../engine/DualBrushEngine';
 import {
   isNaturalPaintBrush,
   NaturalPaintStrokeSession,
@@ -16,6 +23,10 @@ import {
   LayerPixelSampler,
   PaintReservoir,
 } from '../../utils/colorMixingEngine';
+import {
+  compositePigmentOverPixelInto,
+  isPigmentCompatibleCombineMode,
+} from '../../utils/pigmentEngine';
 
 type ScratchpadBg = 'white' | 'gray' | 'dark';
 
@@ -53,6 +64,8 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
     pointerId: number;
     points: Point[];
     natSession: NaturalPaintStrokeSession | null;
+    ribbonSession: RibbonStrokeSession | null;
+    useCompleteCommit: boolean;
     sampler: LayerPixelSampler | null;
     reservoir: PaintReservoir | null;
     remainderDist: number;
@@ -63,6 +76,8 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
     pointerId: -1,
     points: [],
     natSession: null,
+    ribbonSession: null,
+    useCompleteCommit: false,
     sampler: null,
     reservoir: null,
     remainderDist: 0,
@@ -141,6 +156,11 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
     s.totalDist = 0;
 
     const naturalMode = isNaturalPaintBrush(brushSettings);
+    const hasDualBrush = Boolean(resolveDualBrushConfig(brushSettings));
+    const hasCompareDensity = brushSettings.brushCombineMode === 'compare-density';
+    const ribbonMode = !naturalMode && !hasDualBrush && isRibbonBrush(brushSettings);
+    s.useCompleteCommit = !naturalMode && (hasDualBrush || hasCompareDensity);
+
     const needsSampler = Boolean(
       brushSettings.colorMixing !== false &&
         (brushSettings.colorMixing || (naturalMode && brushSettings.naturalPaint?.spatialMixing))
@@ -149,6 +169,7 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
     s.reservoir = brushSettings.colorMixing ? new PaintReservoir(activeColor) : null;
 
     if (naturalMode) {
+      s.ribbonSession = null;
       strokeSeedRef.current = (strokeSeedRef.current + 7919) & 0x7fffffff;
       const previewBs: BrushSettings = {
         ...brushSettings,
@@ -161,8 +182,12 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
         strokeSeedRef.current
       );
       s.natSession.stampInitialPoint(dCtx, pt, s.sampler || undefined, true);
+    } else if (ribbonMode) {
+      s.natSession = null;
+      s.ribbonSession = new RibbonStrokeSession();
     } else {
       s.natSession = null;
+      s.ribbonSession = null;
       const opts = buildBrushRenderOptions(brushSettings, {
         size: Math.min(110, Math.max(2, brushSettings.size || 24)),
         opacity: 1.0,
@@ -198,6 +223,26 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
 
     if (s.natSession) {
       s.natSession.drawCubicSegment(dCtx, p1, c1, c2, p2, s.sampler || undefined, true);
+    } else if (s.ribbonSession) {
+      const previewBs: BrushSettings = {
+        ...brushSettings,
+        color: activeColor,
+        size: Math.min(110, Math.max(2, brushSettings.size || 24)),
+      };
+      const ribbonOpts = buildRibbonRenderOptionsFromBrushSettings(
+        previewBs,
+        'color',
+        false,
+        false,
+        false,
+        false,
+        undefined,
+        {
+          opacity: 1.0,
+          useGpu: false,
+        }
+      );
+      s.ribbonSession.appendCubicSegment(dCtx, { p0: p1, c1, c2, p3: p2 }, ribbonOpts, 'brush');
     } else {
       const opts = buildBrushRenderOptions(brushSettings, {
         size: Math.min(110, Math.max(2, brushSettings.size || 24)),
@@ -239,21 +284,104 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
     }
 
     if (base && draft) {
-      const bCtx = base.getContext('2d');
-      const dCtx = draft.getContext('2d');
+      const bCtx = base.getContext('2d', { willReadFrequently: true });
+      const dCtx = draft.getContext('2d', { willReadFrequently: true });
       if (bCtx && dCtx) {
-        if (s.natSession) {
-          s.natSession.flushPendingTapIfNeeded(s.sampler || undefined);
-          const tapBounds = s.natSession.getDirtyBounds();
-          if (tapBounds && s.points.length <= 1) {
-            s.natSession.flushDirtyRectToContext(dCtx, tapBounds, true, 1.0, 'source-over');
+        const pigmentStrength =
+          brushSettings.perceptualMixing === false ||
+          brushSettings.isTransparentInk ||
+          !isPigmentCompatibleCombineMode(brushSettings.brushCombineMode)
+            ? 0
+            : Math.max(
+                0,
+                Math.min(1, brushSettings.naturalPaint?.pigmentMixingStrength ?? 1.0)
+              );
+        const compositeDraftToBase = () => {
+          const op = Math.max(0.01, Math.min(1, brushSettings.opacity ?? 1.0));
+          if (pigmentStrength > 0.005) {
+            const w = base.width;
+            const h = base.height;
+            const dstImg = bCtx.getImageData(0, 0, w, h);
+            const srcImg = dCtx.getImageData(0, 0, w, h);
+            const dd = dstImg.data;
+            const sd = srcImg.data;
+            const whiteGround = bgMode === 'white';
+            const pxOut: [number, number, number, number] = [0, 0, 0, 0];
+            for (let i = 0; i < dd.length; i += 4) {
+              const sa = sd[i + 3];
+              if (sa === 0) continue;
+              const effA = op >= 0.999 ? sa : Math.round(sa * op);
+              if (effA <= 0) continue;
+              compositePigmentOverPixelInto(
+                dd[i],
+                dd[i + 1],
+                dd[i + 2],
+                dd[i + 3],
+                sd[i],
+                sd[i + 1],
+                sd[i + 2],
+                effA,
+                pigmentStrength,
+                whiteGround,
+                'source-over',
+                brushSettings.brushCombineMode,
+                pxOut
+              );
+              dd[i] = pxOut[0];
+              dd[i + 1] = pxOut[1];
+              dd[i + 2] = pxOut[2];
+              dd[i + 3] = pxOut[3];
+            }
+            bCtx.putImageData(dstImg, 0, 0);
+          } else {
+            bCtx.save();
+            bCtx.globalAlpha = op;
+            bCtx.drawImage(draft, 0, 0);
+            bCtx.restore();
           }
+          dCtx.clearRect(0, 0, draft.width, draft.height);
+        };
+
+        if (s.useCompleteCommit && s.points.length > 0) {
+          dCtx.clearRect(0, 0, draft.width, draft.height);
+          const previewBs: BrushSettings = {
+            ...brushSettings,
+            color: activeColor,
+            size: Math.min(110, Math.max(2, brushSettings.size || 24)),
+            useGpu: false,
+          };
+          if (pigmentStrength > 0.005) {
+            renderCompleteStroke(
+              dCtx,
+              s.points,
+              { ...previewBs, opacity: 1.0, brushCombineMode: undefined },
+              'brush',
+              'color',
+              false,
+              base,
+              false
+            );
+            compositeDraftToBase();
+          } else {
+            renderCompleteStroke(bCtx, s.points, previewBs, 'brush', 'color', false, base, false);
+          }
+        } else {
+          if (s.natSession) {
+            s.natSession.flushPendingTapIfNeeded(s.sampler || undefined);
+            const tapBounds = s.natSession.getDirtyBounds();
+            if (tapBounds && s.points.length <= 1) {
+              s.natSession.flushDirtyRectToContext(dCtx, tapBounds, true, 1.0, 'source-over');
+            }
+          } else if (s.ribbonSession && s.points.length === 1) {
+            const opts = buildBrushRenderOptions(brushSettings, {
+              size: Math.min(110, Math.max(2, brushSettings.size || 24)),
+              opacity: 1.0,
+              useGpu: false,
+            });
+            drawBrushDot(dCtx, s.points[0], activeColor, opts);
+          }
+          compositeDraftToBase();
         }
-        bCtx.save();
-        bCtx.globalAlpha = Math.max(0.01, Math.min(1, brushSettings.opacity ?? 1.0));
-        bCtx.drawImage(draft, 0, 0);
-        bCtx.restore();
-        dCtx.clearRect(0, 0, draft.width, draft.height);
       }
     }
 
@@ -261,6 +389,11 @@ export const BrushStudioScratchpad: React.FC<BrushStudioScratchpadProps> = ({
       s.natSession.finishAndDispose();
       s.natSession = null;
     }
+    if (s.ribbonSession) {
+      s.ribbonSession.reset();
+      s.ribbonSession = null;
+    }
+    s.useCompleteCommit = false;
     s.sampler = null;
     s.reservoir = null;
     s.points = [];

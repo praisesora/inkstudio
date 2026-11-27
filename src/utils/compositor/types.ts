@@ -3,6 +3,7 @@ import {
   CanvasDimensions,
   BlendMode,
   CanvasColorMode,
+  CspBrushCombineMode,
   SoftProofSettings,
 } from '../../types/editor';
 import type {
@@ -94,6 +95,9 @@ export interface CompositorOptions {
   activeDraftSpace?: 'document' | 'viewport';
   activeDraftOpacity?: number;
   activeDraftMonochrome?: boolean;
+  activeDraftPigmentStrength?: number;
+  activeDraftPigmentWhiteGround?: boolean;
+  activeDraftCombineMode?: CspBrushCombineMode;
 }
 
 export interface CompositingUnit {
@@ -283,6 +287,32 @@ export interface CompositorState {
   uViewportDraftIsBgLoc: WebGLUniformLocation | null;
   aViewportDraftQuadPosLoc: number;
 
+  // Live physical Kubelka-Munk pigment draft compositing program
+  pigmentDraftProgram: WebGLProgram | null;
+  aPigmentDraftQuadPosLoc: number;
+  uPigmentDraftLayerTexLoc: WebGLUniformLocation | null;
+  uPigmentDraftDraftTexLoc: WebGLUniformLocation | null;
+  uPigmentDraftMaskTexLoc: WebGLUniformLocation | null;
+  uPigmentDraftLutTexLoc: WebGLUniformLocation | null;
+  uPigmentDraftDocDimensionsLoc: WebGLUniformLocation | null;
+  uPigmentDraftViewportSizeLoc: WebGLUniformLocation | null;
+  uPigmentDraftPanLoc: WebGLUniformLocation | null;
+  uPigmentDraftZoomLoc: WebGLUniformLocation | null;
+  uPigmentDraftRotationRadLoc: WebGLUniformLocation | null;
+  uPigmentDraftFlipLoc: WebGLUniformLocation | null;
+  uPigmentDraftDprLoc: WebGLUniformLocation | null;
+  uPigmentDraftRectLoc: WebGLUniformLocation | null;
+  uPigmentDraftSpaceLoc: WebGLUniformLocation | null;
+  uPigmentDraftOpacityLoc: WebGLUniformLocation | null;
+  uPigmentDraftStrengthLoc: WebGLUniformLocation | null;
+  uPigmentDraftWhiteGroundLoc: WebGLUniformLocation | null;
+  uPigmentDraftCompositeOpLoc: WebGLUniformLocation | null;
+  uPigmentDraftCombineModeLoc: WebGLUniformLocation | null;
+  uPigmentDraftMaskEnabledLoc: WebGLUniformLocation | null;
+  uPigmentDraftLayerColorEnabledLoc: WebGLUniformLocation | null;
+  uPigmentDraftLayerColorLoc: WebGLUniformLocation | null;
+  uPigmentDraftLayerSubColorLoc: WebGLUniformLocation | null;
+
   // Cached attribute locations
   aQuadPosLoc: number;
   aStylesQuadPosLoc: number;
@@ -302,6 +332,8 @@ export interface CompositorState {
   draftTexWidth: number;
   draftTexHeight: number;
   draftHasMipmap: boolean;
+  draftNeedsFullUpload: boolean;
+  lastDraftLayerId: string | null;
   lastDraftVersion: number;
   currentOptions: CompositorOptions | null;
   currentZoom: number;
@@ -401,6 +433,8 @@ export interface CompositorState {
   fallbackTileCanvas: HTMLCanvasElement | null;
   fallbackTileImageData: ImageData | null;
   fallbackIsoCanvas: HTMLCanvasElement | null;
+  fallbackDraftCanvas: HTMLCanvasElement | null;
+  draftUploadCanvas: HTMLCanvasElement | null;
   lastRenderedGrid: SparseTileGrid | null;
 
   // Performance & Renderer Configuration

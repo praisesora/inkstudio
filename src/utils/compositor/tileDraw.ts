@@ -197,40 +197,43 @@ export function drawVisibleTiles(
 }
 
 /**
- * Uploads and renders the active draft canvas in-stack for the active layer.
- * Supports both viewport-space overlays (from CanvasArea) and document-space draft canvases.
+ * Uploads or updates `state.draftTexture` from `draftCanvas` if version or dimensions changed.
+ * Returns `true` when `state.draftTexture` is ready to bind.
  */
-export function renderActiveDraftForLayer(
+export function uploadActiveDraftTexture(
   state: CompositorState,
   gl: WebGL2RenderingContext,
   draftCanvas: HTMLCanvasElement,
-  layer: LayerItem,
-  dimensions: CanvasDimensions,
-  effectiveOpacity: number,
-  modeCode: number,
-  backdropTex: WebGLTexture | null,
-  maskTex: WebGLTexture | null,
   draftVersion?: number,
-  draftSpace: 'document' | 'viewport' = 'document',
-  isDestinationOutMask: boolean = false
-): void {
-  if (draftCanvas.width <= 0 || draftCanvas.height <= 0) return;
-  if ((draftCanvas as any).__draftHasContent === false) return;
+  draftSpace: 'document' | 'viewport' = 'document'
+): boolean {
+  if (draftCanvas.width <= 0 || draftCanvas.height <= 0) return false;
+  if ((draftCanvas as any).__draftHasContent === false) return false;
   if (!state.draftTexture) {
     state.draftTexture = gl.createTexture();
   }
-  if (!state.draftTexture) return;
+  if (!state.draftTexture) return false;
 
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, state.draftTexture);
 
   const ver = draftVersion ?? -1;
   const hasGenerateMipmap = typeof gl.generateMipmap === 'function';
-  const needsMipmap = hasGenerateMipmap && draftSpace === 'document' && state.currentZoom < 0.99;
+  // Only rebuild full draft mipmap pyramid below 50% zoom where trilinear minification prevents aliasing;
+  // at 50%-100% zoom, hardware GL_LINEAR is sharp and skips a costly 38MB mipmap rebuild every frame!
+  const needsMipmap = hasGenerateMipmap && draftSpace === 'document' && state.currentZoom < 0.5;
   const sizeChanged =
     state.draftTexWidth !== draftCanvas.width || state.draftTexHeight !== draftCanvas.height;
+  const activeDraftLayerId = state.currentOptions?.activeDraftLayerId ?? null;
+  const forceFullUpload = Boolean(
+    sizeChanged ||
+      state.draftTexWidth === 0 ||
+      state.draftNeedsFullUpload ||
+      (draftCanvas as any).__draftForceFullUpload === true ||
+      state.lastDraftLayerId !== activeDraftLayerId
+  );
 
-  if (ver === -1 || ver !== state.lastDraftVersion || sizeChanged) {
+  if (ver === -1 || ver !== state.lastDraftVersion || forceFullUpload) {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(
@@ -241,9 +244,50 @@ export function renderActiveDraftForLayer(
     gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
-    if (!sizeChanged && state.draftTexWidth > 0 && typeof gl.texSubImage2D === 'function') {
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+    const frameDirty = (draftCanvas as any).__draftFrameDirtyRect as
+      | { x: number; y: number; width: number; height: number }
+      | null
+      | undefined;
+    if (frameDirty !== undefined) {
+      (draftCanvas as any).__draftFrameDirtyRect = null;
+    }
+    if (!forceFullUpload && !sizeChanged && state.draftTexWidth > 0 && typeof gl.texSubImage2D === 'function') {
+      let uploadedSubRect = false;
+      if (
+        frameDirty &&
+        frameDirty.width > 0 &&
+        frameDirty.height > 0 &&
+        frameDirty.width * frameDirty.height < draftCanvas.width * draftCanvas.height * 0.5 &&
+        typeof document !== 'undefined'
+      ) {
+        const dx = Math.max(0, Math.min(draftCanvas.width - 1, frameDirty.x | 0));
+        const dy = Math.max(0, Math.min(draftCanvas.height - 1, frameDirty.y | 0));
+        const dw = Math.max(1, Math.min(draftCanvas.width - dx, Math.ceil(frameDirty.width)));
+        const dh = Math.max(1, Math.min(draftCanvas.height - dy, Math.ceil(frameDirty.height)));
+        try {
+          if (!state.draftUploadCanvas) {
+            state.draftUploadCanvas = document.createElement('canvas');
+          }
+          if (state.draftUploadCanvas.width !== dw || state.draftUploadCanvas.height !== dh) {
+            state.draftUploadCanvas.width = dw;
+            state.draftUploadCanvas.height = dh;
+          }
+          const subCtx = state.draftUploadCanvas.getContext('2d');
+          if (subCtx && typeof subCtx.drawImage === 'function') {
+            subCtx.clearRect(0, 0, dw, dh);
+            subCtx.drawImage(draftCanvas, dx, dy, dw, dh, 0, 0, dw, dh);
+            gl.texSubImage2D(gl.TEXTURE_2D, 0, dx, dy, gl.RGBA, gl.UNSIGNED_BYTE, state.draftUploadCanvas);
+            uploadedSubRect = true;
+          }
+        } catch {
+          uploadedSubRect = false;
+        }
+      }
+      if (!uploadedSubRect) {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
+      }
     } else {
+      // Full texture replacement orphans any stale GPU backing from a prior/undone stroke
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, draftCanvas);
     }
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
@@ -255,6 +299,11 @@ export function renderActiveDraftForLayer(
     }
     state.draftTexWidth = draftCanvas.width;
     state.draftTexHeight = draftCanvas.height;
+    state.draftNeedsFullUpload = false;
+    state.lastDraftLayerId = activeDraftLayerId;
+    if ((draftCanvas as any).__draftForceFullUpload) {
+      (draftCanvas as any).__draftForceFullUpload = false;
+    }
     state.lastDraftVersion = ver;
   } else {
     if (needsMipmap && !state.draftHasMipmap) {
@@ -276,6 +325,30 @@ export function renderActiveDraftForLayer(
           ? gl.NEAREST
           : gl.LINEAR;
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, draftMagFilter);
+  return true;
+}
+
+/**
+ * Uploads and renders the active draft canvas in-stack for the active layer.
+ * Supports both viewport-space overlays (from CanvasArea) and document-space draft canvases.
+ */
+export function renderActiveDraftForLayer(
+  state: CompositorState,
+  gl: WebGL2RenderingContext,
+  draftCanvas: HTMLCanvasElement,
+  layer: LayerItem,
+  dimensions: CanvasDimensions,
+  effectiveOpacity: number,
+  modeCode: number,
+  backdropTex: WebGLTexture | null,
+  maskTex: WebGLTexture | null,
+  draftVersion?: number,
+  draftSpace: 'document' | 'viewport' = 'document',
+  isDestinationOutMask: boolean = false
+): void {
+  if (!uploadActiveDraftTexture(state, gl, draftCanvas, draftVersion, draftSpace)) {
+    return;
+  }
 
   let effectiveDraftLayer: LayerItem =
     state.currentOptions?.activeDraftMonochrome && layer.expressionColor !== 'monochrome'

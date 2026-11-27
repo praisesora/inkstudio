@@ -22,14 +22,20 @@ import {
   CanvasColorMode,
   CspSensorConfig,
   CspPaperTextureMode,
+  CspSubTipOrder,
   CspTipFlipMode,
   CspAngleDynamicsMode,
   CspBlendTipsMode,
+  CspBrushCombineMode,
   CspSpraySettings,
   CspTaperSettings,
   CspSubTip,
+  CspDualBrushConfig,
+  DualBrushCompositeMode,
 } from '../types/editor';
 import { enforceColorMode } from '../utils/colorUtils';
+import { getSurfaceTextureHeightField, SURFACE_TEXTURE_SIZE } from '../utils/proceduralBrushTips';
+import { compositeBrushPixelInto, isCustomBrushCombineMode } from '../utils/tileEngine/strokeComposite';
 import {
   PaintReservoir,
   SpatialTipMixer,
@@ -41,6 +47,36 @@ import {
 import { GpuDab, WebGlBrushEngine } from './WebGlBrushEngine';
 import { performanceManager } from '../utils/performanceManager';
 import { isNaturalPaintBrush, renderCompleteNaturalPaintStroke } from './NaturalPaintRenderer';
+import {
+  isRibbonBrush,
+  renderCompleteRibbonStroke,
+  RibbonRepeatMode,
+} from './RibbonBrushEngine';
+import {
+  buildSecondaryBrushSettings,
+  combineDualBrushAlpha,
+  combineDualBrushImageData,
+  computeSecondaryBrushSize,
+  dualBrushCompositeModeToIndex,
+  normalizeDualBrushCompositeMode,
+  resolveDualBrushConfig,
+  scalePointForSecondaryBrush,
+  scalePointsForSecondaryBrush,
+  scaleSegmentForSecondaryBrush,
+} from './DualBrushEngine';
+
+export {
+  buildSecondaryBrushSettings,
+  combineDualBrushAlpha,
+  combineDualBrushImageData,
+  computeSecondaryBrushSize,
+  dualBrushCompositeModeToIndex,
+  normalizeDualBrushCompositeMode,
+  resolveDualBrushConfig,
+  scalePointForSecondaryBrush,
+  scalePointsForSecondaryBrush,
+  scaleSegmentForSecondaryBrush,
+};
 
 // ============================================================================
 // 1. Types & Unified Brush Render Options
@@ -54,9 +90,11 @@ export interface BrushRenderOptions {
   brushDensity?: number;
   adjustDensityByGap?: boolean;
   blendTipsMode?: CspBlendTipsMode;
+  brushCombineMode?: CspBrushCombineMode;
   spacing?: number;
   thickness?: number;
   thicknessVertical?: boolean;
+  thicknessSensor?: CspSensorConfig;
   flipH?: CspTipFlipMode;
   flipV?: CspTipFlipMode;
   angle?: number; // degrees
@@ -66,6 +104,9 @@ export interface BrushRenderOptions {
   antiAlias?: number;
   tipImage?: HTMLImageElement;
   isColorTip?: boolean;
+  isDualToneTip?: boolean;
+  isRibbon?: boolean;
+  ribbonRepeatMode?: RibbonRepeatMode;
   pressureCurve?: [number, number][];
   velocityCurve?: [number, number][];
   usePressure?: boolean;
@@ -75,13 +116,15 @@ export interface BrushRenderOptions {
   sizeSensor?: CspSensorConfig;
   opacitySensor?: CspSensorConfig;
   densitySensor?: CspSensorConfig;
+  intervalSensor?: CspSensorConfig;
+  textureDensitySensor?: CspSensorConfig;
   bristleSplaySensor?: CspSensorConfig;
   paintLoadSensor?: CspSensorConfig;
   grainPenetrationSensor?: CspSensorConfig;
   angleSensor?: CspSensorConfig;
   scatterSensor?: CspSensorConfig;
   subTips?: CspSubTip[];
-  subTipOrder?: 'random' | 'sequential' | 'direction' | 'reverse';
+  subTipOrder?: CspSubTipOrder;
   subTipImages?: HTMLImageElement[];
   spray?: CspSpraySettings;
   taper?: CspTaperSettings;
@@ -91,6 +134,11 @@ export interface BrushRenderOptions {
   amountOfPaint?: number;
   densityOfPaint?: number;
   colorStretch?: number;
+  amountOfPaintSensor?: CspSensorConfig;
+  densityOfPaintSensor?: CspSensorConfig;
+  colorStretchSensor?: CspSensorConfig;
+  useBlur?: boolean;
+  blurStrength?: number;
   mixingMode?: NaturalMixingMode;
   wetEdge?: number;
   wetEdgeRadius?: number;
@@ -103,15 +151,37 @@ export interface BrushRenderOptions {
   paperTextureMode?: CspPaperTextureMode;
   paperTextureBrightness?: number;
   paperTextureContrast?: number;
+  paperTextureApplyEachPlot?: boolean;
+  paperTextureEmphasizeDensity?: boolean;
   paperTextureInverted?: boolean;
   paperTextureImage?: HTMLImageElement;
   paperTextureScale?: number;
   paperTextureRotate?: number;
+  /** Internal flag: skip per-dab paper grain when per-stroke texture pass handles it. */
+  skipPerDabPaperGrain?: boolean;
   dualBrush?: boolean;
+  dualBrushConfig?: CspDualBrushConfig;
+  dualTipDataUrl?: string;
   dualTipImage?: HTMLImageElement;
-  dualBrushCompositeMode?: string;
+  dualBrushCompositeMode?: DualBrushCompositeMode | string;
+  dualSize?: number;
+  dualLinkSize?: boolean;
+  dualSpacing?: number;
   dualScale?: number;
+  dualThickness?: number;
+  dualThicknessVertical?: boolean;
   dualAngle?: number;
+  dualAngleDynamics?: CspAngleDynamicsMode;
+  dualAngleSensor?: CspSensorConfig;
+  dualHardness?: number;
+  dualDensity?: number;
+  dualSubTips?: CspSubTip[];
+  dualSubTipImages?: HTMLImageElement[];
+  dualSubTipOrder?: CspSubTipOrder;
+  dualFlipH?: CspTipFlipMode;
+  dualFlipV?: CspTipFlipMode;
+  dualSpray?: CspSpraySettings;
+  dualIsRibbon?: boolean;
   dualScatter?: number;
   dualSurfaceTextureId?: SurfaceTextureId;
   dualGrainDepth?: number;
@@ -134,6 +204,7 @@ export interface BrushRenderOptions {
   initialAngleRad?: number;
   dynamics?: BrushDynamics;
   secondaryColor?: string;
+  strokeJitterColor?: { r: number; g: number; b: number; hex: string };
 }
 
 export interface EvaluatedBezierSample {
@@ -389,22 +460,56 @@ export function getCompiledCurveLut(curve?: readonly [number, number][]): Float3
       }
     }
   } else {
+    const hArr = new Float64Array(n - 1);
     const deltas = new Float64Array(n - 1);
     const m = new Float64Array(n);
     for (let k = 0; k < n - 1; k++) {
-      deltas[k] = (dedup[k + 1][1] - dedup[k][1]) / Math.max(1e-5, dedup[k + 1][0] - dedup[k][0]);
+      hArr[k] = Math.max(1e-5, dedup[k + 1][0] - dedup[k][0]);
+      deltas[k] = (dedup[k + 1][1] - dedup[k][1]) / hArr[k];
     }
     m[0] = deltas[0];
     for (let k = 1; k < n - 1; k++) {
-      m[k] = deltas[k - 1] * deltas[k] <= 0 ? 0 : (deltas[k - 1] + deltas[k]) * 0.5;
+      if (deltas[k - 1] * deltas[k] <= 0) {
+        if (
+          k === 1 &&
+          Math.abs(deltas[0]) < 1e-6 &&
+          hArr[0] < 0.025 &&
+          Math.abs(deltas[1]) > 1e-6
+        ) {
+          // Tiny leading deadzone stub (e.g. (0,0)->(0.0043,0) in CSP effector curves) acts as a
+          // shifted origin rather than a plateau that collapses light-pressure slopes to 0.
+          m[k] = deltas[1];
+        } else if (
+          k === n - 2 &&
+          Math.abs(deltas[n - 2]) < 1e-6 &&
+          hArr[n - 2] < 0.025 &&
+          Math.abs(deltas[n - 3]) > 1e-6
+        ) {
+          m[k] = deltas[n - 3];
+        } else {
+          m[k] = 0;
+        }
+      } else {
+        // Standard Fritsch-Carlson / Brodlie weighted harmonic mean preserves
+        // light-pressure ramps on asymmetric steep-tail CSP effector curves.
+        const w1 = 2 * hArr[k] + hArr[k - 1];
+        const w2 = hArr[k] + 2 * hArr[k - 1];
+        m[k] = (w1 + w2) / (w1 / deltas[k - 1] + w2 / deltas[k]);
+      }
     }
     m[n - 1] = deltas[n - 2];
 
     for (let k = 0; k < n - 1; k++) {
       const dk = deltas[k];
       if (Math.abs(dk) < 1e-6) {
-        m[k] = 0;
-        m[k + 1] = 0;
+        if (k === 0 && hArr[0] < 0.025) {
+          m[0] = 0;
+        } else if (k === n - 2 && hArr[n - 2] < 0.025) {
+          m[n - 1] = 0;
+        } else {
+          m[k] = 0;
+          m[k + 1] = 0;
+        }
       } else {
         const alpha = m[k] / dk;
         const beta = m[k + 1] / dk;
@@ -501,7 +606,20 @@ export function evaluateCspSensor(
   }
   if (sensor.useTilt) {
     const tMin = Math.max(0, Math.min(1, sensor.tiltMin ?? 0));
-    factor *= tMin + (1.0 - tMin) * Math.max(0, Math.min(1, tiltMagnitude));
+    const tMax =
+      typeof sensor.tiltMax === 'number' && Number.isFinite(sensor.tiltMax) && sensor.tiltMax > tMin
+        ? Math.min(10.0, sensor.tiltMax)
+        : 1.0;
+    const clampedTilt = Math.max(0, Math.min(1, tiltMagnitude));
+    // CSP Tilt curves plot pen altitude on X (0 = flat/tilted, 1 = upright),
+    // whereas tiltMagnitude is 0 (upright) -> 1 (flat).
+    const curveX = sensor.invertTilt ? clampedTilt : 1.0 - clampedTilt;
+    const curvedT = sensor.tiltCurve
+      ? evaluateFastSpline(curveX, sensor.tiltCurve)
+      : sensor.invertTilt
+      ? 1.0 - clampedTilt
+      : clampedTilt;
+    factor *= tMin + (tMax - tMin) * curvedT;
   }
   if (sensor.useBarrelTwist) {
     const twMin = Math.max(0, Math.min(1, sensor.twistMin ?? 0));
@@ -511,7 +629,11 @@ export function evaluateCspSensor(
   if (sensor.useVelocity) {
     const vMin = Math.max(0, Math.min(1, sensor.velocityMin ?? 0));
     const vNorm = Math.max(0, Math.min(1, speedPxPerMs / 3.5));
-    const vVal = sensor.invertVelocity !== false ? 1.0 - vNorm : vNorm;
+    const vVal = sensor.velocityCurve
+      ? evaluateFastSpline(vNorm, sensor.velocityCurve)
+      : sensor.invertVelocity !== false
+      ? 1.0 - vNorm
+      : vNorm;
     factor *= vMin + (1.0 - vMin) * vVal;
   }
   if (sensor.useDistance) {
@@ -524,7 +646,55 @@ export function evaluateCspSensor(
     const rMin = Math.max(0, Math.min(1, sensor.randomMin ?? 0));
     factor *= rMin + (1.0 - rMin) * Math.max(0, Math.min(1, randomVal));
   }
-  return Math.max(0, Math.min(1, factor));
+  const maxFactor =
+    sensor.useTilt && typeof sensor.tiltMax === 'number' && Number.isFinite(sensor.tiltMax) && sensor.tiltMax > 1.0
+      ? Math.min(10.0, sensor.tiltMax)
+      : 1.0;
+  return Math.max(0, Math.min(maxFactor, factor));
+}
+
+/**
+ * Computes normalized linear pen tilt magnitude in [0, 1] from W3C/WinTab (tiltX, tiltY) degrees:
+ *   0.0 = vertical/upright (90° altitude), 1.0 = flat/horizontal (0° altitude).
+ * Uses exact spherical tilt angle `atan(hypot(tan(tx), tan(ty))) / 90°` so CSP tilt curves
+ * (plotted linearly against pen altitude 0..90°) match CSP without sin()-curve distortion.
+ */
+export function computeCspTiltMagnitude(tiltX: number, tiltY: number): number {
+  if (tiltX === 0 && tiltY === 0) return 0;
+  const cx = Math.max(-89.9, Math.min(89.9, tiltX));
+  const cy = Math.max(-89.9, Math.min(89.9, tiltY));
+  const tanX = Math.tan((cx * Math.PI) / 180);
+  const tanY = Math.tan((cy * Math.PI) / 180);
+  const tiltAngleDeg = (Math.atan(Math.hypot(tanX, tanY)) * 180) / Math.PI;
+  return Math.max(0, Math.min(1, tiltAngleDeg / 90));
+}
+
+function resolveTiltBehavior(options: BrushRenderOptions): {
+  readTiltInput: boolean;
+  useSyntheticTiltShading: boolean;
+} {
+  const hasExplicitCspTiltControl = Boolean(
+    options.angleDynamics === 'tilt' ||
+      options.sizeSensor?.useTilt ||
+      options.opacitySensor?.useTilt ||
+      options.densitySensor?.useTilt ||
+      options.intervalSensor?.useTilt ||
+      options.thicknessSensor?.useTilt ||
+      options.textureDensitySensor?.useTilt ||
+      options.amountOfPaintSensor?.useTilt ||
+      options.densityOfPaintSensor?.useTilt ||
+      options.colorStretchSensor?.useTilt
+  );
+  // Built-in pencil/chalk presets opt into synthetic elliptical side-shading via useTilt + tiltScale > 0.
+  // CSP .sut brushes with explicit tilt effectors control size/density/interval/thickness/texture/angle
+  // individually and must NEVER trigger synthetic elliptical stretching even if tiltScale defaults to 1.0.
+  const useSyntheticTiltShading = Boolean(
+    options.useTilt &&
+      !hasExplicitCspTiltControl &&
+      (typeof options.tiltScale === 'number' ? options.tiltScale > 0 : true)
+  );
+  const readTiltInput = Boolean(options.useTilt || hasExplicitCspTiltControl);
+  return { readTiltInput, useSyntheticTiltShading };
 }
 
 export function computeEllipticalStepDistance(
@@ -623,6 +793,29 @@ export function resolveTipFlipSigns(
   return { signX, signY };
 }
 
+/**
+ * Computes CSP-accurate dab bounding dimensions so BrushSize always represents the
+ * maximum axis of the thickness-scaled tip (preventing tall tips like 56x300 from blowing up).
+ */
+export function computeTipStampDimensions(
+  baseSize: number,
+  thickness: number = 1.0,
+  thicknessVertical: boolean = false,
+  tipW: number = 1,
+  tipH: number = 1
+): { width: number; height: number } {
+  const safeW = tipW > 0 ? tipW : 1;
+  const safeH = tipH > 0 ? tipH : 1;
+  const effThick = Math.max(0.05, Math.min(20.0, thickness || 1.0));
+  const rawW = thicknessVertical ? safeW * effThick : safeW;
+  const rawH = thicknessVertical ? safeH : safeH * effThick;
+  const maxRaw = Math.max(rawW, rawH, 1e-4);
+  return {
+    width: (baseSize * rawW) / maxRaw,
+    height: (baseSize * rawH) / maxRaw,
+  };
+}
+
 export function applyCspPaperTextureAlpha(
   tipAlpha: number,
   grainNorm: number,
@@ -631,14 +824,19 @@ export function applyCspPaperTextureAlpha(
   mode: CspPaperTextureMode = 'subtract',
   brightness: number = 0,
   contrast: number = 0,
-  inverted: boolean = false
+  inverted: boolean = false,
+  preserveDensity: boolean = false,
+  emphasizeDensity: boolean = false
 ): number {
   if (textureDensity <= 0.001 || tipAlpha <= 0.001) return tipAlpha;
 
   let g = inverted ? 1.0 - grainNorm : grainNorm;
+  if (emphasizeDensity) {
+    g = Math.max(0, Math.min(1, (g - 0.5) * 2.2 + 0.35));
+  }
   if (brightness !== 0) g += brightness / 100.0;
   if (contrast !== 0) {
-    const cFactor = Math.pow((contrast + 100.0) / 100.0, 2);
+    const cFactor = Math.pow(Math.max(0.05, (contrast + 100.0) / 100.0), 2);
     g = (g - 0.5) * cFactor + 0.5;
   }
   g = Math.max(0, Math.min(1, g));
@@ -646,14 +844,20 @@ export function applyCspPaperTextureAlpha(
   const p = Math.max(0, Math.min(1, pressure));
   const heavyExcess = Math.max(0, (p - 0.52) / 0.48);
   const penetration = Math.min(0.92, p * 0.28 + heavyExcess * heavyExcess * 0.64);
-  const effDensity = textureDensity * (1.0 - penetration * 0.85);
+  const effDensity = preserveDensity
+    ? textureDensity
+    : textureDensity * (1.0 - penetration * 0.85);
 
   switch (mode) {
+    case 'normal': {
+      const sil = Math.min(1.0, tipAlpha * 4.0);
+      return Math.max(0, Math.min(1, tipAlpha * (1.0 - effDensity) + g * sil * effDensity));
+    }
     case 'multiply':
       return Math.max(0, Math.min(1, tipAlpha * (1.0 - effDensity * (1.0 - g))));
     case 'subtract': {
       const sub = (1.0 - g) * effDensity;
-      return Math.max(0, Math.min(1, tipAlpha - sub * (1.0 - penetration * 0.5)));
+      return Math.max(0, Math.min(1, tipAlpha - sub * (preserveDensity ? 1.0 : 1.0 - penetration * 0.5)));
     }
     case 'compare': {
       const contactHeight = g * (0.22 + 0.78 * tipAlpha);
@@ -664,8 +868,24 @@ export function applyCspPaperTextureAlpha(
       return Math.max(0, Math.min(1, tipAlpha * t * t * (3.0 - 2.0 * t)));
     }
     case 'overlay': {
-      const ov = tipAlpha < 0.5 ? 2.0 * tipAlpha * g : 1.0 - 2.0 * (1.0 - tipAlpha) * (1.0 - g);
+      // CSP Overlay texture mode: carves valleys strongly at light/medium density
+      // and retains crisp impasto relief even on solid tips (tipAlpha -> 1.0).
+      const dMod = tipAlpha * (1.0 - effDensity * 0.32 * (1.0 - g));
+      const ov = dMod < 0.5 ? 2.0 * dMod * g : 1.0 - 2.0 * (1.0 - dMod) * (1.0 - g);
       return Math.max(0, Math.min(1, tipAlpha + (ov - tipAlpha) * effDensity));
+    }
+    case 'color-burn': {
+      const burned = g <= 0.001 ? 0 : Math.max(0, 1.0 - (1.0 - tipAlpha) / g);
+      return Math.max(0, Math.min(1, tipAlpha + (burned - tipAlpha) * effDensity));
+    }
+    case 'linear-burn': {
+      const burned = Math.max(0, tipAlpha + g - 1.0);
+      return Math.max(0, Math.min(1, tipAlpha + (burned - tipAlpha) * effDensity));
+    }
+    case 'height': {
+      const sil = Math.min(1.0, tipAlpha * 4.0);
+      const relief = Math.max(0, Math.min(1, (tipAlpha + g - 0.5) * 1.6)) * sil;
+      return Math.max(0, Math.min(1, tipAlpha * (1.0 - effDensity) + relief * effDensity));
     }
     case 'outline': {
       const edgeFactor = 4.0 * tipAlpha * (1.0 - tipAlpha);
@@ -673,6 +893,142 @@ export function applyCspPaperTextureAlpha(
     }
     default:
       return tipAlpha;
+  }
+}
+
+/**
+ * Returns true when a brush should apply its paper texture once at the stroke level
+ * (CSP TextureForPlot = 0) instead of cumulatively per dab.
+ */
+export function needsStrokeLevelPaperTexture(options: {
+  paperTextureApplyEachPlot?: boolean;
+  grain?: number;
+  textureDensity?: number;
+  colorMixing?: boolean;
+  isEraser?: boolean;
+  isBgEraser?: boolean;
+}): boolean {
+  if (options.paperTextureApplyEachPlot !== false) return false;
+  if (options.colorMixing || options.isEraser || options.isBgEraser) return false;
+  const density = options.grain ?? options.textureDensity ?? 0;
+  return density > 0.005;
+}
+
+/**
+ * Applies CSP per-stroke paper texture (TextureForPlot = 0) to a rendered stroke ImageData
+ * anchored at world coordinate (originX, originY) with optional uniform canvas scale.
+ */
+export function applyStrokePaperTextureToImageData(
+  imgData: { data: Uint8ClampedArray; width: number; height: number },
+  originX: number,
+  originY: number,
+  options: {
+    textureDensity?: number;
+    grain?: number;
+    surfaceTextureId?: SurfaceTextureId;
+    paperTextureImage?: HTMLImageElement;
+    paperTextureScale?: number;
+    paperTextureRotate?: number;
+    paperTextureMode?: CspPaperTextureMode;
+    paperTextureBrightness?: number;
+    paperTextureContrast?: number;
+    paperTextureInverted?: boolean;
+    paperTextureEmphasizeDensity?: boolean;
+    paperTextureApplyEachPlot?: boolean;
+    grainPenetrationSensor?: CspSensorConfig;
+  },
+  surfaceScale: number = 1.0
+): void {
+  const density = options.grain ?? options.textureDensity ?? 0;
+  if (density <= 0.005) return;
+
+  const customPaper = options.paperTextureImage
+    ? getCustomPaperLuminance(options.paperTextureImage)
+    : null;
+  const surfacePaper =
+    !customPaper && options.surfaceTextureId
+      ? getSurfaceTextureHeightField(options.surfaceTextureId)
+      : null;
+  const paperData = customPaper ? customPaper.lum : surfacePaper ?? paperGrainTable;
+  const paperW = customPaper ? customPaper.width : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE;
+  const paperH = customPaper ? customPaper.height : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE;
+  if (paperW <= 0 || paperH <= 0) return;
+
+  const paperPow2 = (paperW & (paperW - 1)) === 0 && (paperH & (paperH - 1)) === 0;
+  const paperMaskW = paperW - 1;
+  const paperMaskH = paperH - 1;
+  const invScale = 1.0 / Math.max(0.05, options.paperTextureScale ?? 1.0);
+  const rotRad = ((options.paperTextureRotate ?? 0) * Math.PI) / 180;
+  const hasRot = Math.abs(rotRad) > 1e-4;
+  const cosR = hasRot ? Math.cos(rotRad) : 1;
+  const sinR = hasRot ? Math.sin(rotRad) : 0;
+  const mode = options.paperTextureMode ?? 'multiply';
+  const bright = options.paperTextureBrightness ?? 0;
+  const contrast = options.paperTextureContrast ?? 0;
+  const inv = Boolean(options.paperTextureInverted);
+  const emphasize = Boolean(options.paperTextureEmphasizeDensity);
+  const preserveDensity = !options.grainPenetrationSensor?.usePressure;
+  const invSurfScale = surfaceScale > 1e-4 ? 1.0 / surfaceScale : 1.0;
+
+  const { data, width, height } = imgData;
+  const inv255 = 1 / 255;
+
+  for (let y = 0; y < height; y++) {
+    const wy = originY + (y + 0.5) * invSurfScale;
+    const rowOff = y * width;
+    for (let x = 0; x < width; x++) {
+      const pOff = (rowOff + x) << 2;
+      const aByte = data[pOff + 3];
+      if (aByte === 0) continue;
+
+      const wx = originX + (x + 0.5) * invSurfScale;
+      let rotX = wx;
+      let rotY = wy;
+      if (hasRot) {
+        rotX = wx * cosR - wy * sinR;
+        rotY = wx * sinR + wy * cosR;
+      }
+      const psx = rotX * invScale - 0.5;
+      const psy = rotY * invScale - 0.5;
+
+      const pfx = Math.floor(psx);
+      const pfy = Math.floor(psy);
+      const ptx = psx - pfx;
+      const pty = psy - pfy;
+      let px0: number, py0: number, px1: number, py1: number;
+      if (paperPow2) {
+        px0 = pfx & paperMaskW;
+        py0 = pfy & paperMaskH;
+        px1 = (px0 + 1) & paperMaskW;
+        py1 = (py0 + 1) & paperMaskH;
+      } else {
+        px0 = ((pfx % paperW) + paperW) % paperW;
+        py0 = ((pfy % paperH) + paperH) % paperH;
+        px1 = px0 + 1 < paperW ? px0 + 1 : 0;
+        py1 = py0 + 1 < paperH ? py0 + 1 : 0;
+      }
+
+      const pr0 = py0 * paperW;
+      const pr1 = py1 * paperW;
+      const pvTop = paperData[pr0 + px0] + (paperData[pr0 + px1] - paperData[pr0 + px0]) * ptx;
+      const pvBot = paperData[pr1 + px0] + (paperData[pr1 + px1] - paperData[pr1 + px0]) * ptx;
+      const gNorm = (pvTop + (pvBot - pvTop) * pty) * inv255;
+
+      const origAlpha = aByte * inv255;
+      const modAlpha = applyCspPaperTextureAlpha(
+        origAlpha,
+        gNorm,
+        density,
+        0.5,
+        mode,
+        bright,
+        contrast,
+        inv,
+        preserveDensity,
+        emphasize
+      );
+      data[pOff + 3] = Math.max(0, Math.min(255, Math.round(modAlpha * 255)));
+    }
   }
 }
 
@@ -729,6 +1085,17 @@ export function applyCspPostCorrection(
   return current;
 }
 
+/**
+ * Strictly normalizes CSP wet edge alpha/value power into 0..1.
+ * Defensively converts legacy/persisted 0..100 values (> 1.0) by dividing by 100.
+ */
+export function normalizeWetEdgePower01(value: number | undefined, fallback: number = 0): number {
+  const v = value !== undefined && Number.isFinite(value) ? value : fallback;
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  if (v > 1.0) return Math.min(1.0, v / 100.0);
+  return Math.min(1.0, v);
+}
+
 export function applyCspWatercolorEdge(
   strokeImageData: { data: Uint8ClampedArray; width: number; height: number },
   wetEdge: number,
@@ -741,7 +1108,7 @@ export function applyCspWatercolorEdge(
   if (width < 3 || height < 3) return;
 
   const strength = Math.max(0, Math.min(1, wetEdge));
-  const r = Math.max(1, Math.min(8, Math.round(radiusPx)));
+  const r = Math.max(1, Math.min(12, Math.round(radiusPx)));
   const totalPixels = width * height;
 
   const alphaOrig = new Float32Array(totalPixels);
@@ -750,41 +1117,84 @@ export function applyCspWatercolorEdge(
     alphaOrig[i] = data[i * 4 + 3] / 255.0;
   }
 
-  const invKernel = 1.0 / (2 * r + 1);
+  // Clean separable 1D Gaussian blur kernel of exact radius `r` (zero interior pollution beyond `r`)
+  const sigma = Math.max(0.85, radiusPx * 0.72);
+  const twoSigmaSq = 2.0 * sigma * sigma;
+  const kernel = new Float32Array(2 * r + 1);
+  let kSum = 0;
+  for (let k = -r; k <= r; k++) {
+    const w = Math.exp(-(k * k) / twoSigmaSq);
+    kernel[k + r] = w;
+    kSum += w;
+  }
+  const invKSum = 1.0 / kSum;
+  for (let k = 0; k < kernel.length; k++) {
+    kernel[k] *= invKSum;
+  }
+
+  // Horizontal separable pass
   for (let y = 0; y < height; y++) {
     const row = y * width;
-    let sum = alphaOrig[row] * (r + 1);
-    for (let k = 1; k <= r; k++) sum += alphaOrig[row + Math.min(width - 1, k)];
     for (let x = 0; x < width; x++) {
-      alphaTemp[row + x] = sum * invKernel;
-      sum += alphaOrig[row + Math.min(width - 1, x + r + 1)] - alphaOrig[row + Math.max(0, x - r)];
+      let acc = 0;
+      for (let k = -r; k <= r; k++) {
+        const sx = x + k < 0 ? 0 : x + k >= width ? width - 1 : x + k;
+        acc += alphaOrig[row + sx] * kernel[k + r];
+      }
+      alphaTemp[row + x] = acc;
     }
   }
 
-  const aBoost = strength * (0.45 + alphaPower * 1.15);
-  const vDarken = strength * (0.25 + valuePower * 0.55);
+  const normAlphaPower = normalizeWetEdgePower01(alphaPower, 0.25);
+  const normValuePower = normalizeWetEdgePower01(valuePower, 0.15);
+  const aBoost = strength * (0.35 + normAlphaPower * 1.15);
+  const vDarken = strength * (0.18 + normValuePower * 0.55);
 
+  // Vertical separable pass + smooth inner rim alpha boost & chroma-preserving pigment darkening
   for (let x = 0; x < width; x++) {
-    let sum = alphaTemp[x] * (r + 1);
-    for (let k = 1; k <= r; k++) sum += alphaTemp[Math.min(height - 1, k) * width + x];
     for (let y = 0; y < height; y++) {
       const idx = y * width + x;
-      const blurredA = sum * invKernel;
       const origA = alphaOrig[idx];
+      // Strictly skip transparent pixels to guarantee zero black-fringe halo
+      if (origA <= 0.015) continue;
 
-      if (origA > 0.015) {
-        const rim = Math.max(0, origA - blurredA) * 2.4;
-        if (rim > 0.01) {
-          const p = idx * 4;
-          const darkScale = Math.max(0.18, 1.0 - rim * vDarken);
-          data[p] = Math.round(data[p] * darkScale);
-          data[p + 1] = Math.round(data[p + 1] * darkScale);
-          data[p + 2] = Math.round(data[p + 2] * darkScale);
-          data[p + 3] = Math.round(Math.min(1.0, origA * (1.0 + rim * aBoost)) * 255);
-        }
+      let blurredA = 0;
+      for (let k = -r; k <= r; k++) {
+        const sy = y + k < 0 ? 0 : y + k >= height ? height - 1 : y + k;
+        blurredA += alphaTemp[sy * width + x] * kernel[k + r];
       }
 
-      sum += alphaTemp[Math.min(height - 1, y + r + 1) * width + x] - alphaTemp[Math.max(0, y - r) * width + x];
+      // Normalize rim gradient by local wash opacity so translucent watercolor washes
+      // form authentic crisp inner drying rims just like Clip Studio Paint.
+      const relDrop = Math.max(0, origA - blurredA) / Math.max(0.22, origA);
+      const rawRim = relDrop * 2.2;
+      if (rawRim > 0.008) {
+        // Smooth edge guard prevents faint antialiased outer pixels from getting dark fringes
+        const alphaMask = Math.min(1.0, (origA - 0.015) / 0.085);
+        const rim = Math.min(1.0, rawRim) * alphaMask;
+        const p = idx * 4;
+
+        const r0 = data[p] / 255.0;
+        const g0 = data[p + 1] / 255.0;
+        const b0 = data[p + 2] / 255.0;
+
+        const darkScale = Math.max(0.28, 1.0 - rim * vDarken);
+        const dr = r0 * darkScale;
+        const dg = g0 * darkScale;
+        const db = b0 * darkScale;
+
+        // Subtle chroma preservation as pigment concentrates along the drying rim
+        const lum = 0.299 * dr + 0.587 * dg + 0.114 * db;
+        const satBoost = 1.0 + Math.min(0.32, rim * vDarken * 0.42);
+        const outR = Math.max(0, Math.min(r0, lum + (dr - lum) * satBoost));
+        const outG = Math.max(0, Math.min(g0, lum + (dg - lum) * satBoost));
+        const outB = Math.max(0, Math.min(b0, lum + (db - lum) * satBoost));
+
+        data[p] = Math.round(outR * 255);
+        data[p + 1] = Math.round(outG * 255);
+        data[p + 2] = Math.round(outB * 255);
+        data[p + 3] = Math.round(Math.min(1.0, origA * (1.0 + rim * aBoost)) * 255);
+      }
     }
   }
 }
@@ -1053,12 +1463,14 @@ export function centripetalCatmullRomToBezier(
   p2: Point,
   p3: Point
 ): { c1: Point; c2: Point } {
-  const effP0 = p1.isCorner ? p1 : p0;
-  const effP3 = p2.isCorner ? p2 : p3;
+  const rawD01 = Math.hypot(p1.x - p0.x, p1.y - p0.y);
+  const rawD23 = Math.hypot(p3.x - p2.x, p3.y - p2.y);
+  const effP0 = p1.isCorner || rawD01 < 1e-3 ? p1 : p0;
+  const effP3 = p2.isCorner || rawD23 < 1e-3 ? p2 : p3;
 
-  const d01 = Math.hypot(p1.x - effP0.x, p1.y - effP0.y);
+  const d01 = p1.isCorner || rawD01 < 1e-3 ? 0 : rawD01;
   const d12 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-  const d23 = Math.hypot(effP3.x - p2.x, effP3.y - p2.y);
+  const d23 = p2.isCorner || rawD23 < 1e-3 ? 0 : rawD23;
 
   const dt0 = Math.max(1e-4, Math.sqrt(d01));
   const dt1 = Math.max(1e-4, Math.sqrt(d12));
@@ -1175,7 +1587,9 @@ export function getTintedMasterCanvas(
   color: string,
   w: number,
   h: number,
-  isColorTip: boolean = false
+  isColorTip: boolean = false,
+  isDualToneTip: boolean = false,
+  secondaryColor?: string
 ): HTMLCanvasElement {
   if (isColorTip) {
     const key = `color_${sourceKey}_${w}x${h}`;
@@ -1188,6 +1602,42 @@ export function getTintedMasterCanvas(
       ctx.globalCompositeOperation = 'source-over';
       ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
     }
+    tintedMasterCache.set(key, canvas);
+    return canvas;
+  }
+
+  if (isDualToneTip) {
+    const primRgb = parseColorToRgb(color);
+    const secRgb = parseColorToRgb(secondaryColor || '#ffffff');
+    const primHex = rgbToHex(primRgb.r, primRgb.g, primRgb.b);
+    const secHex = rgbToHex(secRgb.r, secRgb.g, secRgb.b);
+    const key = `dualtone_${sourceKey}_${primHex}_${secHex}_${w}x${h}`;
+    const cached = tintedMasterCache.get(key);
+    if (cached) return cached;
+
+    const canvas = evictOrAllocateMasterCanvas(w, h);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return canvas;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(source, 0, 0, canvas.width, canvas.height);
+    if (typeof ctx.getImageData === 'function' && typeof ctx.putImageData === 'function') {
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const d = img.data;
+      const dr = secRgb.r - primRgb.r;
+      const dg = secRgb.g - primRgb.g;
+      const db = secRgb.b - primRgb.b;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i + 3] === 0) continue;
+        const lum = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) / 255.0;
+        d[i] = Math.max(0, Math.min(255, Math.round(primRgb.r + dr * lum)));
+        d[i + 1] = Math.max(0, Math.min(255, Math.round(primRgb.g + dg * lum)));
+        d[i + 2] = Math.max(0, Math.min(255, Math.round(primRgb.b + db * lum)));
+      }
+      ctx.putImageData(img, 0, 0);
+    }
+
     tintedMasterCache.set(key, canvas);
     return canvas;
   }
@@ -1216,11 +1666,22 @@ export function getTintedMasterCanvas(
 export function getTintedTipMaster(
   tipImage: HTMLImageElement,
   color: string,
-  isColorTip: boolean = false
+  isColorTip: boolean = false,
+  isDualToneTip: boolean = false,
+  secondaryColor?: string
 ): HTMLCanvasElement {
   const w = tipImage.naturalWidth || tipImage.width || 64;
   const h = tipImage.naturalHeight || tipImage.height || 64;
-  return getTintedMasterCanvas(tipImage, getUniqueSourceKey(tipImage, 'tip'), color, w, h, isColorTip);
+  return getTintedMasterCanvas(
+    tipImage,
+    getUniqueSourceKey(tipImage, 'tip'),
+    color,
+    w,
+    h,
+    isColorTip,
+    isDualToneTip,
+    secondaryColor
+  );
 }
 
 export function getRadialDabMaster(
@@ -1314,6 +1775,146 @@ export function getRadialDabMaster(
   return getTintedMasterCanvas(maskCanvas, `radial_${maskKey}`, isEraser ? '#000000' : color, size, size);
 }
 
+let _compareScratchCanvas: HTMLCanvasElement | null = null;
+let _compareScratchCtx: CanvasRenderingContext2D | null = null;
+
+function drawCompareDensityStampCpu(
+  ctx: CanvasRenderingContext2D,
+  stampSource: CanvasImageSource,
+  x: number,
+  y: number,
+  renderW: number,
+  renderH: number,
+  angleRad: number,
+  effAlpha: number,
+  flipX: number,
+  flipY: number,
+  antiAlias: number
+): boolean {
+  if (
+    typeof document === 'undefined' ||
+    typeof ctx.getImageData !== 'function' ||
+    typeof ctx.putImageData !== 'function' ||
+    !ctx.canvas ||
+    ctx.canvas.width <= 0 ||
+    ctx.canvas.height <= 0
+  ) {
+    return false;
+  }
+
+  const m =
+    typeof ctx.getTransform === 'function'
+      ? ctx.getTransform()
+      : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+
+  const halfW = renderW * 0.5;
+  const halfH = renderH * 0.5;
+  const cosA = Math.cos(angleRad);
+  const sinA = Math.sin(angleRad);
+  // Compute world-space axis-aligned bounding box of rotated stamp, then map through ctx transform
+  const extX = Math.abs(halfW * cosA) + Math.abs(halfH * sinA);
+  const extY = Math.abs(halfW * sinA) + Math.abs(halfH * cosA);
+  const corners: [number, number][] = [
+    [x - extX, y - extY],
+    [x + extX, y - extY],
+    [x - extX, y + extY],
+    [x + extX, y + extY],
+  ];
+  let dMinX = Infinity;
+  let dMinY = Infinity;
+  let dMaxX = -Infinity;
+  let dMaxY = -Infinity;
+  for (let i = 0; i < 4; i++) {
+    const wx = corners[i][0];
+    const wy = corners[i][1];
+    const dx = m.a * wx + m.c * wy + m.e;
+    const dy = m.b * wx + m.d * wy + m.f;
+    if (dx < dMinX) dMinX = dx;
+    if (dy < dMinY) dMinY = dy;
+    if (dx > dMaxX) dMaxX = dx;
+    if (dy > dMaxY) dMaxY = dy;
+  }
+
+  const bx = Math.max(0, Math.floor(dMinX) - 1);
+  const by = Math.max(0, Math.floor(dMinY) - 1);
+  const ex = Math.min(ctx.canvas.width, Math.ceil(dMaxX) + 1);
+  const ey = Math.min(ctx.canvas.height, Math.ceil(dMaxY) + 1);
+  const bw = ex - bx;
+  const bh = ey - by;
+  if (bw <= 0 || bh <= 0 || bw > 2048 || bh > 2048) return false;
+
+  if (!_compareScratchCanvas) {
+    _compareScratchCanvas = document.createElement('canvas');
+    _compareScratchCanvas.width = Math.max(64, bw);
+    _compareScratchCanvas.height = Math.max(64, bh);
+    _compareScratchCtx = _compareScratchCanvas.getContext('2d', { willReadFrequently: true });
+  } else if (_compareScratchCanvas.width < bw || _compareScratchCanvas.height < bh) {
+    _compareScratchCanvas.width = Math.max(_compareScratchCanvas.width, bw);
+    _compareScratchCanvas.height = Math.max(_compareScratchCanvas.height, bh);
+    _compareScratchCtx = _compareScratchCanvas.getContext('2d', { willReadFrequently: true });
+  }
+  const sCtx = _compareScratchCtx;
+  if (!sCtx || typeof sCtx.getImageData !== 'function') return false;
+
+  sCtx.save();
+  if (typeof sCtx.setTransform === 'function') {
+    sCtx.setTransform(1, 0, 0, 1, 0, 0);
+  }
+  sCtx.clearRect(0, 0, bw, bh);
+  if (typeof sCtx.setTransform === 'function') {
+    sCtx.setTransform(m.a, m.b, m.c, m.d, m.e - bx, m.f - by);
+  } else {
+    sCtx.translate(m.e - bx, m.f - by);
+  }
+  if (antiAlias === 0) sCtx.imageSmoothingEnabled = false;
+  sCtx.globalCompositeOperation = 'source-over';
+  sCtx.globalAlpha = effAlpha;
+  sCtx.translate(x, y);
+  if (Math.abs(angleRad) >= 0.001) sCtx.rotate(angleRad);
+  if ((flipX < 0 || flipY < 0) && typeof sCtx.scale === 'function') {
+    sCtx.scale(flipX < 0 ? -1 : 1, flipY < 0 ? -1 : 1);
+  }
+  sCtx.drawImage(stampSource, -halfW, -halfH, renderW, renderH);
+  sCtx.restore();
+
+  const srcData = sCtx.getImageData(0, 0, bw, bh).data;
+  let hasSrc = false;
+  for (let i = 3; i < srcData.length; i += 4) {
+    if (srcData[i] !== 0) {
+      hasSrc = true;
+      break;
+    }
+  }
+  if (!hasSrc) return false;
+
+  const dstImg = ctx.getImageData(bx, by, bw, bh);
+  const dstData = dstImg.data;
+
+  // CSP Compare Density: alpha = max(dstAlpha, srcAlpha); never accumulates translucent self-overlap
+  for (let i = 0; i < dstData.length; i += 4) {
+    const sa = srcData[i + 3];
+    if (sa === 0) continue;
+    const da = dstData[i + 3];
+    if (sa > da) {
+      if (da === 0) {
+        dstData[i] = srcData[i];
+        dstData[i + 1] = srcData[i + 1];
+        dstData[i + 2] = srcData[i + 2];
+        dstData[i + 3] = sa;
+      } else {
+        const blendT = (sa - da) / sa;
+        dstData[i] = Math.round(dstData[i] + (srcData[i] - dstData[i]) * blendT);
+        dstData[i + 1] = Math.round(dstData[i + 1] + (srcData[i + 1] - dstData[i + 1]) * blendT);
+        dstData[i + 2] = Math.round(dstData[i + 2] + (srcData[i + 2] - dstData[i + 2]) * blendT);
+        dstData[i + 3] = sa;
+      }
+    }
+  }
+
+  ctx.putImageData(dstImg, bx, by);
+  return true;
+}
+
 export function drawSingleStamp(
   ctx: CanvasRenderingContext2D,
   stampSource: CanvasImageSource,
@@ -1330,7 +1931,7 @@ export function drawSingleStamp(
   flipX: number = 1,
   flipY: number = 1,
   antiAlias: number = 2,
-  _blendTipsMode?: CspBlendTipsMode
+  blendTipsMode?: CspBlendTipsMode
 ): void {
   if (width < 0.08 || height < 0.08 || alpha <= 0.002) return;
 
@@ -1340,6 +1941,33 @@ export function drawSingleStamp(
   const renderH = sub.renderH;
   const effAlpha = antiAlias === 0 ? (sub.effAlpha >= 0.45 ? 1.0 : 0) : sub.effAlpha;
   if (effAlpha <= 0.002) return;
+
+  // CSP "Compare density" (blendTipsMode === 'compare'): max(dstAlpha, srcAlpha) inside stroke buffer
+  if (
+    blendTipsMode === 'compare' &&
+    !isEraser &&
+    !isBgEraser &&
+    !isTransparentInk &&
+    !alphaLocked
+  ) {
+    if (
+      drawCompareDensityStampCpu(
+        ctx,
+        stampSource,
+        x,
+        y,
+        renderW,
+        renderH,
+        angleRad,
+        effAlpha,
+        flipX,
+        flipY,
+        antiAlias
+      )
+    ) {
+      return;
+    }
+  }
 
   const targetOp: GlobalCompositeOperation = isBgEraser
     ? 'source-over'
@@ -1381,7 +2009,7 @@ export function drawSingleStamp(
 
 function selectTipIndex(
   tipImages: HTMLImageElement[] | undefined,
-  order: 'random' | 'sequential' | 'direction' | 'reverse' = 'sequential',
+  order: CspSubTipOrder = 'sequential',
   dabIndex: number = 0,
   tangentAngle: number = 0,
   x: number = 0,
@@ -1390,6 +2018,15 @@ function selectTipIndex(
   if (!tipImages || tipImages.length <= 1) return 0;
   const count = tipImages.length;
   if (order === 'random') return Math.floor(dabHashFloat(x, y, dabIndex, 97) * count) % count;
+  if (order === 'random-no-repeat') {
+    const cur = Math.floor(dabHashFloat(x, y, dabIndex, 97) * count) % count;
+    if (dabIndex > 0) {
+      const prev = Math.floor(dabHashFloat(x, y, dabIndex - 1, 97) * count) % count;
+      if (cur === prev) return (cur + 1) % count;
+    }
+    return cur;
+  }
+  if (order === 'once') return Math.min(dabIndex, count - 1);
   if (order === 'reverse') return (count - 1 - (dabIndex % count)) % count;
   if (order === 'direction') {
     const normAngle = ((tangentAngle % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
@@ -1401,7 +2038,7 @@ function selectTipIndex(
 function selectTipImage(
   tipImages: HTMLImageElement[] | undefined,
   fallbackTip: HTMLImageElement,
-  order: 'random' | 'sequential' | 'direction' | 'reverse' = 'sequential',
+  order: CspSubTipOrder = 'sequential',
   dabIndex: number = 0,
   tangentAngle: number = 0,
   x: number = 0,
@@ -1414,128 +2051,220 @@ function selectTipImage(
   return tipImages[idx] ?? fallbackTip;
 }
 
-let _invertedGrainCanvas: HTMLCanvasElement | null = null;
 let _grainScratchCanvas: HTMLCanvasElement | null = null;
 let _grainScratchCtx: CanvasRenderingContext2D | null = null;
-let _grainPattern: CanvasPattern | null = null;
-const _customGrainCanvasCache = new WeakMap<
-  HTMLImageElement,
-  { canvas: HTMLCanvasElement; pattern: CanvasPattern | null }
->();
 
-function getInvertedGrainPattern(
-  scratchCtx: CanvasRenderingContext2D,
-  paperTextureImage?: HTMLImageElement
-): CanvasPattern | null {
-  if (typeof scratchCtx.createPattern !== 'function') return null;
-
-  if (
-    paperTextureImage &&
-    paperTextureImage.complete !== false &&
-    (paperTextureImage.naturalWidth || paperTextureImage.width) > 0
-  ) {
-    const cached = _customGrainCanvasCache.get(paperTextureImage);
-    if (cached) return cached.pattern;
-    const w = paperTextureImage.naturalWidth || paperTextureImage.width;
-    const h = paperTextureImage.naturalHeight || paperTextureImage.height;
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    const gCtx = c.getContext('2d', { willReadFrequently: true });
-    if (gCtx && typeof gCtx.getImageData === 'function') {
-      gCtx.drawImage(paperTextureImage, 0, 0, w, h);
-      const img = gCtx.getImageData(0, 0, w, h);
-      const d = img.data;
-      for (let i = 0; i < d.length; i += 4) {
-        const aNorm = d[i + 3] / 255;
-        const rgbLum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        // CSP paper textures are black-on-transparent RGBA (RGB=0, A=density); composite over white
-        const effLum = rgbLum * aNorm + 255 * (1 - aNorm);
-        d[i] = 255;
-        d[i + 1] = 255;
-        d[i + 2] = 255;
-        d[i + 3] = 255 - Math.round(effLum);
-      }
-      gCtx.putImageData(img, 0, 0);
-      const pat = scratchCtx.createPattern(c, 'repeat');
-      _customGrainCanvasCache.set(paperTextureImage, { canvas: c, pattern: pat });
-      return pat;
-    }
-  }
-
-  if (!_invertedGrainCanvas) {
-    const c = document.createElement('canvas');
-    c.width = GRAIN_SIZE;
-    c.height = GRAIN_SIZE;
-    const gCtx = c.getContext('2d');
-    if (!gCtx) return null;
-    const img = gCtx.createImageData(GRAIN_SIZE, GRAIN_SIZE);
-    const d = img.data;
-    for (let i = 0; i < paperGrainTable.length; i++) {
-      const p = i * 4;
-      d[p] = 255;
-      d[p + 1] = 255;
-      d[p + 2] = 255;
-      d[p + 3] = 255 - paperGrainTable[i];
-    }
-    gCtx.putImageData(img, 0, 0);
-    _invertedGrainCanvas = c;
-    _grainPattern = scratchCtx.createPattern(c, 'repeat');
-  }
-  return _grainPattern;
+interface CpuPaperGrainOptions {
+  paperTextureMode?: CspPaperTextureMode;
+  paperTextureScale?: number;
+  paperTextureRotate?: number;
+  paperTextureBrightness?: number;
+  paperTextureContrast?: number;
+  paperTextureInverted?: boolean;
+  paperTextureEmphasizeDensity?: boolean;
+  preservePaperDensity?: boolean;
+  paperTextureImage?: HTMLImageElement;
+  surfaceTextureId?: SurfaceTextureId;
+  grainMappingMode?: GrainMappingMode;
+  strokeDist?: number;
+  grainRandomOffsetX?: number;
+  grainRandomOffsetY?: number;
+  grainRandomRot?: number;
 }
 
+/**
+ * Exact per-pixel CPU paper grain modulation matching `WebGlBrushEngine.ts` fragment shader
+ * across all 9 CSP `TextureCompositeMode` modes, rotation, scale, brightness, contrast,
+ * invert, emphasizeDensity, preserveDensity, surfaceTextureId, and dab rotation/flip.
+ * Bakes `dabAlpha` before applying non-linear paper modes for <= 3/255 WebGL parity.
+ */
 function applyCpuPerPixelPaperGrain(
   master: CanvasImageSource,
   worldX: number,
   worldY: number,
   renderW: number,
   renderH: number,
+  angleRad: number,
+  flipX: number,
+  flipY: number,
+  dabAlpha: number,
   grainAmount: number,
   pressure: number,
-  paperScale: number = 1.0,
-  paperTextureImage?: HTMLImageElement
+  paperOpts: CpuPaperGrainOptions
 ): HTMLCanvasElement | null {
-  if (typeof document === 'undefined' || grainAmount <= 0.005) return null;
+  if (typeof document === 'undefined' || grainAmount <= 0.001 || dabAlpha <= 0.002) return null;
+
+  const bufW = Math.max(2, Math.min(256, Math.ceil(renderW)));
+  const bufH = Math.max(2, Math.min(256, Math.ceil(renderH)));
+
   if (!_grainScratchCanvas) {
     _grainScratchCanvas = document.createElement('canvas');
-    _grainScratchCanvas.width = 128;
-    _grainScratchCanvas.height = 128;
-    _grainScratchCtx = _grainScratchCanvas.getContext('2d');
+    _grainScratchCanvas.width = bufW;
+    _grainScratchCanvas.height = bufH;
+    _grainScratchCtx = _grainScratchCanvas.getContext('2d', { willReadFrequently: true });
+  } else if (_grainScratchCanvas.width !== bufW || _grainScratchCanvas.height !== bufH) {
+    _grainScratchCanvas.width = bufW;
+    _grainScratchCanvas.height = bufH;
+    _grainScratchCtx = _grainScratchCanvas.getContext('2d', { willReadFrequently: true });
   }
   const sCtx = _grainScratchCtx;
-  if (!sCtx || typeof sCtx.createPattern !== 'function') return null;
-
-  const pat = getInvertedGrainPattern(sCtx, paperTextureImage);
-  if (!pat) return null;
-
-  const bufSize = 128;
-  const p = Math.max(0, Math.min(1, pressure));
-  const heavyExcess = Math.max(0, (p - 0.52) / 0.48);
-  const penetration = Math.min(0.92, p * 0.28 + heavyExcess * heavyExcess * 0.64);
-  const effDensity = Math.max(0, Math.min(0.98, grainAmount * (1.0 - penetration * 0.85)));
-  if (effDensity <= 0.005) return null;
+  if (!sCtx || typeof sCtx.getImageData !== 'function' || typeof sCtx.putImageData !== 'function') {
+    return null;
+  }
 
   sCtx.save();
   sCtx.globalCompositeOperation = 'source-over';
   sCtx.globalAlpha = 1.0;
-  sCtx.clearRect(0, 0, bufSize, bufSize);
-  sCtx.drawImage(master, 0, 0, bufSize, bufSize);
-
-  const scale = Math.max(0.1, paperScale);
-  const sx = (bufSize / Math.max(1, renderW)) * scale;
-  const sy = (bufSize / Math.max(1, renderH)) * scale;
-  const offX = -((worldX - renderW * 0.5) / scale);
-  const offY = -((worldY - renderH * 0.5) / scale);
-
-  sCtx.globalCompositeOperation = 'destination-out';
-  sCtx.globalAlpha = effDensity;
-  sCtx.fillStyle = pat;
-  sCtx.scale(sx, sy);
-  sCtx.translate(offX, offY);
-  sCtx.fillRect(-offX, -offY, bufSize / sx, bufSize / sy);
+  sCtx.clearRect(0, 0, bufW, bufH);
+  if (flipX < 0 || flipY < 0) {
+    sCtx.translate(flipX < 0 ? bufW : 0, flipY < 0 ? bufH : 0);
+    sCtx.scale(flipX < 0 ? -1 : 1, flipY < 0 ? -1 : 1);
+  }
+  sCtx.drawImage(master, 0, 0, bufW, bufH);
   sCtx.restore();
 
+  const imgData = sCtx.getImageData(0, 0, bufW, bufH);
+  const data = imgData.data;
+
+  // Verify the canvas backing store actually rasterized pixels (protects mock Canvas2D unit tests)
+  let hasAnyNonZero = false;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] !== 0) {
+      hasAnyNonZero = true;
+      break;
+    }
+  }
+  if (!hasAnyNonZero) return null;
+
+  const customPaper = paperOpts.paperTextureImage
+    ? getCustomPaperLuminance(paperOpts.paperTextureImage)
+    : null;
+  const surfacePaper =
+    !customPaper && paperOpts.surfaceTextureId
+      ? getSurfaceTextureHeightField(paperOpts.surfaceTextureId)
+      : null;
+  const paperData = customPaper ? customPaper.lum : surfacePaper ?? paperGrainTable;
+  const paperW = customPaper ? customPaper.width : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE;
+  const paperH = customPaper ? customPaper.height : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE;
+  if (paperW <= 0 || paperH <= 0) return null;
+
+  const paperPow2 = (paperW & (paperW - 1)) === 0 && (paperH & (paperH - 1)) === 0;
+  const paperMaskW = paperW - 1;
+  const paperMaskH = paperH - 1;
+
+  const invScale = 1.0 / Math.max(0.05, paperOpts.paperTextureScale ?? 1.0);
+  const rotRad = ((paperOpts.paperTextureRotate ?? 0) * Math.PI) / 180;
+  const hasRot = Math.abs(rotRad) > 1e-4;
+  const cosR = hasRot ? Math.cos(rotRad) : 1;
+  const sinR = hasRot ? Math.sin(rotRad) : 0;
+
+  const mode = paperOpts.paperTextureMode ?? 'subtract';
+  const bright = paperOpts.paperTextureBrightness ?? 0;
+  const contrast = paperOpts.paperTextureContrast ?? 0;
+  const inv = Boolean(paperOpts.paperTextureInverted);
+  const emphasize = Boolean(paperOpts.paperTextureEmphasizeDensity);
+  const preserveDensity = Boolean(paperOpts.preservePaperDensity);
+
+  const gmMode = paperOpts.grainMappingMode ?? 'canvas-locked';
+  const strokeDist = paperOpts.strokeDist ?? 0;
+  const randOffX = paperOpts.grainRandomOffsetX ?? 0;
+  const randOffY = paperOpts.grainRandomOffsetY ?? 0;
+  const randRot = paperOpts.grainRandomRot ?? 0;
+  const randCos = gmMode === 'random-per-stroke' ? Math.cos(randRot) : 1;
+  const randSin = gmMode === 'random-per-stroke' ? Math.sin(randRot) : 0;
+
+  const cosA = Math.cos(angleRad);
+  const sinA = Math.sin(angleRad);
+  const maxDim = Math.max(renderW, renderH);
+  const invBufW = 1 / bufW;
+  const invBufH = 1 / bufH;
+  const inv255 = 1 / 255;
+
+  for (let py = 0; py < bufH; py++) {
+    const vNorm = (py + 0.5) * invBufH - 0.5; // [-0.5, 0.5]
+    const localY = vNorm * renderH;
+    const rowOff = py * bufW;
+
+    for (let px = 0; px < bufW; px++) {
+      const pOff = (rowOff + px) << 2;
+      const aByte = data[pOff + 3];
+      if (aByte === 0) continue;
+
+      const uNorm = (px + 0.5) * invBufW - 0.5; // [-0.5, 0.5]
+      const localX = uNorm * renderW;
+
+      let baseX: number;
+      let baseY: number;
+      if (gmMode === 'brush-aligned') {
+        baseX = uNorm * maxDim;
+        baseY = vNorm * maxDim;
+      } else if (gmMode === 'stroke-flow') {
+        baseX = strokeDist + localX;
+        baseY = localY;
+      } else {
+        const wx = worldX + localX * cosA - localY * sinA;
+        const wy = worldY + localX * sinA + localY * cosA;
+        if (gmMode === 'random-per-stroke') {
+          baseX = wx * randCos - wy * randSin + randOffX;
+          baseY = wx * randSin + wy * randCos + randOffY;
+        } else {
+          baseX = wx;
+          baseY = wy;
+        }
+      }
+
+      let rotX = baseX;
+      let rotY = baseY;
+      if (hasRot) {
+        rotX = baseX * cosR - baseY * sinR;
+        rotY = baseX * sinR + baseY * cosR;
+      }
+      const psx = rotX * invScale - 0.5;
+      const psy = rotY * invScale - 0.5;
+
+      const pfx = Math.floor(psx);
+      const pfy = Math.floor(psy);
+      const ptx = psx - pfx;
+      const pty = psy - pfy;
+      let px0: number, py0: number, px1: number, py1: number;
+      if (paperPow2) {
+        px0 = pfx & paperMaskW;
+        py0 = pfy & paperMaskH;
+        px1 = (px0 + 1) & paperMaskW;
+        py1 = (py0 + 1) & paperMaskH;
+      } else {
+        px0 = ((pfx % paperW) + paperW) % paperW;
+        py0 = ((pfy % paperH) + paperH) % paperH;
+        px1 = px0 + 1 < paperW ? px0 + 1 : 0;
+        py1 = py0 + 1 < paperH ? py0 + 1 : 0;
+      }
+
+      const pr0 = py0 * paperW;
+      const pr1 = py1 * paperW;
+      const pvTop = paperData[pr0 + px0] + (paperData[pr0 + px1] - paperData[pr0 + px0]) * ptx;
+      const pvBot = paperData[pr1 + px0] + (paperData[pr1 + px1] - paperData[pr1 + px0]) * ptx;
+      const gNorm = (pvTop + (pvBot - pvTop) * pty) * inv255;
+
+      // Modulate brush tip profile (0..1) BEFORE scaling by per-dab flow (matching CSP TextureForPlot=1 & SpatialTipMixer)
+      const tipAlpha = Math.max(0, Math.min(1, aByte * inv255));
+      const modTipAlpha = applyCspPaperTextureAlpha(
+        tipAlpha,
+        gNorm,
+        grainAmount,
+        pressure,
+        mode,
+        bright,
+        contrast,
+        inv,
+        preserveDensity,
+        emphasize
+      );
+      const modAlpha = Math.max(0, Math.min(1, modTipAlpha * dabAlpha));
+      data[pOff + 3] = modTipAlpha <= 0.002 ? 0 : Math.max(0, Math.min(255, Math.round(modAlpha * 255)));
+    }
+  }
+
+  sCtx.putImageData(imgData, 0, 0);
   return _grainScratchCanvas;
 }
 
@@ -1548,7 +2277,8 @@ export function canUseWebGlForBrush(options?: BrushRenderOptions): boolean {
   if (perf.renderBackend === 'canvas2d' || !perf.gpuBrushAcceleration) {
     return false;
   }
-  if (!options) return WebGlBrushEngine.getInstance().isAvailable();
+  const gpu = WebGlBrushEngine.getInstance();
+  if (!options) return gpu.isAvailable();
   if (options.useGpu === false) return false;
   if (options.colorMixing) return false;
   if ((options.antiAlias ?? 2) === 0) return false;
@@ -1560,7 +2290,70 @@ export function canUseWebGlForBrush(options?: BrushRenderOptions): boolean {
   ) {
     return false;
   }
-  return WebGlBrushEngine.getInstance().isAvailable();
+  if (options.blendTipsMode === 'compare') {
+    const isMultiColor = Boolean(
+      options.isColorTip ||
+        options.isDualToneTip ||
+        options.subTips?.[0]?.isColor ||
+        options.subTips?.[0]?.isDualToneTip ||
+        options.dynamics?.colorJitterEnabled
+    );
+    if (isMultiColor || !gpu.supportsBlendMax()) {
+      return false;
+    }
+  }
+  return gpu.isAvailable();
+}
+
+function buildGpuBrushSettingsFromOptions(
+  color: string,
+  options: BrushRenderOptions
+): BrushSettings & { alphaLocked?: boolean; isBgEraser?: boolean } {
+  const isBgEraser = Boolean(options.isBgEraser);
+  const grainVal = options.skipPerDabPaperGrain ? 0 : (options.grain ?? options.textureDensity ?? 0);
+  return {
+    size: options.size ?? 10,
+    minSizeFactor: options.minSizeFactor ?? 0,
+    color,
+    secondaryColor: options.secondaryColor,
+    opacity: options.opacity ?? 1.0,
+    flow: options.flow ?? 1.0,
+    blendTipsMode: options.blendTipsMode,
+    brushCombineMode: options.brushCombineMode,
+    spacing: options.spacing ?? 0.08,
+    usePressure: options.usePressure !== false,
+    smoothing: false,
+    stabilization: 0,
+    hardness: options.hardness ?? 1.0,
+    antiAlias: options.antiAlias ?? 2,
+    wetEdge: options.wetEdge ?? 0,
+    grain: grainVal,
+    textureDensity: options.skipPerDabPaperGrain ? 0 : options.textureDensity,
+    opacitySensor: options.opacitySensor,
+    textureDensitySensor: options.textureDensitySensor,
+    grainPenetrationSensor: options.grainPenetrationSensor,
+    surfaceTextureId: options.surfaceTextureId,
+    grainMappingMode: options.grainMappingMode,
+    paperTextureMode: options.paperTextureMode,
+    paperTextureBrightness: options.paperTextureBrightness,
+    paperTextureContrast: options.paperTextureContrast,
+    paperTextureApplyEachPlot: options.paperTextureApplyEachPlot,
+    paperTextureEmphasizeDensity: options.paperTextureEmphasizeDensity,
+    paperTextureInverted: options.paperTextureInverted,
+    paperTextureImage: options.paperTextureImage,
+    paperTextureScale: options.paperTextureScale,
+    paperTextureRotate: options.paperTextureRotate,
+    customTipImage: options.tipImage,
+    isColorTip: options.isColorTip,
+    isDualToneTip: options.isDualToneTip,
+    subTips: options.subTips,
+    subTipImages: options.subTipImages,
+    naturalPaint: options.naturalPaint,
+    colorMixing: false,
+    isTransparentInk: Boolean(options.isTransparentInk),
+    alphaLocked: Boolean(options.alphaLocked),
+    isBgEraser,
+  };
 }
 
 export function flushGpuDabs(
@@ -1576,46 +2369,7 @@ export function flushGpuDabs(
   const isEraser = Boolean(options.isEraser);
   const isBgEraser = Boolean(options.isBgEraser);
   const tool: ToolType = isEraser || isBgEraser ? 'eraser' : 'brush';
-  const settings: BrushSettings & { alphaLocked?: boolean; isBgEraser?: boolean } = {
-    size: options.size ?? 10,
-    minSizeFactor: options.minSizeFactor ?? 0,
-    color,
-    opacity: options.opacity ?? 1.0,
-    flow: options.flow ?? 1.0,
-    spacing: options.spacing ?? 0.08,
-    usePressure: options.usePressure !== false,
-    smoothing: false,
-    stabilization: 0,
-    hardness: options.hardness ?? 1.0,
-    antiAlias: options.antiAlias ?? 2,
-    wetEdge: options.wetEdge ?? 0,
-    grain: options.grain ?? options.textureDensity ?? 0,
-    textureDensity: options.textureDensity,
-    surfaceTextureId: options.surfaceTextureId,
-    grainMappingMode: options.grainMappingMode,
-    paperTextureMode: options.paperTextureMode,
-    paperTextureBrightness: options.paperTextureBrightness,
-    paperTextureContrast: options.paperTextureContrast,
-    paperTextureInverted: options.paperTextureInverted,
-    paperTextureImage: options.paperTextureImage,
-    paperTextureScale: options.paperTextureScale,
-    paperTextureRotate: options.paperTextureRotate,
-    customTipImage: options.tipImage,
-    isColorTip: options.isColorTip,
-    subTips: options.subTips,
-    subTipImages: options.subTipImages,
-    dualBrush: options.dualBrush,
-    dualTipImage: options.dualTipImage,
-    dualBrushCompositeMode: options.dualBrushCompositeMode as BrushSettings['dualBrushCompositeMode'],
-    dualScale: options.dualScale,
-    dualAngle: options.dualAngle,
-    dualScatter: options.dualScatter,
-    naturalPaint: options.naturalPaint,
-    colorMixing: false,
-    isTransparentInk: Boolean(options.isTransparentInk),
-    alphaLocked: Boolean(options.alphaLocked),
-    isBgEraser,
-  };
+  const settings = buildGpuBrushSettingsFromOptions(color, options);
 
   const docW = options.underlyingCanvas?.width || ctx.canvas?.width || 1024;
   const docH = options.underlyingCanvas?.height || ctx.canvas?.height || 1024;
@@ -1631,7 +2385,7 @@ const _customGrainLumCache = new WeakMap<
   { width: number; height: number; lum: Uint8Array }
 >();
 
-function getCustomPaperLuminance(
+export function getCustomPaperLuminance(
   img: HTMLImageElement
 ): { width: number; height: number; lum: Uint8Array } | null {
   const cached = _customGrainLumCache.get(img);
@@ -1661,54 +2415,13 @@ function getCustomPaperLuminance(
   return entry;
 }
 
-function sampleWorldPaperGrainNorm(
-  wx: number,
-  wy: number,
-  scale: number,
-  rotateDeg: number,
-  customPaper?: { width: number; height: number; lum: Uint8Array } | null
-): number {
-  const invScale = 1.0 / Math.max(0.05, scale);
-  let sx = wx * invScale;
-  let sy = wy * invScale;
-  if (rotateDeg !== 0) {
-    const rad = (-rotateDeg * Math.PI) / 180;
-    const c = Math.cos(rad);
-    const s = Math.sin(rad);
-    const rx = sx * c - sy * s;
-    const ry = sx * s + sy * c;
-    sx = rx;
-    sy = ry;
-  }
-  if (customPaper) {
-    const cw = customPaper.width;
-    const ch = customPaper.height;
-    const fx = Math.floor(sx);
-    const fy = Math.floor(sy);
-    const tx = sx - fx;
-    const ty = sy - fy;
-    const x0 = ((fx % cw) + cw) % cw;
-    const y0 = ((fy % ch) + ch) % ch;
-    const x1 = (x0 + 1) % cw;
-    const y1 = (y0 + 1) % ch;
-    const v00 = customPaper.lum[y0 * cw + x0];
-    const v10 = customPaper.lum[y0 * cw + x1];
-    const v01 = customPaper.lum[y1 * cw + x0];
-    const v11 = customPaper.lum[y1 * cw + x1];
-    const top = v00 + (v10 - v00) * tx;
-    const bot = v01 + (v11 - v01) * tx;
-    return (top + (bot - top) * ty) / 255.0;
-  }
-  return getPaperGrain(sx, sy) / 255.0;
-}
-
-function evaluateCspTaperFactors(
+export function evaluateCspTaperFactors(
   taper: CspTaperSettings | undefined,
   strokeDist: number,
   totalLength: number | undefined,
   exitSpeed?: number
 ): { sizeScale: number; alphaScale: number; amountScale: number; paintDensityScale: number } {
-  if (!taper || (!taper.useIn && !taper.useOut)) {
+  if (!taper || taper.inOutType === 0 || (!taper.useIn && !taper.useOut)) {
     return { sizeScale: 1.0, alphaScale: 1.0, amountScale: 1.0, paintDensityScale: 1.0 };
   }
 
@@ -1830,10 +2543,12 @@ function resolveCpuMaster(
   isBgEraser: boolean,
   isColorTip: boolean,
   targetWidth: number,
-  aaMode: number
+  aaMode: number,
+  isDualToneTip: boolean = false,
+  secondaryColor?: string
 ): HTMLCanvasElement {
   if (activeTip) {
-    return getTintedTipMaster(activeTip, color, isColorTip);
+    return getTintedTipMaster(activeTip, color, isColorTip, isDualToneTip, secondaryColor);
   }
   return getRadialDabMaster(hardness, color, isEraser && !isBgEraser, targetWidth, aaMode);
 }
@@ -1849,12 +2564,20 @@ function sampleAndMixColor(
   options: BrushRenderOptions,
   spacingRatio: number = 0.08,
   dirX: number = 0,
-  dirY: number = 0
+  dirY: number = 0,
+  amountOverride?: number,
+  densityOverride?: number,
+  stretchOverride?: number
 ): { colorHex: string; alpha: number; r: number; g: number; b: number } {
   const reservoir = options.reservoir!;
+  const effPigmentStrength =
+    options.perceptualMixing !== false
+      ? Math.max(0, Math.min(1, options.pigmentMixingStrength ?? 1.0))
+      : 0;
+  const usePigmentSample = effPigmentStrength > 0.005;
   let sampled = { r: 255, g: 255, b: 255, a: 0 };
   if (options.sampler) {
-    sampled = options.sampler.sampleColor(x, y, radius);
+    sampled = options.sampler.sampleColor(x, y, radius, usePigmentSample);
   } else {
     const sampleCanvas = options.underlyingCanvas || ctx.canvas;
     const sampleCtx = sampleCanvas ? sampleCanvas.getContext('2d') : null;
@@ -1864,14 +2587,16 @@ function sampleAndMixColor(
   }
 
   const pressureAlreadyApplied = Boolean(
-    options.opacitySensor?.usePressure || options.densitySensor?.usePressure
+    options.opacitySensor?.usePressure ||
+      options.densitySensor?.usePressure ||
+      options.densityOfPaintSensor?.usePressure
   );
 
   const mixed = reservoir.mixWithCanvas(
     sampled,
-    options.amountOfPaint ?? 0.65,
-    options.densityOfPaint ?? 0.9,
-    options.colorStretch ?? 0.75,
+    amountOverride !== undefined ? amountOverride : options.amountOfPaint ?? 0.65,
+    densityOverride !== undefined ? densityOverride : options.densityOfPaint ?? 0.9,
+    stretchOverride !== undefined ? stretchOverride : options.colorStretch ?? 0.75,
     options.mixingMode ?? 'blend',
     pressure,
     flow,
@@ -1896,7 +2621,16 @@ function sampleAndMixColor(
     const trailOffset = radius + depRad + 0.5;
     const depX = x - dirX * trailOffset;
     const depY = y - dirY * trailOffset;
-    options.sampler.depositDab(depX, depY, depRad, mixed.r, mixed.g, mixed.b, effectiveAlpha * 0.45);
+    options.sampler.depositDab(
+      depX,
+      depY,
+      depRad,
+      mixed.r,
+      mixed.g,
+      mixed.b,
+      effectiveAlpha * 0.45,
+      effPigmentStrength
+    );
   }
   return { ...mixed, alpha: effectiveAlpha };
 }
@@ -1918,20 +2652,25 @@ export function drawBrushDot(
   const isVert = Boolean(options.thicknessVertical);
   const aaMode = options.antiAlias ?? 2;
   const spacing = options.spacing ?? 0.08;
-  const useTilt = Boolean(options.useTilt || options.angleDynamics === 'tilt');
-  const grainAmount = options.grain ?? options.textureDensity ?? 0;
+  const { readTiltInput, useSyntheticTiltShading } = resolveTiltBehavior(options);
+  const grainAmount = options.skipPerDabPaperGrain ? 0 : (options.grain ?? options.textureDensity ?? 0);
+  const preservePaperDensity =
+    Boolean(options.textureDensitySensor) ||
+    (options.paperTextureApplyEachPlot !== undefined && !options.grainPenetrationSensor?.usePressure);
 
   let effectiveColor = isBgEraser ? '#ffffff' : color;
   const rawDensity = options.brushDensity ?? options.flow ?? (options.tipImage ? 0.85 : 1.0);
   let effectiveFlow = computeGapAdjustedAlpha(rawDensity, spacing, options.adjustDensityByGap);
 
-  const rawPressure = point.pressure ?? 1.0;
-  const effPressure = options.pressureCurve ? evaluateFastSpline(rawPressure, options.pressureCurve) : rawPressure;
-  const minFactor = options.minSizeFactor ?? 0.2;
+  const effPressure = Math.max(0, Math.min(1, point.pressure ?? 1.0));
+  const curvedPressure = options.pressureCurve ? evaluateFastSpline(effPressure, options.pressureCurve) : effPressure;
+  const minFactor = Math.max(0, Math.min(1.0, options.minSizeFactor ?? 0.2));
   let effWidth =
     point.width > 0
       ? Math.max(0.4, point.width)
-      : Math.max(0.5, (options.size ?? 10) * (minFactor + (1.0 - minFactor) * effPressure));
+      : options.usePressure !== false
+      ? Math.max(0.5, (options.size ?? 10) * (minFactor + (1.0 - minFactor) * curvedPressure))
+      : Math.max(0.5, options.size ?? 10);
 
   let startAmountScale = 1.0;
   let startPaintDensityScale = 1.0;
@@ -1943,13 +2682,25 @@ export function drawBrushDot(
     startPaintDensityScale = startTaper.paintDensityScale;
   }
 
-  const tiltX = useTilt ? point.tiltX ?? 0 : 0;
-  const tiltY = useTilt ? point.tiltY ?? 0 : 0;
-  const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-  const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
+  const tiltX = readTiltInput ? point.tiltX ?? 0 : 0;
+  const tiltY = readTiltInput ? point.tiltY ?? 0 : 0;
+  const tiltMagnitude = computeCspTiltMagnitude(tiltX, tiltY);
   const tiltSpread = tiltMagnitude * (options.tiltScale ?? 1.0);
   const grainPressure =
-    useTilt && tiltMagnitude > 0.01 ? effPressure * (1.0 - tiltMagnitude * 0.55) : effPressure;
+    useSyntheticTiltShading && tiltMagnitude > 0.01 ? effPressure * (1.0 - tiltMagnitude * 0.55) : effPressure;
+  let effGrainAmount = grainAmount;
+  if (grainAmount > 0.005 && options.textureDensitySensor) {
+    const tdFactor = evaluateCspSensor(
+      options.textureDensitySensor,
+      effPressure,
+      tiltMagnitude,
+      0,
+      dabHashFloat(point.x, point.y, 0, 58),
+      point.twist ?? 0,
+      0
+    );
+    effGrainAmount = Math.max(0, Math.min(1, grainAmount * tdFactor));
+  }
 
   if (options.sizeSensor) {
     // Avoid double-applying pressure when point.width already has pressure baked from calculateStrokeWidth
@@ -1962,13 +2713,53 @@ export function drawBrushDot(
       effWidth * evaluateCspSensor(effectiveSizeSensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 50))
     );
   }
-  if (options.opacitySensor) {
-    effectiveFlow *= evaluateCspSensor(options.opacitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 51));
+  const isColorMixing = Boolean(options.colorMixing) && !isEraser && !isBgEraser;
+  const hasConcurrentDensityAndPaintDensityPressure = Boolean(
+    isColorMixing && options.densitySensor?.usePressure && options.densityOfPaintSensor?.usePressure
+  );
+
+  let effDensityOfPaint = (options.densityOfPaint ?? 0.9) * startPaintDensityScale;
+  let paintDensitySensorFactor = 1.0;
+  if (options.densityOfPaintSensor) {
+    paintDensitySensorFactor = evaluateCspSensor(
+      options.densityOfPaintSensor,
+      effPressure,
+      tiltMagnitude,
+      0,
+      dabHashFloat(point.x, point.y, 0, 56),
+      point.twist ?? 0,
+      0
+    );
+    if (!hasConcurrentDensityAndPaintDensityPressure) {
+      effDensityOfPaint *= paintDensitySensorFactor;
+    } else if (paintDensitySensorFactor <= 0.002) {
+      effDensityOfPaint = 0;
+    }
   }
-  if (options.densitySensor) {
-    effectiveFlow *= evaluateCspSensor(options.densitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 52));
+
+  let flowSensorFactor = 1.0;
+  if (hasConcurrentDensityAndPaintDensityPressure) {
+    // In CSP Color Mixing (Blend), BrushFlowEffector drives per-plot brush density while
+    // BrushMixAlphaEffector shapes paint-covering translucency without bottlenecking BrushFlow.
+    const dnF = evaluateCspSensor(options.densitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 52));
+    flowSensorFactor = dnF;
+    if (options.opacitySensor) {
+      flowSensorFactor *= evaluateCspSensor(options.opacitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 51));
+    }
+  } else if (options.opacitySensor && options.densitySensor && (isColorMixing || options.paperTextureApplyEachPlot === false)) {
+    const opF = evaluateCspSensor(options.opacitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 51));
+    const dnF = evaluateCspSensor(options.densitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 52));
+    flowSensorFactor = Math.min(opF, dnF);
+  } else {
+    if (options.opacitySensor) {
+      flowSensorFactor *= evaluateCspSensor(options.opacitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 51));
+    }
+    if (options.densitySensor) {
+      flowSensorFactor *= evaluateCspSensor(options.densitySensor, effPressure, tiltMagnitude, 0, dabHashFloat(point.x, point.y, 0, 52));
+    }
   }
-  if (useTilt && tiltMagnitude > 0.03 && (options.tipImage || grainAmount > 0.005)) {
+  effectiveFlow = Math.max(0, Math.min(1, effectiveFlow * flowSensorFactor));
+  if (useSyntheticTiltShading && tiltMagnitude > 0.03 && (options.tipImage || grainAmount > 0.005)) {
     effectiveFlow *= 1.0 - tiltMagnitude * 0.28;
   }
 
@@ -1977,27 +2768,91 @@ export function drawBrushDot(
     ? selectTipImage(options.subTipImages, options.tipImage, options.subTipOrder, 0, 0, point.x, point.y)
     : undefined;
   const isColorTip = Boolean(options.isColorTip || (options.subTips && options.subTips[0]?.isColor));
-  const aspect = activeTip
-    ? (activeTip.naturalHeight || activeTip.height || 1) / (activeTip.naturalWidth || activeTip.width || 1)
-    : 1.0;
+  const isDualToneTip = !isColorTip && Boolean(options.isDualToneTip || (options.subTips && options.subTips[0]?.isDualToneTip));
+  const tipNaturalW = activeTip ? (activeTip.naturalWidth || activeTip.width || 1) : 1;
+  const tipNaturalH = activeTip ? (activeTip.naturalHeight || activeTip.height || 1) : 1;
+
+  let effThickness = thickness;
+  if (options.thicknessSensor) {
+    // CSP Brush Thickness minimum is 10% (0.10); never collapse below 0.10 unless base thickness itself is thinner.
+    const minThicknessFloor = Math.min(thickness, 0.1);
+    effThickness = Math.max(
+      minThicknessFloor,
+      thickness *
+        evaluateCspSensor(
+          options.thicknessSensor,
+          effPressure,
+          tiltMagnitude,
+          0,
+          dabHashFloat(point.x, point.y, 0, 54),
+          point.twist ?? 0,
+          0
+        )
+    );
+  }
+
+  let effAmountOfPaint = (options.amountOfPaint ?? 0.65) * startAmountScale;
+  if (options.amountOfPaintSensor) {
+    effAmountOfPaint *= evaluateCspSensor(
+      options.amountOfPaintSensor,
+      effPressure,
+      tiltMagnitude,
+      0,
+      dabHashFloat(point.x, point.y, 0, 55),
+      point.twist ?? 0,
+      0
+    );
+  }
+  let effColorStretch = options.colorStretch ?? 0.75;
+  if (options.colorStretchSensor) {
+    effColorStretch *= evaluateCspSensor(
+      options.colorStretchSensor,
+      effPressure,
+      tiltMagnitude,
+      0,
+      dabHashFloat(point.x, point.y, 0, 57),
+      point.twist ?? 0,
+      0
+    );
+  }
 
   let angleRad =
     options.initialAngleRad !== undefined
       ? options.initialAngleRad
       : ((options.angle ?? 0) * Math.PI) / 180;
-  if (useTilt && tiltMagnitude > 0.05) {
+  if (options.angleDynamics === 'tilt' && tiltMagnitude > 0.05) {
+    angleRad = Math.atan2(tiltX, -tiltY) + ((options.angle ?? 0) * Math.PI) / 180;
+  } else if (useSyntheticTiltShading && tiltMagnitude > 0.05) {
     angleRad = Math.atan2(tiltY, tiltX) + ((options.angle ?? 0) * Math.PI) / 180;
   }
-  if (point.twist && (options.angleDynamics === 'twist' || useTilt)) {
+  if (point.twist && (options.angleDynamics === 'twist' || useSyntheticTiltShading)) {
     angleRad += (point.twist * Math.PI) / 180;
   }
 
-  const isColorMixing = Boolean(options.colorMixing) && !isEraser && !isBgEraser;
+  const dynamics = options.dynamics;
+  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+  const colorJitterPerStroke = Boolean(colorJitterEnabled && dynamics?.colorJitterPerStroke);
+  if (colorJitterPerStroke && dynamics) {
+    if (!options.strokeJitterColor) {
+      const prim0 = parseColorToRgb(effectiveColor);
+      const sec0 = parseColorToRgb(options.secondaryColor || '#ffffff');
+      let salt = 200;
+      const strokeIdx = options.strokeIndex ?? 0;
+      options.strokeJitterColor = applyColorDynamics(
+        { r: prim0.r / 255, g: prim0.g / 255, b: prim0.b / 255 },
+        { r: sec0.r / 255, g: sec0.g / 255, b: sec0.b / 255 },
+        dynamics,
+        () => dabHashFloat(point.x, point.y, strokeIdx, salt++)
+      );
+    }
+    effectiveColor = options.strokeJitterColor.hex;
+  }
+  const perDabColorJitter = colorJitterEnabled && !colorJitterPerStroke;
+
   const useSpatialTipMixing =
     isColorMixing &&
     !gpuDabs &&
     !isColorTip &&
-    !options.dynamics?.colorJitterEnabled &&
     !options.spray?.enabled;
 
   if (useSpatialTipMixing) {
@@ -2005,17 +2860,35 @@ export function drawBrushDot(
     if (!options.reservoir.spatialMixer) {
       options.reservoir.spatialMixer = new SpatialTipMixer(effectiveColor);
     }
+    let freshColorOverride: { r: number; g: number; b: number } | undefined;
+    if (perDabColorJitter && dynamics) {
+      const prim0 = parseColorToRgb(effectiveColor);
+      const sec0 = parseColorToRgb(options.secondaryColor || '#ffffff');
+      let salt = 20;
+      const cd = applyColorDynamics(
+        { r: prim0.r / 255, g: prim0.g / 255, b: prim0.b / 255 },
+        { r: sec0.r / 255, g: sec0.g / 255, b: sec0.b / 255 },
+        dynamics,
+        () => dabHashFloat(point.x, point.y, 0, salt++)
+      );
+      freshColorOverride = { r: cd.r * 255, g: cd.g * 255, b: cd.b * 255 };
+    }
     const pressureAlreadyApplied = Boolean(
-      options.opacitySensor?.usePressure || options.densitySensor?.usePressure
+      options.opacitySensor?.usePressure ||
+        options.densitySensor?.usePressure ||
+        options.densityOfPaintSensor?.usePressure
     );
-    let finalW = isVert ? effWidth * thickness : effWidth;
-    let finalH = isVert ? effWidth * aspect : effWidth * aspect * thickness;
-    if (useTilt && tiltMagnitude > 0.01) {
+    const tipDims = computeTipStampDimensions(effWidth, effThickness, isVert, tipNaturalW, tipNaturalH);
+    let finalW = tipDims.width;
+    let finalH = tipDims.height;
+    if (useSyntheticTiltShading && tiltMagnitude > 0.01) {
       finalW *= 1.0 + tiltSpread * 1.85;
       finalH *= Math.max(0.55, 1.0 / (1.0 + tiltMagnitude * 0.45));
     }
     const flips = resolveTipFlipSigns(options.flipH, options.flipV, 0, point.x, point.y);
     const customPaper = options.paperTextureImage ? getCustomPaperLuminance(options.paperTextureImage) : null;
+    const surfacePaper =
+      !customPaper && options.surfaceTextureId ? getSurfaceTextureHeightField(options.surfaceTextureId) : null;
     const texScale = options.paperTextureScale ?? 1.0;
     const texRot = options.paperTextureRotate ?? 0;
     const texMode = options.paperTextureMode ?? 'multiply';
@@ -2041,29 +2914,36 @@ export function drawBrushDot(
       flow: effectiveFlow,
       pressure: effPressure,
       pressureAlreadyApplied,
-      amountOfPaint: (options.amountOfPaint ?? 0.65) * startAmountScale,
-      densityOfPaint: (options.densityOfPaint ?? 0.9) * startPaintDensityScale,
-      colorStretch: options.colorStretch ?? 0.75,
+      amountOfPaint: effAmountOfPaint,
+      densityOfPaint: effDensityOfPaint,
+      colorStretch: effColorStretch,
+      isPureBlender: (options.amountOfPaint ?? 0.65) <= 0.005 || options.mixingMode === 'smear',
       mixingMode: options.mixingMode ?? 'blend',
       perceptualMixing: options.perceptualMixing !== false,
       pigmentMixingStrength: options.pigmentMixingStrength ?? 1.0,
+      useBlur: Boolean(options.useBlur),
+      blurStrength: options.blurStrength,
       tipImage: activeTip,
+      isDualToneTip,
+      secondaryColor: options.secondaryColor,
+      freshColor: freshColorOverride,
       sampler: options.sampler,
-      grainDensity: grainAmount,
-      grainModulate:
-        grainAmount > 0.005
-          ? (wx, wy, tipA) =>
-              applyCspPaperTextureAlpha(
-                tipA,
-                sampleWorldPaperGrainNorm(wx, wy, texScale, texRot, customPaper),
-                grainAmount,
-                grainPressure,
-                texMode,
-                texBright,
-                texContrast,
-                texInv
-              )
-          : undefined,
+      grainDensity: effGrainAmount,
+      paperTextureMode: texMode,
+      paperLumData:
+        effGrainAmount > 0.005 ? (customPaper ? customPaper.lum : surfacePaper ?? paperGrainTable) : undefined,
+      paperLumWidth:
+        effGrainAmount > 0.005 ? (customPaper ? customPaper.width : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE) : undefined,
+      paperLumHeight:
+        effGrainAmount > 0.005 ? (customPaper ? customPaper.height : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE) : undefined,
+      paperTextureScale: texScale,
+      paperTextureRotate: texRot,
+      paperTextureBrightness: texBright,
+      paperTextureContrast: texContrast,
+      paperTextureInverted: texInv,
+      paperTexturePreserveDensity: preservePaperDensity,
+      paperTextureEmphasizeDensity: Boolean(options.paperTextureEmphasizeDensity),
+      grainPressure,
     });
     if (built) {
       options.reservoir.r = built.avgR;
@@ -2097,50 +2977,80 @@ export function drawBrushDot(
 
   if (isColorMixing) {
     if (!options.reservoir) options.reservoir = new PaintReservoir(effectiveColor);
-    const mixed = sampleAndMixColor(ctx, point.x, point.y, Math.max(1, effWidth * 0.5), effPressure, effectiveFlow, 0, options);
+    const mixed = sampleAndMixColor(
+      ctx,
+      point.x,
+      point.y,
+      Math.max(1, effWidth * 0.5),
+      effPressure,
+      effectiveFlow,
+      0,
+      options,
+      spacing,
+      0,
+      0,
+      effAmountOfPaint,
+      effDensityOfPaint,
+      effColorStretch
+    );
     effectiveColor = mixed.colorHex;
     effectiveFlow = mixed.alpha;
   }
   if (effectiveFlow <= 0.002) return;
 
-  const hasPerPixelCpuGrain = !gpuDabs && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
-  if (!gpuDabs && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
-    const gNorm = sampleScalarPaperGrainNorm(point.x, point.y, effWidth, options.paperTextureScale ?? 1.0);
-    const scalarMode = options.paperTextureMode === 'compare' ? 'subtract' : (options.paperTextureMode ?? 'subtract');
-    effectiveFlow *= applyCspPaperTextureAlpha(
-      1.0,
-      gNorm,
-      grainAmount,
-      grainPressure,
-      scalarMode,
-      options.paperTextureBrightness ?? 0,
-      options.paperTextureContrast ?? 0,
-      Boolean(options.paperTextureInverted)
-    );
-  }
-  if (effectiveFlow <= 0.002) return;
+  const tryPerPixelCpuGrain = !gpuDabs && effGrainAmount > 0.005 && typeof document !== 'undefined';
+  const dotSeed = Math.abs(Math.sin(point.x * 12.9898 + point.y * 78.233));
+  const dotRandOffX = dotSeed * 256;
+  const dotRandOffY = ((dotSeed * 397) % 1) * 256;
+  const dotRandRot = Math.abs(Math.cos(point.x * 39.346 + point.y * 11.135)) * Math.PI * 2;
+  const dotPaperOpts: CpuPaperGrainOptions = {
+    paperTextureMode: options.paperTextureMode ?? 'subtract',
+    paperTextureScale: options.paperTextureScale ?? 1.0,
+    paperTextureRotate: options.paperTextureRotate ?? 0,
+    paperTextureBrightness: options.paperTextureBrightness ?? 0,
+    paperTextureContrast: options.paperTextureContrast ?? 0,
+    paperTextureInverted: Boolean(options.paperTextureInverted),
+    paperTextureEmphasizeDensity: Boolean(options.paperTextureEmphasizeDensity),
+    preservePaperDensity,
+    paperTextureImage: options.paperTextureImage,
+    surfaceTextureId: options.surfaceTextureId,
+    grainMappingMode: options.grainMappingMode,
+    strokeDist: 0,
+    grainRandomOffsetX: dotRandOffX,
+    grainRandomOffsetY: dotRandOffY,
+    grainRandomRot: dotRandRot,
+  };
 
   const baseMaster = gpuDabs
     ? null
-    : resolveCpuMaster(activeTip, effectiveColor, hardness, isEraser, isBgEraser, isColorTip, effWidth, aaMode);
+    : resolveCpuMaster(
+        activeTip,
+        effectiveColor,
+        hardness,
+        isEraser,
+        isBgEraser,
+        isColorTip,
+        effWidth,
+        aaMode,
+        isDualToneTip,
+        options.secondaryColor
+      );
 
-  const dynamics = options.dynamics;
   const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
   const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
   const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
   const roundnessJitter = Math.max(0, Math.min(1, dynamics?.roundnessJitter ?? 0));
   const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
   const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
-  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
-  const primRgb = colorJitterEnabled || gpuDabs ? parseColorToRgb(effectiveColor) : null;
-  const secRgb = colorJitterEnabled ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
+  const primRgb = perDabColorJitter || gpuDabs ? parseColorToRgb(effectiveColor) : null;
+  const secRgb = perDabColorJitter ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
 
   for (let k = 0; k < dabCount; k++) {
     let curDabW = effWidth;
     if (sizeJitter > 0) curDabW *= Math.max(0.01, 1.0 - dabHashFloat(point.x, point.y, k, 1) * sizeJitter);
     curDabW = Math.max(0.1, curDabW);
 
-    let curDabThickness = thickness;
+    let curDabThickness = effThickness;
     if (roundnessJitter > 0) curDabThickness *= Math.max(0.05, 1.0 - dabHashFloat(point.x, point.y, k, 2) * roundnessJitter);
 
     let curDabAngle = angleRad;
@@ -2162,7 +3072,7 @@ export function drawBrushDot(
     let dabR = primRgb ? primRgb.r / 255 : 0;
     let dabG = primRgb ? primRgb.g / 255 : 0;
     let dabB = primRgb ? primRgb.b / 255 : 0;
-    if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+    if (perDabColorJitter && primRgb && secRgb && dynamics) {
       let salt = 20;
       const cd = applyColorDynamics(
         { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
@@ -2174,34 +3084,75 @@ export function drawBrushDot(
       dabG = cd.g;
       dabB = cd.b;
       if (!gpuDabs) {
-        curMaster = resolveCpuMaster(activeTip, cd.hex, hardness, isEraser, isBgEraser, isColorTip, curDabW, aaMode);
+        curMaster = resolveCpuMaster(
+          activeTip,
+          cd.hex,
+          hardness,
+          isEraser,
+          isBgEraser,
+          isColorTip,
+          curDabW,
+          aaMode,
+          isDualToneTip,
+          options.secondaryColor
+        );
       }
     }
 
-    let finalW = isVert ? curDabW * curDabThickness : curDabW;
-    let finalH = isVert ? curDabW * aspect : curDabW * aspect * curDabThickness;
-    if (useTilt && tiltMagnitude > 0.01) {
+    const dabDims = computeTipStampDimensions(curDabW, curDabThickness, isVert, tipNaturalW, tipNaturalH);
+    let finalW = dabDims.width;
+    let finalH = dabDims.height;
+    if (useSyntheticTiltShading && tiltMagnitude > 0.01) {
       finalW *= 1.0 + tiltSpread * 1.85;
       finalH *= Math.max(0.55, 1.0 / (1.0 + tiltMagnitude * 0.45));
     }
 
     const flips = resolveTipFlipSigns(options.flipH, options.flipV, k, curDabX, curDabY);
 
-    if (curMaster && hasPerPixelCpuGrain) {
+    let stampAlpha = curDabAlpha;
+    let stampFlipX = flips.signX;
+    let stampFlipY = flips.signY;
+    if (curMaster && tryPerPixelCpuGrain) {
+      const sub = computeSubpixelDabDimensions(finalW, finalH, curDabAlpha, aaMode === 0 ? 1.0 : 0.75);
       const grained = applyCpuPerPixelPaperGrain(
         curMaster,
         curDabX,
         curDabY,
-        finalW,
-        finalH,
-        grainAmount,
+        sub.renderW,
+        sub.renderH,
+        curDabAngle,
+        flips.signX,
+        flips.signY,
+        sub.effAlpha,
+        effGrainAmount,
         grainPressure,
-        options.paperTextureScale ?? 1.0,
-        options.paperTextureImage
+        dotPaperOpts
       );
-      if (grained) curMaster = grained;
+      if (grained) {
+        curMaster = grained;
+        stampAlpha = 1.0;
+        stampFlipX = 1;
+        stampFlipY = 1;
+      } else {
+        const gNorm = sampleScalarPaperGrainNorm(curDabX, curDabY, curDabW, options.paperTextureScale ?? 1.0);
+        const scalarMode = options.paperTextureMode === 'compare' ? 'subtract' : (options.paperTextureMode ?? 'subtract');
+        const modTip = applyCspPaperTextureAlpha(
+          1.0,
+          gNorm,
+          effGrainAmount,
+          grainPressure,
+          scalarMode,
+          options.paperTextureBrightness ?? 0,
+          options.paperTextureContrast ?? 0,
+          Boolean(options.paperTextureInverted),
+          preservePaperDensity,
+          Boolean(options.paperTextureEmphasizeDensity)
+        );
+        stampAlpha = Math.max(0, Math.min(1, curDabAlpha * modTip));
+      }
     }
 
+    const dabGrainDensity = options.textureDensitySensor ? effGrainAmount : undefined;
     if (options.spray?.enabled) {
       const pCount = options.spray.density;
       const pSize = Math.max(1, options.spray.size);
@@ -2213,19 +3164,21 @@ export function drawBrushDot(
         const th = Math.PI * 2 * dabHashFloat(curDabX, curDabY, k * 64 + i, 33);
         const spX = curDabX + r * Math.cos(th);
         const spY = curDabY + r * Math.sin(th);
-        const spW = isVert ? pSize * curDabThickness : pSize;
-        const spH = isVert ? pSize * aspect : pSize * aspect * curDabThickness;
+        const spDims = computeTipStampDimensions(pSize, curDabThickness, isVert, tipNaturalW, tipNaturalH);
+        const spW = spDims.width;
+        const spH = spDims.height;
         if (gpuDabs) {
           gpuDabs.push({
             x: spX, y: spY, width: spW, height: spH, angle: curDabAngle,
             r: dabR, g: dabG, b: dabB, alpha: curDabAlpha, pressure: grainPressure,
             strokeDist: 0, flipX: flips.signX, flipY: flips.signY,
+            grainDensity: dabGrainDensity,
           });
         } else if (curMaster) {
           drawSingleStamp(
-            ctx, curMaster, spX, spY, spW, spH, curDabAngle, curDabAlpha,
+            ctx, curMaster, spX, spY, spW, spH, curDabAngle, stampAlpha,
             isEraser, isBgEraser, options.alphaLocked, options.isTransparentInk,
-            flips.signX, flips.signY, aaMode, options.blendTipsMode
+            stampFlipX, stampFlipY, aaMode, options.blendTipsMode
           );
         }
       }
@@ -2234,12 +3187,13 @@ export function drawBrushDot(
         x: curDabX, y: curDabY, width: finalW, height: finalH, angle: curDabAngle,
         r: dabR, g: dabG, b: dabB, alpha: curDabAlpha, pressure: grainPressure,
         strokeDist: 0, flipX: flips.signX, flipY: flips.signY,
+        grainDensity: dabGrainDensity,
       });
     } else if (curMaster) {
       drawSingleStamp(
-        ctx, curMaster, curDabX, curDabY, finalW, finalH, curDabAngle, curDabAlpha,
+        ctx, curMaster, curDabX, curDabY, finalW, finalH, curDabAngle, stampAlpha,
         isEraser, isBgEraser, options.alphaLocked, options.isTransparentInk,
-        flips.signX, flips.signY, aaMode, options.blendTipsMode
+        stampFlipX, stampFlipY, aaMode, options.blendTipsMode
       );
     }
   }
@@ -2257,7 +3211,14 @@ export function drawBrushCubicBezierSegment(
   color: string,
   options: BrushRenderOptions = {},
   remainderDist: number = 0,
-  dabCounter: { count: number; lastAngle?: number; lastStepDist?: number } = { count: 0 },
+  dabCounter: {
+    count: number;
+    lastAngle?: number;
+    lastStepDist?: number;
+    lockedInitialAngle?: number;
+    initOriginX?: number;
+    initOriginY?: number;
+  } = { count: 0 },
   batchGpuDabs?: GpuDab[]
 ): number {
   const { totalLength: totalCurveLength, steps: arcSteps } = buildFastArcLengthScratch(p0, c1, c2, p3);
@@ -2267,7 +3228,27 @@ export function drawBrushCubicBezierSegment(
 
   const isEraser = Boolean(options.isEraser);
   const isBgEraser = Boolean(options.isBgEraser);
-  const baseColor = isBgEraser ? '#ffffff' : color;
+  const dynamics = options.dynamics;
+  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
+  const colorJitterPerStroke = Boolean(colorJitterEnabled && dynamics?.colorJitterPerStroke);
+  let baseColor = isBgEraser ? '#ffffff' : color;
+  if (colorJitterPerStroke && dynamics) {
+    if (!options.strokeJitterColor) {
+      const prim0 = parseColorToRgb(baseColor);
+      const sec0 = parseColorToRgb(options.secondaryColor || '#ffffff');
+      let salt = 200;
+      const strokeIdx = options.strokeIndex ?? 0;
+      options.strokeJitterColor = applyColorDynamics(
+        { r: prim0.r / 255, g: prim0.g / 255, b: prim0.b / 255 },
+        { r: sec0.r / 255, g: sec0.g / 255, b: sec0.b / 255 },
+        dynamics,
+        () => dabHashFloat(p0.x, p0.y, strokeIdx, salt++)
+      );
+    }
+    baseColor = options.strokeJitterColor.hex;
+  }
+  const perDabColorJitter = colorJitterEnabled && !colorJitterPerStroke;
+
   const hardness = options.hardness ?? 1.0;
   const tipImage = options.tipImage;
   const isColorMixing = Boolean(options.colorMixing) && !isEraser && !isBgEraser;
@@ -2276,9 +3257,8 @@ export function drawBrushCubicBezierSegment(
     options.reservoir = new PaintReservoir(baseColor);
   }
 
-  const aspect = tipImage
-    ? (tipImage.naturalHeight || tipImage.height || 1) / (tipImage.naturalWidth || tipImage.width || 1)
-    : 1.0;
+  const tipNaturalW = tipImage ? (tipImage.naturalWidth || tipImage.width || 1) : 1;
+  const tipNaturalH = tipImage ? (tipImage.naturalHeight || tipImage.height || 1) : 1;
   const baseAngleRad = ((options.angle ?? 0) * Math.PI) / 180;
   const rawDensity = options.brushDensity ?? options.flow ?? (tipImage ? 0.85 : 1.0);
   const spacingRatio = Math.max(0.003, Math.min(2.0, options.spacing ?? (tipImage ? 0.07 : 0.08)));
@@ -2286,15 +3266,18 @@ export function drawBrushCubicBezierSegment(
   const thickness = options.thickness ?? 1.0;
   const isVert = Boolean(options.thicknessVertical);
   const rotationRandomScale = options.rotationRandomScale ?? 0;
-  const useTilt = Boolean(options.useTilt || options.angleDynamics === 'tilt');
+  const { readTiltInput, useSyntheticTiltShading } = resolveTiltBehavior(options);
   const aaMode = options.antiAlias ?? 2;
-  const grainAmount = options.grain ?? options.textureDensity ?? 0;
+  const grainAmount = options.skipPerDabPaperGrain ? 0 : (options.grain ?? options.textureDensity ?? 0);
+  const preservePaperDensity =
+    Boolean(options.textureDensitySensor) ||
+    (options.paperTextureApplyEachPlot !== undefined && !options.grainPenetrationSensor?.usePressure);
   const isColorTip = Boolean(options.isColorTip || (options.subTips && options.subTips[0]?.isColor));
+  const isDualToneTip = !isColorTip && Boolean(options.isDualToneTip || (options.subTips && options.subTips[0]?.isDualToneTip));
 
   const gpuDabs = batchGpuDabs || null;
   const avgSegWidth = Math.max(0.5, (p0.width + p3.width) * 0.5);
   const hasMultiSubTips = Boolean(tipImage && options.subTipImages && options.subTipImages.length > 1);
-  const dynamics = options.dynamics;
   const dabCount = Math.max(1, Math.min(10, Math.round(dynamics?.count ?? 1)));
   const sizeJitter = Math.max(0, Math.min(1, dynamics?.sizeJitter ?? 0));
   const angleJitter = Math.max(0, Math.min(1, dynamics?.angleJitter ?? 0));
@@ -2302,22 +3285,26 @@ export function drawBrushCubicBezierSegment(
   const scatter = Math.max(0, Math.min(5, dynamics?.scatter ?? 0));
   const scatterBothAxes = Boolean(dynamics?.scatterBothAxes);
   const flowJitter = Math.max(0, Math.min(1, dynamics?.flowJitter ?? 0));
-  const colorJitterEnabled = Boolean(dynamics?.colorJitterEnabled);
   const useSpatialTipMixing =
     isColorMixing &&
     !gpuDabs &&
     !isColorTip &&
-    !colorJitterEnabled &&
     !options.spray?.enabled;
   if (useSpatialTipMixing && options.reservoir && !options.reservoir.spatialMixer) {
     options.reservoir.spatialMixer = new SpatialTipMixer(baseColor);
   }
   const pressureAlreadyAppliedToFlow = Boolean(
-    options.opacitySensor?.usePressure || options.densitySensor?.usePressure
+    options.opacitySensor?.usePressure ||
+      options.densitySensor?.usePressure ||
+      options.densityOfPaintSensor?.usePressure
   );
   const customPaper =
     useSpatialTipMixing && grainAmount > 0.005 && options.paperTextureImage
       ? getCustomPaperLuminance(options.paperTextureImage)
+      : null;
+  const surfacePaper =
+    useSpatialTipMixing && grainAmount > 0.005 && !customPaper && options.surfaceTextureId
+      ? getSurfaceTextureHeightField(options.surfaceTextureId)
       : null;
   const texScale = options.paperTextureScale ?? 1.0;
   const texRot = options.paperTextureRotate ?? 0;
@@ -2329,24 +3316,48 @@ export function drawBrushCubicBezierSegment(
   const staticMaster =
     isColorMixing || gpuDabs || hasMultiSubTips
       ? null
-      : resolveCpuMaster(tipImage, baseColor, hardness, isEraser, isBgEraser, isColorTip, avgSegWidth, aaMode);
+      : resolveCpuMaster(
+          tipImage,
+          baseColor,
+          hardness,
+          isEraser,
+          isBgEraser,
+          isColorTip,
+          avgSegWidth,
+          aaMode,
+          isDualToneTip,
+          options.secondaryColor
+        );
 
-  const baseRgb = colorJitterEnabled || gpuDabs ? parseColorToRgb(baseColor) : null;
-  const secRgb = colorJitterEnabled ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
+  const baseRgb = perDabColorJitter || gpuDabs ? parseColorToRgb(baseColor) : null;
+  const secRgb = perDabColorJitter ? parseColorToRgb(options.secondaryColor || '#ffffff') : null;
   const baseMinStepPx = tipImage ? 0.15 : 0.12;
-  const hasPerPixelCpuGrain =
-    !gpuDabs && !useSpatialTipMixing && grainAmount > 0.005 && typeof ctx.createPattern === 'function';
+  const tryPerPixelCpuGrain = !gpuDabs && !useSpatialTipMixing && grainAmount > 0.005 && typeof document !== 'undefined';
+  const segSeed = Math.abs(Math.sin(p0.x * 12.9898 + p0.y * 78.233));
+  const segRandOffX = segSeed * 256;
+  const segRandOffY = ((segSeed * 397) % 1) * 256;
+  const segRandRot = Math.abs(Math.cos(p0.x * 39.346 + p0.y * 11.135)) * Math.PI * 2;
+
+  if (options.angleDynamics === 'initial-direction') {
+    if (options.initialAngleRad !== undefined && dabCounter.lockedInitialAngle === undefined) {
+      dabCounter.lockedInitialAngle = options.initialAngleRad;
+    }
+    if (dabCounter.initOriginX === undefined) {
+      dabCounter.initOriginX = p0.x;
+      dabCounter.initOriginY = p0.y;
+    }
+  }
 
   let hasSmoothAngle = dabCounter.lastAngle !== undefined;
   let smoothCos = hasSmoothAngle ? Math.cos(dabCounter.lastAngle!) : Math.cos(baseAngleRad);
   let smoothSin = hasSmoothAngle ? Math.sin(dabCounter.lastAngle!) : Math.sin(baseAngleRad);
   let currentDist = remainderDist > 0 ? remainderDist : 0;
-  // Preserve true inter-stamp arc distance across Bezier segment boundaries (never reset to partial remainderDist)
+  // Preserve true inter-stamp arc distance across Bezier segment boundaries.
+  // On Dab 1 (lastStepDist === undefined), use 0 so SpatialTipMixer uses nominal spacing instead of
+  // a tiny post-carryover remainderDist from high-frequency pointer segments.
   let prevStepDist =
     dabCounter.lastStepDist !== undefined && dabCounter.lastStepDist > 0
       ? dabCounter.lastStepDist
-      : remainderDist > 0
-      ? remainderDist
       : 0;
 
   while (currentDist <= totalCurveLength) {
@@ -2376,13 +3387,25 @@ export function drawBrushCubicBezierSegment(
     const taperPaintDensityScale = taperFactors.paintDensityScale;
 
     const dabSeq = dabCounter.count++;
-    const tiltX = useTilt ? pt.tiltX : 0;
-    const tiltY = useTilt ? pt.tiltY : 0;
-    const tiltAngleDeg = Math.min(90, Math.sqrt(tiltX * tiltX + tiltY * tiltY));
-    const tiltMagnitude = Math.sin((tiltAngleDeg * Math.PI) / 180);
+    const tiltX = readTiltInput ? pt.tiltX : 0;
+    const tiltY = readTiltInput ? pt.tiltY : 0;
+    const tiltMagnitude = computeCspTiltMagnitude(tiltX, tiltY);
     const tiltSpread = tiltMagnitude * (options.tiltScale ?? 1.0);
     const grainPressure =
-      useTilt && tiltMagnitude > 0.01 ? effPressure * (1.0 - tiltMagnitude * 0.55) : effPressure;
+      useSyntheticTiltShading && tiltMagnitude > 0.01 ? effPressure * (1.0 - tiltMagnitude * 0.55) : effPressure;
+    let effGrainAmount = grainAmount;
+    if (grainAmount > 0.005 && options.textureDensitySensor) {
+      const tdFactor = evaluateCspSensor(
+        options.textureDensitySensor,
+        effPressure,
+        tiltMagnitude,
+        pt.speed * 0.05,
+        dabHashFloat(pt.x, pt.y, dabSeq, 58),
+        pt.twist,
+        strokeDist
+      );
+      effGrainAmount = Math.max(0, Math.min(1, grainAmount * tdFactor));
+    }
 
     if (options.sizeSensor) {
       // Avoid double-applying pressure when pt.width already has pressure baked from calculateStrokeWidth
@@ -2395,14 +3418,98 @@ export function drawBrushCubicBezierSegment(
         effPressure,
         tiltMagnitude,
         pt.speed * 0.05,
-        dabHashFloat(pt.x, pt.y, dabSeq, 50)
+        dabHashFloat(pt.x, pt.y, dabSeq, 50),
+        pt.twist,
+        strokeDist
       );
     }
     curWidth = Math.max(0.1, curWidth);
 
+    let effThickness = thickness;
+    if (options.thicknessSensor) {
+      // CSP Brush Thickness minimum is 10% (0.10); never collapse below 0.10 unless base thickness itself is thinner.
+      const minThicknessFloor = Math.min(thickness, 0.1);
+      effThickness = Math.max(
+        minThicknessFloor,
+        thickness *
+          evaluateCspSensor(
+            options.thicknessSensor,
+            effPressure,
+            tiltMagnitude,
+            pt.speed * 0.05,
+            dabHashFloat(pt.x, pt.y, dabSeq, 54),
+            pt.twist,
+            strokeDist
+          )
+      );
+    }
+
+    let effAmountOfPaint = (options.amountOfPaint ?? 0.65) * taperAmountScale;
+    if (options.amountOfPaintSensor) {
+      effAmountOfPaint *= evaluateCspSensor(
+        options.amountOfPaintSensor,
+        effPressure,
+        tiltMagnitude,
+        pt.speed * 0.05,
+        dabHashFloat(pt.x, pt.y, dabSeq, 55),
+        pt.twist,
+        strokeDist
+      );
+    }
+    let effDensityOfPaint = (options.densityOfPaint ?? 0.9) * taperPaintDensityScale;
+    let paintDensitySensorFactor = 1.0;
+    const hasConcurrentDensityAndPaintDensityPressure = Boolean(
+      isColorMixing && options.densitySensor?.usePressure && options.densityOfPaintSensor?.usePressure
+    );
+    if (options.densityOfPaintSensor) {
+      paintDensitySensorFactor = evaluateCspSensor(
+        options.densityOfPaintSensor,
+        effPressure,
+        tiltMagnitude,
+        pt.speed * 0.05,
+        dabHashFloat(pt.x, pt.y, dabSeq, 56),
+        pt.twist,
+        strokeDist
+      );
+      if (!hasConcurrentDensityAndPaintDensityPressure) {
+        effDensityOfPaint *= paintDensitySensorFactor;
+      } else if (paintDensitySensorFactor <= 0.002) {
+        effDensityOfPaint = 0;
+      }
+    }
+    let effColorStretch = options.colorStretch ?? 0.75;
+    if (options.colorStretchSensor) {
+      effColorStretch *= evaluateCspSensor(
+        options.colorStretchSensor,
+        effPressure,
+        tiltMagnitude,
+        pt.speed * 0.05,
+        dabHashFloat(pt.x, pt.y, dabSeq, 57),
+        pt.twist,
+        strokeDist
+      );
+    }
+
     let stampAngle = baseAngleRad;
     const angleMode = options.angleDynamics;
-    if (angleMode === 'direction' || angleMode === 'direction-random') {
+    if (angleMode === 'initial-direction') {
+      if (dabCounter.lockedInitialAngle !== undefined) {
+        stampAngle = dabCounter.lockedInitialAngle;
+      } else {
+        const ox = dabCounter.initOriginX ?? p0.x;
+        const oy = dabCounter.initOriginY ?? p0.y;
+        const cdx = pt.x - ox;
+        const cdy = pt.y - oy;
+        const chordLen = Math.hypot(cdx, cdy);
+        if (chordLen >= 4.0) {
+          dabCounter.lockedInitialAngle = Math.atan2(cdy, cdx) + baseAngleRad;
+          stampAngle = dabCounter.lockedInitialAngle;
+          dabCounter.lastAngle = stampAngle;
+        } else if (pt.speed > 0.2) {
+          stampAngle = Math.atan2(pt.dy, pt.dx) + baseAngleRad;
+        }
+      }
+    } else if (angleMode === 'direction' || angleMode === 'direction-random') {
       // Deadzone + arc-length-bounded turn rate prevents micro-jitter / pointer-up hooks
       // from spinning flat blades into starbursts while tracking smooth curves faithfully
       const minTangentSpeed = hasSmoothAngle ? 1.2 : 0.2;
@@ -2440,10 +3547,12 @@ export function drawBrushCubicBezierSegment(
       stampAngle += (dabHashFloat(pt.x, pt.y, dabSeq, 12) - 0.5) * Math.PI * 2 * rotationRandomScale;
     }
 
-    if (useTilt && tiltMagnitude > 0.05) {
+    if (angleMode === 'tilt' && tiltMagnitude > 0.05) {
+      stampAngle = Math.atan2(tiltX, -tiltY) + baseAngleRad;
+    } else if (useSyntheticTiltShading && tiltMagnitude > 0.05) {
       stampAngle = Math.atan2(tiltY, tiltX) + baseAngleRad;
     }
-    if (pt.twist && (angleMode === 'twist' || useTilt)) {
+    if (pt.twist && (angleMode === 'twist' || useSyntheticTiltShading)) {
       stampAngle += (pt.twist * Math.PI) / 180;
     }
 
@@ -2451,25 +3560,63 @@ export function drawBrushCubicBezierSegment(
     let dabAlpha = baseFlow * taperAlphaScale;
     let dabRgb = baseRgb;
 
-    if (options.opacitySensor) {
-      dabAlpha *= evaluateCspSensor(
-        options.opacitySensor,
-        effPressure,
-        tiltMagnitude,
-        pt.speed * 0.05,
-        dabHashFloat(pt.x, pt.y, dabSeq, 51)
-      );
-    }
-    if (options.densitySensor) {
-      dabAlpha *= evaluateCspSensor(
+    let flowSensorFactor = 1.0;
+    if (hasConcurrentDensityAndPaintDensityPressure) {
+      const dnF = evaluateCspSensor(
         options.densitySensor,
         effPressure,
         tiltMagnitude,
         pt.speed * 0.05,
         dabHashFloat(pt.x, pt.y, dabSeq, 52)
       );
+      flowSensorFactor = dnF;
+      if (options.opacitySensor) {
+        flowSensorFactor *= evaluateCspSensor(
+          options.opacitySensor,
+          effPressure,
+          tiltMagnitude,
+          pt.speed * 0.05,
+          dabHashFloat(pt.x, pt.y, dabSeq, 51)
+        );
+      }
+    } else if (options.opacitySensor && options.densitySensor && (isColorMixing || options.paperTextureApplyEachPlot === false)) {
+      const opF = evaluateCspSensor(
+        options.opacitySensor,
+        effPressure,
+        tiltMagnitude,
+        pt.speed * 0.05,
+        dabHashFloat(pt.x, pt.y, dabSeq, 51)
+      );
+      const dnF = evaluateCspSensor(
+        options.densitySensor,
+        effPressure,
+        tiltMagnitude,
+        pt.speed * 0.05,
+        dabHashFloat(pt.x, pt.y, dabSeq, 52)
+      );
+      flowSensorFactor = Math.min(opF, dnF);
+    } else {
+      if (options.opacitySensor) {
+        flowSensorFactor *= evaluateCspSensor(
+          options.opacitySensor,
+          effPressure,
+          tiltMagnitude,
+          pt.speed * 0.05,
+          dabHashFloat(pt.x, pt.y, dabSeq, 51)
+        );
+      }
+      if (options.densitySensor) {
+        flowSensorFactor *= evaluateCspSensor(
+          options.densitySensor,
+          effPressure,
+          tiltMagnitude,
+          pt.speed * 0.05,
+          dabHashFloat(pt.x, pt.y, dabSeq, 52)
+        );
+      }
     }
-    if (useTilt && tiltMagnitude > 0.03 && (tipImage || grainAmount > 0.005)) {
+    dabAlpha = Math.max(0, Math.min(1, dabAlpha * flowSensorFactor));
+    if (useSyntheticTiltShading && tiltMagnitude > 0.03 && (tipImage || grainAmount > 0.005)) {
       dabAlpha *= 1.0 - tiltMagnitude * 0.28;
     }
 
@@ -2489,7 +3636,10 @@ export function drawBrushCubicBezierSegment(
         options,
         spacingRatio,
         dirX,
-        dirY
+        dirY,
+        effAmountOfPaint,
+        effDensityOfPaint,
+        effColorStretch
       );
       dabColor = mixed.colorHex;
       dabAlpha = mixed.alpha;
@@ -2498,31 +3648,29 @@ export function drawBrushCubicBezierSegment(
       }
     }
 
-    if (!gpuDabs && !useSpatialTipMixing && grainAmount > 0.005 && !hasPerPixelCpuGrain) {
-      const gNorm = sampleScalarPaperGrainNorm(pt.x, pt.y, curWidth, options.paperTextureScale ?? 1.0);
-      const scalarMode = options.paperTextureMode === 'compare' ? 'subtract' : (options.paperTextureMode ?? 'subtract');
-      dabAlpha *= applyCspPaperTextureAlpha(
-        1.0,
-        gNorm,
-        grainAmount,
-        grainPressure,
-        scalarMode,
-        options.paperTextureBrightness ?? 0,
-        options.paperTextureContrast ?? 0,
-        Boolean(options.paperTextureInverted)
-      );
-    }
-
     const activeTipIdx = tipImage
       ? selectTipIndex(options.subTipImages, options.subTipOrder, dabSeq, stampAngle, pt.x, pt.y)
       : 0;
     const activeTip = tipImage
       ? selectTipImage(options.subTipImages, tipImage, options.subTipOrder, dabSeq, stampAngle, pt.x, pt.y)
       : undefined;
+    const dabIsDualTone = !isColorTip && Boolean(options.subTips?.[activeTipIdx]?.isDualToneTip ?? isDualToneTip);
     const baseMaster =
       gpuDabs || useSpatialTipMixing
         ? null
-        : staticMaster ?? resolveCpuMaster(activeTip, dabColor, hardness, isEraser, isBgEraser, isColorTip, curWidth, aaMode);
+        : staticMaster ??
+          resolveCpuMaster(
+            activeTip,
+            dabColor,
+            hardness,
+            isEraser,
+            isBgEraser,
+            isColorTip,
+            curWidth,
+            aaMode,
+            dabIsDualTone,
+            options.secondaryColor
+          );
 
     let tx = 1;
     let ty = 0;
@@ -2535,9 +3683,27 @@ export function drawBrushCubicBezierSegment(
       ny = tx;
     }
 
-    const primRgb = colorJitterEnabled && isColorMixing ? parseColorToRgb(dabColor) : dabRgb;
-    let stepRefW = isVert ? curWidth * thickness : curWidth;
-    let stepRefH = isVert ? curWidth * aspect : curWidth * aspect * thickness;
+    const primRgb = perDabColorJitter && isColorMixing ? parseColorToRgb(dabColor) : dabRgb;
+    const baseTipDims = computeTipStampDimensions(curWidth, effThickness, isVert, tipNaturalW, tipNaturalH);
+    let stepRefW = baseTipDims.width;
+    let stepRefH = baseTipDims.height;
+
+    const effectiveSpacingRatio = options.intervalSensor
+      ? Math.max(
+          0.02,
+          Math.min(
+            2.0,
+            spacingRatio *
+              evaluateCspSensor(
+                options.intervalSensor,
+                effPressure,
+                tiltMagnitude,
+                pt.speed * 0.05,
+                dabHashFloat(pt.x, pt.y, dabSeq, 53)
+              )
+          )
+        )
+      : spacingRatio;
 
     for (let k = 0; k < dabCount; k++) {
       const seedIdx = dabSeq * 16 + k;
@@ -2545,7 +3711,7 @@ export function drawBrushCubicBezierSegment(
       if (sizeJitter > 0) curDabW *= Math.max(0.01, 1.0 - dabHashFloat(pt.x, pt.y, seedIdx, 1) * sizeJitter);
       curDabW = Math.max(0.1, curDabW);
 
-      let curDabThickness = thickness;
+      let curDabThickness = effThickness;
       if (roundnessJitter > 0) curDabThickness *= Math.max(0.05, 1.0 - dabHashFloat(pt.x, pt.y, seedIdx, 2) * roundnessJitter);
 
       let curDabAngle = stampAngle;
@@ -2569,9 +3735,10 @@ export function drawBrushCubicBezierSegment(
       let curDabAlpha = dabAlpha;
       if (flowJitter > 0) curDabAlpha *= Math.max(0.005, 1.0 - dabHashFloat(pt.x, pt.y, seedIdx, 6) * flowJitter);
 
-      let finalW = isVert ? curDabW * curDabThickness : curDabW;
-      let finalH = isVert ? curDabW * aspect : curDabW * aspect * curDabThickness;
-      if (useTilt && tiltMagnitude > 0.01) {
+      const curDims = computeTipStampDimensions(curDabW, curDabThickness, isVert, tipNaturalW, tipNaturalH);
+      let finalW = curDims.width;
+      let finalH = curDims.height;
+      if (useSyntheticTiltShading && tiltMagnitude > 0.01) {
         finalW *= 1.0 + tiltSpread * 1.85;
         finalH *= Math.max(0.55, 1.0 / (1.0 + tiltMagnitude * 0.45));
       }
@@ -2583,8 +3750,19 @@ export function drawBrushCubicBezierSegment(
       const flips = resolveTipFlipSigns(options.flipH, options.flipV, seedIdx, curDabX, curDabY);
 
       if (useSpatialTipMixing && options.reservoir?.spatialMixer) {
+        let freshColorOverride: { r: number; g: number; b: number } | undefined;
+        if (perDabColorJitter && primRgb && secRgb && dynamics) {
+          let salt = 20;
+          const cd = applyColorDynamics(
+            { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
+            { r: secRgb.r / 255, g: secRgb.g / 255, b: secRgb.b / 255 },
+            dynamics,
+            () => dabHashFloat(pt.x, pt.y, seedIdx, salt++)
+          );
+          freshColorOverride = { r: cd.r * 255, g: cd.g * 255, b: cd.b * 255 };
+        }
         const effectiveStep =
-          prevStepDist > 0 ? prevStepDist : Math.max(0.85, Math.min(finalW, finalH) * Math.max(0.12, spacingRatio));
+          prevStepDist > 0 ? prevStepDist : Math.max(0.75, Math.min(finalW, finalH) * effectiveSpacingRatio);
         const built = options.reservoir.spatialMixer.stepAndBuildStamp({
           x: curDabX,
           y: curDabY,
@@ -2594,7 +3772,7 @@ export function drawBrushCubicBezierSegment(
           dirX,
           dirY,
           stepDist: effectiveStep,
-          spacingRatio,
+          spacingRatio: effectiveSpacingRatio,
           adjustDensityByGap: Boolean(options.adjustDensityByGap),
           dabSeq,
           hardness,
@@ -2604,29 +3782,36 @@ export function drawBrushCubicBezierSegment(
           flow: curDabAlpha,
           pressure: effPressure,
           pressureAlreadyApplied: pressureAlreadyAppliedToFlow,
-          amountOfPaint: (options.amountOfPaint ?? 0.65) * taperAmountScale,
-          densityOfPaint: (options.densityOfPaint ?? 0.9) * taperPaintDensityScale,
-          colorStretch: options.colorStretch ?? 0.75,
+          amountOfPaint: effAmountOfPaint,
+          densityOfPaint: effDensityOfPaint,
+          colorStretch: effColorStretch,
+          isPureBlender: (options.amountOfPaint ?? 0.65) <= 0.005 || options.mixingMode === 'smear',
           mixingMode: options.mixingMode ?? 'blend',
           perceptualMixing: options.perceptualMixing !== false,
           pigmentMixingStrength: options.pigmentMixingStrength ?? 1.0,
+          useBlur: Boolean(options.useBlur),
+          blurStrength: options.blurStrength,
           tipImage: activeTip,
+          isDualToneTip: dabIsDualTone,
+          secondaryColor: options.secondaryColor,
+          freshColor: freshColorOverride,
           sampler: options.sampler,
-          grainDensity: grainAmount,
-          grainModulate:
-            grainAmount > 0.005
-              ? (wx, wy, tipA) =>
-                  applyCspPaperTextureAlpha(
-                    tipA,
-                    sampleWorldPaperGrainNorm(wx, wy, texScale, texRot, customPaper),
-                    grainAmount,
-                    grainPressure,
-                    texMode,
-                    texBright,
-                    texContrast,
-                    texInv
-                  )
-              : undefined,
+          grainDensity: effGrainAmount,
+          paperTextureMode: texMode,
+          paperLumData:
+            effGrainAmount > 0.005 ? (customPaper ? customPaper.lum : surfacePaper ?? paperGrainTable) : undefined,
+          paperLumWidth:
+            effGrainAmount > 0.005 ? (customPaper ? customPaper.width : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE) : undefined,
+          paperLumHeight:
+            effGrainAmount > 0.005 ? (customPaper ? customPaper.height : surfacePaper ? SURFACE_TEXTURE_SIZE : GRAIN_SIZE) : undefined,
+          paperTextureScale: texScale,
+          paperTextureRotate: texRot,
+          paperTextureBrightness: texBright,
+          paperTextureContrast: texContrast,
+          paperTextureInverted: texInv,
+          paperTexturePreserveDensity: preservePaperDensity,
+          paperTextureEmphasizeDensity: Boolean(options.paperTextureEmphasizeDensity),
+          grainPressure,
         });
         if (built) {
           options.reservoir.r = built.avgR;
@@ -2663,7 +3848,7 @@ export function drawBrushCubicBezierSegment(
       let dabG = primRgb ? primRgb.g / 255 : 0;
       let dabB = primRgb ? primRgb.b / 255 : 0;
 
-      if (colorJitterEnabled && primRgb && secRgb && dynamics) {
+      if (perDabColorJitter && primRgb && secRgb && dynamics) {
         let salt = 20;
         const cd = applyColorDynamics(
           { r: primRgb.r / 255, g: primRgb.g / 255, b: primRgb.b / 255 },
@@ -2675,25 +3860,81 @@ export function drawBrushCubicBezierSegment(
         dabG = cd.g;
         dabB = cd.b;
         if (!gpuDabs) {
-          curMaster = resolveCpuMaster(activeTip, cd.hex, hardness, isEraser, isBgEraser, isColorTip, curDabW, aaMode);
+          curMaster = resolveCpuMaster(
+            activeTip,
+            cd.hex,
+            hardness,
+            isEraser,
+            isBgEraser,
+            isColorTip,
+            curDabW,
+            aaMode,
+            dabIsDualTone,
+            options.secondaryColor
+          );
         }
       }
 
-      if (curMaster && hasPerPixelCpuGrain) {
+      let stampAlpha = curDabAlpha;
+      let stampFlipX = flips.signX;
+      let stampFlipY = flips.signY;
+      if (curMaster && tryPerPixelCpuGrain) {
+        const sub = computeSubpixelDabDimensions(finalW, finalH, curDabAlpha, aaMode === 0 ? 1.0 : 0.75);
         const grained = applyCpuPerPixelPaperGrain(
           curMaster,
           curDabX,
           curDabY,
-          finalW,
-          finalH,
-          grainAmount,
+          sub.renderW,
+          sub.renderH,
+          curDabAngle,
+          flips.signX,
+          flips.signY,
+          sub.effAlpha,
+          effGrainAmount,
           grainPressure,
-          options.paperTextureScale ?? 1.0,
-          options.paperTextureImage
+          {
+            paperTextureMode: options.paperTextureMode ?? 'subtract',
+            paperTextureScale: options.paperTextureScale ?? 1.0,
+            paperTextureRotate: options.paperTextureRotate ?? 0,
+            paperTextureBrightness: options.paperTextureBrightness ?? 0,
+            paperTextureContrast: options.paperTextureContrast ?? 0,
+            paperTextureInverted: Boolean(options.paperTextureInverted),
+            paperTextureEmphasizeDensity: Boolean(options.paperTextureEmphasizeDensity),
+            preservePaperDensity,
+            paperTextureImage: options.paperTextureImage,
+            surfaceTextureId: options.surfaceTextureId,
+            grainMappingMode: options.grainMappingMode,
+            strokeDist,
+            grainRandomOffsetX: segRandOffX,
+            grainRandomOffsetY: segRandOffY,
+            grainRandomRot: segRandRot,
+          }
         );
-        if (grained) curMaster = grained;
+        if (grained) {
+          curMaster = grained;
+          stampAlpha = 1.0;
+          stampFlipX = 1;
+          stampFlipY = 1;
+        } else {
+          const gNorm = sampleScalarPaperGrainNorm(curDabX, curDabY, curDabW, options.paperTextureScale ?? 1.0);
+          const scalarMode = options.paperTextureMode === 'compare' ? 'subtract' : (options.paperTextureMode ?? 'subtract');
+          const modTip = applyCspPaperTextureAlpha(
+            1.0,
+            gNorm,
+            effGrainAmount,
+            grainPressure,
+            scalarMode,
+            options.paperTextureBrightness ?? 0,
+            options.paperTextureContrast ?? 0,
+            Boolean(options.paperTextureInverted),
+            preservePaperDensity,
+            Boolean(options.paperTextureEmphasizeDensity)
+          );
+          stampAlpha = Math.max(0, Math.min(1, curDabAlpha * modTip));
+        }
       }
 
+      const dabGrainDensity = options.textureDensitySensor ? effGrainAmount : undefined;
       if (options.spray?.enabled) {
         const pCount = options.spray.density;
         const pSize = Math.max(1, options.spray.size);
@@ -2705,19 +3946,21 @@ export function drawBrushCubicBezierSegment(
           const th = Math.PI * 2 * dabHashFloat(curDabX, curDabY, seedIdx * 64 + sp, 33);
           const spX = curDabX + r * Math.cos(th);
           const spY = curDabY + r * Math.sin(th);
-          const spW = isVert ? pSize * curDabThickness : pSize;
-          const spH = isVert ? pSize * aspect : pSize * aspect * curDabThickness;
+          const spDims = computeTipStampDimensions(pSize, curDabThickness, isVert, tipNaturalW, tipNaturalH);
+          const spW = spDims.width;
+          const spH = spDims.height;
           if (gpuDabs) {
             gpuDabs.push({
               x: spX, y: spY, width: spW, height: spH, angle: curDabAngle,
               r: dabR, g: dabG, b: dabB, alpha: curDabAlpha, pressure: grainPressure,
               strokeDist, flipX: flips.signX, flipY: flips.signY, tipIndex: activeTipIdx,
+              grainDensity: dabGrainDensity,
             });
           } else if (curMaster) {
             drawSingleStamp(
-              ctx, curMaster, spX, spY, spW, spH, curDabAngle, curDabAlpha,
+              ctx, curMaster, spX, spY, spW, spH, curDabAngle, stampAlpha,
               isEraser, isBgEraser, options.alphaLocked, options.isTransparentInk,
-              flips.signX, flips.signY, aaMode, options.blendTipsMode
+              stampFlipX, stampFlipY, aaMode, options.blendTipsMode
             );
           }
         }
@@ -2726,18 +3969,24 @@ export function drawBrushCubicBezierSegment(
           x: curDabX, y: curDabY, width: finalW, height: finalH, angle: curDabAngle,
           r: dabR, g: dabG, b: dabB, alpha: curDabAlpha, pressure: grainPressure,
           strokeDist, flipX: flips.signX, flipY: flips.signY, tipIndex: activeTipIdx,
+          grainDensity: dabGrainDensity,
         });
       } else if (curMaster) {
         drawSingleStamp(
-          ctx, curMaster, curDabX, curDabY, finalW, finalH, curDabAngle, curDabAlpha,
+          ctx, curMaster, curDabX, curDabY, finalW, finalH, curDabAngle, stampAlpha,
           isEraser, isBgEraser, options.alphaLocked, options.isTransparentInk,
-          flips.signX, flips.signY, aaMode, options.blendTipsMode
+          stampFlipX, stampFlipY, aaMode, options.blendTipsMode
         );
       }
     }
 
+    const maxAxis = Math.max(stepRefW, stepRefH);
+    const minAxis = Math.max(0.5, Math.min(stepRefW, stepRefH));
+    // SpatialTipMixer normalizes deposition via Beer-Lambert overlapHits, so scaling the floor
+    // smoothly with brush size eliminates 100-300+ redundant CPU dabs per swipe on large oil/blend brushes
+    // while keeping 12+ overlapping hits across the brush chord for silky, zero-scallop strokes.
     const effectiveMinStep = useSpatialTipMixing
-      ? Math.max(0.55, Math.min(1.05, Math.min(stepRefW, stepRefH) * 0.1))
+      ? Math.max(0.85, Math.min(4.2, minAxis * 0.085))
       : baseMinStepPx;
     let stepAdvance = computeEllipticalStepDistance(
       stepRefW,
@@ -2745,12 +3994,11 @@ export function drawBrushCubicBezierSegment(
       stampAngle,
       pt.dx,
       pt.dy,
-      spacingRatio,
+      effectiveSpacingRatio,
       effectiveMinStep
     );
-    // Angular-sweep stepping: tighten step on curves so outer tips of wide flat blades never fan into comb teeth
-    const maxAxis = Math.max(stepRefW, stepRefH);
-    const minAxis = Math.max(0.5, Math.min(stepRefW, stepRefH));
+    // Angular-sweep stepping: tighten step on curves so outer tips of wide flat blades never fan into comb teeth.
+    // Respect effectiveMinStep for CPU SpatialTipMixer so curves never collapse to 0.2px (10x lag spike).
     if (
       (angleMode === 'direction' || angleMode === 'direction-random') &&
       maxAxis > minAxis * 1.35 &&
@@ -2772,9 +4020,12 @@ export function drawBrushCubicBezierSegment(
         while (dTheta > Math.PI) dTheta -= Math.PI * 2;
         while (dTheta < -Math.PI) dTheta += Math.PI * 2;
         const outerArc = 0.5 * maxAxis * Math.abs(dTheta);
-        const maxOuterArc = Math.max(0.75, minAxis * 0.14);
+        const maxOuterArc = useSpatialTipMixing
+          ? Math.max(1.5, minAxis * 0.22)
+          : Math.max(0.75, minAxis * 0.14);
         if (outerArc > maxOuterArc) {
-          stepAdvance = Math.max(0.2, stepAdvance * (maxOuterArc / outerArc));
+          const curveFloor = useSpatialTipMixing ? effectiveMinStep : 0.2;
+          stepAdvance = Math.max(curveFloor, stepAdvance * (maxOuterArc / outerArc));
         }
       }
     }
@@ -2837,13 +4088,17 @@ export function buildBrushRenderOptions(
     brushDensity: bs.brushDensity,
     adjustDensityByGap: bs.adjustDensityByGap,
     blendTipsMode: bs.blendTipsMode,
+    brushCombineMode: bs.brushCombineMode,
     spacing: bs.spacing ?? 0.08,
     thickness: bs.thickness,
     thicknessVertical: bs.thicknessVertical,
+    thicknessSensor: bs.thicknessSensor,
     flipH: bs.flipH,
     flipV: bs.flipV,
     tipImage: bs.customTipImage,
     isColorTip: bs.isColorTip,
+    isDualToneTip: bs.isDualToneTip,
+    isRibbon: bs.isRibbon,
     angle: bs.customTipAngle,
     angleDynamics: bs.customTipAngleDynamics,
     rotationRandomScale: bs.customTipRotationRandomScale,
@@ -2858,6 +4113,8 @@ export function buildBrushRenderOptions(
     sizeSensor: bs.sizeSensor,
     opacitySensor: bs.opacitySensor,
     densitySensor: bs.densitySensor,
+    intervalSensor: bs.intervalSensor,
+    textureDensitySensor: bs.textureDensitySensor,
     bristleSplaySensor: bs.bristleSplaySensor,
     paintLoadSensor: bs.paintLoadSensor,
     grainPenetrationSensor: bs.grainPenetrationSensor,
@@ -2874,6 +4131,11 @@ export function buildBrushRenderOptions(
     amountOfPaint: bs.amountOfPaint,
     densityOfPaint: bs.densityOfPaint,
     colorStretch: bs.colorStretch,
+    amountOfPaintSensor: bs.amountOfPaintSensor,
+    densityOfPaintSensor: bs.densityOfPaintSensor,
+    colorStretchSensor: bs.colorStretchSensor,
+    useBlur: bs.useBlur,
+    blurStrength: bs.blurStrength,
     mixingMode: bs.mixingMode,
     wetEdge: bs.wetEdge,
     wetEdgeRadius: bs.wetEdgeRadius,
@@ -2886,15 +4148,35 @@ export function buildBrushRenderOptions(
     paperTextureMode: bs.paperTextureMode,
     paperTextureBrightness: bs.paperTextureBrightness,
     paperTextureContrast: bs.paperTextureContrast,
+    paperTextureApplyEachPlot: bs.paperTextureApplyEachPlot,
+    paperTextureEmphasizeDensity: bs.paperTextureEmphasizeDensity,
     paperTextureInverted: bs.paperTextureInverted,
     paperTextureImage: bs.paperTextureImage,
     paperTextureScale: bs.paperTextureScale,
     paperTextureRotate: bs.paperTextureRotate,
     dualBrush: bs.dualBrush,
+    dualBrushConfig: bs.dualBrushConfig,
+    dualTipDataUrl: bs.dualTipDataUrl,
     dualTipImage: bs.dualTipImage,
     dualBrushCompositeMode: bs.dualBrushCompositeMode,
+    dualSize: bs.dualSize,
+    dualLinkSize: bs.dualLinkSize,
+    dualSpacing: bs.dualSpacing,
     dualScale: bs.dualScale,
+    dualThickness: bs.dualThickness,
+    dualThicknessVertical: bs.dualThicknessVertical,
     dualAngle: bs.dualAngle,
+    dualAngleDynamics: bs.dualAngleDynamics,
+    dualAngleSensor: bs.dualAngleSensor,
+    dualHardness: bs.dualHardness,
+    dualDensity: bs.dualDensity,
+    dualSubTips: bs.dualSubTips,
+    dualSubTipImages: bs.dualSubTipImages,
+    dualSubTipOrder: bs.dualSubTipOrder,
+    dualFlipH: bs.dualFlipH,
+    dualFlipV: bs.dualFlipV,
+    dualSpray: bs.dualSpray,
+    dualIsRibbon: bs.dualIsRibbon,
     dualScatter: bs.dualScatter,
     dualSurfaceTextureId: bs.dualSurfaceTextureId,
     dualGrainDepth: bs.dualGrainDepth,
@@ -2946,6 +4228,366 @@ export function renderCompleteStroke(
   const isEraser = tool === 'eraser';
   const strokeColor = isBgEraser ? '#ffffff' : enforceColorMode(resolvedSettings.color, colorMode);
 
+  // True two-pass Clip Studio Paint Dual Brush engine:
+  // Pass 1 renders the full Primary Stroke; Pass 2 renders the independent Secondary Stroke
+  // along the exact same `effectivePoints`; Combine Pass modulates Primary RGBA with Secondary density.
+  const dualCfg = resolveDualBrushConfig(resolvedSettings);
+  if (dualCfg) {
+    const primarySettings: BrushSettings = {
+      ...resolvedSettings,
+      dualBrush: false,
+      dualBrushConfig: undefined,
+    };
+    const secInfo = buildSecondaryBrushSettings(primarySettings, dualCfg);
+    const secondaryPoints = scalePointsForSecondaryBrush(
+      effectivePoints,
+      secInfo.sizeRatio,
+      secInfo.settings.size
+    );
+
+    const strokeHardness = isMono ? 1.0 : primarySettings.hardness ?? 1.0;
+    const strokeFlow = isMono ? 1.0 : primarySettings.flow ?? 1.0;
+    const strokeSpacing = primarySettings.spacing ?? 0.08;
+    const effectiveAntiAlias = isMono
+      ? allowGpuForMonochrome && (primarySettings.antiAlias ?? 2) !== 0 && primarySettings.useGpu !== false
+        ? primarySettings.antiAlias ?? 2
+        : 0
+      : primarySettings.antiAlias;
+
+    const effectiveUnderlying = underlyingCanvas || ctx.canvas;
+
+    const primaryIsNatural =
+      !isEraser && !isBgEraser && !isMono && !primarySettings.isTransparentInk && isNaturalPaintBrush(primarySettings);
+    const primaryIsRibbon = isRibbonBrush(primarySettings);
+    const secondaryIsRibbon = isRibbonBrush(secInfo.settings);
+    const dualHasWetEdge =
+      !isMono && !isEraser && !isBgEraser && !resolvedSettings.isTransparentInk && (resolvedSettings.wetEdge ?? 0) > 0.01;
+    const dualHasCustomCombine =
+      !isEraser && !isBgEraser && !resolvedSettings.isTransparentInk && isCustomBrushCombineMode(resolvedSettings.brushCombineMode);
+    const dualStrokeLevelPaper = needsStrokeLevelPaperTexture({
+      paperTextureApplyEachPlot: primarySettings.paperTextureApplyEachPlot,
+      grain: primarySettings.grain,
+      textureDensity: primarySettings.textureDensity,
+      colorMixing: primarySettings.colorMixing,
+      isEraser: isEraser && !isBgEraser,
+      isBgEraser,
+    });
+
+    // Helper to compute initial lookahead tangent angle for a given brush pass
+    const computePassInitAngle = (pts: Point[], opts: BrushRenderOptions): number | undefined => {
+      if (
+        pts.length < 2 ||
+        (opts.angleDynamics !== 'direction' &&
+          opts.angleDynamics !== 'direction-random' &&
+          opts.angleDynamics !== 'initial-direction')
+      ) {
+        return undefined;
+      }
+      const p0 = pts[0];
+      const minChord =
+        opts.angleDynamics === 'initial-direction'
+          ? Math.max(4.0, Math.min(8.0, (opts.size ?? 10) * 0.25))
+          : Math.max(4.0, (opts.size ?? 10) * 0.12);
+      const minChordSq = minChord * minChord;
+      let fallbackAngle: number | undefined = undefined;
+      for (let i = 1; i < pts.length; i++) {
+        const dx = pts[i].x - p0.x;
+        const dy = pts[i].y - p0.y;
+        const dSq = dx * dx + dy * dy;
+        if (dSq > 0.25 && fallbackAngle === undefined) {
+          fallbackAngle = Math.atan2(dy, dx) + ((opts.angle ?? 0) * Math.PI) / 180;
+        }
+        if (dSq >= minChordSq) {
+          return Math.atan2(dy, dx) + ((opts.angle ?? 0) * Math.PI) / 180;
+        }
+      }
+      return fallbackAngle;
+    };
+
+    const emitPointsIntoDabs = (
+      targetCtx: CanvasRenderingContext2D,
+      pts: Point[],
+      passColor: string,
+      emitOpts: BrushRenderOptions,
+      passSpacing: number,
+      passInitAngle: number | undefined,
+      outDabs: GpuDab[]
+    ) => {
+      emitOpts.currentStrokeDist = 0;
+      drawBrushDot(targetCtx, pts[0], passColor, emitOpts, outDabs);
+      if (pts.length === 1) return;
+
+      const dabCounter: { count: number; lastAngle?: number } = {
+        count: 0,
+        lastAngle: passInitAngle,
+      };
+      const minInitDist = emitOpts.tipImage ? 0.15 : 0.12;
+      let accDist = Math.max(minInitDist, Math.max(0.2, pts[0].width) * passSpacing);
+
+      if (pts.length === 2) {
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const { c1, c2 } = centripetalCatmullRomToBezier(p0, p0, p1, p1);
+        drawBrushCubicBezierSegment(targetCtx, p0, c1, c2, p1, passColor, emitOpts, accDist, dabCounter, outDabs);
+        return;
+      }
+
+      const p0 = pts[0];
+      const p1 = pts[1];
+      const p2 = pts[2];
+      const first = centripetalCatmullRomToBezier(p0, p0, p1, p2);
+      accDist = drawBrushCubicBezierSegment(targetCtx, p0, first.c1, first.c2, p1, passColor, emitOpts, accDist, dabCounter, outDabs);
+      emitOpts.currentStrokeDist = (emitOpts.currentStrokeDist ?? 0) + Math.hypot(p1.x - p0.x, p1.y - p0.y);
+
+      for (let i = 2; i < pts.length - 1; i++) {
+        const seg = centripetalCatmullRomToBezier(pts[i - 2], pts[i - 1], pts[i], pts[i + 1]);
+        accDist = drawBrushCubicBezierSegment(targetCtx, pts[i - 1], seg.c1, seg.c2, pts[i], passColor, emitOpts, accDist, dabCounter, outDabs);
+        emitOpts.currentStrokeDist =
+          (emitOpts.currentStrokeDist ?? 0) + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+      }
+
+      const n = pts.length;
+      const last = centripetalCatmullRomToBezier(pts[n - 3], pts[n - 2], pts[n - 1], pts[n - 1]);
+      drawBrushCubicBezierSegment(targetCtx, pts[n - 2], last.c1, last.c2, pts[n - 1], passColor, emitOpts, accDist, dabCounter, outDabs);
+    };
+
+    // Fast GPU two-pass FBO path when both passes are WebGL-eligible (non-mixing, non-ribbon, non-natural)
+    if (!primaryIsNatural && !primaryIsRibbon && !secondaryIsRibbon && !dualStrokeLevelPaper && !dualHasWetEdge && !dualHasCustomCombine) {
+      let totalLen = 0;
+      for (let i = 1; i < effectivePoints.length; i++) {
+        totalLen += Math.hypot(
+          effectivePoints[i].x - effectivePoints[i - 1].x,
+          effectivePoints[i].y - effectivePoints[i - 1].y
+        );
+      }
+
+      const primaryOpts = buildBrushRenderOptions(primarySettings, {
+        hardness: strokeHardness,
+        flow: strokeFlow,
+        spacing: strokeSpacing,
+        antiAlias: effectiveAntiAlias,
+        underlyingCanvas: effectiveUnderlying,
+        isEraser: isEraser && !isBgEraser,
+        isBgEraser,
+        alphaLocked,
+        isTransparentInk: Boolean(primarySettings.isTransparentInk),
+        totalLength: totalLen,
+        exitSpeed,
+      });
+      primaryOpts.initialAngleRad = computePassInitAngle(effectivePoints, primaryOpts);
+
+      const secSpacing = secInfo.settings.spacing ?? 0.1;
+      const secondaryOpts = buildBrushRenderOptions(secInfo.settings, {
+        hardness: secInfo.settings.hardness ?? 1.0,
+        flow: secInfo.settings.flow ?? 1.0,
+        spacing: secSpacing,
+        antiAlias: effectiveAntiAlias,
+        isEraser: false,
+        isBgEraser: false,
+        alphaLocked: false,
+        isTransparentInk: false,
+        totalLength: totalLen,
+        exitSpeed,
+      });
+      secondaryOpts.initialAngleRad = computePassInitAngle(secondaryPoints, secondaryOpts);
+
+      if (canUseWebGlForBrush(primaryOpts) && canUseWebGlForBrush(secondaryOpts)) {
+        const primaryDabs: GpuDab[] = [];
+        const secondaryDabs: GpuDab[] = [];
+        emitPointsIntoDabs(
+          ctx,
+          effectivePoints,
+          strokeColor,
+          primaryOpts,
+          strokeSpacing,
+          primaryOpts.initialAngleRad,
+          primaryDabs
+        );
+        emitPointsIntoDabs(
+          ctx,
+          secondaryPoints,
+          '#ffffff',
+          secondaryOpts,
+          secSpacing,
+          secondaryOpts.initialAngleRad,
+          secondaryDabs
+        );
+
+        const gpu = WebGlBrushEngine.getInstance();
+        const docW = effectiveUnderlying?.width || ctx.canvas?.width || 1024;
+        const docH = effectiveUnderlying?.height || ctx.canvas?.height || 1024;
+        const primGpuSettings = buildGpuBrushSettingsFromOptions(strokeColor, primaryOpts);
+        const secGpuSettings = buildGpuBrushSettingsFromOptions('#ffffff', secondaryOpts);
+        if (
+          gpu.renderDualBrushDabsToContext(
+            ctx,
+            primaryDabs,
+            primGpuSettings,
+            secondaryDabs,
+            secGpuSettings,
+            dualCfg.compositeMode,
+            tool,
+            docW,
+            docH,
+            effectiveUnderlying
+          )
+        ) {
+          return;
+        }
+      }
+    }
+
+    // Unified two-pass isolated surface path:
+    // Handles CPU fallback, colorMixing (including SpatialTipMixer), Ribbon, NaturalPaint,
+    // AA=0 monochrome, per-stroke paper texture, or WebGL unavailable.
+    if (typeof document !== 'undefined') {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      let maxW = Math.max(primarySettings.size || 10, secInfo.settings.size || 10);
+      for (let i = 0; i < effectivePoints.length; i++) {
+        const p = effectivePoints[i];
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+        if (p.width > maxW) maxW = p.width;
+        const sw = p.width * secInfo.sizeRatio;
+        if (sw > maxW) maxW = sw;
+      }
+      const maxScatter = Math.max(
+        primarySettings.dynamics?.scatter ?? 0,
+        dualCfg.scatter ?? 0
+      );
+      const sprayPad = Math.max(
+        primarySettings.spray?.enabled ? (primarySettings.spray.size || 0) : 0,
+        secInfo.settings.spray?.enabled ? (secInfo.settings.spray.size || 0) : 0
+      );
+      const pad = Math.ceil(maxW * (1.5 + maxScatter) + sprayPad + 12);
+      const bx = Math.floor(minX - pad);
+      const by = Math.floor(minY - pad);
+      const bw = Math.max(1, Math.ceil(maxX + pad) - bx);
+      const bh = Math.max(1, Math.ceil(maxY + pad) - by);
+
+      if (bw <= 4096 && bh <= 4096) {
+        const primarySurface = document.createElement('canvas');
+        primarySurface.width = bw;
+        primarySurface.height = bh;
+        const pCtx = primarySurface.getContext('2d');
+
+        const secondarySurface = document.createElement('canvas');
+        secondarySurface.width = bw;
+        secondarySurface.height = bh;
+        const sCtx = secondarySurface.getContext('2d');
+
+        if (
+          pCtx &&
+          sCtx &&
+          typeof pCtx.getImageData === 'function' &&
+          typeof pCtx.putImageData === 'function' &&
+          typeof sCtx.getImageData === 'function'
+        ) {
+          // Pass 1 (Primary): render full primary stroke (including colorMixing / SpatialTipMixer / ribbon / taper)
+          const pass1Settings: BrushSettings = {
+            ...primarySettings,
+            opacity: 1.0,
+            postCorrection: 0,
+            isTransparentInk: false,
+            wetEdge: 0,
+            color: isEraser && !isBgEraser ? '#000000' : primarySettings.color,
+            ...(dualStrokeLevelPaper
+              ? { grain: 0, textureDensity: 0, paperTextureApplyEachPlot: undefined }
+              : {}),
+          };
+          pCtx.save();
+          pCtx.translate(-bx, -by);
+          renderCompleteStroke(
+            pCtx,
+            effectivePoints,
+            pass1Settings,
+            isEraser && !isBgEraser ? 'brush' : tool,
+            colorMode,
+            isBgEraser,
+            effectiveUnderlying,
+            false,
+            explicitSampler,
+            allowGpuForMonochrome,
+            exitSpeed
+          );
+          pCtx.restore();
+
+          // Pass 2 (Secondary): render independent secondary brush along exact same trajectory
+          sCtx.save();
+          sCtx.translate(-bx, -by);
+          renderCompleteStroke(
+            sCtx,
+            secondaryPoints,
+            {
+              ...secInfo.settings,
+              opacity: 1.0,
+              postCorrection: 0,
+            },
+            'brush',
+            'color',
+            false,
+            undefined,
+            false,
+            undefined,
+            allowGpuForMonochrome,
+            exitSpeed
+          );
+          sCtx.restore();
+
+          // Combine Pass: exact CSP Dual Brush alpha modulation across the tight dirty rect
+          const primaryImg = pCtx.getImageData(0, 0, bw, bh);
+          const secondaryImg = sCtx.getImageData(0, 0, bw, bh);
+          combineDualBrushImageData(
+            primaryImg.data,
+            secondaryImg.data,
+            primaryImg.data,
+            dualCfg.compositeMode
+          );
+
+          if (dualStrokeLevelPaper) {
+            applyStrokePaperTextureToImageData(primaryImg, bx, by, primarySettings, 1.0);
+          }
+
+          if (dualHasWetEdge) {
+            applyCspWatercolorEdge(
+              primaryImg,
+              resolvedSettings.wetEdge ?? 0,
+              resolvedSettings.wetEdgeRadius ?? 3.0,
+              normalizeWetEdgePower01(resolvedSettings.wetEdgeAlphaPower, 0.25),
+              normalizeWetEdgePower01(resolvedSettings.wetEdgeValuePower, 0.15)
+            );
+          }
+
+          pCtx.putImageData(primaryImg, 0, 0);
+
+          const baseCompositeOp: 'source-over' | 'destination-out' | 'source-atop' = isBgEraser
+            ? 'source-over'
+            : isEraser || resolvedSettings.isTransparentInk || resolvedSettings.brushCombineMode === 'clear'
+            ? 'destination-out'
+            : alphaLocked
+            ? 'source-atop'
+            : 'source-over';
+          compositeIsolatedStrokeToCtx(
+            ctx,
+            primarySurface,
+            primaryImg,
+            bx,
+            by,
+            Math.max(0, Math.min(1, resolvedSettings.opacity ?? 1.0)),
+            baseCompositeOp,
+            dualHasCustomCombine ? resolvedSettings.brushCombineMode : undefined
+          );
+          return;
+        }
+      }
+    }
+  }
+
   // Route Natural Paint / Bristle Ribbon / Impasto brushes through the dedicated Natural Paint core
   if (!isEraser && !isBgEraser && !isMono && !resolvedSettings.isTransparentInk && isNaturalPaintBrush(resolvedSettings)) {
     const effectiveUnderlying = underlyingCanvas || ctx.canvas;
@@ -2967,6 +4609,22 @@ export function renderCompleteStroke(
     return;
   }
 
+  // Route Clip Studio Paint Ribbon brushes (`BrushRibbon = 1`, non-NaturalPaint, non-Spray)
+  if (isRibbonBrush(resolvedSettings)) {
+    renderCompleteRibbonStroke(
+      ctx,
+      effectivePoints,
+      resolvedSettings,
+      tool,
+      colorMode,
+      isBgEraser,
+      alphaLocked,
+      allowGpuForMonochrome,
+      exitSpeed
+    );
+    return;
+  }
+
   const strokeHardness = isMono ? 1.0 : resolvedSettings.hardness ?? 1.0;
   const strokeFlow = isMono ? 1.0 : resolvedSettings.flow ?? 1.0;
   const strokeSpacing = resolvedSettings.spacing ?? 0.08;
@@ -2977,6 +4635,26 @@ export function renderCompleteStroke(
     : resolvedSettings.antiAlias;
 
   const effectiveUnderlying = underlyingCanvas || ctx.canvas;
+  let effectiveStrokeColor = strokeColor;
+  let strokeJitterColor: { r: number; g: number; b: number; hex: string } | undefined = undefined;
+  if (
+    !isEraser &&
+    !isBgEraser &&
+    resolvedSettings.dynamics?.colorJitterEnabled &&
+    resolvedSettings.dynamics?.colorJitterPerStroke
+  ) {
+    const prim0 = parseColorToRgb(strokeColor);
+    const sec0 = parseColorToRgb(resolvedSettings.secondaryColor || '#ffffff');
+    let salt = 200;
+    strokeJitterColor = applyColorDynamics(
+      { r: prim0.r / 255, g: prim0.g / 255, b: prim0.b / 255 },
+      { r: sec0.r / 255, g: sec0.g / 255, b: sec0.b / 255 },
+      resolvedSettings.dynamics,
+      () => dabHashFloat(effectivePoints[0].x, effectivePoints[0].y, 0, salt++)
+    );
+    effectiveStrokeColor = strokeJitterColor.hex;
+  }
+
   const options = buildBrushRenderOptions(resolvedSettings, {
     hardness: strokeHardness,
     flow: strokeFlow,
@@ -2986,11 +4664,12 @@ export function renderCompleteStroke(
     sampler: resolvedSettings.colorMixing
       ? explicitSampler || (effectiveUnderlying ? new LayerPixelSampler(effectiveUnderlying) : undefined)
       : undefined,
-    reservoir: resolvedSettings.colorMixing && !isEraser && !isBgEraser ? new PaintReservoir(strokeColor) : undefined,
+    reservoir: resolvedSettings.colorMixing && !isEraser && !isBgEraser ? new PaintReservoir(effectiveStrokeColor) : undefined,
     isEraser: isEraser && !isBgEraser,
     isBgEraser,
     alphaLocked,
     isTransparentInk: Boolean(resolvedSettings.isTransparentInk),
+    strokeJitterColor,
   });
 
   let totalLen = 0;
@@ -3004,10 +4683,15 @@ export function renderCompleteStroke(
   let initAngleRad: number | undefined = undefined;
   if (
     effectivePoints.length >= 2 &&
-    (options.angleDynamics === 'direction' || options.angleDynamics === 'direction-random')
+    (options.angleDynamics === 'direction' ||
+      options.angleDynamics === 'direction-random' ||
+      options.angleDynamics === 'initial-direction')
   ) {
     const p0 = effectivePoints[0];
-    const minChord = Math.max(4.0, (options.size ?? 10) * 0.12);
+    const minChord =
+      options.angleDynamics === 'initial-direction'
+        ? Math.max(4.0, Math.min(8.0, (options.size ?? 10) * 0.25))
+        : Math.max(4.0, (options.size ?? 10) * 0.12);
     const minChordSq = minChord * minChord;
     let fallbackAngle: number | undefined = undefined;
     for (let i = 1; i < effectivePoints.length; i++) {
@@ -3028,23 +4712,45 @@ export function renderCompleteStroke(
   }
   options.initialAngleRad = initAngleRad;
 
-  const emitStroke = (batchGpuDabs: GpuDab[] | undefined) => {
-    options.currentStrokeDist = 0;
-    drawBrushDot(ctx, effectivePoints[0], strokeColor, options, batchGpuDabs);
+  const strokeLevelPaper = needsStrokeLevelPaperTexture(options);
+  const hasWetEdge =
+    !isMono && !isEraser && !isBgEraser && !resolvedSettings.isTransparentInk && (resolvedSettings.wetEdge ?? 0) > 0.01;
+  const needsCompareIsolation =
+    options.blendTipsMode === 'compare' && !isEraser && !isBgEraser && !options.isTransparentInk;
+  const hasCustomCombine =
+    !isEraser && !isBgEraser && !options.isTransparentInk && isCustomBrushCombineMode(resolvedSettings.brushCombineMode);
+
+  const emitStroke = (
+    targetCtx: CanvasRenderingContext2D,
+    emitOpts: BrushRenderOptions,
+    batchGpuDabs: GpuDab[] | undefined
+  ) => {
+    emitOpts.currentStrokeDist = 0;
+    drawBrushDot(targetCtx, effectivePoints[0], effectiveStrokeColor, emitOpts, batchGpuDabs);
     if (effectivePoints.length === 1) return;
 
-    const dabCounter: { count: number; lastAngle?: number } = {
+    const dabCounter: {
+      count: number;
+      lastAngle?: number;
+      lastStepDist?: number;
+      lockedInitialAngle?: number;
+      initOriginX?: number;
+      initOriginY?: number;
+    } = {
       count: 0,
       lastAngle: initAngleRad,
+      lockedInitialAngle: emitOpts.angleDynamics === 'initial-direction' ? initAngleRad : undefined,
+      initOriginX: effectivePoints[0].x,
+      initOriginY: effectivePoints[0].y,
     };
-    const minInitDist = options.tipImage ? 0.15 : 0.12;
+    const minInitDist = emitOpts.tipImage ? 0.15 : 0.12;
     let accDist = Math.max(minInitDist, Math.max(0.2, effectivePoints[0].width) * strokeSpacing);
 
     if (effectivePoints.length === 2) {
       const p0 = effectivePoints[0];
       const p1 = effectivePoints[1];
       const { c1, c2 } = centripetalCatmullRomToBezier(p0, p0, p1, p1);
-      drawBrushCubicBezierSegment(ctx, p0, c1, c2, p1, strokeColor, options, accDist, dabCounter, batchGpuDabs);
+      drawBrushCubicBezierSegment(targetCtx, p0, c1, c2, p1, effectiveStrokeColor, emitOpts, accDist, dabCounter, batchGpuDabs);
       return;
     }
 
@@ -3052,8 +4758,8 @@ export function renderCompleteStroke(
     const p1 = effectivePoints[1];
     const p2 = effectivePoints[2];
     const first = centripetalCatmullRomToBezier(p0, p0, p1, p2);
-    accDist = drawBrushCubicBezierSegment(ctx, p0, first.c1, first.c2, p1, strokeColor, options, accDist, dabCounter, batchGpuDabs);
-    options.currentStrokeDist = (options.currentStrokeDist ?? 0) + Math.hypot(p1.x - p0.x, p1.y - p0.y);
+    accDist = drawBrushCubicBezierSegment(targetCtx, p0, first.c1, first.c2, p1, effectiveStrokeColor, emitOpts, accDist, dabCounter, batchGpuDabs);
+    emitOpts.currentStrokeDist = (emitOpts.currentStrokeDist ?? 0) + Math.hypot(p1.x - p0.x, p1.y - p0.y);
 
     for (let i = 2; i < effectivePoints.length - 1; i++) {
       const seg = centripetalCatmullRomToBezier(
@@ -3063,46 +4769,225 @@ export function renderCompleteStroke(
         effectivePoints[i + 1]
       );
       accDist = drawBrushCubicBezierSegment(
-        ctx,
+        targetCtx,
         effectivePoints[i - 1],
         seg.c1,
         seg.c2,
         effectivePoints[i],
-        strokeColor,
-        options,
+        effectiveStrokeColor,
+        emitOpts,
         accDist,
         dabCounter,
         batchGpuDabs
       );
-      options.currentStrokeDist =
-        (options.currentStrokeDist ?? 0) +
+      emitOpts.currentStrokeDist =
+        (emitOpts.currentStrokeDist ?? 0) +
         Math.hypot(effectivePoints[i].x - effectivePoints[i - 1].x, effectivePoints[i].y - effectivePoints[i - 1].y);
     }
 
     const n = effectivePoints.length;
     const last = centripetalCatmullRomToBezier(effectivePoints[n - 3], effectivePoints[n - 2], effectivePoints[n - 1], effectivePoints[n - 1]);
     drawBrushCubicBezierSegment(
-      ctx,
+      targetCtx,
       effectivePoints[n - 2],
       last.c1,
       last.c2,
       effectivePoints[n - 1],
-      strokeColor,
-      options,
+      effectiveStrokeColor,
+      emitOpts,
       accDist,
       dabCounter,
       batchGpuDabs
     );
   };
 
-  if (canUseWebGlForBrush(options)) {
-    const batchGpuDabs: GpuDab[] = [];
-    emitStroke(batchGpuDabs);
-    if (flushGpuDabs(ctx, batchGpuDabs, strokeColor, options)) {
-      return;
+  const renderIntoContext = (targetCtx: CanvasRenderingContext2D, emitOpts: BrushRenderOptions) => {
+    if (canUseWebGlForBrush(emitOpts)) {
+      const batchGpuDabs: GpuDab[] = [];
+      emitStroke(targetCtx, emitOpts, batchGpuDabs);
+      if (flushGpuDabs(targetCtx, batchGpuDabs, effectiveStrokeColor, emitOpts)) {
+        return;
+      }
+    }
+    // Single general CPU Canvas2D fallback (WebGL unavailable/lost, AA=0, CPU colorMixing, or multi-subTip)
+    emitStroke(targetCtx, emitOpts, undefined);
+  };
+
+  // Isolated stroke accumulation surface for:
+  // - CSP TextureForPlot=0 (per-stroke paper texture)
+  // - CSP Watercolor Edge (works both with and without colorMixing!)
+  // - CSP Compare Density (stroke-level non-accumulating alpha before compositing onto existing pixels)
+  // - CSP BrushCombineMode (all 26+ layer-level brush blend modes including behind/clear/multiply/add-glow)
+  const needsIsolatedSurface = strokeLevelPaper || hasWetEdge || needsCompareIsolation || hasCustomCombine;
+  if (needsIsolatedSurface && typeof document !== 'undefined') {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxW = options.size ?? 10;
+    for (let i = 0; i < effectivePoints.length; i++) {
+      const p = effectivePoints[i];
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+      if (p.width > maxW) maxW = p.width;
+    }
+    const scatterPad = Math.max(0, options.dynamics?.scatter ?? 0) * maxW;
+    const wetPad = hasWetEdge ? Math.ceil((resolvedSettings.wetEdgeRadius ?? 3.0) * 2) + 4 : 0;
+    const pad = Math.ceil(maxW * 1.25 + scatterPad + wetPad + 8);
+    const bx = Math.floor(minX - pad);
+    const by = Math.floor(minY - pad);
+    const bw = Math.max(1, Math.ceil(maxX + pad) - bx);
+    const bh = Math.max(1, Math.ceil(maxY + pad) - by);
+    if (bw <= 4096 && bh <= 4096) {
+      const scratch = document.createElement('canvas');
+      scratch.width = bw;
+      scratch.height = bh;
+      const sCtx = scratch.getContext('2d');
+      if (sCtx && typeof sCtx.getImageData === 'function' && typeof sCtx.putImageData === 'function') {
+        const isolatedOpts: BrushRenderOptions = {
+          ...options,
+          skipPerDabPaperGrain: strokeLevelPaper ? true : options.skipPerDabPaperGrain,
+          wetEdge: 0,
+          alphaLocked: false,
+          isTransparentInk: false,
+          brushCombineMode: undefined,
+        };
+        sCtx.save();
+        sCtx.translate(-bx, -by);
+        renderIntoContext(sCtx, isolatedOpts);
+        sCtx.restore();
+
+        const imgData = sCtx.getImageData(0, 0, bw, bh);
+        if (strokeLevelPaper) {
+          applyStrokePaperTextureToImageData(imgData, bx, by, options, 1.0);
+        }
+        if (hasWetEdge) {
+          applyCspWatercolorEdge(
+            imgData,
+            resolvedSettings.wetEdge ?? 0,
+            resolvedSettings.wetEdgeRadius ?? 3.0,
+            normalizeWetEdgePower01(resolvedSettings.wetEdgeAlphaPower, 0.25),
+            normalizeWetEdgePower01(resolvedSettings.wetEdgeValuePower, 0.15)
+          );
+        }
+        sCtx.putImageData(imgData, 0, 0);
+
+        const baseCompositeOp: 'source-over' | 'destination-out' | 'source-atop' =
+          options.isTransparentInk || resolvedSettings.brushCombineMode === 'clear'
+            ? 'destination-out'
+            : alphaLocked
+            ? 'source-atop'
+            : 'source-over';
+        compositeIsolatedStrokeToCtx(
+          ctx,
+          scratch,
+          imgData,
+          bx,
+          by,
+          Math.max(0, Math.min(1, options.opacity ?? 1.0)),
+          baseCompositeOp,
+          hasCustomCombine ? resolvedSettings.brushCombineMode : undefined
+        );
+        return;
+      }
     }
   }
 
-  // Single general CPU Canvas2D fallback (WebGL unavailable/lost, AA=0, CPU colorMixing, or multi-subTip)
-  emitStroke(undefined);
+  renderIntoContext(ctx, options);
+}
+
+function compositeIsolatedStrokeToCtx(
+  ctx: CanvasRenderingContext2D,
+  strokeCanvas: HTMLCanvasElement,
+  strokeImg: { data: Uint8ClampedArray; width: number; height: number },
+  bx: number,
+  by: number,
+  opacity: number,
+  compositeOp: 'source-over' | 'destination-out' | 'source-atop',
+  brushCombineMode?: CspBrushCombineMode
+): void {
+  const hasCustom = isCustomBrushCombineMode(brushCombineMode);
+  if (
+    hasCustom &&
+    ctx.canvas &&
+    ctx.canvas.width > 0 &&
+    ctx.canvas.height > 0 &&
+    typeof ctx.getImageData === 'function' &&
+    typeof ctx.putImageData === 'function'
+  ) {
+    const m =
+      typeof ctx.getTransform === 'function'
+        ? ctx.getTransform()
+        : { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0 };
+    const isTranslationOnly =
+      Math.abs(m.a - 1) < 1e-4 &&
+      Math.abs(m.d - 1) < 1e-4 &&
+      Math.abs(m.b) < 1e-4 &&
+      Math.abs(m.c) < 1e-4;
+    if (isTranslationOnly) {
+      const dx0 = Math.round(bx + m.e);
+      const dy0 = Math.round(by + m.f);
+      const rx0 = Math.max(0, dx0);
+      const ry0 = Math.max(0, dy0);
+      const rx1 = Math.min(ctx.canvas.width, dx0 + strokeImg.width);
+      const ry1 = Math.min(ctx.canvas.height, dy0 + strokeImg.height);
+      const rw = rx1 - rx0;
+      const rh = ry1 - ry0;
+      if (rw > 0 && rh > 0) {
+        const dstImg = ctx.getImageData(rx0, ry0, rw, rh);
+        const dst = dstImg.data;
+        const src = strokeImg.data;
+        const pxOut: [number, number, number, number] = [0, 0, 0, 0];
+        const fullOp = opacity >= 0.999;
+        for (let y = 0; y < rh; y++) {
+          const sy = ry0 - dy0 + y;
+          const sRow = sy * strokeImg.width;
+          const dRow = y * rw;
+          for (let x = 0; x < rw; x++) {
+            const sx = rx0 - dx0 + x;
+            const sOff = (sRow + sx) << 2;
+            const sa = src[sOff + 3];
+            if (sa === 0) continue;
+            const effA = fullOp ? sa : Math.round(sa * opacity);
+            if (effA <= 0) continue;
+            const dOff = (dRow + x) << 2;
+            compositeBrushPixelInto(
+              dst[dOff],
+              dst[dOff + 1],
+              dst[dOff + 2],
+              dst[dOff + 3],
+              src[sOff],
+              src[sOff + 1],
+              src[sOff + 2],
+              effA,
+              compositeOp,
+              brushCombineMode,
+              pxOut
+            );
+            dst[dOff] = pxOut[0];
+            dst[dOff + 1] = pxOut[1];
+            dst[dOff + 2] = pxOut[2];
+            dst[dOff + 3] = pxOut[3];
+          }
+        }
+        ctx.putImageData(dstImg, rx0, ry0);
+        return;
+      }
+    }
+  }
+
+  const prevOp = ctx.globalCompositeOperation;
+  const prevAlpha = ctx.globalAlpha;
+  ctx.globalCompositeOperation =
+    brushCombineMode === 'behind'
+      ? 'destination-over'
+      : brushCombineMode === 'clear'
+      ? 'destination-out'
+      : compositeOp;
+  ctx.globalAlpha = opacity;
+  ctx.drawImage(strokeCanvas, bx, by);
+  ctx.globalAlpha = prevAlpha;
+  ctx.globalCompositeOperation = prevOp;
 }

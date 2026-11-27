@@ -24,10 +24,19 @@ import {
   WireLayerItem,
 } from '../types/multiplayer';
 import {
+  buildP2pShareUrl,
   multiplayerService,
-  ParsedInviteLink,
-  parseInviteUrl,
+  parseCollabTarget,
+  ParsedCollabTarget,
 } from '../services/multiplayerService';
+import { WebRtcHostHub, WebRtcTurnConfig } from '../services/webrtcHostHub';
+import { WebRtcGuestClient } from '../services/webrtcGuestClient';
+import {
+  computeRoomTopicHash,
+  generateP2pRoomCredentials,
+  normalizeRoomCode,
+  normalizeRoomSecret,
+} from '../services/webrtcSignaling';
 import {
   getBrushAssetRecord,
   registerRemoteBrushAsset,
@@ -112,14 +121,42 @@ function getInitialPeerName(): string {
   }
 }
 
-interface ActiveSessionParams {
-  wsUrl: string;
-  token?: string;
-  roomName: string;
-  host: string;
-  port: number;
-  isSecure: boolean;
-  isHost: boolean;
+type ActiveSessionParams =
+  | {
+      kind: 'ws';
+      wsUrl: string;
+      token?: string;
+      roomName: string;
+      host: string;
+      port: number;
+      isSecure: boolean;
+      isHost: boolean;
+    }
+  | {
+      kind: 'webrtc-guest';
+      roomCode: string;
+      roomSecret: string;
+      roomHash: string;
+      roomName: string;
+      customSignalingUrl?: string;
+      isHost: false;
+    };
+
+function getWebRtcNetworkConfigFromSettings(signalingOverride?: string): {
+  customSignalingUrl?: string;
+  turnConfig?: WebRtcTurnConfig;
+} {
+  const settings = useUiStore.getState().appSettings;
+  const customSignalingUrl = (signalingOverride || settings.collabSignalingUrl || '').trim() || undefined;
+  const turnUrl = (settings.collabTurnUrl || '').trim();
+  const turnConfig: WebRtcTurnConfig | undefined = turnUrl
+    ? {
+        turnUrl,
+        turnUsername: settings.collabTurnUsername || undefined,
+        turnCredential: settings.collabTurnCredential || undefined,
+      }
+    : undefined;
+  return { customSignalingUrl, turnConfig };
 }
 
 export interface UseMultiplayerProps {
@@ -210,12 +247,12 @@ export function useMultiplayer({
   >([]);
   const [isHostModalOpen, setIsHostModalOpen] = useState(false);
 
-  // Smart Clipboard Invitation Prompt
-  const [clipboardInvite, setClipboardInvite] = useState<ParsedInviteLink | null>(null);
+  // Smart Clipboard Invitation Prompt (supports WS links, P2P links, and INK-XXXX room codes)
+  const [clipboardInvite, setClipboardInvite] = useState<ParsedCollabTarget | null>(null);
   const lastProcessedClipboardUrlRef = useRef<string | null>(null);
 
-  // Web Landing modal for browser guests visiting via ?room=...
-  const [webLandingInvite, setWebLandingInvite] = useState<ParsedInviteLink | null>(null);
+  // Web Landing modal for browser guests visiting via ?room=... or ?p2p=...
+  const [webLandingInvite, setWebLandingInvite] = useState<ParsedCollabTarget | null>(null);
 
   // Auto-reconnect & seq/version tracking refs
   const sessionParamsRef = useRef<ActiveSessionParams | null>(null);
@@ -405,41 +442,44 @@ export function useMultiplayer({
   }, []);
 
   // Paced async tile streaming so large canvases never saturate WS or server mpsc buffers
-  const streamTilesPaced = useCallback((layersToStream: LayerItem[]) => {
-    const activeGrid = documentStore.getActiveTileGrid();
-    const queue: Array<{ layerId: string; tile: TileBuffer }> = [];
-    for (const layer of layersToStream) {
-      const tiles = activeGrid.getLayerTiles(layer.id);
-      for (const tile of tiles) {
-        if (tile.data && tile.data.byteLength > 0) {
-          queue.push({ layerId: layer.id, tile });
+  const streamTilesPaced = useCallback(
+    (layersToStream: LayerItem[], targetPeerId?: string | number) => {
+      const activeGrid = documentStore.getActiveTileGrid();
+      const queue: Array<{ layerId: string; tile: TileBuffer }> = [];
+      for (const layer of layersToStream) {
+        const tiles = activeGrid.getLayerTiles(layer.id);
+        for (const tile of tiles) {
+          if (tile.data && tile.data.byteLength > 0) {
+            queue.push({ layerId: layer.id, tile });
+          }
         }
       }
-    }
-    if (queue.length === 0) return;
+      if (queue.length === 0) return;
 
-    let idx = 0;
-    const BATCH_SIZE = 16;
-    const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+      let idx = 0;
+      const BATCH_SIZE = 16;
+      const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
 
-    const pump = () => {
-      if (!multiplayerService.isConnected()) return;
-      if (multiplayerService.getBufferedAmount() > MAX_BUFFERED_BYTES) {
-        setTimeout(pump, 20);
-        return;
-      }
-      const end = Math.min(idx + BATCH_SIZE, queue.length);
-      for (; idx < end; idx++) {
-        const entry = queue[idx];
-        multiplayerService.sendTileDelta(entry.layerId, entry.tile);
-      }
-      if (idx < queue.length) {
-        setTimeout(pump, 4);
-      }
-    };
+      const pump = () => {
+        if (!multiplayerService.isConnected()) return;
+        if (multiplayerService.getBufferedAmount() > MAX_BUFFERED_BYTES) {
+          setTimeout(pump, 20);
+          return;
+        }
+        const end = Math.min(idx + BATCH_SIZE, queue.length);
+        for (; idx < end; idx++) {
+          const entry = queue[idx];
+          multiplayerService.sendTileDelta(entry.layerId, entry.tile, targetPeerId);
+        }
+        if (idx < queue.length) {
+          setTimeout(pump, 4);
+        }
+      };
 
-    pump();
-  }, []);
+      pump();
+    },
+    []
+  );
 
   // Auto-reconnect scheduler with exponential backoff and missed seq/tile catch-up
   const scheduleReconnectRef = useRef<(immediate?: boolean) => void>(() => {});
@@ -454,8 +494,13 @@ export function useMultiplayer({
 
       const nextAttempt = reconnectAttemptRef.current + 1;
       if (nextAttempt > RECONNECT_MAX_ATTEMPTS) {
+        const wasWebRtcGuest = params.kind === 'webrtc-guest';
         resetSessionState();
-        showToastRef.current('Unable to reconnect to collaborative session');
+        showToastRef.current(
+          wasWebRtcGuest
+            ? 'Host disconnected — the P2P room has ended. Your canvas remains open locally.'
+            : 'Unable to reconnect to collaborative session'
+        );
         return;
       }
 
@@ -485,11 +530,31 @@ export function useMultiplayer({
         isReconnectingInFlightRef.current = true;
         pendingReconnectCatchUpRef.current = true;
 
-        multiplayerService
-          .connect(targetParams.wsUrl, reconnectPeer, targetParams.token, {
-            isReconnect: true,
-            sinceSeq,
-          })
+        const attemptConnect =
+          targetParams.kind === 'ws'
+            ? multiplayerService.connect(targetParams.wsUrl, reconnectPeer, targetParams.token, {
+                isReconnect: true,
+                sinceSeq,
+              })
+            : (async () => {
+                const { customSignalingUrl, turnConfig } = getWebRtcNetworkConfigFromSettings(
+                  targetParams.customSignalingUrl
+                );
+                const guestClient = new WebRtcGuestClient({
+                  roomHash: targetParams.roomHash,
+                  peerId: String(reconnectPeer.id),
+                  customSignalingUrl,
+                  turnConfig,
+                });
+                await guestClient.connect();
+                multiplayerService.attachTransport(guestClient, reconnectPeer, {
+                  isReconnect: true,
+                  sinceSeq,
+                  sendJoinRequest: true,
+                });
+              })();
+
+        attemptConnect
           .then(() => {
             isReconnectingInFlightRef.current = false;
             if (intentionalDisconnectRef.current || !sessionParamsRef.current) {
@@ -768,11 +833,16 @@ export function useMultiplayer({
               animationTimeline: wireAnim,
             });
 
-            streamTilesPaced(effectiveLayers);
+            streamTilesPaced(effectiveLayers, guestPeer.id);
 
             for (const layer of effectiveLayers) {
               if (layer.maskCanvas) {
-                multiplayerService.sendLayerMaskData(layer.id, layer.maskCanvas);
+                multiplayerService.sendLayerMaskData(
+                  layer.id,
+                  layer.maskCanvas,
+                  undefined,
+                  guestPeer.id
+                );
               }
             }
 
@@ -1123,16 +1193,32 @@ export function useMultiplayer({
     });
 
     // Unexpected close: keep session state & seq cursors, reconnect with exponential backoff
-    const unsubClose = multiplayerService.onClose(() => {
+    const unsubClose = multiplayerService.onClose((reason?: string) => {
       if (intentionalDisconnectRef.current || !sessionParamsRef.current) {
         resetSessionState();
+        return;
+      }
+
+      // If the P2P host explicitly closed the room, notify cleanly without endless retries
+      if (
+        sessionParamsRef.current.kind === 'webrtc-guest' &&
+        reason &&
+        /host closed/i.test(reason)
+      ) {
+        intentionalDisconnectRef.current = true;
+        resetSessionState();
+        showToastRef.current('Host ended the P2P room. Your canvas remains open locally.');
         return;
       }
 
       setIsConnected(false);
       setConnectionStatus('reconnecting');
       if (reconnectAttemptRef.current === 0) {
-        showToastRef.current('Connection lost. Reconnecting...');
+        showToastRef.current(
+          sessionParamsRef.current.kind === 'webrtc-guest'
+            ? 'Host connection interrupted. Reconnecting to P2P room...'
+            : 'Connection lost. Reconnecting...'
+        );
       }
       scheduleReconnectRef.current(false);
     });
@@ -1153,7 +1239,7 @@ export function useMultiplayer({
         const text = await navigator.clipboard.readText();
         if (!text || text === lastProcessedClipboardUrlRef.current) return;
 
-        const parsed = parseInviteUrl(text);
+        const parsed = parseCollabTarget(text);
         if (parsed) {
           lastProcessedClipboardUrlRef.current = text;
           setClipboardInvite(parsed);
@@ -1170,7 +1256,7 @@ export function useMultiplayer({
   // Check URL query parameters on initial page load (for Web Browser joins)
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const parsed = parseInviteUrl(window.location.href);
+    const parsed = parseCollabTarget(window.location.href);
     if (parsed) {
       setWebLandingInvite(parsed);
     }
@@ -1253,6 +1339,7 @@ export function useMultiplayer({
           peerCount: serverInfo.peerCount || 1,
           isGlobal: isGlobalServer,
           localInviteUrl,
+          transport: 'ws',
         };
 
         setHostInfo(normalizedServerInfo);
@@ -1283,6 +1370,7 @@ export function useMultiplayer({
         // Host connects locally via 127.0.0.1 with the room token
         const wsUrl = `ws://127.0.0.1:${resolvedPort}/ws`;
         sessionParamsRef.current = {
+          kind: 'ws',
           wsUrl,
           token: resolvedRoomToken || undefined,
           roomName: resolvedRoomName,
@@ -1345,13 +1433,127 @@ export function useMultiplayer({
     [clearReconnectTimer, resetSessionState, showToast, streamTilesPaced]
   );
 
+  // START QUICK P2P HOSTING (SERVERLESS WEBRTC STAR HUB, NO CLOUDFLARED REQUIRED)
+  const startWebRtcHosting = useCallback(
+    async (
+      roomName: string = 'Ink Studio Session',
+      hostNickname?: string,
+      onStatus?: (status: string) => void
+    ): Promise<SessionHostInfo> => {
+      try {
+        clearReconnectTimer();
+        intentionalDisconnectRef.current = false;
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        setConnectionStatus('connecting');
+
+        let currentName = myPeerRef.current.name;
+        if (hostNickname && hostNickname.trim()) {
+          currentName = hostNickname.trim();
+        }
+
+        const resolvedRoomName = roomName.trim() || 'Ink Studio Session';
+        const creds = generateP2pRoomCredentials();
+        const { customSignalingUrl, turnConfig } = getWebRtcNetworkConfigFromSettings();
+
+        onStatus?.('Connecting to P2P signaling...');
+
+        const hostPeer: CollabPeer = {
+          ...myPeerRef.current,
+          name: currentName,
+          isHost: true,
+          role: 'host',
+        };
+
+        const hub = new WebRtcHostHub({
+          roomHash: creds.roomHash,
+          hostPeerId: String(hostPeer.id),
+          customSignalingUrl,
+          turnConfig,
+        });
+
+        await hub.start();
+
+        const shareUrl = buildP2pShareUrl(
+          creds.roomCode,
+          creds.roomSecret,
+          resolvedRoomName,
+          customSignalingUrl
+        );
+
+        const normalizedServerInfo: SessionHostInfo = {
+          isRunning: true,
+          port: 0,
+          localIp: 'WebRTC P2P',
+          roomName: resolvedRoomName,
+          roomToken: creds.roomSecret,
+          inviteUrl: shareUrl,
+          peerCount: 1,
+          isGlobal: true,
+          transport: 'webrtc',
+          roomCode: creds.roomCode,
+          roomSecret: creds.roomSecret,
+          joinCode: creds.joinCode,
+        };
+
+        setHostInfo(normalizedServerInfo);
+        setIsHost(true);
+        isHostRef.current = true;
+        hostInfoRef.current = normalizedServerInfo;
+
+        bannedPeerIdsRef.current.clear();
+        setBannedPeerIds([]);
+        peerRolesRef.current.clear();
+        lastAppliedSeqRef.current = 0;
+        tileSeqMapRef.current.clear();
+        tileVersionMapRef.current.clear();
+        pendingReconnectCatchUpRef.current = false;
+
+        setMyPeer(hostPeer);
+        myPeerRef.current = hostPeer;
+        myRoleRef.current = 'host';
+        setMyRole('host');
+        multiplayerService.setLocalRole('host');
+
+        sessionParamsRef.current = null;
+        multiplayerService.attachTransport(hub, hostPeer, { sendJoinRequest: false });
+
+        setIsConnected(true);
+        setConnectionStatus('connected');
+
+        // Auto-copy short join code (graceful fallback if clipboard blocked)
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(creds.joinCode);
+            lastProcessedClipboardUrlRef.current = creds.joinCode;
+            showToast(`Quick P2P room ready! Code ${creds.joinCode} copied.`);
+          } else {
+            showToast(`Quick P2P room ready: ${creds.joinCode}`);
+          }
+        } catch {
+          showToast(`Quick P2P room ready: ${creds.joinCode}`);
+        }
+
+        return normalizedServerInfo;
+      } catch (err: any) {
+        console.error('Failed to start WebRTC P2P host session:', err);
+        resetSessionState();
+        const errMsg = err?.message || (typeof err === 'string' ? err : 'P2P connection error');
+        showToast(`Failed to start P2P room: ${errMsg}`);
+        throw err;
+      }
+    },
+    [clearReconnectTimer, resetSessionState, showToast]
+  );
+
   // STOP HOSTING
   const stopHosting = useCallback(async () => {
     try {
+      const wasWebRtc = hostInfoRef.current?.transport === 'webrtc';
       intentionalDisconnectRef.current = true;
       clearReconnectTimer();
       multiplayerService.disconnect();
-      if (isTauriEnvironment()) {
+      if (!wasWebRtc && isTauriEnvironment()) {
         const { invoke } = await import('@tauri-apps/api/core');
         await invoke('stop_collab_server');
       }
@@ -1371,7 +1573,8 @@ export function useMultiplayer({
       guestNickname?: string,
       token?: string,
       isSecureOverride?: boolean,
-      persistName: boolean = false
+      persistName: boolean = false,
+      wsPath?: string
     ): Promise<boolean> => {
       try {
         clearReconnectTimer();
@@ -1396,7 +1599,8 @@ export function useMultiplayer({
             : isHttps || port === 443 || host.toLowerCase().endsWith('.trycloudflare.com');
         const proto = isSecure ? 'wss' : 'ws';
         const portPart = port === 80 || port === 443 || !port ? '' : `:${port}`;
-        const wsUrl = `${proto}://${host}${portPart}/ws`;
+        const normalizedPath = wsPath && wsPath.startsWith('/') ? wsPath : '/ws';
+        const wsUrl = `${proto}://${host}${portPart}${normalizedPath}`;
 
         const guestPeer: CollabPeer = {
           ...myPeerRef.current,
@@ -1416,6 +1620,7 @@ export function useMultiplayer({
         pendingReconnectCatchUpRef.current = false;
 
         sessionParamsRef.current = {
+          kind: 'ws',
           wsUrl,
           token,
           roomName,
@@ -1442,6 +1647,7 @@ export function useMultiplayer({
           inviteUrl: `${inviteProto}://${host}${portPart}/?room=${encodeURIComponent(roomName)}${tokenQuery}`,
           peerCount: 1,
           isGlobal: isSecure,
+          transport: 'ws',
         };
         setHostInfo(nextHostInfo);
         hostInfoRef.current = nextHostInfo;
@@ -1457,24 +1663,153 @@ export function useMultiplayer({
     [clearReconnectTimer, resetSessionState, showToast]
   );
 
-  const joinByInviteUrl = useCallback(
-    async (rawUrl: string, nickname?: string, persistName: boolean = false): Promise<boolean> => {
-      const parsed = parseInviteUrl(rawUrl);
-      if (!parsed) {
-        showToast('Invalid invite link. Paste the full room URL.');
+  // JOIN WORLDWIDE P2P ROOM (WEBRTC GUEST)
+  const joinWebRtcRoom = useCallback(
+    async (
+      rawRoomCode: string,
+      rawRoomSecret: string = '',
+      guestNickname?: string,
+      signalingUrlOverride?: string,
+      persistName: boolean = false,
+      roomNameOverride?: string
+    ): Promise<boolean> => {
+      try {
+        clearReconnectTimer();
+        intentionalDisconnectRef.current = false;
+        reconnectAttemptRef.current = 0;
+        setReconnectAttempt(0);
+        setConnectionStatus('connecting');
+
+        const roomCode = normalizeRoomCode(rawRoomCode);
+        const roomSecret = normalizeRoomSecret(rawRoomSecret);
+        const roomHash = computeRoomTopicHash(roomCode, roomSecret);
+        const joinCode = roomSecret ? `${roomCode}-${roomSecret}` : roomCode;
+        const resolvedRoomName = (roomNameOverride || roomCode).trim() || roomCode;
+
+        let currentName = myPeerRef.current.name;
+        if (guestNickname && guestNickname.trim()) {
+          currentName = guestNickname.trim();
+          if (persistName) {
+            safeLocalStorageSetItem(NICKNAME_KEY, currentName, 'artist name');
+            safeLocalStorageSetItem(NICKNAME_CUSTOMIZED_KEY, '1', 'artist name flag');
+          }
+        }
+
+        const guestPeer: CollabPeer = {
+          ...myPeerRef.current,
+          name: currentName,
+          isHost: false,
+          role: 'editor',
+        };
+        setMyPeer(guestPeer);
+        myPeerRef.current = guestPeer;
+        myRoleRef.current = 'editor';
+        setMyRole('editor');
+        multiplayerService.setLocalRole('editor');
+
+        lastAppliedSeqRef.current = 0;
+        tileSeqMapRef.current.clear();
+        tileVersionMapRef.current.clear();
+        pendingReconnectCatchUpRef.current = false;
+
+        const { customSignalingUrl, turnConfig } =
+          getWebRtcNetworkConfigFromSettings(signalingUrlOverride);
+
+        sessionParamsRef.current = {
+          kind: 'webrtc-guest',
+          roomCode,
+          roomSecret,
+          roomHash,
+          roomName: resolvedRoomName,
+          customSignalingUrl,
+          isHost: false,
+        };
+
+        const guestClient = new WebRtcGuestClient({
+          roomHash,
+          peerId: String(guestPeer.id),
+          customSignalingUrl,
+          turnConfig,
+        });
+
+        await guestClient.connect();
+        multiplayerService.attachTransport(guestClient, guestPeer, {
+          sendJoinRequest: true,
+        });
+
+        setIsConnected(true);
+        setConnectionStatus('connected');
+        setIsHost(false);
+        isHostRef.current = false;
+
+        const nextHostInfo: SessionHostInfo = {
+          isRunning: true,
+          port: 0,
+          localIp: 'WebRTC P2P',
+          roomName: resolvedRoomName,
+          roomToken: roomSecret || undefined,
+          inviteUrl: buildP2pShareUrl(roomCode, roomSecret, resolvedRoomName, customSignalingUrl),
+          peerCount: 1,
+          isGlobal: true,
+          transport: 'webrtc',
+          roomCode,
+          roomSecret: roomSecret || undefined,
+          joinCode,
+        };
+        setHostInfo(nextHostInfo);
+        hostInfoRef.current = nextHostInfo;
+        setClipboardInvite(null);
+        setWebLandingInvite(null);
+        return true;
+      } catch (err: any) {
+        resetSessionState();
+        showToast(`Failed to join P2P room: ${err?.message || err}`);
         return false;
       }
+    },
+    [clearReconnectTimer, resetSessionState, showToast]
+  );
+
+  const joinByInviteUrl = useCallback(
+    async (
+      rawUrl: string,
+      nickname?: string,
+      persistName: boolean = false,
+      secretOverride?: string
+    ): Promise<boolean> => {
+      const target = parseCollabTarget(rawUrl);
+      if (!target) {
+        showToast(
+          'Invalid room code or link. Enter an INK-XXXX code, P2P link, or wss:// / ws:// URL.'
+        );
+        return false;
+      }
+      if (target.kind === 'p2p') {
+        const effectiveSecret =
+          secretOverride !== undefined && secretOverride.trim()
+            ? secretOverride.trim()
+            : target.roomSecret;
+        return joinWebRtcRoom(
+          target.roomCode,
+          effectiveSecret,
+          nickname,
+          target.signalingUrl,
+          persistName,
+          target.roomName
+        );
+      }
       return joinRoom(
-        parsed.host,
-        parsed.port,
-        parsed.roomName,
+        target.host,
+        target.port,
+        target.roomName,
         nickname,
-        parsed.token,
-        parsed.isSecure,
-        persistName
+        target.token,
+        target.isSecure,
+        persistName,
+        target.wsPath
       );
     },
-    [joinRoom, showToast]
+    [joinRoom, joinWebRtcRoom, showToast]
   );
 
   const leaveRoom = useCallback(() => {
@@ -1620,8 +1955,10 @@ export function useMultiplayer({
     isHostModalOpen,
     setIsHostModalOpen,
     startHosting,
+    startWebRtcHosting,
     stopHosting,
     joinRoom,
+    joinWebRtcRoom,
     joinByInviteUrl,
     leaveRoom,
     setPeerRole,

@@ -16,6 +16,7 @@ import { CubicBezierSegment } from '../../../engine/SplineGenerator';
 import { BrushRenderOptions } from '../../../engine/BrushEngine';
 import { GpuDab } from '../../../engine/WebGlBrushEngine';
 import { NaturalPaintStrokeSession } from '../../../engine/NaturalPaintRenderer';
+import { RibbonStrokeSession } from '../../../engine/RibbonBrushEngine';
 import { PaintReservoir, LayerPixelSampler } from '../../../utils/colorMixingEngine';
 import { PerspectiveRuler, StraightRuler, ConstraintAxis } from '../../../types/perspective';
 import { PerspectiveSnapSession } from '../../../utils/perspectiveSnapping';
@@ -138,6 +139,22 @@ export interface StrokeSessionState {
   strokePipeline: StrokePipeline;
   frameGpuDabs: GpuDab[];
   reusableRegionCanvas: HTMLCanvasElement | null;
+  rawDraftCanvas: HTMLCanvasElement | null;
+  isStrokePaperTextureActive: boolean;
+  isDualBrushStroke: boolean;
+  dualPrimaryCanvas: HTMLCanvasElement | null;
+  dualSecondaryCanvas: HTMLCanvasElement | null;
+  dualSecondaryRemainderDist: number;
+  dualSecondaryDabCounter: {
+    count: number;
+    lastAngle?: number;
+    lastStepDist?: number;
+    lockedInitialAngle?: number;
+    initOriginX?: number;
+    initOriginY?: number;
+  };
+  dualSecondaryRibbonSession: RibbonStrokeSession | null;
+  dualFrameSecondaryGpuDabs: GpuDab[];
   scratchDocCoord: { x: number; y: number };
   predCoordPool: Array<{ x: number; y: number; pressure?: number }>;
   predDocCoords: Array<{ x: number; y: number; pressure?: number }>;
@@ -145,14 +162,24 @@ export interface StrokeSessionState {
   lastQueuedPressure: number;
   stabilizedPoint: Point | null;
   stampRemainderDist: number;
-  liveDabCounter: { count: number; lastAngle?: number; lastStepDist?: number };
+  liveDabCounter: {
+    count: number;
+    lastAngle?: number;
+    lastStepDist?: number;
+    lockedInitialAngle?: number;
+    initOriginX?: number;
+    initOriginY?: number;
+  };
   activeReservoir: PaintReservoir | null;
   layerPixelSampler: LayerPixelSampler | null;
   naturalPaintSession: NaturalPaintStrokeSession | null;
+  ribbonSession: RibbonStrokeSession | null;
   naturalStrokeSeed: number;
   isWetColorStroke: boolean;
   liveNeedsNotify: boolean;
   isShiftLineStroke: boolean;
+  deferredInitialDot: boolean;
+  deferredStartRawPressure: number;
   lastPointTime: number;
   recentPointsTrail: RecentPointSample[];
   strokeTotalDistance: number;
@@ -180,6 +207,15 @@ export function createInitialStrokeSessionState(): StrokeSessionState {
     strokePipeline: new StrokePipeline(),
     frameGpuDabs: [],
     reusableRegionCanvas: null,
+    rawDraftCanvas: null,
+    isStrokePaperTextureActive: false,
+    isDualBrushStroke: false,
+    dualPrimaryCanvas: null,
+    dualSecondaryCanvas: null,
+    dualSecondaryRemainderDist: 0,
+    dualSecondaryDabCounter: { count: 0 },
+    dualSecondaryRibbonSession: null,
+    dualFrameSecondaryGpuDabs: [],
     scratchDocCoord: { x: 0, y: 0 },
     predCoordPool: [
       { x: 0, y: 0, pressure: 0.5 },
@@ -196,10 +232,13 @@ export function createInitialStrokeSessionState(): StrokeSessionState {
     activeReservoir: null,
     layerPixelSampler: null,
     naturalPaintSession: null,
+    ribbonSession: null,
     naturalStrokeSeed: 1337,
     isWetColorStroke: false,
     liveNeedsNotify: false,
     isShiftLineStroke: false,
+    deferredInitialDot: false,
+    deferredStartRawPressure: 0,
     lastPointTime: 0,
     recentPointsTrail: [],
     strokeTotalDistance: 0,
@@ -229,7 +268,8 @@ export type EmitLiveSegmentFn = (
   useWireframeEraser: boolean,
   canvas: HTMLCanvasElement | null,
   activeLayer: LayerItem | undefined,
-  gpuBatch: GpuDab[] | undefined
+  gpuBatch: GpuDab[] | undefined,
+  precomputedBrushOpts?: BrushRenderOptions
 ) => void;
 
 export type BuildLiveBrushOptionsFn = (

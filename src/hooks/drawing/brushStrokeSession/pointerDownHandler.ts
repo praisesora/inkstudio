@@ -2,10 +2,24 @@ import React from 'react';
 import { Point } from '../../../types/editor';
 import { calculateStrokeWidth, get2DContext } from '../../../utils/canvasUtils';
 import { PaintReservoir, LayerPixelSampler } from '../../../utils/colorMixingEngine';
+import { detectWhitePaperGround } from '../../../utils/pigmentEngine';
 import {
   isNaturalPaintBrush,
   NaturalPaintStrokeSession,
 } from '../../../engine/NaturalPaintRenderer';
+import { isRibbonBrush, RibbonStrokeSession } from '../../../engine/RibbonBrushEngine';
+import {
+  buildSecondaryBrushSettings,
+  needsStrokeLevelPaperTexture,
+  resolveDualBrushConfig,
+} from '../../../engine/BrushEngine';
+import {
+  prepareDualDraftCanvases,
+  prepareRawDraftCanvasForStrokeTexture,
+  resolveStrokePigmentStrength,
+  syncDualBrushRegionToDraft,
+  syncStrokePaperTextureRegionToDraft,
+} from './strokeHelpers';
 import { useUiStore } from '../../../stores';
 import { recoveryService } from '../../../services/recoveryService';
 import { isLinearPressureCurve } from '../../../utils/pressureCurve';
@@ -20,6 +34,7 @@ import {
   renderShiftLineInitialSegment,
   setupDraftCanvasSurface,
 } from './pointerDownInitialStamp';
+import { NATIVE_PEN_POINTER_ID } from './nativeTabletBridge';
 
 export function runPointerDown(
   state: StrokeSessionState,
@@ -41,6 +56,14 @@ export function runPointerDown(
   }
   e.preventDefault();
   if (params.isDrawingRef.current) {
+    // Defense-in-depth: never let a WinTab CXO_SYSTEM-synthesized DOM mouse pointerdown
+    // abort an active native pen stroke that carries true hardware pressure.
+    if (
+      state.activePointerId === NATIVE_PEN_POINTER_ID &&
+      e.pointerId !== NATIVE_PEN_POINTER_ID
+    ) {
+      return;
+    }
     helpers.abortActiveStroke();
   }
 
@@ -48,9 +71,12 @@ export function runPointerDown(
   const currentLayerIdCheck = params.activeLayerIdRef.current;
   if (!currentLayerIdCheck || dims.width <= 0 || dims.height <= 0) return;
 
+  // Flush any deferred idle history tasks from previous strokes before starting a new stroke
+  // so undo/redo order and tile deltas stay strictly consistent during rapid sketching.
+  params.flushPendingHistoryTasks();
+
   const maskCanvas = params.getActiveMaskCanvas();
   if (params.isMaskModeRef.current) {
-    params.flushPendingHistoryTasks();
     if (!maskCanvas) return;
   }
 
@@ -90,12 +116,18 @@ export function runPointerDown(
   const draftCompositeOp: GlobalCompositeOperation =
     isVectorOrMask || isBgEraser
       ? 'source-over'
-      : isEraser || bs.isTransparentInk
+      : isEraser || bs.isTransparentInk || bs.brushCombineMode === 'clear'
       ? 'destination-out'
+      : bs.brushCombineMode === 'behind'
+      ? 'destination-over'
       : activeLayer?.alphaLocked
       ? 'source-atop'
       : 'source-over';
 
+  const preferNativeDraftScale = Boolean(
+    !isVectorOrMask &&
+      (bs.colorMixing || bs.customTipImage || bs.paperTextureImage)
+  );
   const draftScale = setupDraftCanvasSurface(
     params,
     draftCanvas,
@@ -103,8 +135,20 @@ export function runPointerDown(
     vRect,
     dims,
     draftCompositeOp,
-    isMonochrome
+    isMonochrome,
+    preferNativeDraftScale
   );
+
+  const draftPigmentStrength = isVectorOrMask
+    ? 0
+    : resolveStrokePigmentStrength(bs, isEraser, isBgEraser, isMonochrome);
+  draftCanvas.__draftPigmentStrength = draftPigmentStrength;
+  draftCanvas.__draftPigmentWhiteGround =
+    draftPigmentStrength > 0.005
+      ? detectWhitePaperGround(allLayers, currentLayerId, params.activeTileGridRef.current)
+      : false;
+  draftCanvas.__draftCombineMode =
+    (isEraser && !isBgEraser) || bs.isTransparentInk ? undefined : bs.brushCombineMode;
 
   helpers.clearPredictedCanvas();
 
@@ -172,14 +216,17 @@ export function runPointerDown(
     hasCustomGlobalCurve || Boolean(bs.pressureCurve && bs.pressureCurve.length > 0);
   const taperEngine = pipeline.getTaperEngine();
   if (bs.usePressure) {
-    const baseStartP = hasCustomCurve
+    const rawStartP = firstEvent.pointerType === 'mouse' ? 0.5 : firstEvent.pressure ?? 0;
+    const rawBaseStartP = hasCustomCurve
       ? startPoint.pressure
       : taperEngine.mapPressure(startPoint.pressure);
+    const baseStartP = rawStartP > 0.005 ? Math.max(0.015, rawBaseStartP) : rawBaseStartP;
     const smoothStartP = taperEngine.smoothPressure(baseStartP);
-    startPoint.pressure = smoothStartP;
+    const effectiveStartP = rawStartP > 0.005 ? Math.max(0.015, smoothStartP) : smoothStartP;
+    startPoint.pressure = effectiveStartP;
     startPoint.width = calculateStrokeWidth(
       bs.size,
-      smoothStartP,
+      effectiveStartP,
       bs.minSizeFactor,
       bs.usePressure,
       firstEvent.pointerType,
@@ -193,13 +240,14 @@ export function runPointerDown(
     startPoint.width = 1.25;
   }
 
-  const scatterFactor = Math.max(0, bs.dynamics?.scatter ?? 0);
+  const dualCfg = resolveDualBrushConfig(bs);
+  const dualSecInfo = dualCfg ? buildSecondaryBrushSettings(bs, dualCfg) : null;
+  const scatterFactor = Math.max(0, bs.dynamics?.scatter ?? 0, dualCfg?.scatter ?? 0);
+  const maxBrushDim = Math.max(startPoint.width, bs.size || 10, dualSecInfo?.settings.size || 0);
   const blurMargin = (1 - strokeHardness) * (startPoint.width * 1.5);
   const r = Math.max(
     32,
-    Math.ceil(
-      Math.max(startPoint.width, bs.size || 10) * (2.8 + scatterFactor * 2) + blurMargin + 32
-    )
+    Math.ceil(maxBrushDim * (2.8 + scatterFactor * 2) + blurMargin + 32)
   );
 
   const shiftAction = useUiStore.getState().appSettings.modifierKeys.shift;
@@ -361,6 +409,61 @@ export function runPointerDown(
     );
   }
 
+  const isRibbonStroke =
+    !useWireframeEraser &&
+    !state.naturalPaintSession &&
+    isRibbonBrush(bs);
+  state.ribbonSession = isRibbonStroke ? new RibbonStrokeSession() : null;
+
+  state.isStrokePaperTextureActive =
+    !isEraser &&
+    !isBgEraser &&
+    !isMonochrome &&
+    !isVectorOrMask &&
+    !state.naturalPaintSession &&
+    !isRibbonStroke &&
+    needsStrokeLevelPaperTexture(bs);
+
+  state.isDualBrushStroke = Boolean(
+    dualCfg && !useWireframeEraser && !isVectorOrMask && !state.naturalPaintSession
+  );
+  state.dualSecondaryDabCounter.count = 0;
+  state.dualSecondaryDabCounter.lastAngle = undefined;
+  state.dualSecondaryDabCounter.lastStepDist = undefined;
+  state.dualFrameSecondaryGpuDabs.length = 0;
+  state.dualSecondaryRibbonSession =
+    state.isDualBrushStroke && dualSecInfo && isRibbonBrush(dualSecInfo.settings)
+      ? new RibbonStrokeSession()
+      : null;
+
+  let activeDrawCtx: CanvasRenderingContext2D = draftCtx;
+  if (state.isDualBrushStroke) {
+    const dualPair = prepareDualDraftCanvases(
+      state,
+      draftCanvas,
+      dims,
+      params.selectionRef.current
+    );
+    if (dualPair) {
+      activeDrawCtx = dualPair.primaryCtx;
+    } else {
+      state.isDualBrushStroke = false;
+    }
+  }
+  if (!state.isDualBrushStroke && state.isStrokePaperTextureActive) {
+    const rawCtx = prepareRawDraftCanvasForStrokeTexture(
+      state,
+      draftCanvas,
+      dims,
+      params.selectionRef.current
+    );
+    if (rawCtx) {
+      activeDrawCtx = rawCtx;
+    } else {
+      state.isStrokePaperTextureActive = false;
+    }
+  }
+
   const strokeId = `stroke-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
   state.currentStrokeId = strokeId;
   params.onCollabStrokeStartRef.current?.(strokeId, currentLayerId, bs, currentTool, startPoint);
@@ -368,9 +471,24 @@ export function runPointerDown(
   state.liveDabCounter.count = 0;
   state.liveDabCounter.lastAngle = undefined;
   state.liveDabCounter.lastStepDist = undefined;
+  state.liveDabCounter.lockedInitialAngle = undefined;
+  state.liveDabCounter.initOriginX = undefined;
+  state.liveDabCounter.initOriginY = undefined;
+  state.dualSecondaryDabCounter.lockedInitialAngle = undefined;
+  state.dualSecondaryDabCounter.initOriginX = undefined;
+  state.dualSecondaryDabCounter.initOriginY = undefined;
   state.stampRemainderDist = bs.customTipImage
     ? Math.max(0.15, startPoint.width * (bs.spacing ?? 0.07))
     : Math.max(0.12, startPoint.width * (bs.spacing ?? 0.08));
+  if (state.isDualBrushStroke && dualSecInfo) {
+    const secStartW = Math.max(0.2, startPoint.width * dualSecInfo.sizeRatio);
+    const secSpacing = dualSecInfo.settings.spacing ?? 0.1;
+    state.dualSecondaryRemainderDist = dualSecInfo.settings.customTipImage
+      ? Math.max(0.15, secStartW * secSpacing)
+      : Math.max(0.12, secStartW * secSpacing);
+  } else {
+    state.dualSecondaryRemainderDist = 0;
+  }
 
   const firstDotPoint = state.allStrokePoints[0];
 
@@ -380,13 +498,38 @@ export function runPointerDown(
     !isShiftLine &&
     !state.naturalPaintSession &&
     !useWireframeEraser &&
-    (bs.customTipAngleDynamics === 'direction' ||
-      bs.customTipAngleDynamics === 'direction-random') &&
-    (bs.thickness ?? 1.0) < 0.85;
+    (isRibbonStroke ||
+      ((bs.customTipAngleDynamics === 'direction' ||
+        bs.customTipAngleDynamics === 'direction-random' ||
+        bs.customTipAngleDynamics === 'initial-direction') &&
+        (bs.thickness ?? 1.0) < 0.85));
 
-  if (!deferDirectionInitialDot) {
+  // For stylus strokes with pressure-sensitive opacity/density/curve or an unpopulated 0.5
+  // Windows Ink / W3C pointerdown sentinel, defer the initial dot until the first real
+  // pointermove delivers confirmed hardware pressure (single taps still stamp cleanly on pointerup).
+  const isPenDown = firstEvent.pointerType === 'pen';
+  const rawPenDownP = firstEvent.pressure ?? 0;
+  const isSentinelPenDown = isPenDown && Math.abs(rawPenDownP - 0.5) < 1e-4;
+  const hasPressureDensityOrCurve = Boolean(
+    bs.usePressure &&
+      (bs.densitySensor?.usePressure ||
+        bs.opacitySensor?.usePressure ||
+        bs.densityOfPaintSensor?.usePressure ||
+        (bs.pressureCurve && bs.pressureCurve.length > 0))
+  );
+  const deferPenInitialDot =
+    !isShiftLine &&
+    !state.naturalPaintSession &&
+    !useWireframeEraser &&
+    isPenDown &&
+    (hasPressureDensityOrCurve || isSentinelPenDown);
+
+  state.deferredInitialDot = deferPenInitialDot;
+  state.deferredStartRawPressure = rawPenDownP;
+
+  if (!deferDirectionInitialDot && !deferPenInitialDot) {
     renderInitialStrokeDot(state, helpers, {
-      draftCtx,
+      draftCtx: activeDrawCtx,
       firstDotPoint,
       bs,
       strokeColor,
@@ -405,11 +548,14 @@ export function runPointerDown(
   } else {
     // Start stamping right at distance 0 on the first movement segment so there is no gap at stroke start
     state.stampRemainderDist = 0;
+    if (state.isDualBrushStroke) {
+      state.dualSecondaryRemainderDist = 0;
+    }
   }
 
   if (isShiftLine && prevStrokeEnd) {
     renderShiftLineInitialSegment(state, helpers, {
-      draftCtx,
+      draftCtx: activeDrawCtx,
       startPoint,
       startNow,
       dirtyRadius: r,
@@ -428,9 +574,39 @@ export function runPointerDown(
     });
   }
 
-  draftCanvas.__draftHasContent = true;
-  draftCanvas.__draftVersion = (draftCanvas.__draftVersion || 0) + 1;
-  params.activeTileGridRef.current.notifyChange(true);
+  if (state.isDualBrushStroke && state.dirtyRect) {
+    syncDualBrushRegionToDraft(
+      state,
+      draftCanvas,
+      draftCtx,
+      bs,
+      state.dirtyRect.minX,
+      state.dirtyRect.minY,
+      state.dirtyRect.maxX,
+      state.dirtyRect.maxY
+    );
+  } else if (state.isStrokePaperTextureActive && state.dirtyRect) {
+    syncStrokePaperTextureRegionToDraft(
+      state,
+      draftCanvas,
+      draftCtx,
+      bs,
+      state.dirtyRect.minX,
+      state.dirtyRect.minY,
+      state.dirtyRect.maxX,
+      state.dirtyRect.maxY
+    );
+  }
+
+  const hasInitialVisualContent =
+    (!deferDirectionInitialDot && !deferPenInitialDot) || (isShiftLine && Boolean(prevStrokeEnd));
+  if (hasInitialVisualContent) {
+    draftCanvas.__draftHasContent = true;
+    draftCanvas.__draftVersion = (draftCanvas.__draftVersion || 0) + 1;
+    params.activeTileGridRef.current.notifyChange(true);
+  } else {
+    draftCanvas.__draftHasContent = false;
+  }
   state.liveNeedsNotify = false;
 
   if (pipeline.getPendingCount() > 0 && state.drawRafId === null) {

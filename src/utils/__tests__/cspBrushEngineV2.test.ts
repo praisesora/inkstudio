@@ -168,7 +168,9 @@ describe('CSP Brush Engine V2 - Mathematics, Sensors & Post-Processing', () => {
     expect(stepBrushSizePreset(0.5, -1)).toBe(0.5);
     expect(stepBrushSizePreset(2000, 1)).toBe(2000);
     expect(BUILTIN_BRUSHES.map((b) => b.id)).toContain('g-pen');
+    expect(BUILTIN_BRUSHES.map((b) => b.id)).toContain('rough-pen');
+    expect(BUILTIN_BRUSHES.map((b) => b.id)).toContain('blend-velvet-soft');
     expect(BUILTIN_BRUSHES.map((b) => b.id)).toContain('impasto-bristle-oil');
-    expect(BUILTIN_BRUSHES.length).toBe(26);
+    expect(BUILTIN_BRUSHES.length).toBe(35);
   });
 });

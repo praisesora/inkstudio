@@ -70,6 +70,8 @@ import {
   sanitizeWireLayerTree,
   serializeLayerForWire,
 } from '../utils/collabSyncUtils';
+import { CollabTransportKind, ICollabTransport } from './collabTransport';
+import { normalizeRoomCode, normalizeRoomSecret } from './webrtcSignaling';
 
 type MessageHandler = (msg: MultiplayerMessage) => void;
 
@@ -120,6 +122,9 @@ const TOOL_TYPES_LIST: ToolType[] = [
   'shape',
   'object',
   '3d',
+  'gradient',
+  'retouch',
+  'pen',
 ];
 
 export const DEEP_LINK_SCHEME = 'inkstudio:';
@@ -131,6 +136,8 @@ export interface ParsedInviteLink {
   url: string;
   token?: string;
   isSecure: boolean;
+  /** Optional custom WebSocket path (defaults to "/ws" when omitted). */
+  wsPath?: string;
 }
 
 export function parseInviteUrl(raw: string): ParsedInviteLink | null {
@@ -145,19 +152,44 @@ export function parseInviteUrl(raw: string): ParsedInviteLink | null {
   }
 
   if (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:') {
+    const hostname = parsedUrl.hostname.trim();
+    if (!hostname) return null;
+    const isTryCloudflare =
+      parsedUrl.protocol === 'https:' && hostname.toLowerCase().endsWith('.trycloudflare.com');
     const roomParam = parsedUrl.searchParams.get('room');
-    if (!roomParam) return null;
+    if (!roomParam && !isTryCloudflare) return null;
     const isSecure = parsedUrl.protocol === 'https:';
     const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : isSecure ? 443 : 80;
     if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
     const token = parsedUrl.searchParams.get('token') || undefined;
     return {
-      roomName: roomParam,
-      host: parsedUrl.hostname,
+      roomName: (roomParam || 'Studio').trim() || 'Studio',
+      host: hostname,
       port,
       url: trimmed,
       token,
       isSecure,
+    };
+  }
+
+  if (parsedUrl.protocol === 'ws:' || parsedUrl.protocol === 'wss:') {
+    const hostname = parsedUrl.hostname.trim();
+    if (!hostname) return null;
+    const isSecure = parsedUrl.protocol === 'wss:';
+    const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : isSecure ? 443 : 80;
+    if (!Number.isFinite(port) || port <= 0 || port > 65535) return null;
+    const roomName = (parsedUrl.searchParams.get('room') || 'Studio').trim() || 'Studio';
+    const token = parsedUrl.searchParams.get('token') || undefined;
+    const pathname = parsedUrl.pathname;
+    const wsPath = pathname && pathname !== '/' && pathname !== '/ws' ? pathname : undefined;
+    return {
+      roomName,
+      host: hostname,
+      port,
+      url: trimmed,
+      token,
+      isSecure,
+      ...(wsPath ? { wsPath } : {}),
     };
   }
 
@@ -185,6 +217,176 @@ export function parseInviteUrl(raw: string): ParsedInviteLink | null {
   }
 
   return null;
+}
+
+export interface ParsedP2pInvite {
+  kind: 'p2p';
+  roomCode: string;
+  roomSecret: string;
+  joinCode: string;
+  roomName: string;
+  signalingUrl?: string;
+  url: string;
+}
+
+export interface ParsedWsInvite extends ParsedInviteLink {
+  kind: 'ws';
+}
+
+export type ParsedCollabTarget = ParsedP2pInvite | ParsedWsInvite;
+
+const P2P_SHORT_CODE_REGEX = /^INK-([A-Z0-9]{4,8})(?:[-:\s]+([A-Z0-9]{4,16}))?$/i;
+
+function sanitizeSignalingUrlParam(raw: string | null): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (
+      parsed.protocol === 'wss:' ||
+      parsed.protocol === 'ws:' ||
+      parsed.protocol === 'https:' ||
+      parsed.protocol === 'http:'
+    ) {
+      return trimmed;
+    }
+  } catch {
+    // ignore invalid signaling URL param
+  }
+  return undefined;
+}
+
+function splitEmbeddedP2pCode(rawCode: string, explicitSecret?: string | null): {
+  roomCode: string;
+  roomSecret: string;
+} | null {
+  const match = rawCode.trim().match(P2P_SHORT_CODE_REGEX);
+  if (!match) return null;
+  const roomCode = normalizeRoomCode(`INK-${match[1]}`);
+  const roomSecret = normalizeRoomSecret(explicitSecret || match[2] || '');
+  return { roomCode, roomSecret };
+}
+
+/**
+ * Auto-detects whether user input is:
+ *  - a short P2P room code (`INK-7429` or `INK-7429-K8P2M9`)
+ *  - a P2P invite link (`https://.../?p2p=INK-7429&secret=...` or `inkstudio://p2p?code=...`)
+ *  - a WebSocket / Cloudflare / LAN invite link (`wss://...`, `ws://...`, `https://...trycloudflare.com`, `http://.../?room=...`)
+ */
+export function parseCollabTarget(raw: string): ParsedCollabTarget | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  // 1. Bare or combined short P2P room code (e.g. INK-7429 or INK-7429-K8P2M9)
+  const directCode = splitEmbeddedP2pCode(trimmed);
+  if (directCode) {
+    const joinCode = directCode.roomSecret
+      ? `${directCode.roomCode}-${directCode.roomSecret}`
+      : directCode.roomCode;
+    return {
+      kind: 'p2p',
+      roomCode: directCode.roomCode,
+      roomSecret: directCode.roomSecret,
+      joinCode,
+      roomName: directCode.roomCode,
+      url: trimmed,
+    };
+  }
+
+  // 2. P2P URL (`https://.../?p2p=INK-7429&secret=...` or `inkstudio://p2p?code=INK-7429&secret=...`)
+  try {
+    const parsedUrl = new URL(trimmed);
+    if (parsedUrl.protocol === 'http:' || parsedUrl.protocol === 'https:') {
+      const p2pParam = parsedUrl.searchParams.get('p2p');
+      if (p2pParam) {
+        const split = splitEmbeddedP2pCode(
+          p2pParam,
+          parsedUrl.searchParams.get('secret') || parsedUrl.searchParams.get('token')
+        );
+        if (split) {
+          const roomName =
+            (parsedUrl.searchParams.get('room') || split.roomCode).trim() || split.roomCode;
+          const signalingUrl = sanitizeSignalingUrlParam(parsedUrl.searchParams.get('sig'));
+          return {
+            kind: 'p2p',
+            roomCode: split.roomCode,
+            roomSecret: split.roomSecret,
+            joinCode: split.roomSecret ? `${split.roomCode}-${split.roomSecret}` : split.roomCode,
+            roomName,
+            ...(signalingUrl ? { signalingUrl } : {}),
+            url: trimmed,
+          };
+        }
+      }
+    } else if (parsedUrl.protocol === DEEP_LINK_SCHEME) {
+      const hostOrPath = `${parsedUrl.hostname}${parsedUrl.pathname}`.toLowerCase();
+      const codeParam = parsedUrl.searchParams.get('code') || parsedUrl.searchParams.get('p2p');
+      if (codeParam && (hostOrPath.includes('p2p') || parsedUrl.searchParams.has('code'))) {
+        const split = splitEmbeddedP2pCode(
+          codeParam,
+          parsedUrl.searchParams.get('secret') || parsedUrl.searchParams.get('token')
+        );
+        if (split) {
+          const roomName =
+            (parsedUrl.searchParams.get('room') || split.roomCode).trim() || split.roomCode;
+          const signalingUrl = sanitizeSignalingUrlParam(parsedUrl.searchParams.get('sig'));
+          return {
+            kind: 'p2p',
+            roomCode: split.roomCode,
+            roomSecret: split.roomSecret,
+            joinCode: split.roomSecret ? `${split.roomCode}-${split.roomSecret}` : split.roomCode,
+            roomName,
+            ...(signalingUrl ? { signalingUrl } : {}),
+            url: trimmed,
+          };
+        }
+      }
+    }
+  } catch {
+    // Not a URL — fall through
+  }
+
+  // 3. WebSocket / Cloudflare / LAN / inkstudio://join invite URL
+  const wsInvite = parseInviteUrl(trimmed);
+  if (wsInvite) {
+    return {
+      kind: 'ws',
+      ...wsInvite,
+    };
+  }
+
+  return null;
+}
+
+export function buildP2pShareUrl(
+  roomCode: string,
+  roomSecret: string,
+  roomName: string,
+  customSignalingUrl?: string
+): string {
+  const params = new URLSearchParams();
+  const sig = sanitizeSignalingUrlParam(customSignalingUrl || null);
+
+  const isWebHttpOrigin =
+    typeof window !== 'undefined' &&
+    (window.location.protocol === 'http:' || window.location.protocol === 'https:') &&
+    window.location.hostname !== 'tauri.localhost' &&
+    window.location.hostname !== '';
+
+  if (isWebHttpOrigin) {
+    params.set('p2p', normalizeRoomCode(roomCode));
+    if (roomSecret) params.set('secret', normalizeRoomSecret(roomSecret));
+    if (roomName) params.set('room', roomName);
+    if (sig) params.set('sig', sig);
+    return `${window.location.origin}/?${params.toString()}`;
+  }
+
+  params.set('code', normalizeRoomCode(roomCode));
+  if (roomSecret) params.set('secret', normalizeRoomSecret(roomSecret));
+  if (roomName) params.set('room', roomName);
+  if (sig) params.set('sig', sig);
+  return `${DEEP_LINK_SCHEME}//p2p?${params.toString()}`;
 }
 
 function sanitizeRemoteBrushSettings(raw: unknown): BrushSettings | null {
@@ -586,9 +788,11 @@ export interface ConnectOptions {
 
 class MultiplayerService {
   private ws: WebSocket | null = null;
+  private transport: ICollabTransport | null = null;
+  private transportUnsubs: Array<() => void> = [];
   private messageHandlers: Set<MessageHandler> = new Set();
-  private closeHandlers: Set<() => void> = new Set();
-  private errorHandlers: Set<(err: Event) => void> = new Set();
+  private closeHandlers: Set<(reason?: string) => void> = new Set();
+  private errorHandlers: Set<(err: Event | Error) => void> = new Set();
   private currentPeer: CollabPeer | null = null;
   private localRole: CollabRole = 'editor';
 
@@ -653,7 +857,16 @@ class MultiplayerService {
   }
 
   public isConnected(): boolean {
-    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    return (
+      (this.ws !== null && this.ws.readyState === WebSocket.OPEN) ||
+      (this.transport !== null && this.transport.isOpen())
+    );
+  }
+
+  public getTransportKind(): CollabTransportKind | null {
+    if (this.transport && this.transport.isOpen()) return this.transport.kind;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return 'ws';
+    return null;
   }
 
   public getPeer(): CollabPeer | null {
@@ -680,10 +893,60 @@ class MultiplayerService {
   }
 
   public getBufferedAmount(): number {
+    if (this.transport) return this.transport.getBufferedAmount();
     return this.ws ? this.ws.bufferedAmount : 0;
   }
 
+  private handleIncomingBinaryPayload(buf: ArrayBuffer): void {
+    const parsed = this.decodeBinaryPacket(buf);
+    if (!parsed) return;
+    if (buf.byteLength >= 7) {
+      const serverSeq = new DataView(buf).getUint32(3, true);
+      if (serverSeq > 0) {
+        parsed.seq = serverSeq;
+        this.updateServerSeq(serverSeq);
+      }
+    }
+    this.notifyHandlers(parsed);
+  }
+
+  private handleIncomingTextPayload(rawText: string): void {
+    if (rawText.length > MAX_JSON_MESSAGE_CHARS) return;
+    const raw = JSON.parse(rawText) as unknown;
+    const sanitized = sanitizeIncomingJsonMessage(raw);
+    if (!sanitized) return;
+    if (typeof sanitized.seq === 'number') {
+      this.updateServerSeq(sanitized.seq);
+    }
+    const remoteLamport = (sanitized as { lamport?: unknown }).lamport;
+    if (typeof remoteLamport === 'number' && Number.isFinite(remoteLamport)) {
+      this.updateLamport(remoteLamport);
+    }
+    this.notifyHandlers(sanitized);
+  }
+
+  private detachTransportQuietly(): void {
+    for (const unsub of this.transportUnsubs) {
+      try {
+        unsub();
+      } catch {
+        // ignore
+      }
+    }
+    this.transportUnsubs = [];
+    if (this.transport) {
+      const closing = this.transport;
+      this.transport = null;
+      try {
+        closing.close();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
   private closeSocketQuietly(): void {
+    this.detachTransportQuietly();
     if (!this.ws) return;
     const closingWs = this.ws;
     this.ws = null;
@@ -695,6 +958,84 @@ class MultiplayerService {
       closingWs.close();
     } catch {
       // ignore close errors
+    }
+  }
+
+  /**
+   * Attaches a custom `ICollabTransport` (e.g., WebRtcHostHub or WebRtcGuestClient)
+   * so the entire existing binary (`IN...`) & JSON protocol works identically over WebRTC.
+   */
+  public attachTransport(
+    transport: ICollabTransport,
+    peer: CollabPeer,
+    options?: ConnectOptions & { sendJoinRequest?: boolean }
+  ): void {
+    const isReconnect = Boolean(options?.isReconnect);
+    if (isReconnect) {
+      this.closeSocketQuietly();
+    } else {
+      this.disconnect();
+    }
+
+    this.transport = transport;
+    this.currentPeer = peer;
+    this.localRole = peer.isHost ? 'host' : peer.role ?? (isReconnect ? this.localRole : 'editor');
+
+    const unsubText = transport.onTextMessage((text) => {
+      if (this.transport !== transport) return;
+      try {
+        this.handleIncomingTextPayload(text);
+      } catch (err) {
+        console.error('[Multiplayer] Failed to parse transport JSON:', err);
+      }
+    });
+
+    const unsubBin = transport.onBinaryMessage((buf) => {
+      if (this.transport !== transport) return;
+      try {
+        this.handleIncomingBinaryPayload(buf);
+      } catch (err) {
+        console.error('[Multiplayer] Failed to parse transport binary:', err);
+      }
+    });
+
+    const unsubClose = transport.onClose((reason) => {
+      if (this.transport === transport) {
+        this.transport = null;
+        this.transportUnsubs = [];
+        this.closeHandlers.forEach((h) => h(reason));
+      }
+    });
+
+    const unsubErr = transport.onError((err) => {
+      if (this.transport !== transport) return;
+      this.errorHandlers.forEach((h) => h(err));
+    });
+
+    this.transportUnsubs = [unsubText, unsubBin, unsubClose, unsubErr];
+
+    const shouldSendJoin =
+      options?.sendJoinRequest !== undefined
+        ? options.sendJoinRequest
+        : transport.kind === 'webrtc-guest';
+
+    if (shouldSendJoin && transport.isOpen()) {
+      const resumeSeq =
+        isReconnect &&
+        typeof options?.sinceSeq === 'number' &&
+        Number.isSafeInteger(options.sinceSeq) &&
+        options.sinceSeq >= 0
+          ? options.sinceSeq
+          : isReconnect
+            ? this.lastServerSeq
+            : undefined;
+
+      this.sendMessage({
+        type: 'JOIN_REQUEST',
+        peer: this.currentPeer,
+        ...(isReconnect ? { isReconnect: true } : {}),
+        ...(resumeSeq !== undefined ? { sinceSeq: resumeSeq } : {}),
+      });
     }
   }
 
@@ -852,6 +1193,19 @@ class MultiplayerService {
   }
 
   public disconnect() {
+    if (this.transport) {
+      if (
+        this.currentPeer &&
+        this.transport.isOpen() &&
+        this.transport.kind !== 'webrtc-host'
+      ) {
+        this.sendMessage({
+          type: 'PEER_LEFT',
+          peerId: this.currentPeer.id,
+        });
+      }
+      this.detachTransportQuietly();
+    }
     if (this.ws) {
       const closingWs = this.ws;
       if (this.currentPeer && closingWs.readyState === WebSocket.OPEN) {
@@ -902,17 +1256,24 @@ class MultiplayerService {
     return () => this.messageHandlers.delete(handler);
   }
 
-  public onClose(handler: () => void): () => void {
+  public onClose(handler: (reason?: string) => void): () => void {
     this.closeHandlers.add(handler);
     return () => this.closeHandlers.delete(handler);
   }
 
-  public onError(handler: (err: Event) => void): () => void {
+  public onError(handler: (err: Event | Error) => void): () => void {
     this.errorHandlers.add(handler);
     return () => this.errorHandlers.delete(handler);
   }
 
   public sendMessage(msg: MultiplayerMessage) {
+    if (this.transport && this.transport.isOpen()) {
+      if (!msg.senderId && this.currentPeer) {
+        msg.senderId = this.currentPeer.id;
+      }
+      this.transport.sendText(JSON.stringify(msg));
+      return;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       if (!msg.senderId && this.currentPeer) {
         msg.senderId = this.currentPeer.id;
@@ -921,7 +1282,15 @@ class MultiplayerService {
     }
   }
 
-  public sendBinary(buffer: ArrayBuffer | Uint8Array) {
+  public sendBinary(buffer: ArrayBuffer | Uint8Array, targetPeerId?: string | number) {
+    if (this.transport && this.transport.isOpen()) {
+      if (targetPeerId !== undefined && this.transport.sendBinaryTo) {
+        this.transport.sendBinaryTo(targetPeerId, buffer);
+        return;
+      }
+      this.transport.sendBinary(buffer);
+      return;
+    }
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(buffer as any);
     }
@@ -959,6 +1328,7 @@ class MultiplayerService {
         if (!safeSettings || !isValidRemotePoint(data?.startPoint)) return null;
         return {
           type: 'STROKE_START',
+          senderId: data.peerId,
           strokeId: String(data.strokeId || '').slice(0, 128),
           peerId: data.peerId,
           peerName: String(data.peerName || 'Peer').slice(0, 64),
@@ -1034,6 +1404,7 @@ class MultiplayerService {
 
         return {
           type: 'STROKE_CHUNK',
+          senderId: peerId,
           strokeId,
           peerId,
           points,
@@ -1045,6 +1416,7 @@ class MultiplayerService {
         const data = JSON.parse(jsonStr);
         return {
           type: 'STROKE_FINISH',
+          senderId: data.peerId,
           strokeId: String(data.strokeId || '').slice(0, 128),
           peerId: data.peerId,
           layerId: String(data.layerId || '').slice(0, 256),
@@ -1158,6 +1530,7 @@ class MultiplayerService {
 
         return {
           type: 'CURSOR_MOVE',
+          senderId: peerId,
           peerId,
           x,
           y,
@@ -1171,6 +1544,7 @@ class MultiplayerService {
         const data = JSON.parse(jsonStr);
         return {
           type: 'SELECTIVE_UNDO',
+          senderId: data.peerId,
           strokeId: data.strokeId,
           peerId: data.peerId,
           lamport: data.lamport,
@@ -1445,14 +1819,16 @@ class MultiplayerService {
   /**
    * Stream a single LZ4-compressed binary tile (or 14-byte deletion tombstone when tile.data === null).
    */
-  public sendTileDelta(layerId: string, tile: TileBuffer) {
+  public sendTileDelta(layerId: string, tile: TileBuffer, targetPeerId?: string | number) {
     if (!this.isConnected() || !this.canSendMutation()) return;
 
     const tileKey = `${layerId}:${tile.tileX}:${tile.tileY}`;
-    if (tile.data === null) {
-      this.sentTileVersions.delete(tileKey);
-    } else if (tile.version > 0) {
-      this.sentTileVersions.set(tileKey, tile.version);
+    if (targetPeerId === undefined) {
+      if (tile.data === null) {
+        this.sentTileVersions.delete(tileKey);
+      } else if (tile.version > 0) {
+        this.sentTileVersions.set(tileKey, tile.version);
+      }
     }
 
     const encoder = new TextEncoder();
@@ -1476,7 +1852,7 @@ class MultiplayerService {
     offset += layerIdBytes.length;
 
     packet.set(tileBytes, offset);
-    this.sendBinary(packet);
+    this.sendBinary(packet, targetPeerId);
   }
 
   /**
@@ -1775,7 +2151,8 @@ class MultiplayerService {
     height: number,
     isFullReplace: boolean,
     solidValue: number | null,
-    pixels: Uint8Array | null
+    pixels: Uint8Array | null,
+    targetPeerId?: string | number
   ) {
     if (!this.isConnected() || !this.canSendMutation() || !layerId || width <= 0 || height <= 0) return;
 
@@ -1825,7 +2202,7 @@ class MultiplayerService {
     offset += 16;
 
     packet.set(body, offset);
-    this.sendBinary(packet);
+    this.sendBinary(packet, targetPeerId);
   }
 
   public sendLayerMaskSolid(
@@ -1833,13 +2210,19 @@ class MultiplayerService {
     width: number,
     height: number,
     value: number = 255,
-    isFullReplace: boolean = true
+    isFullReplace: boolean = true,
+    targetPeerId?: string | number
   ) {
     if (!this.isConnected() || width <= 0 || height <= 0) return;
-    this.sendMaskPacket(layerId, 0, 0, width, height, isFullReplace, value, null);
+    this.sendMaskPacket(layerId, 0, 0, width, height, isFullReplace, value, null, targetPeerId);
   }
 
-  public sendLayerMaskData(layerId: string, maskCanvas: HTMLCanvasElement, rect?: DirtyRect) {
+  public sendLayerMaskData(
+    layerId: string,
+    maskCanvas: HTMLCanvasElement,
+    rect?: DirtyRect,
+    targetPeerId?: string | number
+  ) {
     if (!this.isConnected() || !maskCanvas || maskCanvas.width <= 0 || maskCanvas.height <= 0) {
       return;
     }
@@ -1874,7 +2257,8 @@ class MultiplayerService {
         extracted.height,
         isFull,
         extracted.solidValue,
-        extracted.solidValue === null ? extracted.pixels : null
+        extracted.solidValue === null ? extracted.pixels : null,
+        targetPeerId
       );
       return;
     }
@@ -1915,7 +2299,7 @@ class MultiplayerService {
     // Fast collapse if all chunks share the same uniform solid fill
     const firstSolid = chunks[0].solidValue;
     if (firstSolid !== null && chunks.every((c) => c.solidValue === firstSolid)) {
-      this.sendMaskPacket(layerId, x0, y0, totalW, totalH, isFull, firstSolid, null);
+      this.sendMaskPacket(layerId, x0, y0, totalW, totalH, isFull, firstSolid, null, targetPeerId);
       return;
     }
 
@@ -1930,7 +2314,17 @@ class MultiplayerService {
       const end = Math.min(idx + 8, chunks.length);
       for (; idx < end; idx++) {
         const c = chunks[idx];
-        this.sendMaskPacket(layerId, c.x, c.y, c.width, c.height, false, c.solidValue, c.pixels);
+        this.sendMaskPacket(
+          layerId,
+          c.x,
+          c.y,
+          c.width,
+          c.height,
+          false,
+          c.solidValue,
+          c.pixels,
+          targetPeerId
+        );
       }
       if (idx < chunks.length) {
         setTimeout(pump, 4);

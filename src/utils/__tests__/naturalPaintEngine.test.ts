@@ -690,7 +690,9 @@ describe('Natural Paint Engine — Bristles, Spatial Mixing, Surface Textures & 
     engineMid.emitCubicSegment(strokePts[0], strokePts[1], strokePts[2], strokePts[3], samplerMid);
 
     // Green dominates both red and blue (subtractive Yellow+Blue = Green, not swallowed into pure blue)
-    expect(engineMid.reservoir.g[midBristle]).toBeGreaterThan(120);
+    expect(engineMid.reservoir.g[midBristle]).toBeGreaterThan(100);
+    expect(engineMid.reservoir.g[midBristle]).toBeGreaterThan(engineMid.reservoir.r[midBristle] + 35);
+    expect(engineMid.reservoir.g[midBristle]).toBeGreaterThan(engineMid.reservoir.b[midBristle] + 10);
     expect(engineMid.reservoir.b[midBristle]).toBeLessThan(150);
   });
 });

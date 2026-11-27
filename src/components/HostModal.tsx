@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   SessionHostInfo,
   CollabPeer,
   CollabRole,
   ConnectionStatus,
 } from '../types/multiplayer';
+import { parseCollabTarget } from '../services/multiplayerService';
+import { MAX_WEBRTC_PEERS } from '../services/webrtcHostHub';
 import {
   Users,
   Copy,
@@ -22,6 +24,7 @@ import {
   Ban,
   UserX,
   RefreshCw,
+  Radio,
 } from 'lucide-react';
 
 interface HostModalProps {
@@ -44,8 +47,18 @@ interface HostModalProps {
     isGlobal?: boolean,
     onStatus?: (status: string) => void
   ) => Promise<any>;
+  onStartWebRtcHosting?: (
+    roomName: string,
+    hostNickname?: string,
+    onStatus?: (status: string) => void
+  ) => Promise<any>;
   onStopHosting: () => void;
-  onJoinByInviteUrl: (rawUrl: string, nickname?: string, persistName?: boolean) => Promise<boolean>;
+  onJoinByInviteUrl: (
+    rawUrl: string,
+    nickname?: string,
+    persistName?: boolean,
+    secretOverride?: string
+  ) => Promise<boolean>;
   onLeaveRoom: () => void;
   onSetPeerRole?: (peerId: string | number, role: 'editor' | 'viewer') => void;
   onKickPeer?: (peerId: string | number) => void;
@@ -73,6 +86,7 @@ export const HostModal: React.FC<HostModalProps> = ({
   myPeer,
   onUpdateMyName,
   onStartHosting,
+  onStartWebRtcHosting,
   onStopHosting,
   onJoinByInviteUrl,
   onLeaveRoom,
@@ -86,9 +100,13 @@ export const HostModal: React.FC<HostModalProps> = ({
   const [nickname, setNickname] = useState(myPeer.name || 'Artist');
   const [roomName, setRoomName] = useState(() => defaultStudioName(myPeer.name));
   const [port, setPort] = useState(30303);
-  const [isGlobal, setIsGlobal] = useState(true);
+  const [hostMode, setHostMode] = useState<'p2p' | 'tunnel' | 'lan'>(() =>
+    onStartWebRtcHosting ? 'p2p' : 'tunnel'
+  );
   const [joinUrl, setJoinUrl] = useState('');
+  const [manualSecret, setManualSecret] = useState('');
   const [copied, setCopied] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(false);
   const [copiedLocal, setCopiedLocal] = useState(false);
   const [isStarting, setIsStarting] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
@@ -97,6 +115,14 @@ export const HostModal: React.FC<HostModalProps> = ({
 
   const nicknameEditedRef = useRef(false);
   const roomNameEditedRef = useRef(false);
+
+  const parsedJoinTarget = useMemo(() => {
+    const trimmed = joinUrl.trim();
+    if (!trimmed) return null;
+    return parseCollabTarget(trimmed);
+  }, [joinUrl]);
+
+  const isP2pSession = hostInfo?.transport === 'webrtc';
 
   // Sync nickname & default room name when OS username resolves or Preferences changes
   useEffect(() => {
@@ -108,12 +134,13 @@ export const HostModal: React.FC<HostModalProps> = ({
     }
   }, [myPeer.name]);
 
-  // Reset transient error when modal re-opens
+  // Reset transient error and default to P2P mode whenever modal opens
   useEffect(() => {
     if (isOpen) {
       setStartError(null);
+      setHostMode(onStartWebRtcHosting ? 'p2p' : 'tunnel');
     }
-  }, [isOpen]);
+  }, [isOpen, onStartWebRtcHosting]);
 
   // Escape key closes modal
   useEffect(() => {
@@ -143,6 +170,19 @@ export const HostModal: React.FC<HostModalProps> = ({
     }
   };
 
+  const handleCopyCode = async () => {
+    const code = hostInfo?.joinCode || hostInfo?.roomCode;
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopiedCode(true);
+      showToast('Room code copied.');
+      setTimeout(() => setCopiedCode(false), 2000);
+    } catch {
+      showToast('Failed to copy to clipboard.');
+    }
+  };
+
   const handleCopyLocalLink = async () => {
     if (!hostInfo?.localInviteUrl) return;
     try {
@@ -155,20 +195,35 @@ export const HostModal: React.FC<HostModalProps> = ({
     }
   };
 
-  const handleStart = async (overrideGlobal?: boolean) => {
-    const useGlobal = overrideGlobal !== undefined ? overrideGlobal : isGlobal;
+  const handleStart = async (overrideMode?: 'tunnel' | 'p2p' | 'lan') => {
+    const mode = overrideMode ?? hostMode;
     setIsStarting(true);
     setStartError(null);
-    setStartStatus(useGlobal ? 'Starting Worldwide Tunnel...' : 'Starting Local Server...');
+    setStartStatus(
+      mode === 'p2p'
+        ? 'Opening Quick P2P Room...'
+        : mode === 'tunnel'
+          ? 'Starting Worldwide Tunnel...'
+          : 'Starting Local Server...'
+    );
     try {
       const resolvedName = nickname.trim() || myPeer.name || 'Artist';
       if (nicknameEditedRef.current && resolvedName !== myPeer.name) {
         onUpdateMyName(resolvedName);
       }
       const resolvedRoom = roomName.trim() || defaultStudioName(resolvedName);
-      await onStartHosting(resolvedRoom, port, resolvedName, useGlobal, (status) => {
-        setStartStatus(status);
-      });
+      if (mode === 'p2p') {
+        if (!onStartWebRtcHosting) {
+          throw new Error('Quick P2P hosting is unavailable in this context.');
+        }
+        await onStartWebRtcHosting(resolvedRoom, resolvedName, (status) => {
+          setStartStatus(status);
+        });
+      } else {
+        await onStartHosting(resolvedRoom, port, resolvedName, mode === 'tunnel', (status) => {
+          setStartStatus(status);
+        });
+      }
     } catch (err: any) {
       const msg = err?.message || (typeof err === 'string' ? err : 'Failed to start server');
       setStartError(msg);
@@ -182,7 +237,7 @@ export const HostModal: React.FC<HostModalProps> = ({
     e.preventDefault();
     const trimmedUrl = joinUrl.trim();
     if (!trimmedUrl) {
-      showToast('Paste a room invite link first.');
+      showToast('Enter a room code (INK-XXXX) or invite link first.');
       return;
     }
     setIsJoining(true);
@@ -191,9 +246,16 @@ export const HostModal: React.FC<HostModalProps> = ({
       if (nicknameEditedRef.current && resolvedName !== myPeer.name) {
         onUpdateMyName(resolvedName);
       }
-      const ok = await onJoinByInviteUrl(trimmedUrl, resolvedName, nicknameEditedRef.current);
+      const extraSecret =
+        parsedJoinTarget?.kind === 'p2p' && !parsedJoinTarget.roomSecret
+          ? manualSecret.trim() || undefined
+          : undefined;
+      const ok = extraSecret
+        ? await onJoinByInviteUrl(trimmedUrl, resolvedName, nicknameEditedRef.current, extraSecret)
+        : await onJoinByInviteUrl(trimmedUrl, resolvedName, nicknameEditedRef.current);
       if (ok) {
         setJoinUrl('');
+        setManualSecret('');
         onClose();
       }
     } finally {
@@ -281,7 +343,21 @@ export const HostModal: React.FC<HostModalProps> = ({
           ) : isConnected && isHost ? (
             // Active Host View
             <div className="space-y-4">
-              {hostInfo?.isGlobal ? (
+              {isP2pSession ? (
+                <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3.5 flex items-start gap-3">
+                  <Radio className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-medium text-emerald-300">
+                      Quick P2P Room Active (WebRTC)
+                    </div>
+                    <div className="text-[11px] text-[#b5b5b5] mt-0.5">
+                      Room: <span className="text-[#e5e5e5] font-medium">{hostInfo?.roomName}</span>{' '}
+                      — Android tablets &amp; PCs can join worldwide with the short code below (up to{' '}
+                      {MAX_WEBRTC_PEERS} guests).
+                    </div>
+                  </div>
+                </div>
+              ) : hostInfo?.isGlobal ? (
                 <div className="rounded-md border border-[var(--accent-border)] bg-[#161616] p-3.5 flex items-start gap-3">
                   <Globe className="w-4 h-4 text-[var(--accent)] shrink-0 mt-0.5" />
                   <div className="flex-1 min-w-0">
@@ -309,59 +385,115 @@ export const HostModal: React.FC<HostModalProps> = ({
                 </div>
               )}
 
-              {/* Shareable Link Box */}
-              <div>
-                <label className="block text-[11px] font-medium text-[#8a8a8a] mb-1.5 flex items-center justify-between">
-                  <span>
-                    {hostInfo?.isGlobal
-                      ? 'Worldwide Invite Link (Browser or Desktop App)'
-                      : 'Local Wi-Fi Invite Link'}
-                  </span>
-                  {hostInfo?.isGlobal && (
-                    <span className="text-[10px] text-[var(--accent)] font-mono flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                      <span>HTTPS + WSS</span>
-                    </span>
-                  )}
-                </label>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    readOnly
-                    value={hostInfo?.inviteUrl || ''}
-                    className="flex-1 rounded border border-[#2c2c2c] bg-[#161616] px-3 py-1.5 text-xs text-[#e5e5e5] font-mono select-all focus:outline-hidden"
-                  />
-                  <button
-                    type="button"
-                    onClick={handleCopyLink}
-                    className="flex items-center gap-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 px-3 py-1.5 text-xs font-medium transition-opacity shrink-0 cursor-pointer"
-                  >
-                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                    <span>{copied ? 'Copied' : 'Copy'}</span>
-                  </button>
-                </div>
+              {/* Shareable Code / Link Box */}
+              {isP2pSession ? (
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-[11px] font-medium text-[#8a8a8a] mb-1.5 flex items-center justify-between">
+                      <span>Quick P2P Room Code (Android &amp; Desktop)</span>
+                      <span className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                        <span>WEBRTC P2P</span>
+                      </span>
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        readOnly
+                        data-testid="host-p2p-join-code"
+                        value={hostInfo?.joinCode || hostInfo?.roomCode || ''}
+                        className="flex-1 rounded border border-[#2c2c2c] bg-[#161616] px-3 py-1.5 text-sm font-bold tracking-wider text-[#e5e5e5] font-mono select-all focus:outline-hidden"
+                      />
+                      <button
+                        type="button"
+                        onClick={handleCopyCode}
+                        className="flex items-center gap-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 px-3 py-1.5 text-xs font-medium transition-opacity shrink-0 cursor-pointer"
+                      >
+                        {copiedCode ? (
+                          <Check className="w-3.5 h-3.5" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                        <span>{copiedCode ? 'Copied' : 'Copy Code'}</span>
+                      </button>
+                    </div>
+                  </div>
 
-                {hostInfo?.isGlobal && hostInfo.localInviteUrl && (
-                  <div className="mt-2 pt-2 border-t border-[#2c2c2c] flex items-center justify-between text-[10px] text-[#8a8a8a]">
-                    <span className="truncate">
-                      Local LAN:{' '}
-                      <span className="font-mono text-[#b5b5b5]">{hostInfo.localInviteUrl}</span>
+                  {hostInfo?.inviteUrl && (
+                    <div className="pt-2 border-t border-[#2c2c2c] flex items-center justify-between text-[10px] text-[#8a8a8a]">
+                      <span className="truncate">
+                        Invite Link:{' '}
+                        <span className="font-mono text-[#b5b5b5]">{hostInfo.inviteUrl}</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleCopyLink}
+                        className="text-[#b5b5b5] hover:text-[#e5e5e5] underline cursor-pointer ml-2 shrink-0"
+                      >
+                        {copied ? 'Copied' : 'Copy Link'}
+                      </button>
+                    </div>
+                  )}
+
+                  <p className="text-[10px] text-[#8a8a8a] leading-relaxed">
+                    Share this Room Code with Android tablet or desktop users — no cloudflared
+                    required. Keep this app open while hosting.
+                  </p>
+                </div>
+              ) : (
+                <div>
+                  <label className="text-[11px] font-medium text-[#8a8a8a] mb-1.5 flex items-center justify-between">
+                    <span>
+                      {hostInfo?.isGlobal
+                        ? 'Worldwide Invite Link (Browser or Desktop App)'
+                        : 'Local Wi-Fi Invite Link'}
                     </span>
+                    {hostInfo?.isGlobal && (
+                      <span className="text-[10px] text-[var(--accent)] font-mono flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                        <span>HTTPS + WSS</span>
+                      </span>
+                    )}
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      readOnly
+                      value={hostInfo?.inviteUrl || ''}
+                      className="flex-1 rounded border border-[#2c2c2c] bg-[#161616] px-3 py-1.5 text-xs text-[#e5e5e5] font-mono select-all focus:outline-hidden"
+                    />
                     <button
                       type="button"
-                      onClick={handleCopyLocalLink}
-                      className="text-[#b5b5b5] hover:text-[#e5e5e5] underline cursor-pointer ml-2 shrink-0"
+                      onClick={handleCopyLink}
+                      className="flex items-center gap-1.5 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 px-3 py-1.5 text-xs font-medium transition-opacity shrink-0 cursor-pointer"
                     >
-                      {copiedLocal ? 'Copied' : 'Copy Local'}
+                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{copied ? 'Copied' : 'Copy'}</span>
                     </button>
                   </div>
-                )}
 
-                <p className="text-[10px] text-[#8a8a8a] mt-1.5 leading-relaxed">
-                  Share this link to open directly in a browser or paste it into the Join tab in the
-                  desktop app.
-                </p>
-              </div>
+                  {hostInfo?.isGlobal && hostInfo.localInviteUrl && (
+                    <div className="mt-2 pt-2 border-t border-[#2c2c2c] flex items-center justify-between text-[10px] text-[#8a8a8a]">
+                      <span className="truncate">
+                        Local LAN:{' '}
+                        <span className="font-mono text-[#b5b5b5]">{hostInfo.localInviteUrl}</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleCopyLocalLink}
+                        className="text-[#b5b5b5] hover:text-[#e5e5e5] underline cursor-pointer ml-2 shrink-0"
+                      >
+                        {copiedLocal ? 'Copied' : 'Copy Local'}
+                      </button>
+                    </div>
+                  )}
+
+                  <p className="text-[10px] text-[#8a8a8a] mt-1.5 leading-relaxed">
+                    Share this link to open directly in a browser or paste it into the Join tab in the
+                    desktop app.
+                  </p>
+                </div>
+              )}
 
               {/* Connected Peers List */}
               <div>
@@ -490,19 +622,31 @@ export const HostModal: React.FC<HostModalProps> = ({
             // Active Guest View
             <div className="space-y-4">
               <div className="rounded-md border border-[var(--accent-border)] bg-[#161616] p-3.5 flex items-start gap-3">
-                <Globe className="w-4 h-4 text-[var(--accent)] shrink-0 mt-0.5" />
+                {isP2pSession ? (
+                  <Radio className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                ) : (
+                  <Globe className="w-4 h-4 text-[var(--accent)] shrink-0 mt-0.5" />
+                )}
                 <div className="flex-1 min-w-0">
-                  <div className="text-xs font-medium text-[#e5e5e5]">Connected to Session</div>
+                  <div className="text-xs font-medium text-[#e5e5e5]">
+                    {isP2pSession ? 'Connected via WebRTC P2P' : 'Connected to Session'}
+                  </div>
                   <div className="text-[11px] text-[#8a8a8a] mt-0.5 truncate">
                     Room:{' '}
                     <span className="text-[#e5e5e5] font-medium">
                       {hostInfo?.roomName || 'Studio'}
                     </span>
                   </div>
-                  {hostInfo?.localIp && (
+                  {isP2pSession && hostInfo?.roomCode ? (
                     <div className="text-[10px] text-[#8a8a8a] font-mono truncate mt-0.5">
-                      {hostInfo.localIp}
+                      Code: {hostInfo.joinCode || hostInfo.roomCode}
                     </div>
+                  ) : (
+                    hostInfo?.localIp && (
+                      <div className="text-[10px] text-[#8a8a8a] font-mono truncate mt-0.5">
+                        {hostInfo.localIp}
+                      </div>
+                    )
                   )}
                 </div>
               </div>
@@ -588,7 +732,7 @@ export const HostModal: React.FC<HostModalProps> = ({
                       : 'text-[#8a8a8a] hover:text-[#e5e5e5]'
                   }`}
                 >
-                  Join via Link
+                  Join Room
                 </button>
               </div>
 
@@ -633,52 +777,98 @@ export const HostModal: React.FC<HostModalProps> = ({
                     <label className="block text-[11px] font-medium text-[#b5b5b5] mb-1.5">
                       Connection Mode
                     </label>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsGlobal(true);
-                          setStartError(null);
-                        }}
-                        className={`flex items-start gap-2 rounded-md border p-2.5 text-left transition-colors cursor-pointer ${
-                          isGlobal
-                            ? 'border-[var(--accent-border)] bg-[var(--accent-subtle)] text-[#e5e5e5]'
-                            : 'border-[#2c2c2c] bg-[#161616] text-[#8a8a8a] hover:border-[#3a3a3a] hover:text-[#e5e5e5]'
-                        }`}
-                      >
-                        <Globe
-                          className={`w-4 h-4 shrink-0 mt-0.5 ${isGlobal ? 'text-[var(--accent)]' : 'text-[#8a8a8a]'}`}
-                        />
-                        <div>
-                          <div className="text-xs font-medium">Worldwide (Internet)</div>
-                          <div className="text-[10px] opacity-75">Cloudflare Tunnel</div>
-                        </div>
-                      </button>
+                    <div className="space-y-2">
+                      {onStartWebRtcHosting && (
+                        <button
+                          type="button"
+                          data-testid="host-mode-p2p-btn"
+                          aria-pressed={hostMode === 'p2p'}
+                          onClick={() => {
+                            setHostMode('p2p');
+                            setStartError(null);
+                          }}
+                          className={`w-full flex items-start gap-2.5 rounded-md border p-2.5 text-left transition-colors cursor-pointer ${
+                            hostMode === 'p2p'
+                              ? 'border-[var(--accent-border)] bg-[var(--accent-subtle)] text-[#e5e5e5]'
+                              : 'border-[#2c2c2c] bg-[#161616] text-[#8a8a8a] hover:border-[#3a3a3a] hover:text-[#e5e5e5]'
+                          }`}
+                        >
+                          <Radio
+                            className={`w-4 h-4 shrink-0 mt-0.5 ${hostMode === 'p2p' ? 'text-[var(--accent)]' : 'text-[#8a8a8a]'}`}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="text-xs font-medium">
+                                Worldwide P2P (Room Code)
+                              </span>
+                              <span className="text-[9px] font-medium px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25 leading-none">
+                                Recommended
+                              </span>
+                            </div>
+                            <div className="text-[10px] opacity-75 mt-0.5">
+                              Fast direct INK-XXXX code for PC &amp; Android tablets · No setup
+                            </div>
+                          </div>
+                        </button>
+                      )}
 
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setIsGlobal(false);
-                          setStartError(null);
-                        }}
-                        className={`flex items-start gap-2 rounded-md border p-2.5 text-left transition-colors cursor-pointer ${
-                          !isGlobal
-                            ? 'border-[var(--accent-border)] bg-[var(--accent-subtle)] text-[#e5e5e5]'
-                            : 'border-[#2c2c2c] bg-[#161616] text-[#8a8a8a] hover:border-[#3a3a3a] hover:text-[#e5e5e5]'
-                        }`}
-                      >
-                        <Wifi
-                          className={`w-4 h-4 shrink-0 mt-0.5 ${!isGlobal ? 'text-[var(--accent)]' : 'text-[#8a8a8a]'}`}
-                        />
-                        <div>
-                          <div className="text-xs font-medium">Local Network Only</div>
-                          <div className="text-[10px] opacity-75">Same Wi-Fi network</div>
-                        </div>
-                      </button>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          data-testid="host-mode-tunnel-btn"
+                          aria-pressed={hostMode === 'tunnel'}
+                          onClick={() => {
+                            setHostMode('tunnel');
+                            setStartError(null);
+                          }}
+                          className={`flex items-start gap-2 rounded-md border p-2.5 text-left transition-colors cursor-pointer ${
+                            hostMode === 'tunnel'
+                              ? 'border-[var(--accent-border)] bg-[var(--accent-subtle)] text-[#e5e5e5]'
+                              : 'border-[#2c2c2c] bg-[#161616] text-[#8a8a8a] hover:border-[#3a3a3a] hover:text-[#e5e5e5]'
+                          }`}
+                        >
+                          <Globe
+                            className={`w-4 h-4 shrink-0 mt-0.5 ${hostMode === 'tunnel' ? 'text-[var(--accent)]' : 'text-[#8a8a8a]'}`}
+                          />
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium leading-tight">
+                              Web Link (Cloudflare Tunnel)
+                            </div>
+                            <div className="text-[10px] opacity-75 mt-0.5">
+                              Browser guests &amp; up to 16 peers
+                            </div>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid="host-mode-lan-btn"
+                          aria-pressed={hostMode === 'lan'}
+                          onClick={() => {
+                            setHostMode('lan');
+                            setStartError(null);
+                          }}
+                          className={`flex items-start gap-2 rounded-md border p-2.5 text-left transition-colors cursor-pointer ${
+                            hostMode === 'lan'
+                              ? 'border-[var(--accent-border)] bg-[var(--accent-subtle)] text-[#e5e5e5]'
+                              : 'border-[#2c2c2c] bg-[#161616] text-[#8a8a8a] hover:border-[#3a3a3a] hover:text-[#e5e5e5]'
+                          }`}
+                        >
+                          <Wifi
+                            className={`w-4 h-4 shrink-0 mt-0.5 ${hostMode === 'lan' ? 'text-[var(--accent)]' : 'text-[#8a8a8a]'}`}
+                          />
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium leading-tight">
+                              Local Network (LAN)
+                            </div>
+                            <div className="text-[10px] opacity-75 mt-0.5">Same Wi-Fi network</div>
+                          </div>
+                        </button>
+                      </div>
                     </div>
                   </div>
 
-                  {!isGlobal && (
+                  {hostMode === 'lan' && (
                     <div>
                       <label className="block text-[11px] font-medium text-[#b5b5b5] mb-1.5">
                         Local Port
@@ -701,17 +891,31 @@ export const HostModal: React.FC<HostModalProps> = ({
                         <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-400" />
                         <span className="break-words">{startError}</span>
                       </div>
-                      {isGlobal && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setIsGlobal(false);
-                            void handleStart(false);
-                          }}
-                          className="text-[11px] text-[#e5e5e5] underline hover:text-white cursor-pointer"
-                        >
-                          Start Local Wi-Fi Server instead
-                        </button>
+                      {hostMode === 'tunnel' && (
+                        <div className="flex flex-wrap gap-3">
+                          {onStartWebRtcHosting && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setHostMode('p2p');
+                                void handleStart('p2p');
+                              }}
+                              className="text-[11px] text-[#e5e5e5] underline hover:text-white cursor-pointer"
+                            >
+                              Start Quick P2P Room instead
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setHostMode('lan');
+                              void handleStart('lan');
+                            }}
+                            className="text-[11px] text-[#e5e5e5] underline hover:text-white cursor-pointer"
+                          >
+                            Start Local Wi-Fi Server instead
+                          </button>
+                        </div>
                       )}
                     </div>
                   )}
@@ -720,18 +924,25 @@ export const HostModal: React.FC<HostModalProps> = ({
                     <div className="flex items-center gap-1.5 text-[#e5e5e5] font-medium">
                       <Shield className="w-3.5 h-3.5 text-[#8a8a8a]" />
                       <span>
-                        {isGlobal ? 'Encrypted Worldwide Tunnel' : 'Local Wi-Fi Access'}
+                        {hostMode === 'p2p'
+                          ? 'Direct Encrypted WebRTC P2P'
+                          : hostMode === 'tunnel'
+                            ? 'Encrypted Worldwide Tunnel'
+                            : 'Local Wi-Fi Access'}
                       </span>
                     </div>
                     <p className="leading-relaxed">
-                      {isGlobal
-                        ? 'Launches a Cloudflare HTTPS/WSS tunnel (HTTP/2 over port 443) so friends on any network can join in a browser or desktop app.'
-                        : 'Reachable only by devices on the same Wi-Fi network or virtual LAN (e.g. Tailscale).'}
+                      {hostMode === 'p2p'
+                        ? `Generates a short Room Code (INK-XXXX-XXXXXX) with zero server setup or cloudflared download. Android tablets and desktop apps connect directly over WebRTC (up to ${MAX_WEBRTC_PEERS} guests).`
+                        : hostMode === 'tunnel'
+                          ? 'Launches a Cloudflare HTTPS/WSS tunnel (HTTP/2 over port 443) so friends on any network can join in a browser or desktop app.'
+                          : 'Reachable only by devices on the same Wi-Fi network or virtual LAN (e.g. Tailscale).'}
                     </p>
                   </div>
 
                   <button
                     type="button"
+                    data-testid="host-start-btn"
                     disabled={isStarting}
                     onClick={() => void handleStart()}
                     className="w-full flex items-center justify-center gap-2 rounded bg-[var(--accent)] text-[var(--accent-contrast)] hover:opacity-90 py-2 text-xs font-medium transition-opacity disabled:opacity-50 cursor-pointer"
@@ -741,17 +952,27 @@ export const HostModal: React.FC<HostModalProps> = ({
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
                         <span>
                           {startStatus ||
-                            (isGlobal ? 'Starting Worldwide Tunnel...' : 'Starting Server...')}
+                            (hostMode === 'p2p'
+                              ? 'Opening P2P Room...'
+                              : hostMode === 'tunnel'
+                                ? 'Starting Worldwide Tunnel...'
+                                : 'Starting Server...')}
                         </span>
                       </>
                     ) : (
                       <>
-                        {isGlobal ? (
+                        {hostMode === 'p2p' ? (
+                          <Radio className="w-3.5 h-3.5" />
+                        ) : hostMode === 'tunnel' ? (
                           <Globe className="w-3.5 h-3.5" />
                         ) : (
                           <Users className="w-3.5 h-3.5" />
                         )}
-                        <span>Start Server &amp; Copy Link</span>
+                        <span>
+                          {hostMode === 'p2p'
+                            ? 'Start Room & Copy Code'
+                            : 'Start Server & Copy Link'}
+                        </span>
                       </>
                     )}
                   </button>
@@ -761,19 +982,61 @@ export const HostModal: React.FC<HostModalProps> = ({
                   <div>
                     <label className="text-[11px] font-medium text-[#b5b5b5] mb-1.5 flex items-center gap-1.5">
                       <Link2 className="w-3.5 h-3.5 text-[#8a8a8a]" />
-                      <span>Invite Link</span>
+                      <span>Room Code (INK-XXXX...) or Invite Link</span>
                     </label>
                     <input
                       type="text"
+                      data-testid="join-target-input"
                       value={joinUrl}
                       onChange={(e) => setJoinUrl(e.target.value)}
-                      placeholder="https://....trycloudflare.com/?room=...&token=..."
+                      placeholder="INK-7429-K8P2M9 or invite link (ws://, wss://, trycloudflare.com)"
                       className="w-full rounded border border-[#2c2c2c] bg-[#161616] px-3 py-2 text-xs text-[#e5e5e5] font-mono focus:border-[var(--accent-border)] focus:outline-hidden"
                     />
+                    {parsedJoinTarget && (
+                      <div
+                        data-testid="join-target-badge"
+                        className="mt-1.5 flex items-center gap-1.5 text-[10px] font-mono text-emerald-400"
+                      >
+                        {parsedJoinTarget.kind === 'p2p' ? (
+                          <>
+                            <Radio className="w-3 h-3 shrink-0" />
+                            <span>
+                              WebRTC P2P Room detected ({parsedJoinTarget.roomCode})
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <Globe className="w-3 h-3 shrink-0" />
+                            <span>
+                              {parsedJoinTarget.isSecure
+                                ? 'Secure WebSocket (WSS)'
+                                : 'WebSocket (WS)'}{' '}
+                              detected ({parsedJoinTarget.host})
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    )}
                     <p className="text-[10px] text-[#8a8a8a] mt-1">
-                      Paste the full worldwide or LAN invite link shared by the host.
+                      Paste an Android/PC P2P Room Code (INK-XXXX-XXXXXX), P2P invite link, or
+                      Cloudflare / LAN WebSocket URL.
                     </p>
                   </div>
+
+                  {parsedJoinTarget?.kind === 'p2p' && !parsedJoinTarget.roomSecret && (
+                    <div>
+                      <label className="block text-[11px] font-medium text-[#b5b5b5] mb-1.5">
+                        Room Passcode (if separate)
+                      </label>
+                      <input
+                        type="text"
+                        value={manualSecret}
+                        onChange={(e) => setManualSecret(e.target.value.toUpperCase())}
+                        placeholder="e.g. K8P2M9"
+                        className="w-full rounded border border-[#2c2c2c] bg-[#161616] px-3 py-2 text-xs text-[#e5e5e5] font-mono focus:border-[var(--accent-border)] focus:outline-hidden"
+                      />
+                    </div>
+                  )}
 
                   <button
                     type="submit"
@@ -787,8 +1050,16 @@ export const HostModal: React.FC<HostModalProps> = ({
                       </>
                     ) : (
                       <>
-                        <Link2 className="w-3.5 h-3.5" />
-                        <span>Join Session</span>
+                        {parsedJoinTarget?.kind === 'p2p' ? (
+                          <Radio className="w-3.5 h-3.5" />
+                        ) : (
+                          <Link2 className="w-3.5 h-3.5" />
+                        )}
+                        <span>
+                          {parsedJoinTarget?.kind === 'p2p'
+                            ? 'Join P2P Room'
+                            : 'Join Session'}
+                        </span>
                       </>
                     )}
                   </button>

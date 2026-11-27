@@ -11,6 +11,7 @@ import {
   applyRetouchStrokeSegment,
   createRetouchStrokeSession,
 } from '../../utils/retouchEngine';
+import { detectWhitePaperGround } from '../../utils/pigmentEngine';
 import { createSelectionMask } from '../../utils/tonalEngine';
 import { documentStore } from '../../utils/documentStore';
 import { TileFormat } from '../../utils/tileEngine';
@@ -167,6 +168,7 @@ export function useRetouchTool({
         layerId: activeLayerId,
         targetFormat,
         alphaLock: Boolean(activeLayer.alphaLocked),
+        pigmentWhiteGround: detectWhitePaperGround(layers, activeLayerId, grid),
         dimensions,
         selectionMask: selMask,
         cloneOffset,

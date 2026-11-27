@@ -183,7 +183,7 @@ export function downsample2x2ToParentTile(
             dst[outIdx + 3] = 255;
           } else {
             const halfA = sumA >> 1;
-            dst[outIdx + 3] = sumA >> 2;
+            dst[outIdx + 3] = (sumA + 2) >> 2;
             dst[outIdx] = ((childData[p00] * a0 + childData[p10] * a1 + childData[p01] * a2 + childData[p11] * a3 + halfA) / sumA) | 0;
             dst[outIdx + 1] = ((childData[p00 + 1] * a0 + childData[p10 + 1] * a1 + childData[p01 + 1] * a2 + childData[p11 + 1] * a3 + halfA) / sumA) | 0;
             dst[outIdx + 2] = ((childData[p00 + 2] * a0 + childData[p10 + 2] * a1 + childData[p01 + 2] * a2 + childData[p11 + 2] * a3 + halfA) / sumA) | 0;

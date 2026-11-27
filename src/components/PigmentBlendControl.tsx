@@ -33,16 +33,16 @@ interface SwatchPair {
 }
 
 const DEFAULT_PAIRS: readonly SwatchPair[] = [
-  { id: 'blue-yellow', label: 'Blue + Yellow', c1: '#0084ff', c2: '#fff000' },
-  { id: 'green-magenta', label: 'Green + Magenta', c1: '#28ff00', c2: '#ff00a6' },
-  { id: 'sky-cream', label: 'Sky + Cream', c1: '#4fa8ff', c2: '#fffef0' },
+  { id: 'blue-yellow', label: 'Blue + Yellow', c1: '#002185', c2: '#fcd300' },
+  { id: 'navy-white', label: 'Navy + White', c1: '#0d1b44', c2: '#ffffff' },
+  { id: 'crimson-yellow', label: 'Crimson + Yellow', c1: '#80022e', c2: '#fcd300' },
 ];
 
 const PREVIEW_STEPS = 14;
 
 /**
- * Computes a CSS linear-gradient string directly from Ink Studio's 7-band Kubelka-Munk
- * spectral pigment engine so the UI swatch matches canvas blending 1:1.
+ * Computes a CSS linear-gradient string directly from Ink Studio's physical Kubelka-Munk
+ * pigment engine so the UI swatch matches canvas blending 1:1.
  */
 export function buildPigmentPreviewGradient(
   colorA: string,
@@ -131,7 +131,7 @@ export const PigmentBlendControl: React.FC<PigmentBlendControlProps> = React.mem
                 : 'bg-white/[0.04] text-[#7a7a7a] border-white/[0.07]'
             }`}
           >
-            {enabled ? 'Spectral' : 'RGB'}
+            {enabled ? 'Pigment' : 'RGB'}
           </span>
         </div>
 

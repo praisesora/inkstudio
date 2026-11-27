@@ -1,5 +1,49 @@
 # Changelog
 
+## v1.0.4
+
+### New
+- Added custom in-app confirmation and alert dialogs (including a delete confirmation with brush preview for custom brushes), replacing all browser popups
+- Added a dedicated Filter settings dialog (`Gaussian Blur`, `Motion Blur`, `Unsharp Mask`, and `Film Grain`) with sliders and reset controls
+- Added detachable, free-floating windows for all studio panels with drag-and-drop docking, resizing, one-click Pin/Unpin, a panel menu, and automatic layout saving
+- Added Worldwide peer-to-peer collaborative rooms using short `INK-XXXX-XXXXXX` room codes (up to 8 guests) with auto-reconnect and optional custom server settings
+- Added Ribbon brush support for smooth, continuous decorative strokes
+- Added full Dual Brush support
+- Added two-color brush tip support using both primary and secondary colors
+- Added real-life pigment color mixing for brushes, Smudge, Blur, and Gradients — colors now blend naturally like real paint (blue + yellow makes vibrant green, red + yellow makes bright orange, and dark colors fade cleanly into light tones instead of turning gray)
+- Added a simple Regular / Pigment toggle and Pigment Strength slider for every brush so you can switch back to standard blending anytime
+- Added a new Blend section with 6 dedicated blending brushes
+- Added Rough Pen to the Pen section for organic, textured ink linework
+- Added Optical Blur and Blur Strength sliders in the Brush Inspector and Brush Studio for smoother blending
+
+### Improvements
+- Redesigned older dialogs and panels to match Ink Studio's dark theme with consistent buttons, layout, and `Esc` closing behavior
+- Made panel tab dragging smoother with clear drop previews and synced visibility when hiding/showing palettes (`Tab`)
+- Made Worldwide Room Code the default connection mode in Collaborative Drawing and improved reliability when syncing large canvases
+- Reworked `Chalk Painting` and `Blend Chalk Brush` from scratch with sharper tips, richer paper grain, and smoother blending
+- Greatly improved Clip Studio Paint (`.sut`) brush import with full-resolution tips and paper textures, better color jitter, blending, and accurate brush previews
+- Improved paper texture effects and brush color mixing to feel closer to Clip Studio Paint
+- Improved pen tablet responsiveness and stroke stabilization for lower lag, faster stroke response, and smoother line endings
+- Reworked G-Pen, Real G-Pen, and Textured Pen to better match the feel, tilt response, and edge texture of classic inking pens
+- Upgraded built-in brush tips to higher resolution so bristles and textures stay crisp at large sizes
+- Improved Brush Studio scratchpad and brush preview swatches so blending brushes and textured pens preview more accurately
+- Old built-in brush presets and Quick Access shortcuts now automatically update to the new brushes while keeping your Sketch and Natural Paint settings intact
+- Improved brush responsiveness and reduced lag across Blend, Natural Paint, and heavy oil brushes (especially Loaded Impasto Oil and Dry Bristle Rake), making blending much smoother on large canvases
+
+### Bug Fixes
+- Fixed strokes cutting off, ending short, or fading out early on Windows Ink tablets and tight curves
+- Fixed light stylus pressure turning into nearly invisible hairlines mid-stroke on `G-Pen` and `Real G-Pen`
+- Fixed heavy lag and end-of-stroke freezes when painting or blending with color-mixing brushes
+- Fixed brush strokes losing quality or blurring after using the Transform tool (`Ctrl+T`)
+- Fixed watercolor edges appearing too dark or disappearing on color-mixing brushes
+- Fixed some large imported `.sut` brushes getting the wrong size
+- Fixed semi-transparent strokes becoming overly dark when overlapping
+- Fixed Textured Pen not showing up when drawing over filled or opaque layers
+- Fixed subtle angle jitter looking inaccurate in brush list previews
+- Fixed pure blending brushes leaving foreground color on blank areas of the canvas
+- Fixed settings carrying over between brushes when switching presets
+- Fixed ghost strokes briefly reappearing on the canvas when drawing right after pressing `Ctrl+Z`
+
 ## v1.0.3
 
 ### New

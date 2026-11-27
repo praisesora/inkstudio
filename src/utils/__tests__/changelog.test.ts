@@ -8,12 +8,30 @@ import {
 } from '../changelog';
 
 describe('changelog parser', () => {
-  it('parses bundled CHANGELOG.md including v1.0.3, v1.0.2, and v1.0.1 sections', () => {
+  it('parses bundled CHANGELOG.md including v1.0.4, v1.0.3, v1.0.2, and v1.0.1 sections', () => {
     const entries = getChangelogEntries();
-    expect(entries.length).toBeGreaterThanOrEqual(3);
+    expect(entries.length).toBeGreaterThanOrEqual(4);
 
     const latest = getChangelogForVersion();
-    expect(latest?.version).toBe('1.0.3');
+    expect(latest?.version).toBe('1.0.4');
+
+    const v104 = getChangelogForVersion('1.0.4');
+    expect(v104).toBeDefined();
+    expect(v104?.version).toBe('1.0.4');
+    expect(v104?.sections.map((s) => s.title)).toEqual([
+      'New',
+      'Improvements',
+      'Bug Fixes',
+    ]);
+    expect(v104?.sections[0].items).toContain(
+      'Added full Dual Brush support'
+    );
+    expect(v104?.sections[1].items).toContain(
+      'Improved paper texture effects and brush color mixing to feel closer to Clip Studio Paint'
+    );
+    expect(v104?.sections[2].items).toContain(
+      'Fixed ghost strokes briefly reappearing on the canvas when drawing right after pressing `Ctrl+Z`'
+    );
 
     const v103 = getChangelogForVersion('1.0.3');
     expect(v103).toBeDefined();

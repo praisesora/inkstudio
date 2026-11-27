@@ -7,6 +7,7 @@ import type {
   BrushSettings,
   CspAngleDynamicsMode,
   CspPaperTextureMode,
+  CspSubTipOrder,
   CspTaperSettings,
   CspTipFlipMode,
   GrainMappingMode,
@@ -240,7 +241,7 @@ export const ShapeBristlesTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch })
                 </div>
               ))}
             </div>
-            <StudioSegmented<'random' | 'sequential' | 'direction' | 'reverse'>
+            <StudioSegmented<CspSubTipOrder>
               label="Sub-Tip Order"
               value={bs.subTipOrder ?? 'sequential'}
               options={[
@@ -723,10 +724,31 @@ export const TextureGrainTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) 
 export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => {
   const dualInputRef = useRef<HTMLInputElement>(null);
 
+  const patchDual = (patch: Partial<typeof bs>) => {
+    const baseCfg = bs.dualBrushConfig;
+    const nextEnabled = patch.dualBrush !== undefined ? patch.dualBrush : (baseCfg?.enabled ?? Boolean(bs.dualBrush));
+    const nextCfg = baseCfg
+      ? {
+          ...baseCfg,
+          enabled: nextEnabled,
+          ...(patch.dualBrushCompositeMode !== undefined
+            ? { compositeMode: patch.dualBrushCompositeMode as NonNullable<typeof bs.dualBrushConfig>['compositeMode'] }
+            : {}),
+          ...(patch.dualScale !== undefined ? { sizeRatio: patch.dualScale } : {}),
+          ...(patch.dualAngle !== undefined ? { angle: patch.dualAngle } : {}),
+          ...(patch.dualScatter !== undefined ? { scatter: patch.dualScatter } : {}),
+          ...(patch.dualSpacing !== undefined ? { spacing: patch.dualSpacing } : {}),
+          ...(patch.dualTipDataUrl !== undefined ? { tipDataUrl: patch.dualTipDataUrl } : {}),
+          ...(patch.dualTipImage !== undefined ? { tipImage: patch.dualTipImage } : {}),
+        }
+      : undefined;
+    onPatch(nextCfg ? { ...patch, dualBrushConfig: nextCfg } : patch);
+  };
+
   const handleUploadDualTip = async (file: File) => {
     try {
       const res = await readImageFileAsDataUrl(file);
-      onPatch({
+      patchDual({
         dualBrush: true,
         dualTipDataUrl: res.dataUrl,
         dualTipImage: res.image,
@@ -743,7 +765,7 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
           label="Enable Dual Brush Compositing"
           description="Modulate primary tip with a secondary tip shape"
           checked={Boolean(bs.dualBrush)}
-          onChange={(v) => onPatch({ dualBrush: v })}
+          onChange={(v) => patchDual({ dualBrush: v })}
         />
 
         {bs.dualBrush && (
@@ -771,7 +793,7 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
                     onClick={() => {
                       const url = generateNaturalTipByProfile('rake');
                       const img = url ? getPreloadedBuiltinTipImage(url) : undefined;
-                      onPatch({ dualTipDataUrl: url, dualTipImage: img });
+                      patchDual({ dualTipDataUrl: url, dualTipImage: img });
                     }}
                     className="px-2 py-1 rounded bg-[#242424] hover:bg-[#323232] text-[10px] text-[#cccccc] cursor-pointer"
                   >
@@ -792,13 +814,27 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
               />
             </div>
 
-            <StudioSegmented<'multiply' | 'subtract' | 'darken' | 'overlay' | 'screen'>
+            <StudioSegmented<
+              | 'multiply'
+              | 'subtract'
+              | 'darken'
+              | 'height'
+              | 'linear-burn'
+              | 'color-burn'
+              | 'compare-density'
+              | 'overlay'
+              | 'screen'
+            >
               label="Composite Blend Mode"
               value={
                 ((bs.dualBrushCompositeMode as
                   | 'multiply'
                   | 'subtract'
                   | 'darken'
+                  | 'height'
+                  | 'linear-burn'
+                  | 'color-burn'
+                  | 'compare-density'
                   | 'overlay'
                   | 'screen') || 'multiply')
               }
@@ -806,10 +842,14 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
                 { id: 'multiply', label: 'Multiply' },
                 { id: 'subtract', label: 'Subtract' },
                 { id: 'darken', label: 'Darken' },
+                { id: 'height', label: 'Height' },
+                { id: 'linear-burn', label: 'Lin Burn' },
+                { id: 'color-burn', label: 'Col Burn' },
+                { id: 'compare-density', label: 'Compare' },
                 { id: 'overlay', label: 'Overlay' },
                 { id: 'screen', label: 'Screen' },
               ]}
-              onChange={(v) => onPatch({ dualBrushCompositeMode: v })}
+              onChange={(v) => patchDual({ dualBrushCompositeMode: v })}
             />
 
             <StudioSlider
@@ -818,7 +858,7 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
               min={20}
               max={300}
               valueLabel={`${Math.round((bs.dualScale ?? 1.0) * 100)}%`}
-              onChange={(v) => onPatch({ dualScale: v / 100 })}
+              onChange={(v) => patchDual({ dualScale: v / 100 })}
             />
             <StudioSlider
               label="Dual Angle"
@@ -826,7 +866,7 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
               min={-180}
               max={180}
               valueLabel={`${Math.round(bs.dualAngle ?? 0)}°`}
-              onChange={(v) => onPatch({ dualAngle: v })}
+              onChange={(v) => patchDual({ dualAngle: v })}
             />
             <StudioSlider
               label="Dual Scatter"
@@ -834,7 +874,7 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
               min={0}
               max={200}
               valueLabel={`${Math.round((bs.dualScatter ?? 0) * 100)}%`}
-              onChange={(v) => onPatch({ dualScatter: v / 100 })}
+              onChange={(v) => patchDual({ dualScatter: v / 100 })}
             />
             <StudioSlider
               label="Dual Spacing"
@@ -842,7 +882,7 @@ export const DualBrushTab: React.FC<BrushStudioTabProps> = ({ bs, onPatch }) => 
               min={2}
               max={100}
               valueLabel={`${Math.round((bs.dualSpacing ?? 0.1) * 100)}%`}
-              onChange={(v) => onPatch({ dualSpacing: v / 100 })}
+              onChange={(v) => patchDual({ dualSpacing: v / 100 })}
             />
           </>
         )}

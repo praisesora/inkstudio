@@ -192,18 +192,24 @@ export class SplineGenerator {
     const d12 = Math.hypot(p2.x - p1.x, p2.y - p1.y);
     const d23 = Math.hypot(p3.x - p2.x, p3.y - p2.y);
 
+    // Guard degenerate micro-chords (<1e-3 px) so floating-point dust never skews tangent directions
+    const effP0 = d01 < 1e-3 ? p1 : p0;
+    const effP3 = d23 < 1e-3 ? p2 : p3;
+    const effD01 = d01 < 1e-3 ? 0 : d01;
+    const effD23 = d23 < 1e-3 ? 0 : d23;
+
     // Centripetal parameterization (alpha = 0.5): dt = sqrt(chord)
-    const dt0 = Math.max(1e-4, Math.sqrt(d01));
+    const dt0 = Math.max(1e-4, Math.sqrt(effD01));
     const dt1 = Math.max(1e-4, Math.sqrt(d12));
-    const dt2 = Math.max(1e-4, Math.sqrt(d23));
+    const dt2 = Math.max(1e-4, Math.sqrt(effD23));
 
     // Non-uniform centripetal Catmull-Rom tangents at P1 and P2:
     // m1 = (P1-P0)/dt0 - (P2-P0)/(dt0+dt1) + (P2-P1)/dt1  (reduces to (P2-P0)/2 for uniform knots)
-    const t1x = (p1.x - p0.x) / dt0 - (p2.x - p0.x) / (dt0 + dt1) + (p2.x - p1.x) / dt1;
-    const t1y = (p1.y - p0.y) / dt0 - (p2.y - p0.y) / (dt0 + dt1) + (p2.y - p1.y) / dt1;
+    const t1x = (p1.x - effP0.x) / dt0 - (p2.x - effP0.x) / (dt0 + dt1) + (p2.x - p1.x) / dt1;
+    const t1y = (p1.y - effP0.y) / dt0 - (p2.y - effP0.y) / (dt0 + dt1) + (p2.y - p1.y) / dt1;
 
-    const t2x = (p2.x - p1.x) / dt1 - (p3.x - p1.x) / (dt1 + dt2) + (p3.x - p2.x) / dt2;
-    const t2y = (p2.y - p1.y) / dt1 - (p3.y - p1.y) / (dt1 + dt2) + (p3.y - p2.y) / dt2;
+    const t2x = (p2.x - p1.x) / dt1 - (effP3.x - p1.x) / (dt1 + dt2) + (effP3.x - p2.x) / dt2;
+    const t2y = (p2.y - p1.y) / dt1 - (effP3.y - p1.y) / (dt1 + dt2) + (effP3.y - p2.y) / dt2;
 
     let dx1 = (t1x * dt1) / 3.0;
     let dy1 = (t1y * dt1) / 3.0;

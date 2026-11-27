@@ -54,7 +54,11 @@ export function calculateStrokeWidth(
 
   const minRatio = Math.max(0, Math.min(1.0, minSizeFactor ?? 0));
   const dynamicWidth = baseSize * (minRatio + (1.0 - minRatio) * curvePressure) * velocityScale;
-  return Math.max(0.1, dynamicWidth);
+  // Keep light continuous pen contact (> 0.005) above sub-pixel invisible collapse (width = 0.1),
+  // while still allowing flick taper tails (pressure <= 0.005) to razor-taper down to 0.1px.
+  const contactFloor =
+    effectivePressure > 0.005 ? Math.min(baseSize, Math.max(0.35, baseSize * minRatio)) : 0.1;
+  return Math.max(contactFloor, dynamicWidth);
 }
 
 /**

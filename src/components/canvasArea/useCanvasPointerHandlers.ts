@@ -10,7 +10,7 @@ import { ModifierAction } from '../../types/settings';
 import { CanvasNavigationHandle } from '../../hooks/useCanvasNavigation';
 import { screenToCanvas } from '../../utils/canvasUtils';
 import { resolvePointerModifierAction } from '../../utils/shortcutManager';
-import { isNativePenStreamActive } from '../../utils/nativeTabletInput';
+import { shouldSuppressDomPointerEvent } from '../../utils/nativeTabletInput';
 import { artworkTimeTracker } from '../../utils/artworkTimeTracker';
 import { toolStoreActions, useToolStore, useUiStore } from '../../stores';
 import { extractCoalescedEvents, extractPredictedEvents } from './types';
@@ -290,11 +290,11 @@ export function useCanvasPointerHandlers({
       return;
     }
 
-    // Native WinTab / Windows Ink channel owns pen brush/eraser strokes; skip duplicate DOM PointerEvent.
+    // Native WinTab / Windows Ink channel owns pen brush/eraser strokes; skip duplicate DOM
+    // pen events AND WinTab CXO_SYSTEM-synthesized mouse events (which carry constant pressure=0.5).
     if (
-      e.pointerType === 'pen' &&
-      isNativePenStreamActive() &&
-      (tool === 'brush' || tool === 'eraser')
+      (tool === 'brush' || tool === 'eraser') &&
+      shouldSuppressDomPointerEvent(e.pointerType, e.clientX, e.clientY)
     ) {
       return;
     }
@@ -310,9 +310,8 @@ export function useCanvasPointerHandlers({
 
   const handleCanvasPointerMove = (e: React.PointerEvent<HTMLElement>) => {
     if (
-      e.pointerType === 'pen' &&
-      isNativePenStreamActive() &&
-      (tool === 'brush' || tool === 'eraser')
+      (tool === 'brush' || tool === 'eraser') &&
+      shouldSuppressDomPointerEvent(e.pointerType, e.clientX, e.clientY)
     ) {
       return;
     }
@@ -330,9 +329,8 @@ export function useCanvasPointerHandlers({
   const handleCanvasPointerUp = (e: React.PointerEvent<HTMLElement>) => {
     if (
       !(
-        e.pointerType === 'pen' &&
-        isNativePenStreamActive() &&
-        (tool === 'brush' || tool === 'eraser')
+        (tool === 'brush' || tool === 'eraser') &&
+        shouldSuppressDomPointerEvent(e.pointerType, e.clientX, e.clientY)
       )
     ) {
       onPointerUp(e);
