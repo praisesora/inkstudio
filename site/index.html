@@ -4,12 +4,27 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.github.com; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
-  <title>Ink Studio — Digital Painting, Manga &amp; Collaboration</title>
-  <meta name="description" content="Open-source desktop application for digital painting, illustration, and manga. WebGL brushes, sparse-tile and vector layers, manga panels, 3D pose reference, cel animation, and real-time Rust multiplayer.">
-  <meta name="theme-color" content="#141414">
-  <meta property="og:title" content="Ink Studio — Digital Painting &amp; Manga Studio">
-  <meta property="og:description" content="WebGL brush engine, manga &amp; webtoon tools, 3D pose reference, cel animation, and real-time multiplayer. Built with Tauri, Rust, and React.">
+  <title>Ink Studio — Natural Paint, Manga Ink &amp; Shared Canvases</title>
+  <meta name="description" content="Free, open-source painting and manga studio for desktop. Real pigment mixing, 3D impasto, Clip Studio .sut/.clip import, 3D color sphere, manga tools, and live multiplayer. No subscriptions, no AI.">
+  <meta name="theme-color" content="#0f0e0d">
+
+  <!-- Open Graph / Social Preview -->
+  <meta property="og:site_name" content="Ink Studio">
+  <meta property="og:title" content="Ink Studio — Natural Paint, Manga Ink &amp; Shared Canvases">
+  <meta property="og:description" content="Free, open-source painting and manga app built by an artist. Pigment mixing, 3D impasto, .clip &amp; .sut brush import, and real-time collaborative canvases.">
   <meta property="og:type" content="website">
+  <meta property="og:url" content="https://praisesora.github.io/inkstudio/">
+  <meta property="og:image" content="https://praisesora.github.io/inkstudio/assets/og-preview.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Oil portrait painted in Ink Studio alongside headline: Natural paint, manga ink &amp; shared canvases.">
+
+  <!-- Twitter / X / Bluesky Card -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Ink Studio — Natural Paint, Manga Ink &amp; Shared Canvases">
+  <meta name="twitter:description" content="Free, open-source desktop painting &amp; manga app. Real pigment mixing, 3D impasto, .sut/.clip import, and live multiplayer. No subscriptions, no AI.">
+  <meta name="twitter:image" content="https://praisesora.github.io/inkstudio/assets/og-preview.jpg">
+
   <link rel="icon" href="./assets/favicon.ico" sizes="any">
   <link rel="icon" type="image/png" href="./assets/app-icon.png">
   <link rel="stylesheet" href="./styles.css">
@@ -24,14 +39,15 @@
       </a>
 
       <nav class="nav-links" aria-label="Primary">
-        <a href="#features">Features</a>
+        <a href="#pigment">Pigment Paint</a>
+        <a href="#gallery">Artwork</a>
+        <a href="#features">Tools</a>
+        <a href="#studio">Try Canvas</a>
         <a href="#download">Download</a>
-        <a href="#formats">Formats</a>
-        <a href="#releases">Releases</a>
       </nav>
 
       <div class="header-actions">
-        <a href="https://discord.gg/37dYhgBePe" target="_blank" rel="noopener noreferrer" class="header-link hide-sm" title="Discord">Discord</a>
+        <a href="https://discord.gg/37dYhgBePe" target="_blank" rel="noopener noreferrer" class="header-link hide-sm" title="Join Discord community">Discord</a>
         <a href="https://github.com/praisesora/inkstudio" target="_blank" rel="noopener noreferrer" class="header-link hide-sm" title="Source code on GitHub">GitHub</a>
         <a href="#download" id="header-download-btn" class="btn btn-primary btn-sm">Download</a>
       </div>
@@ -39,41 +55,378 @@
   </header>
 
   <main id="top" class="page">
-    <!-- Hero -->
-    <section id="studio" class="hero">
-      <div class="hero-header">
+    <!-- Hero: Artwork-First Studio Split -->
+    <section class="hero" aria-label="Introduction">
+      <div class="hero-grid">
         <div class="hero-copy">
           <p class="hero-meta">
-            <span>Open-source desktop app</span>
+            <span>Free &amp; open-source</span>
             <span class="sep" aria-hidden="true">/</span>
-            <span>GPL-3.0</span>
+            <span>No subscriptions</span>
             <span class="sep" aria-hidden="true">/</span>
-            <span id="hero-release-pill" class="mono">Tauri + Rust</span>
+            <span>No AI</span>
+            <span class="sep" aria-hidden="true">/</span>
+            <span id="hero-release-pill" class="mono">GPL-3.0</span>
           </p>
-          <h1>Digital painting and manga, built for desktop.</h1>
+
+          <h1>Natural paint, manga ink, and shared canvases.</h1>
+
           <p class="hero-lead">
-            WebGL brushes, sparse-tile and vector layers, manga panels, 3D pose reference,
-            cel animation, and built-in multiplayer. Local-first with zero telemetry.
+            A desktop painting and manga app built by an artist. Mix colors like real pigment with
+            3D impasto relief, bring your Clip Studio <code>.sut</code> brushes and <code>.clip</code>
+            files, or send a link to draw together live.
           </p>
+
+          <div class="hero-cta">
+            <div class="cta-row">
+              <a id="primary-download-btn" href="https://github.com/praisesora/inkstudio/releases/latest" class="btn btn-primary btn-lg">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                <span id="primary-download-label">Download Latest</span>
+              </a>
+              <a href="#studio" class="btn btn-secondary btn-lg">Try browser canvas</a>
+            </div>
+            <p id="primary-download-meta" class="cta-meta mono">Windows x64 installer · macOS &amp; Linux from source · Opens .psd, .clip &amp; .sut</p>
+          </div>
         </div>
 
-        <div class="hero-cta">
-          <div class="cta-row">
-            <a id="primary-download-btn" href="https://github.com/praisesora/inkstudio/releases/latest" class="btn btn-primary btn-lg">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              <span id="primary-download-label">Download Latest</span>
-            </a>
-            <a href="#download" class="btn btn-secondary btn-lg">All Installers</a>
+        <figure class="hero-plate">
+          <div class="plate-stage">
+            <button type="button" class="plate-zoom-trigger" id="hero-plate-zoom" aria-label="Inspect artwork full size">
+              <img
+                id="hero-plate-img"
+                src="./assets/gallery/meri-oil-portrait.webp"
+                alt="Expressive impasto oil portrait painted in Ink Studio showing textured brushstrokes and translucent wrap highlights"
+                width="1600"
+                height="1178"
+                decoding="async"
+                fetchpriority="high"
+              >
+            </button>
           </div>
-          <p id="primary-download-meta" class="cta-meta mono">Windows x64 · Auto-updates built in</p>
+
+          <figcaption class="plate-bar">
+            <div class="plate-tabs" role="tablist" aria-label="Preview artwork and workspaces">
+              <button
+                type="button"
+                class="plate-tab active"
+                role="tab"
+                aria-selected="true"
+                data-src="./assets/gallery/meri-oil-portrait.webp"
+                data-alt="Expressive impasto oil portrait painted in Ink Studio"
+                data-caption="Painted in Ink Studio — Natural Paint &amp; 3D Impasto"
+              >01 Oil &amp; Impasto</button>
+              <button
+                type="button"
+                class="plate-tab"
+                role="tab"
+                aria-selected="false"
+                data-src="./assets/gallery/ui-illustration.webp"
+                data-alt="Ink Studio Illustration workspace with crimson portrait and brush dock"
+                data-caption="Illustration workspace — custom oil brushes, Wintab &amp; Windows Ink"
+              >02 Illustration UI</button>
+              <button
+                type="button"
+                class="plate-tab"
+                role="tab"
+                aria-selected="false"
+                data-src="./assets/gallery/ui-manga.webp"
+                data-alt="Ink Studio Manga workspace showing monochrome black and white character ink"
+                data-caption="Manga Studio workspace — G-Pen hatching, Quick Access &amp; tone tools"
+              >03 Manga Ink</button>
+            </div>
+            <span id="hero-plate-caption" class="plate-caption">Painted in Ink Studio — Natural Paint &amp; 3D Impasto</span>
+          </figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <!-- Pigment Mixing & Natural Paint Spotlight -->
+    <section id="pigment" class="section">
+      <div class="pigment-split">
+        <figure class="pigment-figure">
+          <button
+            type="button"
+            class="zoomable-frame pigment-mat"
+            data-lightbox-src="./assets/gallery/pigment-blend.webp"
+            data-lightbox-caption="Comparison inside Ink Studio: standard RGB averaging vs. pigment color mixing with and without impasto bristle relief"
+            aria-label="Inspect pigment mixing comparison full size"
+          >
+            <img
+              src="./assets/gallery/pigment-blend.webp"
+              alt="Side-by-side comparison of Regular RGB blending turning gray versus Ink Studio Pigment blending producing rich green with impasto bristle relief and smooth painterly blending"
+              width="1600"
+              height="900"
+              loading="lazy"
+              decoding="async"
+            >
+          </button>
+        </figure>
+
+        <div class="pigment-copy">
+          <p class="eyebrow">Natural Paint &amp; Impasto</p>
+          <h2>Blue and yellow actually make green.</h2>
+          <p class="body-copy">
+            Regular digital brushes average RGB values into muddy gray the moment two colors meet.
+            Ink Studio mixes pigment like physical paint on individual bristles—with canvas-tooth
+            valley fill, dry-brush drag, watercolor granulation, and thick 3D impasto ridges that catch the light.
+          </p>
+          <ul class="plain-list">
+            <li>Dual-channel RGBA + paint heightmap with directional impasto shading</li>
+            <li>4 canvas grain mapping modes for dry brush, chalk, oil, and watercolor</li>
+            <li>Dedicated 8-tab Brush Studio with a live scratchpad to tweak feel fast</li>
+            <li>Import your favorite Clip Studio Paint <code>.sut</code> brushes in seconds</li>
+          </ul>
         </div>
       </div>
+    </section>
 
-      <!-- Interactive Studio Canvas -->
+    <!-- Made in Ink Studio Gallery -->
+    <section id="gallery" class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Gallery</p>
+          <h2>Painted and inked in Ink Studio.</h2>
+        </div>
+        <span class="section-note">Click any piece to zoom in on brushwork and paper grain</span>
+      </div>
+
+      <div class="art-spread">
+        <figure class="art-card art-card-tall">
+          <button
+            type="button"
+            class="zoomable-frame"
+            data-lightbox-src="./assets/gallery/chiaroscuro-study.webp"
+            data-lightbox-caption="Chiaroscuro figure study — warm glazing and fine canvas grain in Ink Studio"
+            aria-label="Inspect Chiaroscuro study full size"
+          >
+            <img
+              src="./assets/gallery/chiaroscuro-study.webp"
+              alt="Warm sepia chiaroscuro classical portrait painted on textured canvas grain in Ink Studio"
+              width="1400"
+              height="1925"
+              loading="lazy"
+              decoding="async"
+            >
+          </button>
+          <figcaption class="art-caption">
+            <span class="art-title">Chiaroscuro Study</span>
+            <span class="art-meta">Canvas grain &amp; warm glazing</span>
+          </figcaption>
+        </figure>
+
+        <div class="art-stack">
+          <figure class="art-card">
+            <button
+              type="button"
+              class="zoomable-frame"
+              data-lightbox-src="./assets/gallery/crimson-portrait.webp"
+              data-lightbox-caption="Crimson Portrait — painterly oil blending and specular highlights in Ink Studio"
+              aria-label="Inspect Crimson Portrait full size"
+            >
+              <img
+                src="./assets/gallery/crimson-portrait.webp"
+                alt="Expressive crimson digital oil portrait painted in Ink Studio"
+                width="1600"
+                height="1200"
+                loading="lazy"
+                decoding="async"
+              >
+            </button>
+            <figcaption class="art-caption">
+              <span class="art-title">Crimson Portrait</span>
+              <span class="art-meta">Oil brush blending &amp; wet edges</span>
+            </figcaption>
+          </figure>
+
+          <figure class="art-card">
+            <button
+              type="button"
+              class="zoomable-frame"
+              data-lightbox-src="./assets/gallery/ui-pencil.webp"
+              data-lightbox-caption="6B / 8B Graphite Sketch inside Ink Studio — natural pencil grain and tilt sensitivity"
+              aria-label="Inspect Graphite Sketch full size"
+            >
+              <img
+                src="./assets/gallery/ui-pencil.webp"
+                alt="Pencil sketch of a dark fantasy swordsman drawn using 6B and 8B pencil brushes in Ink Studio"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+              >
+            </button>
+            <figcaption class="art-caption">
+              <span class="art-title">6B / 8B Graphite Sketch</span>
+              <span class="art-meta">Pencil tooth &amp; tilt shading</span>
+            </figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <!-- Visual Tool Highlights -->
+    <section id="features" class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Studio Tools</p>
+          <h2>Built around how artists actually work.</h2>
+        </div>
+        <span class="section-note">Local-first · Crash recovery · Zero telemetry</span>
+      </div>
+
+      <div class="showcase-rows">
+        <!-- Row 1: 3D Color Sphere -->
+        <article class="showcase-row showcase-row-sphere">
+          <div class="showcase-media showcase-media-sphere">
+            <button
+              type="button"
+              class="zoomable-frame sphere-frame"
+              data-lightbox-src="./assets/gallery/ui-color-sphere.png"
+              data-lightbox-caption="3D Color Sphere Picker — sample shadow, base, highlight, and rim tones with live lighting moods and B&amp;W value checking"
+              aria-label="Inspect 3D Color Sphere Picker full size"
+            >
+              <img
+                src="./assets/gallery/ui-color-sphere.png"
+                alt="Ink Studio 3D Color Sphere Picker panel showing lit sphere with shadow, midtone, highlight, and rim color slots"
+                width="368"
+                height="784"
+                loading="lazy"
+                decoding="async"
+              >
+            </button>
+          </div>
+          <div class="showcase-copy">
+            <p class="eyebrow">Color &amp; Values</p>
+            <h3>A lit 3D color sphere instead of guessing shadows.</h3>
+            <p class="body-copy">
+              Sample painterly shadow, base, highlight, and rim tones directly off an interactive
+              sphere. Rotate the light, switch lighting mood presets, flip to B&amp;W to check values
+              in one click, or unpin it as a floating palette anywhere over your canvas.
+            </p>
+            <p class="detail-note">
+              Also includes a classic Color Wheel, Color Sliders, CMYK soft proofing with gamut warning,
+              and a Sub View reference window you can eyedrop straight from.
+            </p>
+          </div>
+        </article>
+
+        <!-- Row 2: Real-Time Multiplayer -->
+        <article class="showcase-row showcase-row-reverse">
+          <div class="showcase-media">
+            <button
+              type="button"
+              class="zoomable-frame media-frame"
+              data-lightbox-src="./assets/gallery/ui-collab.webp"
+              data-lightbox-caption="Collaborative Drawing dialog — host a live canvas room over LAN or worldwide tunnel and share a browser invite link"
+              aria-label="Inspect Collaborative Drawing dialog full size"
+            >
+              <img
+                src="./assets/gallery/ui-collab.webp"
+                alt="Ink Studio Collaborative Drawing window showing Host Session over Worldwide Cloudflare Tunnel or Local Network"
+                width="1400"
+                height="875"
+                loading="lazy"
+                decoding="async"
+              >
+            </button>
+          </div>
+          <div class="showcase-copy">
+            <p class="eyebrow">Multiplayer Canvas</p>
+            <h3>Draw together live—friends don’t even have to install it.</h3>
+            <p class="body-copy">
+              Start a room for up to 16 artists over Wi-Fi or the internet in one click. Copy the
+              invite link and friends can paint right alongside you from the desktop app or directly
+              in their web browser.
+            </p>
+            <p class="detail-note">
+              Full layer-tree sync, live cursors, Host/Editor/Viewer permissions, layer locking so
+              nobody paints over your lineart, and automatic reconnect.
+            </p>
+          </div>
+        </article>
+
+        <!-- Row 3: Manga, Webtoon & 3D Pose -->
+        <article class="showcase-row">
+          <div class="showcase-media">
+            <button
+              type="button"
+              class="zoomable-frame media-frame"
+              data-lightbox-src="./assets/gallery/ui-manga.webp"
+              data-lightbox-caption="Manga Studio workspace — G-Pen, Quick Access strip, frame borders, tones, perspective rulers, and 3D reference"
+              aria-label="Inspect Manga Studio workspace full size"
+            >
+              <img
+                src="./assets/gallery/ui-manga.webp"
+                alt="Ink Studio Manga workspace showing crisp black and white inked character art with G-Pen and Quick Access panel"
+                width="1600"
+                height="1000"
+                loading="lazy"
+                decoding="async"
+              >
+            </button>
+          </div>
+          <div class="showcase-copy">
+            <p class="eyebrow">Manga, Webtoon &amp; 3D Reference</p>
+            <h3>Panels, tones, perspective rulers, and a posable 3D figure.</h3>
+            <p class="body-copy">
+              Cut frame border folders, place parametric speech balloons, set horizontal or vertical
+              typography, and drop screentones or speed lines onto 1-bit monochrome layers.
+            </p>
+            <p class="detail-note">
+              Includes 1/2/3-point perspective rulers with brush snapping, a posable 3D mannequin
+              (plus <code>.glb</code>/<code>.obj</code> import) with camera-to-ruler sync and line-and-tone
+              baking, and 9:16 Webtoon chapter slice export.
+            </p>
+          </div>
+        </article>
+      </div>
+
+      <!-- Practical everyday essentials -->
+      <div class="essentials-grid">
+        <article class="essential-item">
+          <h3>Keep your old files &amp; brushes</h3>
+          <p>
+            Opens <code>.psd</code>, <code>.psb</code>, <code>.clip</code>, <code>.csp</code>, and
+            <code>.lip</code> projects with lossless PSD/PSB round-trip across all 28 blend modes.
+            Import Clip Studio <code>.sut</code> brushes, work on editable vector layers, and use
+            multi-layer Liquify, Mesh Warp, Curves, Levels, and Gradient Maps.
+          </p>
+        </article>
+
+        <article class="essential-item">
+          <h3>Cel animation &amp; time-lapse</h3>
+          <p>
+            Animate frame-by-frame with an onion-skinning cel timeline, or let Ink Studio record
+            stroke-based time-lapses while you paint. Export straight to GIF, APNG, WebM, H.264 MP4,
+            or PNG sequence archives.
+          </p>
+        </article>
+
+        <article class="essential-item">
+          <h3>Fast, offline, and yours</h3>
+          <p>
+            Native Windows Wintab and Windows Ink stylus input for zero-lag lines, automatic crash
+            recovery, and custom dockable workspaces. No logins, no cloud lock-in, no subscriptions,
+            and zero generative AI.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <!-- Interactive Studio Scratchpad -->
+    <section id="studio" class="section">
+      <div class="section-head">
+        <div>
+          <p class="eyebrow">Browser Scratchpad</p>
+          <h2>Test a G-Pen stroke right here.</h2>
+        </div>
+        <span class="section-note">Lightweight HTML5 preview · Supports pen pressure &amp; stabilization</span>
+      </div>
+
       <div class="studio-frame" aria-label="Interactive Ink Studio canvas preview">
         <div class="studio-topbar">
           <div class="studio-doc-tab">
@@ -169,7 +522,7 @@
                 <div class="swatches" role="group" aria-label="Ink colors">
                   <button type="button" class="swatch active" data-color="#141414" title="Sumi Black" aria-label="Sumi Black"></button>
                   <button type="button" class="swatch" data-color="#2563eb" title="Draft Blue" aria-label="Draft Blue"></button>
-                  <button type="button" class="swatch" data-color="#dc2626" title="Correction Red" aria-label="Correction Red"></button>
+                  <button type="button" class="swatch" data-color="#c94435" title="Vermilion Red" aria-label="Vermilion Red"></button>
                   <button type="button" class="swatch" data-color="#52525b" title="Graphite" aria-label="Graphite"></button>
                   <button type="button" class="swatch" data-color="#059669" title="Annotation Green" aria-label="Annotation Green"></button>
                 </div>
@@ -254,50 +607,13 @@
       </div>
     </section>
 
-    <!-- Features -->
-    <section id="features" class="section">
-      <div class="section-head">
-        <h2>Core capabilities</h2>
-        <span class="section-note">Local scratch disk · Crash recovery · No account required</span>
-      </div>
-
-      <div class="capability-grid">
-        <article class="capability-item">
-          <h3>WebGL Brush Engine</h3>
-          <p>Pressure, tilt, velocity, taper, dual brush tips, paper textures, wet edges, color mixing, and custom pressure curves. Imports Clip Studio Paint <code>.sut</code> and native <code>.inkb</code> presets.</p>
-        </article>
-
-        <article class="capability-item">
-          <h3>Sparse-Tile &amp; Vector Layers</h3>
-          <p>Raster tiles and editable vector strokes with pinch, width, and simplify tools. Includes clipping and layer masks, layer styles, 17 blend modes, Curves/Levels/Gradient Map adjustments, CMYK soft proofing, and 1-bit Monochrome mode.</p>
-        </article>
-
-        <article class="capability-item">
-          <h3>Manga &amp; Webtoon</h3>
-          <p>Frame border folders with panel splitting, parametric speech balloons, horizontal and vertical typography, screentones, effect lines, 1/2/3-point perspective rulers with brush snapping, and 9:16 Webtoon slice export.</p>
-        </article>
-
-        <article class="capability-item">
-          <h3>3D Reference &amp; LT Baking</h3>
-          <p>Embedded Three.js viewport with a posable IK mannequin, pose presets, <code>.glb</code>/<code>.gltf</code>/<code>.obj</code> import, adjustable lights, camera-to-perspective-ruler sync, and line-and-tone extraction.</p>
-        </article>
-
-        <article class="capability-item">
-          <h3>Cel Animation &amp; Time-lapse</h3>
-          <p>Frame-by-frame cel animation timeline with onion skinning alongside stroke-based time-lapse recording. Export to GIF, APNG, WebM, H.264 MP4, or PNG sequence archives.</p>
-        </article>
-
-        <article class="capability-item">
-          <h3>Real-Time Multiplayer</h3>
-          <p>Built-in Rust WebSocket server for up to 16 concurrent artists over LAN or public invite links via Cloudflare Tunnel. Live cursors, tile-level sync, layer reservation, and browser guest access.</p>
-        </article>
-      </div>
-    </section>
-
     <!-- Download -->
     <section id="download" class="section">
       <div class="section-head">
-        <h2>Download</h2>
+        <div>
+          <p class="eyebrow">Get Ink Studio</p>
+          <h2>Download</h2>
+        </div>
         <div class="section-note mono" id="sync-status">Checking latest release...</div>
       </div>
 
@@ -316,7 +632,7 @@
         </div>
 
         <div class="download-footer">
-          <span class="muted">SHA-verified via GitHub Releases · Automatic updates on Windows</span>
+          <span class="muted">Free under GPL-3.0 · Automatic updates on Windows · No sign-up required</span>
           <a href="https://github.com/praisesora/inkstudio/releases" target="_blank" rel="noopener noreferrer" class="mono link-muted">
             All releases &rarr;
           </a>
@@ -327,8 +643,11 @@
     <!-- Formats & Shortcuts -->
     <section id="formats" class="section">
       <div class="section-head">
-        <h2>Formats &amp; keybinds</h2>
-        <span class="section-note">Customizable in Settings · <kbd>Ctrl+,</kbd></span>
+        <div>
+          <p class="eyebrow">Compatibility</p>
+          <h2>Formats &amp; keybinds</h2>
+        </div>
+        <span class="section-note">Fully customizable in Settings · <kbd>Ctrl+,</kbd></span>
       </div>
 
       <div class="specs-grid">
@@ -337,19 +656,19 @@
           <dl class="format-table">
             <div class="format-row">
               <dt>Open</dt>
-              <dd class="mono">.ink, .psd, .psb, .clip, .csp, .png, .jpg, .webp, .gif, .bmp, .svg, .sora</dd>
+              <dd class="mono">.ink, .psd, .psb, .clip, .csp, .lip, .png, .jpg, .webp, .gif, .bmp, .svg</dd>
             </div>
             <div class="format-row">
               <dt>Save</dt>
-              <dd class="mono">.ink, .psd, .png, .jpg, .webp</dd>
+              <dd class="mono">.ink, .psd, .psb, .png, .jpg, .webp</dd>
             </div>
             <div class="format-row">
-              <dt>Import</dt>
-              <dd class="mono">.inkb, .sut, .glb, .gltf, .obj</dd>
+              <dt>Brushes</dt>
+              <dd class="mono">.inkb (import &amp; export), .sut (Clip Studio Paint import)</dd>
             </div>
             <div class="format-row">
-              <dt>Export</dt>
-              <dd class="mono">.png, .zip (Webtoon slices), .gif, .apng, .webm, .mp4</dd>
+              <dt>3D &amp; Export</dt>
+              <dd class="mono">.glb, .gltf, .obj · Webtoon .zip, .gif, .apng, .webm, .mp4</dd>
             </div>
           </dl>
         </div>
@@ -362,7 +681,7 @@
             <div class="shortcut-row"><span>Resize brush</span><kbd>Ctrl+Alt+Drag</kbd></div>
             <div class="shortcut-row"><span>Pan canvas</span><kbd>Space+Drag</kbd></div>
             <div class="shortcut-row"><span>Rotate canvas</span><kbd>Shift+Space</kbd></div>
-            <div class="shortcut-row"><span>Free transform</span><kbd>Ctrl+T</kbd></div>
+            <div class="shortcut-row"><span>Liquify</span><kbd>J</kbd></div>
             <div class="shortcut-row"><span>Perspective ruler</span><kbd>Ctrl+Shift+R</kbd></div>
             <div class="shortcut-row"><span>Toggle palettes</span><kbd>Tab</kbd></div>
           </div>
@@ -373,7 +692,10 @@
     <!-- Releases -->
     <section id="releases" class="section">
       <div class="section-head">
-        <h2>Recent releases</h2>
+        <div>
+          <p class="eyebrow">Changelog</p>
+          <h2>Recent releases</h2>
+        </div>
         <a href="https://github.com/praisesora/inkstudio/releases" target="_blank" rel="noopener noreferrer" class="mono link-muted">
           GitHub Releases &rarr;
         </a>
@@ -392,16 +714,31 @@
         <img src="./assets/app-icon.png" alt="" width="18" height="18" class="brand-icon">
         <span>Ink Studio</span>
         <span class="sep" aria-hidden="true">·</span>
-        <span class="muted">GPL-3.0 · &copy; 2026 Sora</span>
+        <span class="muted">Made by Sora · GPL-3.0 · &copy; 2026</span>
       </div>
       <div class="footer-links">
-        <a href="https://github.com/praisesora/inkstudio" target="_blank" rel="noopener noreferrer">Source</a>
+        <a href="https://discord.gg/37dYhgBePe" target="_blank" rel="noopener noreferrer">Discord</a>
+        <a href="https://github.com/praisesora/inkstudio" target="_blank" rel="noopener noreferrer">GitHub</a>
         <a href="https://github.com/praisesora/inkstudio/releases" target="_blank" rel="noopener noreferrer">Releases</a>
         <a href="https://github.com/praisesora/inkstudio/issues" target="_blank" rel="noopener noreferrer">Issues</a>
         <a href="https://github.com/praisesora/inkstudio/blob/main/PRIVACY.md" target="_blank" rel="noopener noreferrer">Privacy</a>
-        <a href="https://discord.gg/37dYhgBePe" target="_blank" rel="noopener noreferrer">Discord</a>
       </div>
     </div>
   </footer>
+
+  <!-- Full-resolution artwork & UI lightbox -->
+  <dialog id="art-lightbox" class="lightbox" aria-label="Artwork inspection">
+    <div class="lightbox-shell">
+      <div class="lightbox-bar">
+        <p id="lightbox-caption" class="lightbox-caption"></p>
+        <button type="button" id="lightbox-close" class="lightbox-close" aria-label="Close preview">
+          Close <kbd>Esc</kbd>
+        </button>
+      </div>
+      <div class="lightbox-stage">
+        <img id="lightbox-img" src="" alt="">
+      </div>
+    </div>
+  </dialog>
 </body>
 </html>

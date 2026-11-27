@@ -274,10 +274,10 @@
     const syncStatus = document.getElementById('sync-status');
 
     if (!latest) {
-      if (heroPill) heroPill.textContent = 'Tauri + Rust';
+      if (heroPill) heroPill.textContent = 'GPL-3.0';
       if (primaryBtn) primaryBtn.href = RELEASES_PAGE_URL;
       if (primaryLabel) primaryLabel.textContent = 'View GitHub Releases';
-      if (primaryMeta) primaryMeta.textContent = 'No public release published yet · Build from source below';
+      if (primaryMeta) primaryMeta.textContent = 'Windows x64 installer · macOS & Linux from source · Opens .psd, .clip & .sut';
       if (syncStatus) syncStatus.textContent = 'Waiting for first published release';
       return;
     }
@@ -970,7 +970,95 @@
     });
   }
 
+  /* --------------------------------------------------------------------------
+   * Hero Gallery Plate Switcher & Lightbox Inspection
+   * -------------------------------------------------------------------------- */
+  function initGalleryAndLightbox() {
+    const dialog = document.getElementById('art-lightbox');
+    const lightboxImg = document.getElementById('lightbox-img');
+    const lightboxCaption = document.getElementById('lightbox-caption');
+    const lightboxClose = document.getElementById('lightbox-close');
+
+    function openLightbox(src, alt, caption) {
+      if (!dialog || !lightboxImg || !src) return;
+      lightboxImg.src = src;
+      lightboxImg.alt = alt || caption || '';
+      if (lightboxCaption) lightboxCaption.textContent = caption || alt || '';
+      if (typeof dialog.showModal === 'function') {
+        dialog.showModal();
+      } else {
+        dialog.setAttribute('open', '');
+      }
+    }
+
+    function closeLightbox() {
+      if (!dialog) return;
+      if (typeof dialog.close === 'function' && dialog.open) {
+        dialog.close();
+      } else {
+        dialog.removeAttribute('open');
+      }
+    }
+
+    if (lightboxClose) {
+      lightboxClose.addEventListener('click', closeLightbox);
+    }
+
+    if (dialog) {
+      dialog.addEventListener('click', (e) => {
+        if (e.target === dialog) closeLightbox();
+      });
+    }
+
+    // Hero plate switcher
+    const heroImg = document.getElementById('hero-plate-img');
+    const heroCaption = document.getElementById('hero-plate-caption');
+    const heroZoomBtn = document.getElementById('hero-plate-zoom');
+    const plateTabs = document.querySelectorAll('.plate-tab');
+
+    plateTabs.forEach((tab) => {
+      tab.addEventListener('click', () => {
+        const src = tab.dataset.src;
+        const alt = tab.dataset.alt || '';
+        const caption = tab.dataset.caption || '';
+        if (heroImg && src) {
+          heroImg.src = src;
+          heroImg.alt = alt;
+        }
+        if (heroCaption) heroCaption.textContent = caption;
+        plateTabs.forEach((t) => {
+          const active = t === tab;
+          t.classList.toggle('active', active);
+          t.setAttribute('aria-selected', String(active));
+        });
+      });
+    });
+
+    if (heroZoomBtn && heroImg) {
+      heroZoomBtn.addEventListener('click', () => {
+        openLightbox(
+          heroImg.getAttribute('src'),
+          heroImg.alt,
+          heroCaption ? heroCaption.textContent : heroImg.alt
+        );
+      });
+    }
+
+    // Any zoomable gallery or feature frame
+    document.querySelectorAll('[data-lightbox-src]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const img = btn.querySelector('img');
+        openLightbox(
+          btn.dataset.lightboxSrc,
+          img ? img.alt : '',
+          btn.dataset.lightboxCaption || (img ? img.alt : '')
+        );
+      });
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', () => {
+    initGalleryAndLightbox();
     initStudioCanvas();
     void initReleases();
   });
