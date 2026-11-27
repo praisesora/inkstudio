@@ -30,7 +30,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "publisher": "Sora",
     "shortDescription": "Collaborative Drawing Studio",
     "copyright": "Copyright © 2026 Sora",
